@@ -2,7 +2,8 @@
 """
 SD-WAN Secure Router Onboarding Pipeline for Cisco One Experience Lab
 
-Full pipeline: Onboard → License → Associate → Set Vars → Deploy → Bootstrap → Copy → Controller-Mode
+Full pipeline: License → Associate → Set Vars → Deploy → Bootstrap → Copy
+(Stops after TFTP copy; controller-mode must be verified manually before enabling)
 
 Usage:
   uv run --directory ~/sw_projects/pod_automator python3 onboard.py [--serial SERIAL] [--phase N]
@@ -30,7 +31,7 @@ JUMP_PASS = os.getenv("JUMP_PASS", "<LAB_PASS>")
 SERIAL = "FJC300412NA"
 UUID = f"C8231-G2-{SERIAL}"
 CG_ID = "ae290e0f-7bc4-40f7-9bfa-23b1e7b2a71a"
-POD_DIR = os.path.expanduser("~/sw_projects/pod_automator")
+POD_DIR = os.getenv("POD_DIR", os.path.dirname(os.path.abspath(__file__)))
 CSV_PATH = os.path.join(POD_DIR, "PseudocoBranches_Config-Group-Template.csv")
 BOOTSTRAP_PATH = os.path.join(POD_DIR, "data", "bootstrap", "ciscosdwan.cfg")
 
@@ -85,29 +86,20 @@ def _read_csv():
 
 # ── Phases ──────────────────────────────────────────────────────────────────
 
-def phase_onboard():
-    """Quick Connect onboard — set system-ip, site-id, host-name."""
-    print("[1/8] Onboard...")
-    csv_row = _read_csv()
-    payload = {
-        "deviceList": [{
-            "deviceId": UUID,
-            "serialNumber": SERIAL,
-            "systemIp": csv_row["System IP"],
-            "siteId": csv_row["Site Id"],
-            "hostName": csv_row["Host Name"],
-            "board": True,
-        }]
-    }
-    r = _post("/dataservice/template/config/quickConnect/submitDevices", payload)
-    ok = r.status_code == 200
-    print(f"  {'OK' if ok else 'FAIL'} {r.status_code}")
-    if not ok: print(f"  {r.text[:200]}")
-    return ok
-
 def phase_license():
-    """Assign WAN Advantage license."""
+    """Assign WAN Advantage license (skip if already assigned)."""
     print("[2/8] License...")
+
+    r = _post("/dataservice/v1/licensing/licenses", {
+        "uuids": [UUID], "appliedFilters": {
+            "billingType": "Prepaid", "licenseClassification": "Advantage",
+        }
+    })
+    if r.status_code == 200:
+        for bl in r.json().get("baseLicenses", []):
+            if UUID in bl.get("uuids", []):
+                print("  Already licensed ✅")
+                return True
 
     r = _post("/dataservice/v1/licensing/sa-va-distribution", {
         "appliedFilters": {"billingType": "Prepaid", "licenseClassification": "Advantage"},
@@ -142,12 +134,16 @@ def phase_license():
     return ok
 
 def phase_associate():
-    """Associate device to config group."""
+    """Associate device to config group (skip if already associated)."""
     print("[3/8] Associate CG...")
     r = _post(f"/dataservice/v1/config-group/{CG_ID}/device/associate",
               {"devices": [{"id": UUID}]})
     ok = r.status_code == 200
+    if "already associated" in r.text.lower():
+        print("  Already associated ✅")
+        return True
     print(f"  {'OK' if ok else 'FAIL'} {r.status_code}")
+    if not ok: print(f"  {r.text[:200]}")
     return ok
 
 def phase_set_variables():
@@ -223,57 +219,43 @@ def phase_bootstrap():
     return ok
 
 def phase_tftp_copy():
-    """SCP bootstrap to jump host, TFTP to router bootflash."""
+    """Copy bootstrap via scp -O (legacy protocol) after enabling SCP server."""
     print("[7/8] Copy bootstrap to router...")
     local = BOOTSTRAP_PATH
-    remote = f"C:\\\\TFTP-ROOT\\\\ciscosdwan.cfg"
 
-    r = subprocess.run(["sshpass", "-p", JUMP_PASS, "scp", "-o", "StrictHostKeyChecking=no",
-                        "-o", "ConnectTimeout=10", local, f"{JUMP_USER}@{JUMP_HOST}:{remote}"],
-                       capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
-        print(f"  SCP FAIL: {r.stderr[:100]}")
-        return False
-    print(f"  SCP OK")
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(ROUTER_IP, username=ROUTER_USER, password=ROUTER_PASS,
                        look_for_keys=False, allow_agent=False, timeout=15)
         shell = client.invoke_shell(width=200, height=50)
-        time.sleep(2)
-        if shell.recv_ready(): shell.recv(65535)
-        shell.send("enable\n"); time.sleep(1)
-        if shell.recv_ready(): shell.recv(65535)
-        shell.send(f"{ROUTER_PASS}\n"); time.sleep(2)
-        if shell.recv_ready(): shell.recv(65535)
-
-        src = f"tftp://{JUMP_HOST}/ciscosdwan.cfg"
-        shell.send(f"copy {src} bootflash:ciscosdwan.cfg\n")
-
-        text = ""
-        for i in range(30):
-            time.sleep(2)
-            while shell.recv_ready():
-                text += shell.recv(65535).decode(errors="replace")
-            if "bytes copied" in text.lower():
-                break
-            if "?" in text or "over write" in text.lower() or "confirm" in text.lower():
-                shell.send("\n")
-
-        ok = "bytes copied" in text.lower()
-        print(f"  {'OK' if ok else 'FAIL'}")
-        if ok:
-            for line in text.splitlines():
-                if "bytes copied" in line:
-                    print(f"    {line.strip()}")
-        return ok
-    except Exception as e:
-        print(f"  TFTP FAIL: {e}")
-        return False
-    finally:
+        time.sleep(2); shell.recv(65535)
+        shell.send("enable\n"); time.sleep(1); shell.recv(65535)
+        shell.send(f"{ROUTER_PASS}\n"); time.sleep(2); shell.recv(65535)
+        shell.send("configure terminal\n"); time.sleep(1); shell.recv(65535)
+        shell.send("ip scp server enable\n"); time.sleep(2); shell.recv(65535)
+        shell.send("end\n"); time.sleep(1); shell.recv(65535)
+        shell.send("write memory\n"); time.sleep(3)
         client.close()
+    except Exception as e:
+        print(f"  Enable SCP: {e}")
+
+    for attempt in range(3):
+        r = subprocess.run(
+            ["sshpass", "-p", ROUTER_PASS, "scp", "-O",
+             "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+             "-o", "IPQoS=0",
+             local, f"{ROUTER_USER}@{ROUTER_IP}:ciscosdwan.cfg"],
+            capture_output=True, text=True, timeout=60
+        )
+        if r.returncode == 0:
+            print(f"  SCP OK (attempt {attempt+1})")
+            return True
+        print(f"  SCP attempt {attempt+1} FAIL: {r.stderr[:100]}")
+        time.sleep(3)
+
+    print("  SCP failed after 3 attempts")
+    return False
 
 def phase_controller_mode():
     """Enable controller-mode on router."""
@@ -377,14 +359,12 @@ def check_switches():
 
 # ── Main ────────────────────────────────────────────────────────────────────
 PHASES = [
-    ("onboard",          phase_onboard),
     ("license",          phase_license),
     ("associate",        phase_associate),
     ("set_variables",    phase_set_variables),
     ("deploy",           phase_deploy),
     ("bootstrap",        phase_bootstrap),
     ("tftp_copy",        phase_tftp_copy),
-    ("controller_mode",  phase_controller_mode),
 ]
 
 def main():
@@ -394,9 +374,11 @@ def main():
         start_phase = int(sys.argv[idx + 1])
     if "--serial" in sys.argv:
         idx = sys.argv.index("--serial")
-        global SERIAL, UUID
-        SERIAL = sys.argv[idx + 1]
-        UUID = f"C8231-G2-{SERIAL}"
+        val = sys.argv[idx + 1]
+        if val.strip():
+            global SERIAL, UUID
+            SERIAL = val.strip()
+            UUID = f"C8231-G2-{SERIAL}"
 
     print(f"{'='*50}")
     print(f"SD-WAN Onboarding Pipeline")
@@ -419,14 +401,9 @@ def main():
             sys.exit(1)
 
     print(f"{'='*50}")
-    print("Pipeline complete! Waiting for router to come online...")
+    print("Pipeline complete! Bootstrap copied to router bootflash.")
+    print("Verify the config manually, then run controller-mode enable.")
     print(f"{'='*50}\n")
-
-    if phase_verify_online():
-        check_switches()
-        print(f"\n{'='*50}")
-        print("All done! Router online, switches verified.")
-        print(f"{'='*50}")
 
 if __name__ == "__main__":
     main()

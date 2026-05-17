@@ -1,6 +1,6 @@
 services:
   vpn:
-    image: alpine/openconnect
+    image: pod-automator:latest
     container_name: vpn-{{pod_id}}
     cap_add: [NET_ADMIN, SYS_ADMIN]
     devices: [/dev/net/tun]
@@ -8,16 +8,13 @@ services:
       OPENCONNECT_PASSWORD: {{vpn_pass}}
       OPENCONNECT_USER: {{vpn_user}}
       OPENCONNECT_URL: {{vpn_host}}
-    command: >
-      sh -c 'echo "$$OPENCONNECT_PASSWORD" |
-        openconnect --interface tun0
-          --user "$$OPENCONNECT_USER"
-          --passwd-on-stdin
-          --script-tun
-          "$$OPENCONNECT_URL"'
+    entrypoint: "/bin/sh"
+    command:
+      - "-c"
+      - "mkdir -p /dev/net && (mknod /dev/net/tun c 10 200 2>/dev/null || true) && echo \"$${OPENCONNECT_PASSWORD}\" | openconnect --interface tun0 --user \"$${OPENCONNECT_USER}\" --authgroup \"Anyconnect-to-dCloud\" --passwd-on-stdin -s /usr/share/vpnc-scripts/vpnc-script \"$${OPENCONNECT_URL}\""
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "ping", "-c", "1", "{{vmanage_ip}}"]
+      test: ["CMD-SHELL", "ip link show tun0 2>/dev/null | grep -q UP"]
       interval: 15s
       timeout: 5s
       retries: 12
@@ -44,6 +41,7 @@ services:
     volumes:
       - {{pod_id}}-bootstrap:/pipeline/data/bootstrap
       - {{pod_id}}-ssh:/root/.ssh
+      - {{host_data_dir}}:/pipeline/data
     command: ["--serial", "{{serial}}"]
     restart: "no"
 

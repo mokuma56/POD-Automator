@@ -574,7 +574,6 @@ if __name__ == "__main__":
         ("deploy_config_group", lambda: phase_deploy(s)),
         ("generate_bootstrap", lambda: phase_generate_bootstrap(s)),
         ("copy_bootstrap", phase_copy_bootstrap),
-        ("controller_mode_enable", phase_controller_mode),
         ("verify_online", lambda: True),
         ("verify_border_spine", lambda: run_switch_checks("verify_border_spine")),
         ("verify_leaf1", lambda: run_switch_checks("verify_leaf1")),
@@ -615,4 +614,4 @@ conn.commit()"""], timeout=5)
 
     print(f"\n{'='*40}")
     print(f"Pipeline complete for {pod_id}")
-    print("Router in SD-WAN mode, switches verified, connectivity tested.")
+    print("Bootstrap copied to router bootflash. Verify config, then enable controller-mode manually.")

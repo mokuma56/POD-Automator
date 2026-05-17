@@ -44,6 +44,33 @@ def check_pod_vpn(pod_id):
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
+    # Try lowercase project name too
+    try:
+        r = subprocess.run(
+            ["docker", "compose", "-p", pod_id.lower(), "ps", "--format=json"],
+            capture_output=True, text=True, timeout=8
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
+            for line in lines:
+                try:
+                    data = json.loads(line)
+                    if data.get("Service") == "vpn":
+                        state = data.get("Status", data.get("State", ""))
+                        health = data.get("Health", "")
+                        if health == "healthy":
+                            return {"status": "connected", "detail": "Docker VPN healthy"}
+                        elif "Up" in state:
+                            if health in ("starting", ""):
+                                return {"status": "connecting", "detail": "Docker VPN starting"}
+                            return {"status": "connected", "detail": "Docker VPN up"}
+                        else:
+                            return {"status": "disconnected", "detail": f"Docker: {state[:40]}"}
+                except json.JSONDecodeError:
+                    pass
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
     # Fallback: check host VPN
     try:
         r = subprocess.run(["pgrep", "openconnect"], capture_output=True, text=True, timeout=3)
@@ -56,6 +83,125 @@ def check_pod_vpn(pod_id):
         return {"status": "connecting", "detail": "Host VPN, waiting for routes"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+
+
+# ---- VPN management ---- #
+def vpn_connect(host=None, user=None, password=None):
+    """Start openconnect VPN. Reads creds from first POD if not provided."""
+    import subprocess, time
+    if not host or not user or not password:
+        conn = _db()
+        row = conn.execute("SELECT vpn_host, vpn_user, vpn_pass FROM pods WHERE vpn_host != '' LIMIT 1").fetchone()
+        conn.close()
+        if row:
+            host, user, password = row["vpn_host"], row["vpn_user"], row["vpn_pass"]
+        if not host:
+            return False, "No VPN credentials in DB"
+    try:
+        subprocess.run(["sudo", "pkill", "openconnect"], capture_output=True, timeout=5)
+        time.sleep(1)
+        proc = subprocess.Popen(
+            ["sudo", "openconnect", "--interface", "utun9",
+             "--user", user, "--passwd-on-stdin",
+             "--script-tun", host, "-b"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        proc.communicate(input=(password + "\n").encode(), timeout=15)
+        time.sleep(3)
+        r = subprocess.run(["pgrep", "openconnect"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return True, "VPN connected"
+        return False, "openconnect exited (check credentials)"
+    except Exception as e:
+        return False, str(e)
+
+
+def vpn_disconnect():
+    """Kill openconnect VPN."""
+    import subprocess
+    subprocess.run(["sudo", "pkill", "openconnect"], capture_output=True, timeout=5)
+
+
+# ---- Docker launch ---- #
+TEMPLATE = DATA_DIR / "docker" / "compose-template.yml"
+PROJECT_ROOT = DATA_DIR
+IMAGE = "pod-automator:latest"
+
+
+def _build_image():
+    import subprocess
+    r = subprocess.run(["docker", "images", "-q", IMAGE], capture_output=True, text=True, timeout=15)
+    if r.stdout.strip():
+        return True
+    print("  Building pod-automator image...")
+    r = subprocess.run(
+        ["docker", "compose", "-f", str(PROJECT_ROOT / "docker-compose.yml"), "build"],
+        capture_output=True, text=True, timeout=300
+    )
+    if r.returncode != 0:
+        print(f"  Build failed: {r.stderr[:200]}")
+        return False
+    return True
+
+
+def _generate_compose(pod_conf):
+    """Render compose template with POD variables."""
+    import re
+    with open(TEMPLATE) as f:
+        tmpl = f.read()
+    def _repl(m):
+        key = m.group(1)
+        val = pod_conf.get(key)
+        if val is None:
+            raise KeyError(f"Missing template variable: {key}")
+        return str(val)
+    return re.sub(r"\{\{(\w+)\}\}", _repl, tmpl)
+
+
+def _docker_launch_one(pod_data):
+    """Launch Docker compose stack for a single POD."""
+    import subprocess, tempfile, os
+    pod_id = pod_data["pod_id"]
+    dp_id = pod_id.lower()  # Docker compose requires lowercase project names
+    conf = {
+        "pod_id": dp_id,
+        "pod_display": pod_id,
+        "vpn_host": pod_data.get("vpn_host", ""),
+        "vpn_user": pod_data.get("vpn_user", ""),
+        "vpn_pass": pod_data.get("vpn_pass", ""),
+        "router_ip": pod_data.get("router_ip", ""),
+        "serial": pod_data.get("router_serial", ""),
+        "vmanage_ip": "198.18.133.10",
+        "vmanage_user": "admin",
+        "vmanage_pass": "<LAB_PASS>",
+        "jump_host": pod_data.get("jump_host", "198.18.133.36"),
+        "jump_user": "demouser",
+        "jump_pass": "<LAB_PASS>",
+        "router_user": "admin",
+        "router_pass": "<LAB_PASS>",
+        "host_data_dir": str(DATA_DIR / "data"),
+    }
+    if not conf["router_ip"]:
+        try:
+            n = int(pod_id.replace("POD-", ""))
+            conf["router_ip"] = f"198.18.133.{21 + n}"
+        except ValueError:
+            pass
+    compose_data = _generate_compose(conf)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        f.write(compose_data)
+        tmp_path = f.name
+    try:
+        r = subprocess.run(
+            ["docker", "compose", "-p", dp_id, "-f", tmp_path, "up", "-d"],
+            capture_output=True, text=True, timeout=120
+        )
+        os.unlink(tmp_path)
+        return r.returncode == 0, r.stderr[:200] or r.stdout[:200]
+    except Exception as e:
+        os.unlink(tmp_path)
+        return False, str(e)
+
 
 # ---- DB helpers ----
 def _db():
@@ -381,6 +527,52 @@ def api_switches(pod_id):
 
     return jsonify(switch_data)
 
+@app.route("/api/vpn/connect/<pod_id>", methods=["POST"])
+def api_vpn_connect(pod_id):
+    """Reconnect VPN for a specific POD. Tries Docker container first, falls back to host VPN."""
+    import subprocess, json
+    # Check if Docker compose stack exists (try both cases)
+    dp_id = pod_id.lower()
+    r = subprocess.run(
+        ["docker", "compose", "-p", dp_id, "ps", "--format=json"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        # Docker mode: restart the VPN container
+        subprocess.run(
+            ["docker", "compose", "-p", dp_id, "restart", "vpn"],
+            capture_output=True, timeout=30
+        )
+        return jsonify({"status": "ok", "message": "Docker VPN container restarted"})
+    # Fallback: restart host VPN
+    conn = _db()
+    row = conn.execute("SELECT vpn_host, vpn_user, vpn_pass FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+    conn.close()
+    if row and row["vpn_host"]:
+        ok, msg = vpn_connect(row["vpn_host"], row["vpn_user"], row["vpn_pass"])
+    else:
+        ok, msg = vpn_connect()
+    return jsonify({"status": "ok" if ok else "error", "message": msg})
+
+
+@app.route("/api/vpn/disconnect/<pod_id>", methods=["POST"])
+def api_vpn_disconnect(pod_id):
+    import subprocess
+    dp_id = pod_id.lower()
+    r = subprocess.run(
+        ["docker", "compose", "-p", dp_id, "ps", "--format=json"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        subprocess.run(
+            ["docker", "compose", "-p", dp_id, "stop", "vpn"],
+            capture_output=True, timeout=30
+        )
+        return jsonify({"status": "ok", "message": "Docker VPN container stopped"})
+    vpn_disconnect()
+    return jsonify({"status": "ok", "message": "Host VPN disconnected"})
+
+
 @app.route("/api/upload-event", methods=["POST"])
 def upload_event():
     if "file" not in request.files:
@@ -473,6 +665,25 @@ def upload_event():
         conn.close()
         created += 1
 
+    # Auto-launch Docker stacks + connect host VPN after CSV upload
+    if created > 0:
+        import threading
+        def _auto_deploy():
+            # 1. Try Docker — launch per-POD compose stacks in parallel
+            docker_ok = _build_image()
+            if docker_ok:
+                conn = _db()
+                pods = conn.execute("SELECT * FROM pods WHERE status='pending'").fetchall()
+                conn.close()
+                for p in pods:
+                    d = dict(p)
+                    ok, msg = _docker_launch_one(d)
+                    print(f"  Docker {d['pod_id']}: {'OK' if ok else 'FAIL'} {msg[:60]}")
+            # 2. Connect host VPN as fallback for single-POD use
+            ok, msg = vpn_connect()
+            print(f"Auto-VPN: {msg}")
+        t = threading.Thread(target=_auto_deploy, daemon=True)
+        t.start()
     return jsonify({"status": "ok", "pods_created": created, "columns": reader.fieldnames})
 
 @app.route("/api/start-pipeline/<pod_id>", methods=["POST"])
@@ -579,6 +790,10 @@ DASHBOARD_HTML = """
   .btn-start:hover { background: #00ff9a; }
   .btn-start:disabled { background: #1a2d4a; color: #667788; cursor: not-allowed; }
   .btn-start.running { background: #02c8ff; color: #001f3d; }
+  .btn-reconnect { background: #1a2d4a; color: #02c8ff; border: 1px solid #02c8ff; border-radius: 4px;
+                  padding: 2px 8px; font-size: 11px; cursor: pointer; }
+  .btn-reconnect:hover { background: #02c8ff; color: #001f3d; }
+  .btn-reconnect:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn-start-all { background: #02c8ff; color: #001f3d; border: none; border-radius: 6px;
                    padding: 8px 20px; font-size: 14px; font-weight: 700; cursor: pointer; }
   .btn-start-all:hover { background: #00d4ff; }
@@ -669,6 +884,7 @@ DASHBOARD_HTML = """
         <th>POD</th>
         <th>Status</th>
         <th>VPN</th>
+        <th>Action</th>
         <th>Serial</th>
         <th>SD-WAN</th>
         <th>Pipeline</th>
@@ -744,6 +960,27 @@ async function handleFile(file) {
   }
 }
 
+async function reconnectVpn(podId) {
+  const btn = document.getElementById('vpn-btn-' + podId);
+  btn.disabled = true;
+  btn.textContent = 'Reconnecting...';
+  try {
+    const r = await fetch('/api/vpn/connect/' + podId, { method: 'POST' });
+    const data = await r.json();
+    if (data.status === 'ok') {
+      btn.textContent = 'Connected';
+      setTimeout(() => { btn.textContent = 'Reconnect'; btn.disabled = false; }, 3000);
+    } else {
+      btn.textContent = 'Failed: ' + (data.message || '').slice(0, 30);
+      btn.disabled = false;
+      setTimeout(() => { btn.textContent = 'Reconnect'; }, 5000);
+    }
+  } catch(e) {
+    btn.textContent = 'Error';
+    btn.disabled = false;
+  }
+}
+
 async function load() {
   const r = await fetch('/api/pods');
   const pods = await r.json();
@@ -811,6 +1048,7 @@ function renderTable(pods) {
       <td class="pod-id" onclick="showPipeline('${p.pod_id}')">${p.pod_id}</td>
       <td><span class="badge ${p.status === 'ready' ? 'pass' : p.status === 'pending' ? 'pending' : 'fail'}">${p.status || 'pending'}</span></td>
       <td style="text-align:center"><span style="color:${vpnColor};font-size:18px;line-height:1" title="${p.vpn_detail || ''}">&#x25cf;</span></td>
+      <td><button class="btn-reconnect" id="vpn-btn-${p.pod_id}" onclick="reconnectVpn('${p.pod_id}')">Reconnect</button></td>
       <td style="font-size:11px;color:#667788">${serial}</td>
       <td class="device-col">${badge(p.sdwan_online, 'Online')}</td>
       <td>${pipeLabel}</td>
