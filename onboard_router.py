@@ -6,7 +6,12 @@ Usage: uv run --directory ~/sw_projects/pod_automator python3 onboard_router.py 
 import csv, json, os, sys, time, paramiko, requests, subprocess, urllib3
 urllib3.disable_warnings()
 
-SERIAL = sys.argv[1] if len(sys.argv) > 1 else "FJC300412NA"
+SERIAL = "FJC300412NA"
+for a in sys.argv[1:]:
+    if not a.startswith("--"):
+        SERIAL = a
+        break
+stop_after_copy = "--stop-after-copy" in sys.argv
 UUID = f"C8231-G2-{SERIAL}"
 CG_ID = "ae290e0f-7bc4-40f7-9bfa-23b1e7b2a71a"
 VMANAGE = "https://198.18.133.10"
@@ -257,88 +262,80 @@ def phase_generate_bootstrap(s):
     return ok
 
 
-def upload_to_tftp_jump():
-    """SCP bootstrap file to the Windows jump host TFTP directory."""
-    JUMP_HOST = "198.18.133.36"
-    cmd = (
-        f'sshpass -p "C1sco12345" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 '
-        f'"{BOOTSTRAP_PATH}" '
-        f'"corp.pseudoco.com\\\\demouser@{JUMP_HOST}:C:\\\\TFTP-ROOT\\\\ciscosdwan.cfg"'
-    )
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-    return result.returncode == 0, result.stderr[:100]
-
-
-def tftp_copy_to_router(shell):
-    """Send TFTP copy command and wait for completion, handling prompts."""
-    shell.send("copy tftp://198.18.133.36/ciscosdwan.cfg bootflash:ciscosdwan.cfg\n")
-    all_out = ""
-    for i in range(30):
-        time.sleep(2)
-        out = read_shell(shell, 2)
-        all_out += out
-        if "bytes copied" in all_out.lower():
-            return True, all_out
-        # Handle prompts: Destination filename, over write confirm, etc.
-        if "?" in out or any(kw in out.lower() for kw in ("confirm", "over write", "destination")):
-            shell.send("\n")
-    return False, all_out
+def _find_vpn_ip():
+    """Find the host VPN IP (utun interface with 198.18 route)."""
+    import subprocess
+    r = subprocess.run(["netstat", "-rn"], capture_output=True, text=True, timeout=10)
+    for line in r.stdout.splitlines():
+        if "198.18" in line and "utun" in line:
+            parts = line.split()
+            for p in parts:
+                if p.startswith("10.") and "." in p[3:]:
+                    return p
+    return None
 
 
 def phase_copy_bootstrap():
     expected_size = os.path.getsize(BOOTSTRAP_PATH)
     print(f"     Local file: {BOOTSTRAP_PATH} ({expected_size} bytes)")
 
-    # Step 1: Upload bootstrap to jump host TFTP
-    ok, err = upload_to_tftp_jump()
-    if not ok:
-        print(f"     Upload to jump host failed: {err}")
+    vpn_ip = _find_vpn_ip()
+    if not vpn_ip:
+        print("     VPN host IP not found!")
         return False
-    print("     Uploaded to jump host")
+    print(f"     VPN host IP: {vpn_ip}")
 
-    # Step 2: SSH router and TFTP copy to bootflash (with retry)
+    import http.server, socketserver, threading
+    http_port = 8088
+    os.chdir(os.path.dirname(BOOTSTRAP_PATH))
+    httpd = socketserver.TCPServer(("0.0.0.0", http_port), http.server.SimpleHTTPRequestHandler)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    print(f"     HTTP server started on port {http_port}")
+
     client = None
-    for attempt in range(5):
-        try:
-            client, shell = router_shell()
-            break
-        except Exception as e:
-            print(f"     SSH attempt {attempt+1}: {e}")
-            if attempt == 4:
-                return False
-            time.sleep(6)
-    router_enable(shell)
-
-    ok, output = tftp_copy_to_router(shell)
-    if ok:
-        print(f"     TFTP copy: {output[-200:]}")
-    else:
-        print(f"     TFTP copy failed: {output[-300:]}")
-        client.close()
-        return False
-
-    client.close()
-    time.sleep(2)  # Let SSH session fully close before reconnecting
-
-    # Step 3: Verify file on bootflash (with retry)
     for attempt in range(3):
         try:
             client, shell = router_shell()
             router_enable(shell)
-            shell.send("dir bootflash:ciscosdwan.cfg\n")
+            shell.send("terminal length 0\n"); time.sleep(1); read_shell(shell, 1)
+
+            src = f"http://{vpn_ip}:{http_port}/ciscosdwan.cfg"
+            shell.send(f"copy {src} bootflash:ciscosdwan.cfg\n")
             time.sleep(3)
-            out = read_shell(shell, 3)
-            client.close()
-            size_str = str(expected_size)
-            if size_str in out.replace(",", ""):
-                print(f"     Verified: {expected_size} bytes on bootflash ✅")
-                return True
-            print(f"     Verify attempt {attempt+1}: size mismatch")
+            all_out = ""
+            for i in range(20):
+                time.sleep(2)
+                out = read_shell(shell, 2)
+                all_out += out
+                if "bytes copied" in all_out.lower():
+                    client.close()
+                    print(f"     HTTP copy: {all_out[-200:]}")
+                    httpd.shutdown()
+                    # Verify
+                    for v in range(3):
+                        try:
+                            c2, s2 = router_shell()
+                            router_enable(s2)
+                            s2.send("dir bootflash:ciscosdwan.cfg\n"); time.sleep(3)
+                            vout = read_shell(s2, 3)
+                            c2.close()
+                            if str(expected_size) in vout.replace(",", ""):
+                                print(f"     Verified: {expected_size} bytes ✅")
+                                return True
+                        except: time.sleep(2)
+                    print("     Size mismatch, proceed anyway")
+                    return True
+                if "?" in out.lower() or any(kw in out.lower() for kw in ("confirm", "over write", "destination")):
+                    shell.send("\n")
+            print(f"     HTTP copy result: {all_out[-200:]}")
         except Exception as e:
-            print(f"     Verify attempt {attempt+1}: {e}")
-            time.sleep(3)
-    print(f"     Could not verify file size. Continuing anyway (copy reported success).")
-    return True
+            print(f"     Attempt {attempt+1}: {e}")
+        finally:
+            if client: client.close()
+        time.sleep(3)
+    httpd.shutdown()
+    return False
 
 
 def phase_controller_mode():
@@ -574,13 +571,16 @@ if __name__ == "__main__":
         ("deploy_config_group", lambda: phase_deploy(s)),
         ("generate_bootstrap", lambda: phase_generate_bootstrap(s)),
         ("copy_bootstrap", phase_copy_bootstrap),
-        ("controller_mode_enable", phase_controller_mode),
-        ("verify_online", lambda: True),
-        ("verify_border_spine", lambda: run_switch_checks("verify_border_spine")),
-        ("verify_leaf1", lambda: run_switch_checks("verify_leaf1")),
-        ("verify_leaf2", lambda: run_switch_checks("verify_leaf2")),
-        ("connectivity_test", phase_connectivity_test),
     ]
+    if not stop_after_copy:
+        steps += [
+            ("controller_mode_enable", phase_controller_mode),
+            ("verify_online", lambda: True),
+            ("verify_border_spine", lambda: run_switch_checks("verify_border_spine")),
+            ("verify_leaf1", lambda: run_switch_checks("verify_leaf1")),
+            ("verify_leaf2", lambda: run_switch_checks("verify_leaf2")),
+            ("connectivity_test", phase_connectivity_test),
+        ]
 
     import subprocess, json  # noqa
     def report_step(step_name, status, result=""):
