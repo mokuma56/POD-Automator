@@ -1,27 +1,20 @@
 services:
   vpn:
-    image: alpine/openconnect
+    image: pod-automator:latest
     container_name: vpn-{{pod_id}}
     cap_add: [NET_ADMIN, SYS_ADMIN]
     devices: [/dev/net/tun]
-    environment:
-      OPENCONNECT_PASSWORD: {{vpn_pass}}
-      OPENCONNECT_USER: {{vpn_user}}
-      OPENCONNECT_URL: {{vpn_host}}
-    command: >
-      sh -c 'echo "$$OPENCONNECT_PASSWORD" |
-        openconnect --interface tun0
-          --user "$$OPENCONNECT_USER"
-          --passwd-on-stdin
-          --script-tun
-          "$$OPENCONNECT_URL"'
+    entrypoint: ["/bin/sh"]
+    command:
+      - -c
+      - echo "{{vpn_pass}}" | openconnect --interface tun0 --user "{{vpn_user}}" --passwd-on-stdin "{{vpn_host}}"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "ping", "-c", "1", "{{vmanage_ip}}"]
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('{{vmanage_ip}}', 443), timeout=3).close()"]
       interval: 15s
       timeout: 5s
       retries: 12
-      start_period: 30s
+      start_period: 10s
 
   pipeline:
     image: pod-automator:latest
@@ -32,21 +25,16 @@ services:
         condition: service_healthy
     environment:
       POD_ID: {{pod_id}}
+      SERIAL: {{serial}}
       VMANAGE: {{vmanage_ip}}
       VMANAGE_USER: {{vmanage_user}}
       VMANAGE_PASS: {{vmanage_pass}}
       ROUTER_IP: {{router_ip}}
       ROUTER_USER: {{router_user}}
       ROUTER_PASS: {{router_pass}}
-      JUMP_HOST: {{jump_host}}
-      JUMP_USER: {{jump_user}}
-      JUMP_PASS: {{jump_pass}}
     volumes:
       - {{pod_id}}-bootstrap:/pipeline/data/bootstrap
-      - {{pod_id}}-ssh:/root/.ssh
-    command: ["--serial", "{{serial}}"]
     restart: "no"
 
 volumes:
   {{pod_id}}-bootstrap:
-  {{pod_id}}-ssh:

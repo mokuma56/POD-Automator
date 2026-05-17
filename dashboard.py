@@ -2,7 +2,6 @@
 
 import sqlite3, json, threading, csv, io, os, time, sys
 from pathlib import Path
-from queue import Queue
 from flask import Flask, render_template_string, jsonify, request
 
 sys.path.insert(0, str(Path.home() / "sw_projects" / "pod_automator"))
@@ -15,12 +14,12 @@ app = Flask(__name__)
 
 # ---- VPN status check ---- #
 def check_pod_vpn(pod_id):
-    """Check VPN status for a POD — Docker container first, then host fallback."""
+    """Check VPN status for a POD — Docker container only."""
     import subprocess, json
+    proj_name = pod_id.lower()
     try:
-        # Check if Docker compose stack exists for this POD
         r = subprocess.run(
-            ["docker", "compose", "-p", pod_id, "ps", "--format=json"],
+            ["docker", "compose", "-p", proj_name, "ps", "--format=json"],
             capture_output=True, text=True, timeout=8
         )
         if r.returncode == 0 and r.stdout.strip():
@@ -43,19 +42,8 @@ def check_pod_vpn(pod_id):
                     pass
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
+    return {"status": "disconnected", "detail": "No Docker VPN container"}
 
-    # Fallback: check host VPN
-    try:
-        r = subprocess.run(["pgrep", "openconnect"], capture_output=True, text=True, timeout=3)
-        if r.returncode != 0:
-            return {"status": "disconnected", "detail": "Host VPN down"}
-        r = subprocess.run(["ping", "-c", "1", "-W", "2", "198.18.133.10"],
-                           capture_output=True, timeout=5)
-        if r.returncode == 0:
-            return {"status": "connected", "detail": "Host VPN up"}
-        return {"status": "connecting", "detail": "Host VPN, waiting for routes"}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
 
 # ---- DB helpers ----
 def _db():
@@ -103,10 +91,7 @@ def _migrate():
 
 _migrate()
 
-# ---- Background pipeline runner ----
-_runners = {}
-_runner_logs = {}
-
+# ---- Log helpers ----
 def log(pod_id, msg):
     conn = _db()
     conn.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
@@ -129,105 +114,6 @@ def set_step(pod_id, step_name, status, result=""):
     conn.execute("UPDATE pods SET updated_at = datetime('now') WHERE pod_id = ?", (pod_id,))
     conn.commit()
     conn.close()
-
-def get_pod_data(pod_id):
-    conn = _db()
-    p = conn.execute("SELECT * FROM pods WHERE pod_id = ?", (pod_id,)).fetchone()
-    conn.close()
-    return dict(p) if p else None
-
-def run_onboard_thread(pod_id):
-    try:
-        log(pod_id, "Starting pipeline...")
-        set_step(pod_id, "verify_router", "running", "Checking connectivity...")
-        pod = get_pod_data(pod_id)
-        serial = (pod or {}).get("router_serial", "") or "FJC300412NA"
-        router_ip = (pod or {}).get("router_ip", "") or "198.18.133.25"
-        log(pod_id, f"Router serial: {serial}, IP: {router_ip}")
-
-        # Set module globals for this POD
-        onboard_router.SERIAL = serial
-        onboard_router.UUID = f"C8231-G2-{serial}"
-        onboard_router.ROUTER_IP = router_ip
-        log(pod_id, f"Using serial {serial}, UUID {onboard_router.UUID}")
-
-        s = onboard_router.vmanage_session()
-        log(pod_id, "vManage session OK")
-        set_step(pod_id, "verify_router", "completed", "vManage reachable")
-
-        phases = [
-            ("config_group_associate", lambda: onboard_router.phase_associate(s)),
-            ("set_variables", lambda: onboard_router.phase_set_variables(s)),
-            ("assign_license", lambda: onboard_router.phase_assign_license(s)),
-            ("deploy_config_group", lambda: onboard_router.phase_deploy(s)),
-            ("generate_bootstrap", lambda: onboard_router.phase_generate_bootstrap(s)),
-            ("copy_bootstrap", onboard_router.phase_copy_bootstrap),
-            ("controller_mode_enable", onboard_router.phase_controller_mode),
-        ]
-
-        for step_name, func in phases:
-            log(pod_id, f"Running {step_name}...")
-            set_step(pod_id, step_name, "running", "")
-            try:
-                r = func()
-                if r:
-                    set_step(pod_id, step_name, "completed", "OK")
-                    log(pod_id, f"  {step_name}: OK")
-                else:
-                    set_step(pod_id, step_name, "failed", "Phase returned False")
-                    log(pod_id, f"  {step_name}: FAILED")
-                    return
-            except Exception as e:
-                set_step(pod_id, step_name, "failed", str(e)[:200])
-                log(pod_id, f"  {step_name}: ERROR {e}")
-                return
-
-        set_step(pod_id, "verify_online", "running", "Router rebooting, waiting...")
-        log(pod_id, "Router rebooting into SD-WAN mode")
-        conn = _db()
-        conn.execute("UPDATE pods SET status='in_progress', sdwan_online='waiting', notes='Router booting SD-WAN mode' WHERE pod_id=?", (pod_id,))
-        conn.commit()
-        conn.close()
-
-        # Verify switches
-        for sw_name in ["verify_border_spine", "verify_leaf1", "verify_leaf2"]:
-            log(pod_id, f"Running {sw_name}...")
-            set_step(pod_id, sw_name, "running", "")
-            try:
-                ok, result = onboard_router.run_switch_checks(sw_name)
-                if ok:
-                    set_step(pod_id, sw_name, "completed", result[:200])
-                    log(pod_id, f"  {sw_name}: OK")
-                else:
-                    set_step(pod_id, sw_name, "failed", result[:200])
-                    log(pod_id, f"  {sw_name}: FAILED")
-            except Exception as e:
-                set_step(pod_id, sw_name, "failed", str(e)[:200])
-                log(pod_id, f"  {sw_name}: ERROR {e}")
-
-        # Connectivity test
-        log(pod_id, "Running connectivity_test...")
-        set_step(pod_id, "connectivity_test", "running", "")
-        try:
-            ok, result = onboard_router.phase_connectivity_test()
-            if ok:
-                set_step(pod_id, "connectivity_test", "completed", result[:200])
-                log(pod_id, f"  connectivity_test: OK")
-            else:
-                set_step(pod_id, "connectivity_test", "failed", result[:200])
-                log(pod_id, f"  connectivity_test: FAILED")
-        except Exception as e:
-            set_step(pod_id, "connectivity_test", "failed", str(e)[:200])
-            log(pod_id, f"  connectivity_test: ERROR {e}")
-
-        conn = _db()
-        conn.execute("UPDATE pods SET status='ready', notes='Pipeline complete' WHERE pod_id=?", (pod_id,))
-        conn.commit()
-        conn.close()
-        log(pod_id, "Pipeline complete")
-    except Exception as e:
-        log(pod_id, f"Pipeline failed: {e}")
-        set_step(pod_id, "pipeline", "failed", str(e)[:200])
 
 
 # ---- Flask routes ----
@@ -475,43 +361,152 @@ def upload_event():
 
     return jsonify({"status": "ok", "pods_created": created, "columns": reader.fieldnames})
 
-@app.route("/api/start-pipeline/<pod_id>", methods=["POST"])
-def start_pipeline(pod_id):
-    if pod_id in _runners and _runners[pod_id].is_alive():
-        return jsonify({"error": "Pipeline already running"}), 409
-    clear_logs(pod_id)
-    conn = _db()
-    conn.execute("DELETE FROM pipeline_steps WHERE pod_id = ?", (pod_id,))
-    conn.execute("UPDATE pods SET status='running', updated_at=datetime('now') WHERE pod_id = ?", (pod_id,))
-    conn.commit()
-    conn.close()
+# ---- Docker per-POD launch ---- #
+@app.route("/api/vpn-connect-pod/<pod_id>", methods=["POST"])
+def vpn_connect_pod(pod_id):
+    """Connect VPN for a single POD (Docker stack, VPN container only)."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            [sys.executable, "docker/generate.py", "--db", "--up", "--pod", pod_id, "--vpn-only"],
+            capture_output=True, text=True, timeout=300,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        output = (r.stdout + r.stderr)[:2000]
+        return jsonify({
+            "status": "ok" if r.returncode == 0 else "error",
+            "output": output
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"status": "error", "output": "Timed out after 300s"})
+    except Exception as e:
+        return jsonify({"status": "error", "output": str(e)[:500]})
 
-    t = threading.Thread(target=run_onboard_thread, args=(pod_id,), daemon=True)
-    _runners[pod_id] = t
-    t.start()
-    return jsonify({"status": "started"})
+@app.route("/api/vpn/connect/<pod_id>", methods=["POST"])
+def api_vpn_connect(pod_id):
+    import subprocess
+    dp_id = pod_id.lower()
+    r = subprocess.run(
+        ["docker", "compose", "-p", dp_id, "ps", "--format=json"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        subprocess.run(
+            ["docker", "compose", "-p", dp_id, "restart", "vpn"],
+            capture_output=True, timeout=30
+        )
+        return jsonify({"status": "ok", "message": "Docker VPN restarted"})
+    return jsonify({"status": "error", "message": f"No Docker stack found for {pod_id}"})
 
-@app.route("/api/start-all", methods=["POST"])
-def start_all():
+@app.route("/api/run-pod/<pod_id>", methods=["POST"])
+def run_pod(pod_id):
+    """Run the pipeline for a single POD (VPN must already be connected)."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["docker", "compose", "-p", pod_id.lower(), "restart", "pipeline"],
+            capture_output=True, text=True, timeout=30
+        )
+        if r.returncode == 0:
+            return jsonify({"status": "ok", "message": f"Pipeline started for {pod_id}"})
+        return jsonify({"status": "error", "message": r.stderr[:300] or r.stdout[:300]})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)[:300]})
+
+@app.route("/api/run-all", methods=["POST"])
+def run_all():
+    """Run pipeline containers for all PODs with connected VPNs."""
+    import subprocess, json
     conn = _db()
-    pods = conn.execute("SELECT pod_id FROM pods WHERE status IN ('pending', 'available', 'ready')").fetchall()
+    rows = conn.execute("SELECT pod_id FROM pods").fetchall()
     conn.close()
-    started = []
-    for p in pods:
-        pod_id = p["pod_id"]
-        if pod_id in _runners and _runners[pod_id].is_alive():
-            continue
-        clear_logs(pod_id)
-        c = _db()
-        c.execute("DELETE FROM pipeline_steps WHERE pod_id = ?", (pod_id,))
-        c.execute("UPDATE pods SET status='running', updated_at=datetime('now') WHERE pod_id = ?", (pod_id,))
-        c.commit()
-        c.close()
-        t = threading.Thread(target=run_onboard_thread, args=(pod_id,), daemon=True)
-        _runners[pod_id] = t
-        t.start()
-        started.append(pod_id)
-    return jsonify({"status": "ok", "started": started})
+    results = []
+    for row in rows:
+        pod_id = row["pod_id"]
+        try:
+            r = subprocess.run(
+                ["docker", "compose", "-p", pod_id.lower(), "ps", "--format=json"],
+                capture_output=True, text=True, timeout=8
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
+                has_vpn = any("vpn" in json.loads(l).get("Service","") for l in lines)
+                if has_vpn:
+                    subprocess.run(
+                        ["docker", "compose", "-p", pod_id.lower(), "restart", "pipeline"],
+                        capture_output=True, timeout=30
+                    )
+                    results.append(f"{pod_id} started")
+        except:
+            pass
+    return jsonify({"status": "ok", "message": "; ".join(results) if results else "No PODs with VPN found"})
+
+@app.route("/api/vpn/disconnect/<pod_id>", methods=["POST"])
+def api_vpn_disconnect(pod_id):
+    import subprocess
+    dp_id = pod_id.lower()
+    r = subprocess.run(
+        ["docker", "compose", "-p", dp_id, "ps", "--format=json"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        subprocess.run(
+            ["docker", "compose", "-p", dp_id, "stop", "vpn"],
+            capture_output=True, timeout=30
+        )
+        return jsonify({"status": "ok", "message": "Docker VPN stopped"})
+    return jsonify({"status": "error", "message": f"No Docker stack found for {pod_id}"})
+
+@app.route("/api/vpn-connect-all", methods=["POST"])
+def vpn_connect_all():
+    """Connect all POD VPNs (Docker stacks, VPN containers only)."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            [sys.executable, "docker/generate.py", "--db", "--up", "--vpn-only"],
+            capture_output=True, text=True, timeout=300,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        return jsonify({
+            "status": "ok" if r.returncode == 0 else "error",
+            "output": (r.stdout + r.stderr)[:2000]
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"status": "error", "output": "Timed out after 300s"})
+    except Exception as e:
+        return jsonify({"status": "error", "output": str(e)[:500]})
+
+@app.route("/api/docker-down", methods=["POST"])
+def docker_down():
+    import subprocess
+    try:
+        r = subprocess.run(
+            [sys.executable, "docker/generate.py", "--db", "--down"],
+            capture_output=True, text=True, timeout=120,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        return jsonify({
+            "status": "ok" if r.returncode == 0 else "error",
+            "output": (r.stdout + r.stderr)[:2000]
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "output": str(e)[:500]})
+
+@app.route("/api/docker-status")
+def docker_status():
+    import subprocess
+    try:
+        r = subprocess.run(
+            [sys.executable, "docker/generate.py", "--db", "--status"],
+            capture_output=True, text=True, timeout=30,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        return jsonify({
+            "status": "ok",
+            "output": (r.stdout + r.stderr)[:2000]
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "output": str(e)[:500]})
 
 @app.route("/api/pipeline-status/<pod_id>")
 def pipeline_status(pod_id):
@@ -584,6 +579,10 @@ DASHBOARD_HTML = """
   .btn-start-all:hover { background: #00d4ff; }
   .btn-start-all:disabled { background: #1a2d4a; color: #667788; cursor: not-allowed; }
   .btn-start-all.running { animation: pulse 1.5s infinite; }
+  .btn-reconnect { background: #1a2d4a; color: #02c8ff; border: 1px solid #02c8ff; border-radius: 4px;
+                   padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer; }
+  .btn-reconnect:hover { background: #02c8ff; color: #001f3d; }
+  .btn-reconnect:disabled { opacity: 0.4; cursor: not-allowed; }
   @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
 
   .progress-mini { width: 60px; height: 12px; background: #0a1628; border-radius: 4px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 6px; }
@@ -658,9 +657,11 @@ DASHBOARD_HTML = """
 
   <div class="summary" id="summary"></div>
 
-  <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;">
-    <button class="btn-start-all" id="btn-start-all" onclick="startAllPods()">&#9654; Start All PODs</button>
-    <span id="start-all-status" style="font-size:12px;color:#667788;"></span>
+  <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
+    <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
+    <button class="btn-start-all" id="btn-docker-down" onclick="dockerDown()" style="background:#ff4757;color:#fff;">&#9632; Teardown All</button>
+    <span id="docker-status" style="font-size:12px;color:#667788;"></span>
   </div>
 
   <table>
@@ -712,9 +713,11 @@ DASHBOARD_HTML = """
 <script>
 const PIPELINE_ORDER = [
   "verify_router",
+  "reset_device",
+  "quick_connect",
   "config_group_associate",
-  "set_variables",
   "assign_license",
+  "set_variables",
   "deploy_config_group",
   "generate_bootstrap",
   "copy_bootstrap",
@@ -800,7 +803,6 @@ function renderTable(pods) {
   tbody.innerHTML = pods.map(p => {
     const pipe = pipelinePhase(p);
     const serial = p.router_serial || '-';
-    const isRunning = p.status === 'running' || p.status === 'in_progress';
     const barColor = pipe.pct === 100 ? '#00e68a' : pipe.text.includes('fail') ? '#ff4757' : '#02c8ff';
     const miniBar = pipe.pct > 0 ? `<div class="progress-mini"><div class="progress-mini-fill" style="width:${pipe.pct}%;background:${barColor}"></div></div>` : '';
     const pipeLabel = `${miniBar}<span class="badge ${pipe.pct === 100 ? 'pass' : pipe.text.includes('fail') ? 'fail' : pipe.text.includes('running') ? 'running' : 'pending'}">${pipe.text}</span>`;
@@ -814,54 +816,64 @@ function renderTable(pods) {
       <td style="font-size:11px;color:#667788">${serial}</td>
       <td class="device-col">${badge(p.sdwan_online, 'Online')}</td>
       <td>${pipeLabel}</td>
-      <td>
-        <button class="btn-start ${isRunning ? 'running' : ''}" id="btn-${p.pod_id}"
-          onclick="startPipeline('${p.pod_id}')" ${isRunning ? 'disabled' : ''}>
-          ${isRunning ? 'Running...' : 'Start'}
-        </button>
+      <td style="display:flex;gap:4px;flex-wrap:wrap;">
+        <button class="btn-start" onclick="connectVpn('${p.pod_id}')">Connect VPN</button>
+        <button class="btn-reconnect" onclick="runPod('${p.pod_id}')" style="background:#7c3aed;border-color:#7c3aed;color:#fff;">&#9654; Run Automation</button>
+        <button class="btn-reconnect" onclick="reconnectVpn('${p.pod_id}')">Reconnect VPN</button>
+        <button class="btn-reconnect" onclick="disconnectVpn('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;">Disconnect VPN</button>
       </td>
       <td class="notes" title="${(p.notes||'').replace(/"/g,'&quot;')}">${p.notes || '-'}</td>
     </tr>`;
   }).join('');
 }
 
-async function startPipeline(podId) {
-  const btn = document.getElementById('btn-' + podId);
-  btn.disabled = true;
-  btn.textContent = 'Starting...';
-  btn.className = 'btn-start running';
-
-  const r = await fetch('/api/start-pipeline/' + podId, { method: 'POST' });
+async function runPod(podId) {
+  const status = document.getElementById('docker-status');
+  status.textContent = 'Running automation for ' + podId + '...';
+  const r = await fetch('/api/run-pod/' + podId, { method: 'POST' });
   const data = await r.json();
-  if (data.error) {
-    btn.textContent = 'Error';
-    btn.disabled = false;
-    btn.className = 'btn-start';
-    return;
-  }
-  btn.textContent = 'Running';
-  showPipeline(podId);
+  status.textContent = data.message || 'Done';
+  setTimeout(() => status.textContent = '', 8000);
+  load();
 }
 
-async function startAllPods() {
-  const btn = document.getElementById('btn-start-all');
-  const status = document.getElementById('start-all-status');
-  btn.disabled = true;
-  btn.classList.add('running');
-  btn.textContent = 'Starting all...';
-  status.textContent = 'Starting pipelines...';
-
-  const r = await fetch('/api/start-all', { method: 'POST' });
+async function runAllPods() {
+  const status = document.getElementById('docker-status');
+  status.textContent = 'Starting all POD automation...';
+  const r = await fetch('/api/run-all', { method: 'POST' });
   const data = await r.json();
-  if (data.error) {
-    status.textContent = 'Error: ' + data.error;
-    btn.disabled = false;
-    btn.classList.remove('running');
-    btn.textContent = '▶ Start All PODs';
-    return;
-  }
-  status.textContent = 'Started ' + data.started.length + ' POD(s): ' + data.started.join(', ');
-  btn.textContent = 'Running all...';
+  status.textContent = data.message || 'Done';
+  setTimeout(() => status.textContent = '', 10000);
+  load();
+}
+
+async function connectVpn(podId) {
+  const status = document.getElementById('docker-status');
+  status.textContent = 'Connecting VPN for ' + podId + '...';
+  const r = await fetch('/api/vpn-connect-pod/' + podId, { method: 'POST' });
+  const data = await r.json();
+  status.textContent = data.output.slice(0, 200);
+  setTimeout(() => { if (status.textContent === data.output.slice(0,200)) status.textContent = ''; }, 8000);
+  load();
+}
+
+async function reconnectVpn(podId) {
+  const status = document.getElementById('docker-status');
+  status.textContent = 'Reconnecting VPN for ' + podId + '...';
+  const r = await fetch('/api/vpn/connect/' + podId, { method: 'POST' });
+  const data = await r.json();
+  status.textContent = data.message || data.output || 'Done';
+  setTimeout(() => status.textContent = '', 5000);
+  load();
+}
+
+async function disconnectVpn(podId) {
+  const status = document.getElementById('docker-status');
+  status.textContent = 'Disconnecting VPN for ' + podId + '...';
+  const r = await fetch('/api/vpn/disconnect/' + podId, { method: 'POST' });
+  const data = await r.json();
+  status.textContent = data.message || data.output || 'Done';
+  setTimeout(() => status.textContent = '', 5000);
   load();
 }
 
@@ -1013,6 +1025,38 @@ function closeDetail() {
   document.getElementById('detail-panel').style.display = 'none';
   document.getElementById('detail-pod-id').textContent = '';
   if (logPollId) clearInterval(logPollId);
+}
+
+async function connectAllVpn() {
+  const btn = document.getElementById('btn-vpn-all');
+  const status = document.getElementById('docker-status');
+  btn.disabled = true;
+  btn.textContent = 'Connecting...';
+  status.textContent = 'Connecting all VPNs...';
+
+  const r = await fetch('/api/vpn-connect-all', { method: 'POST' });
+  const data = await r.json();
+  status.textContent = data.output.slice(0, 300);
+  btn.disabled = false;
+  btn.textContent = '▶ Connect All VPN';
+  setTimeout(() => status.textContent = '', 10000);
+  load();
+}
+
+async function dockerDown() {
+  const btn = document.getElementById('btn-docker-down');
+  const status = document.getElementById('docker-status');
+  btn.disabled = true;
+  btn.textContent = 'Tearing down...';
+  status.textContent = 'Tearing down Docker stacks...';
+
+  const r = await fetch('/api/docker-down', { method: 'POST' });
+  const data = await r.json();
+  status.textContent = data.output.slice(0, 300);
+  btn.disabled = false;
+  btn.textContent = '■ Teardown All';
+  setTimeout(() => status.textContent = '', 10000);
+  load();
 }
 
 load();
