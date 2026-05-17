@@ -473,11 +473,9 @@ def phase_controller_mode():
             up_lines = [l for l in out.splitlines() if "up" in l.lower() and "control" not in l.lower()]
             n_up = len(up_lines)
             print(f"     Control connections up: {n_up}")
-            if n_up >= 2:
+            if n_up >= 3:
                 print(f"     SD-WAN connected ({n_up} tunnels) ✅")
                 return True
-            if n_up == 1:
-                print(f"     {n_up}/2 tunnels, waiting...")
         except:
             pass
         time.sleep(15)
