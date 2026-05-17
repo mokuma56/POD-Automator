@@ -26,13 +26,9 @@ DEFAULTS = {
     "vmanage_ip": "198.18.133.10",
     "vmanage_user": "admin",
     "vmanage_pass": "C1sco12345",
-    "jump_host": "198.18.133.36",
-    "jump_user": "demouser",
-    "jump_pass": "C1sco12345",
     "router_user": "admin",
     "router_pass": "C1sco12345",
 }
-
 REQUIRED_CSV = ["pod_id", "vpn_host", "vpn_user", "vpn_pass", "router_ip", "router_serial"]
 
 
@@ -135,20 +131,24 @@ def build_image():
     return True
 
 
-def action_up(pods):
+def action_up(pods, vpn_only=False):
     if not build_image():
         return
     successes = 0
     for p in pods:
         pod_id = p["pod_id"]
+        proj_name = pod_id.lower()
         compose_data = generate_compose(p)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
             f.write(compose_data); tmp_path = f.name
         try:
-            print(f"  Launching {pod_id}...", end="", flush=True)
+            label = "VPN" if vpn_only else "full stack"
+            print(f"  Launching {pod_id} ({label})...", end="", flush=True)
+            cmd = ["docker", "compose", "-p", proj_name, "-f", tmp_path, "up", "-d"]
+            if vpn_only:
+                cmd.append("vpn")
             r = subprocess.run(
-                ["docker", "compose", "-p", pod_id, "-f", tmp_path, "up", "-d"],
-                capture_output=True, text=True, timeout=120
+                cmd, capture_output=True, text=True, timeout=120
             )
             os.unlink(tmp_path)
             if r.returncode == 0:
@@ -162,19 +162,21 @@ def action_up(pods):
             print(f" ❌ {e}")
     print(f"\n── {successes}/{len(pods)} PODs up ──")
     for p in pods:
-        print(f"  docker compose -p {p['pod_id']} logs -f pipeline")
+        proj_name = p["pod_id"].lower()
+        print(f"  docker compose -p {proj_name} logs -f pipeline")
 
 
 def action_down(pods):
     for p in pods:
         pod_id = p["pod_id"]
+        proj_name = pod_id.lower()
         compose_data = generate_compose(p)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
             f.write(compose_data); tmp_path = f.name
         try:
             print(f"  Tearing down {pod_id}...", end="", flush=True)
             r = subprocess.run(
-                ["docker", "compose", "-p", pod_id, "-f", tmp_path, "down", "-v"],
+                ["docker", "compose", "-p", proj_name, "-f", tmp_path, "down", "-v"],
                 capture_output=True, text=True, timeout=60
             )
             os.unlink(tmp_path)
@@ -188,8 +190,9 @@ def action_down(pods):
 def action_status(pods):
     for p in pods:
         pod_id = p["pod_id"]
+        proj_name = pod_id.lower()
         r = subprocess.run(
-            ["docker", "compose", "-p", pod_id, "ps", "--format=json"],
+            ["docker", "compose", "-p", proj_name, "ps", "--format=json"],
             capture_output=True, text=True, timeout=15
         )
         lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
@@ -221,12 +224,13 @@ def action_status(pods):
 def action_logs(pods, pod_id_target):
     for p in pods:
         if p["pod_id"] == pod_id_target:
+            proj_name = pod_id_target.lower()
             compose_data = generate_compose(p)
             with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
                 f.write(compose_data); tmp_path = f.name
             try:
                 subprocess.run(
-                    ["docker", "compose", "-p", pod_id_target, "-f", tmp_path,
+                    ["docker", "compose", "-p", proj_name, "-f", tmp_path,
                      "logs", "-f"],
                     timeout=3600
                 )
@@ -263,6 +267,10 @@ def main():
     parser.add_argument("--logs", metavar="POD_ID", help="Tail logs for a POD")
     parser.add_argument("--generate", metavar="DIR",
                         help="Write compose files to DIR")
+    parser.add_argument("--pod", metavar="POD_ID",
+                        help="Single POD ID to act on (e.g. POD-4)")
+    parser.add_argument("--vpn-only", action="store_true",
+                        help="Start VPN containers only (no pipeline)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print compose content only")
 
@@ -271,13 +279,22 @@ def main():
     # Load PODs from CSV or DB
     if args.db or not args.source:
         # DB mode
-        pods = read_db()
-        if not pods:
-            print("No pending PODs found in dashboard DB")
-            print(f"  DB: {DB_PATH}")
-            print("Upload EventsDetails.csv via dashboard first, then run this.")
-            sys.exit(1)
-        print(f"Loaded {len(pods)} POD(s) from dashboard DB")
+        if args.pod:
+            pods = read_db(status_filter=())
+            pods = [p for p in pods if p["pod_id"] == args.pod]
+            if not pods:
+                print(f"POD '{args.pod}' not found in dashboard DB")
+                sys.exit(1)
+            # Override status — allow running/in_progress for single POD ops
+            print(f"Loaded 1 POD ({args.pod}) from dashboard DB")
+        else:
+            pods = read_db()
+            if not pods:
+                print("No pending PODs found in dashboard DB")
+                print(f"  DB: {DB_PATH}")
+                print("Upload EventsDetails.csv via dashboard first, then run this.")
+                sys.exit(1)
+            print(f"Loaded {len(pods)} POD(s) from dashboard DB")
     else:
         # CSV mode
         path = Path(args.source)
@@ -290,6 +307,11 @@ def main():
             print("No valid PODs found in CSV")
             sys.exit(1)
         print(f"Loaded {len(pods)} POD(s) from {path}")
+        if args.pod:
+            pods = [p for p in pods if p["pod_id"] == args.pod]
+            if not pods:
+                print(f"POD '{args.pod}' not found in CSV")
+                sys.exit(1)
 
     if args.dry_run:
         for p in pods:
@@ -304,7 +326,7 @@ def main():
     elif args.logs:
         action_logs(pods, args.logs)
     elif args.up:
-        action_up(pods)
+        action_up(pods, vpn_only=args.vpn_only)
     elif args.down:
         action_down(pods)
     else:
