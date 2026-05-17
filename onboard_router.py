@@ -16,6 +16,8 @@ UUID = f"C8231-G2-{SERIAL}"
 CG_ID = "ae290e0f-7bc4-40f7-9bfa-23b1e7b2a71a"
 VMANAGE = "https://198.18.133.10"
 ROUTER_IP = "198.18.133.25"
+SYSTEM_IP = "100.100.100.105"
+SITE_ID = 105
 BOOTSTRAP_PATH = os.path.expanduser("~/sw_projects/pod_automator/data/bootstrap/ciscosdwan.cfg")
 
 
@@ -75,45 +77,89 @@ def router_enable(shell):
     read_shell(shell, 2)
 
 
-def phase_associate(s):
+def phase_quick_connect(s):
+    # Step 1: Get quick connect variable schema (UI does this first)
+    s.post(
+        f"{VMANAGE}/dataservice/template/device/config/quickconnectvariable",
+        json=[{"deviceId": UUID}], timeout=10
+    )
+
+    csv_row = read_csv_values()
+    host_name = csv_row.get("Host Name", "auto-assigned")
+    # Step 2: Submit quick connect with system-ip, site-id, host-name
+    payload = {
+        "data": [{
+            "csv-deviceId": UUID,
+            "csv-host-name": "auto-assigned",
+            "csv-deviceIP": SYSTEM_IP,
+            "//system/site-id": SITE_ID,
+            "//system/host-name": "auto-assigned",
+            "//system/ipv6-strict-control": False,
+            "//system/system-ip": SYSTEM_IP,
+        }]
+    }
     r = s.post(
+        f"{VMANAGE}/dataservice/template/config/quickConnect/submitDevices",
+        json=payload, timeout=10
+    )
+    ok = r.status_code == 200
+    print(f"  1. Quick Connect: {'✅' if ok else '❌'} {r.status_code}")
+    if not ok and r.status_code != 409:
+        print(f"     Error: {r.text[:200]}")
+        return False
+    return True
+
+
+def phase_associate(s):
+    r = s.put(
         f"{VMANAGE}/dataservice/v1/config-group/{CG_ID}/device/associate",
         json={"devices": [{"id": UUID}]}, timeout=10
     )
     ok = r.status_code == 200
-    print(f"  1. Associate: {'✅' if ok else '❌'} {r.status_code}")
-    return True
+    print(f"  3. Associate: {'✅' if ok else '❌'} {r.status_code}")
+    if not ok:
+        print(f"     Error: {r.text[:200]}")
+    return ok
 
 
 def phase_set_variables(s):
-    r = s.get(f"{VMANAGE}/dataservice/v1/config-group/{CG_ID}/device/variables", timeout=10)
-    vars_data = r.json()
-
     csv_row = read_csv_values()
     csv_keys = {k.lower().replace(" ", "_"): k for k in csv_row}
+    var_names = {v.lower(): o for o, v in csv_row.items() if v.strip()}
+    for k, v in csv_keys.items():
+        var_names[k] = v
 
     int_fields = {"pseudo_commit_timer", "site_id", "VPN10-BGP-REMOTE-AS",
                   "VPN10-DIS-BGP-REMOTE-AS", "VPN101-BGP-REMOTE-AS", "VPN102-BGP-REMOTE-AS"}
     bool_fields = {"ipv6_strict_control"}
+
+    # Step 1: POST suggestions:true to get variable schema + suggested values
+    sug = s.post(
+        f"{VMANAGE}/dataservice/v1/config-group/{CG_ID}/device/variables",
+        json={"deviceIds": [UUID], "suggestions": True}, timeout=10
+    )
+    vars_data = sug.json()
 
     variables = []
     for dev in vars_data.get("devices", []):
         if dev.get("device-id") == UUID:
             for var in dev.get("variables", []):
                 vname = var["name"]
-                if "value" in var and var.get("value") is not None:
-                    variables.append({"name": vname, "value": var["value"]})
-                    continue
-                csv_key = csv_keys.get(vname.lower())
-                if csv_key and csv_row[csv_key]:
-                    val = csv_row[csv_key]
+                vdef = var.get("defaultValue", "")
+                cv_key = var_names.get(vname.lower()) or csv_keys.get(vname.lower())
+                if cv_key and csv_row.get(cv_key, "").strip():
+                    val = csv_row[cv_key]
                     if vname in int_fields:
                         val = int(val)
                     elif vname in bool_fields:
                         val = val.lower() == "true"
                     variables.append({"name": vname, "value": val})
+                elif "value" in var and var.get("value") is not None and str(var.get("value")) != "":
+                    variables.append({"name": vname, "value": var["value"]})
+                elif vdef != "":
+                    variables.append({"name": vname, "value": vdef})
                 else:
-                    variables.append({"name": vname, "value": var.get("value", "")})
+                    variables.append({"name": vname, "value": ""})
             break
 
     payload = {"solution": "sdwan", "devices": [{"device-id": UUID, "variables": variables}]}
@@ -122,7 +168,7 @@ def phase_set_variables(s):
         json=payload, timeout=10
     )
     ok = r.status_code == 200
-    print(f"  2. Set variables ({len(variables)}): {'✅' if ok else '❌'} {r.status_code}")
+    print(f"  4. Set variables ({len(variables)}): {'✅' if ok else '❌'} {r.status_code}")
     if not ok:
         print(f"     Error: {r.text[:300]}")
     return ok
@@ -147,7 +193,7 @@ def phase_assign_license(s):
     if already_licensed:
         return True
 
-    print(f"  3. Querying available licenses...")
+    print(f"  2. Querying available licenses...")
     if r.status_code == 200:
         for bl in r.json().get("baseLicenses", []):
             for lic in bl.get("licenses", []):
@@ -214,13 +260,13 @@ def phase_deploy(s):
         json={"devices": [{"id": UUID}]}, timeout=10
     )
     if r.status_code != 200:
-        print(f"  4. Deploy: ❌ {r.status_code} {r.text[:200]}")
+        print(f"  5. Deploy: ❌ {r.status_code} {r.text[:200]}")
         return False
     try:
         task_id = r.json().get("id", "")
     except Exception:
         task_id = ""
-    print(f"  4. Deploy: ✅ task={task_id[:40]}")
+    print(f"  5. Deploy: ✅ task={task_id[:40]}")
 
     # Poll until deployment completes
     if task_id:
@@ -245,11 +291,11 @@ def phase_deploy(s):
 
 def phase_generate_bootstrap(s):
     r = s.get(
-        f"{VMANAGE}/dataservice/system/device/bootstrap/device/{UUID}?configtype=cloudinit&inclDefRootCert=true",
+        f"{VMANAGE}/dataservice/system/device/bootstrap/device/{UUID}?configtype=cloudinit&inclDefRootCert=true&version=v1",
         timeout=10
     )
     ok = r.status_code == 200
-    print(f"  5. Bootstrap: {'✅' if ok else '❌'} {r.status_code} len={len(r.text)}")
+    print(f"  6. Bootstrap: {'✅' if ok else '❌'} {r.status_code} len={len(r.text)}")
     if ok:
         os.makedirs(os.path.dirname(BOOTSTRAP_PATH), exist_ok=True)
         # vManage returns JSON with bootstrapConfig containing raw MIME multipart.
@@ -565,9 +611,10 @@ if __name__ == "__main__":
     s = vmanage_session()
     steps = [
         ("verify_router", lambda: True),
+        ("quick_connect", lambda: phase_quick_connect(s)),
+        ("assign_license", lambda: phase_assign_license(s)),
         ("config_group_associate", lambda: phase_associate(s)),
         ("set_variables", lambda: phase_set_variables(s)),
-        ("assign_license", lambda: phase_assign_license(s)),
         ("deploy_config_group", lambda: phase_deploy(s)),
         ("generate_bootstrap", lambda: phase_generate_bootstrap(s)),
         ("copy_bootstrap", phase_copy_bootstrap),
