@@ -394,21 +394,26 @@ def phase_copy_bootstrap():
     return False
 
 
-def phase_controller_mode():
-    # Check if device is already in controller mode via vManage
-    try:
-        s = vmanage_session()
-        r = s.get(f"{VMANAGE}/dataservice/system/device/vedges?uuid={UUID}", timeout=10)
-        data = r.json()
-        for dev in data.get("data", []):
-            mode = dev.get("configOperationMode", "")
-            if mode == "vmanage":
-                print(f"     Device already in controller mode (vmanage) — skipping")
-                return True
-    except Exception as e:
-        print(f"     vManage check: {e} (proceeding with SSH)")
-        s = vmanage_session()
+def _wait_router_online(timeout=600):
+    """Poll SSH until router comes back online. Returns seconds waited."""
+    t0 = time.time()
+    for i in range(int(timeout / 10)):
+        time.sleep(10)
+        try:
+            c = paramiko.SSHClient()
+            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c.connect(ROUTER_IP, username="admin", password="C1sco12345",
+                      look_for_keys=False, allow_agent=False, timeout=8)
+            c.close()
+            waited = int(time.time() - t0)
+            print(f"     Router online after {waited}s")
+            return True, waited
+        except:
+            pass
+    return False, int(time.time() - t0)
 
+
+def phase_controller_mode():
     for attempt in range(3):
         try:
             client, shell = router_shell()
@@ -421,48 +426,63 @@ def phase_controller_mode():
             print(f"     SSH attempt {attempt+1} failed, retrying...")
             time.sleep(3)
 
-    def read_all(timeout=5):
-        return read_shell(shell, timeout)
-
-    # Verify bootstrap file exists and check size
+    # Verify bootstrap
     shell.send("dir bootflash:ciscosdwan.cfg\n")
     time.sleep(3)
-    out = read_all(3)
+    out = read_shell(shell, 3)
     found = "ciscosdwan.cfg" in out
-    print(f"     Verify bootflash: {'found' if found else 'NOT FOUND'}")
-
+    print(f"     Bootstrap: {'found' if found else 'NOT FOUND'}")
     if not found:
-        print("     Bootstrap file missing! Attempting re-copy...")
+        print("     Re-copying bootstrap...")
         client.close()
         if not phase_copy_bootstrap():
             return False
         client, shell = router_shell()
         router_enable(shell)
 
-    # Verify bootstrap content
-    shell.send("more bootflash:ciscosdwan.cfg | begin system\n")
-    time.sleep(3)
-    out = read_all(3)
-    if "system-ip" in out:
-        for line in out.split("\n"):
-            if "system-ip" in line or "site-id" in line or "host-name" in line:
-                print(f"     {line.strip()}")
-
-    # Controller-mode enable
+    # Enable controller mode
     shell.send("controller-mode enable\n")
     time.sleep(3)
-    out = read_all(5)
-    print(f"     Controller-mode prompt: {out[-200:]}")
+    out = read_shell(shell, 5)
+    print(f"     Controller-mode: {out[-150:]}")
 
     if "confirm" in out.lower():
         shell.send("yes\n")
-        time.sleep(3)
-        out += read_all(5)
-        print(f"     After yes: {out[-200:]}")
-        client.close()
-        return True
-
+        time.sleep(2)
+        out = read_shell(shell, 3)
+        print(f"     Confirmed: {out[-100:]}")
     client.close()
+
+    # Wait for router to reboot and come back
+    print(f"     Router rebooting...")
+    ok, secs = _wait_router_online(600)
+    if not ok:
+        print(f"     Router did not come back after {secs}s")
+        return False
+
+    # Wait for SD-WAN to initialize then verify control connections
+    time.sleep(30)
+    for attempt in range(30):
+        try:
+            c2, s2 = router_shell()
+            router_enable(s2)
+            s2.send("show sdwan control connections | include up\n")
+            time.sleep(5)
+            out = read_shell(s2, 5)
+            c2.close()
+            up_lines = [l for l in out.splitlines() if "up" in l.lower() and "control" not in l.lower()]
+            n_up = len(up_lines)
+            print(f"     Control connections up: {n_up}")
+            if n_up >= 2:
+                print(f"     SD-WAN connected ({n_up} tunnels) ✅")
+                return True
+            if n_up == 1:
+                print(f"     {n_up}/2 tunnels, waiting...")
+        except:
+            pass
+        time.sleep(15)
+
+    print(f"     Not enough control connections up after {30 + 30*15}s")
     return False
 
 
