@@ -1,0 +1,36 @@
+! BRANCH-SEC-RTR Base Config
+! Cisco C8231-G2 Secure Router
+!
+hostname BRANCH-SEC-RTR
+!
+ip domain name corp.pseudoco.com
+!
+enable secret C1sco12345
+aaa new-model
+username admin privilege 15 password C1sco12345
+!
+interface TwoGigabitEthernet0/0/6
+ ip address 198.18.4.14 255.255.255.0
+ no shutdown
+!
+interface GigabitEthernet0
+ vrf forwarding Mgmt-intf
+ ip address 198.18.133.25 255.255.192.0
+ negotiation auto
+ no shutdown
+!
+ip ftp source-interface GigabitEthernet0
+ip tftp source-interface GigabitEthernet0
+ip route 0.0.0.0 0.0.0.0 198.18.4.1
+ip route vrf Mgmt-intf 0.0.0.0 0.0.0.0 198.18.128.1
+!
+line vty 0 4
+ login authentication default
+ transport input ssh
+!
+exit
+!
+crypto key generate rsa modulus 2048
+!
+end
+!

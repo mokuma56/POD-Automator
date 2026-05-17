@@ -1,0 +1,13 @@
+[project]
+name = "pod-automator"
+version = "1.0.0"
+description = "Cisco SD-WAN Router Onboarding Automation — dashboard, pipeline, and multi-POD parallel launcher"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "flask>=3.1",
+    "paramiko>=3.0",
+    "requests>=2.31",
+    "urllib3>=2.0",
+]

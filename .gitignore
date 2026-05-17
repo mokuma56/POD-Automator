@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.DS_Store
+*.env
+.env
+pods.csv
+data/pod_state.db
+data/bootstrap/*.cfg
+data/*.har
+*.db
+dist/
+build/
