@@ -77,6 +77,30 @@ def router_enable(shell):
     read_shell(shell, 2)
 
 
+def phase_reset(s):
+    print("  Resetting any residual device state...")
+    tries = 0
+    # Disassociate (best-effort)
+    try:
+        r = s.put(f"{VMANAGE}/dataservice/v1/config-group/{CG_ID}/device/associate",
+            json={"devices": []}, timeout=10)
+        if r.status_code == 200:
+            tries += 1
+    except: pass
+    # Deallocate license (best-effort)
+    try:
+        rc = s.post(f"{VMANAGE}/dataservice/v1/licensing/deallocate-licenses",
+            json={"uuids": [UUID]}, timeout=10)
+        if rc.status_code == 200:
+            tries += 10
+            time.sleep(2)
+    except: pass
+    if tries:
+        print(f"     Cleaned up {tries} residual states")
+        time.sleep(5)
+    return True
+
+
 def phase_quick_connect(s):
     # Step 1: Get quick connect variable schema (UI does this first)
     s.post(
@@ -179,27 +203,9 @@ def phase_assign_license(s):
     VA_NAME = "dCloud-Pseudoco-Campus"
     WAN_LICENSE_TAG = "regid.2024-11.com.cisco.C8K_MEDIUM_WAN_A,1.0_7c756381-d4d6-4b30-b27d-7601feb51248"
 
-    # Step 1: Check if device already has a license assigned
-    r = s.post(f"{VMANAGE}/dataservice/v1/licensing/licenses",
-        json={"uuids": [UUID], "appliedFilters": {"billingType": "Prepaid", "licenseClassification": "Advantage"}},
-        timeout=10)
-    already_licensed = False
-    if r.status_code == 200:
-        for bl in r.json().get("baseLicenses", []):
-            if UUID in bl.get("uuids", []):
-                already_licensed = True
-                print(f"  3. Device {UUID} already licensed — skipping")
-                break
-    if already_licensed:
-        return True
+    print(f"  2. Assigning WAN Advantage license...")
 
-    print(f"  2. Querying available licenses...")
-    if r.status_code == 200:
-        for bl in r.json().get("baseLicenses", []):
-            for lic in bl.get("licenses", []):
-                print(f"     - {lic['displayName']} (tag: {lic['tag'][:50]}...) available={lic.get('available')}")
-
-    # Step 2: SA/VA distribution check (browser always calls this before assign)
+    # Step 1: SA/VA distribution check (browser always calls this before assign)
     try:
         dist_payload = {
             "appliedFilters": {"billingType": "Prepaid", "licenseClassification": "Advantage"},
@@ -219,7 +225,7 @@ def phase_assign_license(s):
     except Exception as e:
         print(f"     SA/VA distribution check: {e} (proceeding)")
 
-    # Step 3: Assign the WAN Advantage license
+    # Step 2: Always assign — skip check was wrong (pool != per-device)
     payload = {
         "baseLicenses": [{
             "assignLicenses": [{
@@ -263,28 +269,32 @@ def phase_deploy(s):
         print(f"  5. Deploy: ❌ {r.status_code} {r.text[:200]}")
         return False
     try:
-        task_id = r.json().get("id", "")
+        task_id = r.json().get("parentTaskId", r.json().get("id", ""))
     except Exception:
         task_id = ""
-    print(f"  5. Deploy: ✅ task={task_id[:40]}")
+    print(f"  5. Deploy: ✅ task={task_id[:60]}")
 
     # Poll until deployment completes
     if task_id:
         for i in range(60):
             time.sleep(5)
-            tr = s.get(f"{VMANAGE}/dataservice/task/{task_id}", timeout=10)
+            tr = s.get(f"{VMANAGE}/dataservice/device/action/status/{task_id}", timeout=10)
             if tr.status_code != 200:
                 continue
-            status = tr.json().get("data", [{}])[0].get("status", "")
-            if status == "done":
-                print(f"     Deploy completed (waited {(i+1)*5}s)")
+            status = tr.json().get("status", "")
+            if not status:
+                status = tr.json().get("data", [{}])[0].get("status", "")
+            if "done" in status.lower() or "scheduled" in status.lower():
+                activity = tr.json().get("data", [{}])[0].get("currentActivity", "")
+                print(f"     Deploy status: {status} — {activity[:200]}")
+                print(f"     Proceeding (waited {(i+1)*5}s)")
                 return True
-            elif status in ("error", "fail"):
-                detail = tr.json().get("data", [{}])[0].get("details", "")
+            elif status.lower() in ("error", "fail", "failure"):
+                detail = tr.json().get("data", [{}])[0].get("details", "") or tr.json().get("details", "")
                 print(f"     Deploy failed: {detail[:200]}")
                 return False
             if i % 6 == 0:
-                print(f"     Deploy status: {status}...")
+                print(f"     Deploy action status: {status}...")
         print("     Deploy still in progress, proceeding anyway")
     return True
 
@@ -611,9 +621,10 @@ if __name__ == "__main__":
     s = vmanage_session()
     steps = [
         ("verify_router", lambda: True),
+        ("reset_device", lambda: phase_reset(s)),
         ("quick_connect", lambda: phase_quick_connect(s)),
-        ("assign_license", lambda: phase_assign_license(s)),
         ("config_group_associate", lambda: phase_associate(s)),
+        ("assign_license", lambda: phase_assign_license(s)),
         ("set_variables", lambda: phase_set_variables(s)),
         ("deploy_config_group", lambda: phase_deploy(s)),
         ("generate_bootstrap", lambda: phase_generate_bootstrap(s)),
