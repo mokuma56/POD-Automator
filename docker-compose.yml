@@ -1,0 +1,7 @@
+services:
+  pipeline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: pod-automator:latest
+    # No default command — generate.py creates per-POD compose stacks
