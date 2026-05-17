@@ -5,7 +5,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     net-tools \
     openssh-client \
-    sshpass \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /pipeline
@@ -16,11 +15,9 @@ ENV VMANAGE=198.18.133.10 \
     VMANAGE_USER=admin \
     VMANAGE_PASS=C1sco12345 \
     ROUTER_USER=admin \
-    ROUTER_PASS=C1sco12345 \
-    JUMP_USER=demouser \
-    JUMP_PASS=C1sco12345
+    ROUTER_PASS=C1sco12345
 
-COPY onboard.py PseudocoBranches_Config-Group-Template.csv ./
+COPY onboard.py onboard_router.py PseudocoBranches_Config-Group-Template.csv ./
 COPY data/ ./data/
 
 ENTRYPOINT ["python3", "onboard.py"]
