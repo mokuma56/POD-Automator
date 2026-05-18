@@ -1664,7 +1664,7 @@ async function loadAd(podId) {
       <span style="font-size:22px;color:${statusColor}">${statusIcon}</span>
       <span style="font-size:15px;font-weight:600;color:#e0e8f0">AD User Verification</span>
       <button onclick="recheckAd('${podId}')" style="margin-left:auto;padding:5px 14px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:6px;cursor:pointer;font-size:12px;">⟳ Re-check</button>
-      <button onclick="rerunAd('${podId}')" style="padding:5px 14px;background:#1a2a3a;border:1px solid #ff4757;color:#ff4757;border-radius:6px;cursor:pointer;font-size:12px;">⚠ Re-run PS1</button>
+      <button onclick="rerunAd('${podId}')" style="padding:5px 14px;background:#1a2a3a;border:1px solid #ff4757;color:#ff4757;border-radius:6px;cursor:pointer;font-size:12px;">⚠ Re-run AD Automation</button>
     </div>
     <div style="background:#0d1f2d;border-radius:8px;padding:14px;margin-bottom:14px;">
       <div style="font-size:11px;color:#667788;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Status</div>
