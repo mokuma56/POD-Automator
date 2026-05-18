@@ -731,32 +731,27 @@ DASHBOARD_HTML = """
                    font-size: 11px; font-weight: 700; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
   .progress-label { font-size: 12px; color: #8899aa; margin-bottom: 6px; }
 
-  .switch-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-  .switch-header .device-role { font-size: 11px; font-weight: 700; text-transform: uppercase;
-                                 letter-spacing: 1px; padding: 2px 8px; border-radius: 4px; }
-  .switch-header .device-role.border { background: #1a0a3d; color: #a855f7; }
-  .switch-header .device-role.leaf { background: #0a2a1a; color: #22c55e; }
-  .switch-header .device-role.cc { background: #0a1a3d; color: #3b82f6; }
-  .switch-header .device-model { font-size: 11px; color: #667788; }
-  .switch-header .device-ip { font-size: 11px; color: #445566; margin-left: auto; }
-  .switch-summary-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
-  .switch-summary-bar .bar-bg { flex: 1; height: 6px; background: #1a2d4a; border-radius: 3px; overflow: hidden; }
-  .switch-summary-bar .bar-fill-pass { height: 100%; background: #00e68a; border-radius: 3px; transition: width 0.5s; }
-  .switch-summary-bar .bar-fill-fail { height: 100%; background: #ff4757; border-radius: 3px; }
-  .switch-summary-bar .bar-text { font-size: 11px; color: #8899aa; white-space: nowrap; }
-  .switch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
-  .switch-card { background: #0a1628; border-radius: 10px; padding: 16px; border: 1px solid #1a2d4a;
-                 transition: border-color 0.2s; }
+  .switch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+  .switch-card { background: #0a1628; border-radius: 8px; padding: 12px; border: 1px solid #1a2d4a; }
   .switch-card.fail { border-color: #3d0000; }
   .switch-card.pass { border-color: #003d2a; }
-  .switch-card h4 { color: #e0e6ed; font-size: 14px; margin: 0; font-weight: 600; }
-  .switch-card .subtitle { font-size: 11px; color: #667788; margin-left: 8px; }
+  .switch-card-title { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+  .switch-card-title .role-tag { font-size: 10px; font-weight: 700; text-transform: uppercase;
+                                  letter-spacing: 0.5px; padding: 1px 6px; border-radius: 3px; }
+  .switch-card-title .role-tag.border { background: #1a0a3d; color: #a855f7; }
+  .switch-card-title .role-tag.leaf { background: #0a2a1a; color: #22c55e; }
+  .switch-card-title .role-tag.cc { background: #0a1a3d; color: #3b82f6; }
+  .switch-card-title .device-name { color: #e0e6ed; font-size: 13px; font-weight: 600; }
+  .switch-card-title .device-model { color: #667788; font-size: 10px; margin-left: auto; }
+  .switch-bar { height: 4px; background: #1a2d4a; border-radius: 2px; margin-bottom: 8px; overflow: hidden; }
+  .switch-bar-fill { height: 100%; border-radius: 2px; transition: width 0.5s; }
   .switch-check { display: flex; justify-content: space-between; align-items: center;
-                   padding: 5px 0; font-size: 12px; border-bottom: 1px solid #112240; }
+                   padding: 3px 0; font-size: 11px; border-bottom: 1px solid #112240; }
   .switch-check:last-child { border-bottom: none; }
   .switch-check .check-label { color: #c0c8d0; }
-  .switch-check .check-label .check-icon { margin-right: 6px; font-size: 13px; }
-  .switch-check .check-result { font-weight: 600; font-size: 11px; }
+  .switch-check .check-label .check-icon { margin-right: 4px; font-size: 12px; }
+  .switch-check .check-result { font-weight: 600; font-size: 10px; max-width: 50%; text-align: right;
+                                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .check-pass { color: #00e68a; }
   .check-fail { color: #ff4757; }
   .check-na { color: #445566; }
@@ -1164,16 +1159,16 @@ async function loadSwitches(podId) {
   const pct = totalChecks > 0 ? Math.round(totalPass / totalChecks * 100) : 0;
 
   const summaryHtml = `
-    <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap;">
-      <div style="font-size:14px;font-weight:600;color:${allPass ? '#00e68a' : hasFail ? '#ff4757' : '#8899aa'}">
-        ${allPass ? '✓ All checks passed' : hasFail ? `✗ ${totalFail} check${totalFail > 1 ? 's' : ''} failed` : '— pending'}
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
+      <div style="font-size:13px;font-weight:600;color:${allPass ? '#00e68a' : hasFail ? '#ff4757' : '#8899aa'}">
+        ${allPass ? '✓ All passed' : hasFail ? `✗ ${totalFail} fail` : '— pending'}
       </div>
-      <div style="flex:1;min-width:120px;">
-        <div style="background:#1a2d4a;border-radius:4px;height:8px;overflow:hidden;">
-          <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#ff4757,#ffa502,#00e68a);border-radius:4px;transition:width 0.5s;"></div>
+      <div style="flex:1;min-width:80px;">
+        <div style="background:#1a2d4a;border-radius:3px;height:6px;overflow:hidden;">
+          <div style="height:100%;width:${pct}%;background:${allPass ? '#00e68a' : hasFail ? '#ff4757' : '#445566'};border-radius:3px;transition:width 0.5s;"></div>
         </div>
       </div>
-      <div style="font-size:12px;color:#667788;white-space:nowrap;">${totalPass}/${totalChecks}</div>
+      <div style="font-size:11px;color:#667788;white-space:nowrap;">${totalPass}/${totalChecks}</div>
       ${recheckBtn}
     </div>`;
 
@@ -1181,6 +1176,7 @@ async function loadSwitches(podId) {
     const hasAnyFail = (sw.checks || []).some(c => c.status === 'fail');
     const allDevicePass = (sw.checks || []).every(c => c.status === 'pass');
     const devicePct = sw.total > 0 ? Math.round((sw.passed || 0) / sw.total * 100) : 0;
+    const barColor = allDevicePass ? '#00e68a' : hasAnyFail ? '#ff4757' : '#445566';
 
     const checksHtml = (sw.checks || []).map(c => {
       const icon = c.status === 'pass' ? '✓' : c.status === 'fail' ? '✗' : '○';
@@ -1191,22 +1187,15 @@ async function loadSwitches(podId) {
       </div>`;
     }).join('');
 
-    const statusIcon = allDevicePass ? '✓' : hasAnyFail ? '✗' : '○';
-    const statusColor = allDevicePass ? '#00e68a' : hasAnyFail ? '#ff4757' : '#667788';
+    const roleLabel = sw.name === 'Catalyst Center' ? 'CC' : sw.name.includes('Border') ? 'Spine' : 'Leaf';
 
     return `<div class="switch-card ${allDevicePass ? 'pass' : hasAnyFail ? 'fail' : ''}">
-      <div class="switch-header">
-        <span class="device-role ${roleClass(sw.name)}">${sw.name === 'Catalyst Center' ? 'Connectivity' : sw.name.includes('Border') ? 'Border Spine' : 'Leaf'}</span>
-        <h4 style="color:${statusColor}">${statusIcon} ${escHtml(sw.name)}</h4>
+      <div class="switch-card-title">
+        <span class="role-tag ${roleClass(sw.name)}">${roleLabel}</span>
+        <span class="device-name">${escHtml(sw.name)}</span>
         <span class="device-model">${escHtml(sw.model || '')}</span>
-        <span class="device-ip">${sw.host === 'connectivity' ? '198.18.5.100' : sw.host === 'verify_border_spine' ? '198.18.128.24' : '198.18.128.2' + (sw.host === 'verify_leaf1' ? '2' : '3')}</span>
       </div>
-      <div class="switch-summary-bar">
-        <div class="bar-bg">
-          <div class="bar-fill-pass" style="width:${devicePct}%"></div>
-        </div>
-        <span class="bar-text">${sw.passed || 0}/${sw.total}</span>
-      </div>
+      <div class="switch-bar"><div class="switch-bar-fill" style="width:${devicePct}%;background:${barColor}"></div></div>
       ${checksHtml}
     </div>`;
   }).join('');

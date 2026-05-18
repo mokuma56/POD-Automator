@@ -608,10 +608,15 @@ def run_switch_checks(step_name):
 
         # VRF
         out = switch_cmd(shell, "show vrf")
-        vrf_lines = [l for l in out.splitlines() if l.strip() and not l.startswith("Name") and "show vrf" not in l]
-        # Mgmt-vrf should be the only non-empty line
+        vrf_lines = [
+            l.strip() for l in out.splitlines()
+            if l.strip()
+            and "show vrf" not in l.lower()
+            and not l.strip().endswith("#")
+            and not l.strip().endswith(">")
+        ]
         has_mgmt = any("Mgmt-vrf" in l for l in vrf_lines)
-        extra_vrfs = [l.strip() for l in vrf_lines if "Mgmt-vrf" not in l and "Default" not in l and l.strip()]
+        extra_vrfs = [l for l in vrf_lines if "Mgmt-vrf" not in l and "Default" not in l]
         if has_mgmt and not extra_vrfs:
             parts.append(f"PASS: VRF OK (Mgmt-vrf only)")
         else:
@@ -620,7 +625,15 @@ def run_switch_checks(step_name):
         # Version
         out = switch_cmd(shell, "show ver | i Version")
         ver_ok = "17.12" in out
-        parts.append(f"{'PASS' if ver_ok else 'FAIL'}: Version {out.split('Version')[1].strip().split()[0] if 'Version' in out else '??'}")
+        ver_str = "??"
+        if "Version" in out:
+            for line in out.splitlines():
+                if "Version" in line and "Cisco" in line:
+                    parts2 = line.split("Version")[-1].strip().split()
+                    if parts2:
+                        ver_str = parts2[0]
+                    break
+        parts.append(f"{'PASS' if ver_ok else 'FAIL'}: Version {ver_str}")
 
         # VLAN
         out = switch_cmd(shell, "show vlan")
@@ -631,7 +644,14 @@ def run_switch_checks(step_name):
         # Leaf switches
         # Skip OSPF — just check VRF, version, VLAN
         out = switch_cmd(shell, "show vrf")
-        extra_vrfs = [l for l in out.splitlines() if l.strip() and not l.startswith("Name") and "Mgmt-vrf" not in l and "Default" not in l]
+        vrf_lines = [
+            l.strip() for l in out.splitlines()
+            if l.strip() and not l.startswith("Name")
+            and "show vrf" not in l.lower()
+            and not l.strip().endswith("#")
+            and not l.strip().endswith(">")
+        ]
+        extra_vrfs = [l for l in vrf_lines if "Mgmt-vrf" not in l and "Default" not in l]
         parts.append(f"PASS: VRF OK (Mgmt-vrf only)" if not extra_vrfs else f"FAIL: extra VRFs {extra_vrfs}")
 
         out = switch_cmd(shell, "show ver | i Version")
@@ -658,7 +678,7 @@ def phase_connectivity_test():
         ip = info["ip"]
         try:
             client, shell = ssh_switch(ip)
-            out = switch_cmd(shell, "ping 198.18.5.100 source loopback0 repeat 2")
+            out = switch_cmd(shell, "ping 198.18.5.100 source loopback 0 repeat 2")
             success = "Success rate is 100" in out
             results.append(f"{'PASS' if success else 'FAIL'}: {info['name']} ({ip}) -> 198.18.5.100 {'OK' if success else 'FAILED'}")
             client.close()
