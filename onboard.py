@@ -139,6 +139,7 @@ steps = [
     ("verify_leaf1",       lambda: onboard_router.run_switch_checks("verify_leaf1")),
     ("verify_leaf2",       lambda: onboard_router.run_switch_checks("verify_leaf2")),
     ("connectivity_test",  onboard_router.phase_connectivity_test),
+    ("cdfmc_check",        onboard_router.phase_cdfmc_check),
 ]
 
 for step_name, func in steps:
@@ -162,6 +163,22 @@ for step_name, func in steps:
         print(f"  {log_line}")
         live_log(log_line)
         report_step(step_name, "completed", str(result)[:200] or "OK")
+        # Extract and persist scc_org from cdfmc_check result
+        if step_name == "cdfmc_check" and isinstance(result, str) and "scc_org=" in result:
+            import re as _re
+            m = _re.search(r"scc_org=([^\s|]+)", result)
+            if m:
+                _scc = m.group(1)
+                try:
+                    subprocess.run([sys.executable, "-c", f"""
+import sqlite3
+conn = sqlite3.connect('{DB_PATH}')
+conn.execute("UPDATE pods SET scc_org=?, updated_at=datetime('now') WHERE pod_id=?", ('{_scc}', '{pod_id}'))
+conn.commit()
+conn.close()
+"""], timeout=5)
+                except Exception:
+                    pass
     except Exception as e:
         log_line = f"✗ {step_name} FAILED: {str(e)[:200]}"
         print(log_line)
