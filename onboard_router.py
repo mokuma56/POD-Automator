@@ -458,34 +458,66 @@ def phase_controller_mode():
     # Enable controller mode
     # Strategy: send command+confirmation together in one write, then detect
     # reboot (router goes offline) as proof it worked.
-    shell_send(shell, "controller-mode enable\nyes\n")
-    time.sleep(8)
-    out = read_shell(shell, 5)
-    print(f"     Output: {out[-200:]}")
-    shell_send(shell, "\n")
-    time.sleep(3)
-    out = read_shell(shell, 3)
-    print(f"     After extra Enter: {out[-100:]}")
-    client.close()
 
-    # Wait for router to go DOWN first (proves the command actually worked)
-    print(f"     Router rebooting — waiting for disconnect...")
-    t0 = time.time()
+    # First check if already in SD-WAN mode
+    shell_send(shell, "show sdwan control connections | include up\n")
+    time.sleep(5)
+    out = read_shell(shell, 5)
+    if "vsmart" in out and "up" in out:
+        up_lines2 = [l for l in out.splitlines() if "up" in l.lower() and "control" not in l.lower()]
+        n_up2 = len(up_lines2)
+        if n_up2 >= 3:
+            print(f"     Already in SD-WAN mode ({n_up2} tunnels up) ✓")
+            client.close()
+            return True
+        print(f"     SD-WAN mode detected ({n_up2} tunnels), waiting for 3...")
+        client.close()
+        return _wait_sdwan_tunnels()
+
+    # Cancel any pending reload that would interfere with the prompt
+    shell_send(shell, "\nreload cancel\n")
+    time.sleep(2)
+    read_shell(shell, 2)
+
     went_down = False
-    for i in range(60):
-        if i % 6 == 0:
-            print(f"     still connected after {i*5}s...")
-        try:
-            c = paramiko.SSHClient()
-            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            c.connect(ROUTER_IP, username="admin", password="C1sco12345",
-                      look_for_keys=False, allow_agent=False, timeout=5)
-            c.close()
-        except:
-            went_down = True
-            print(f"     Router went down after {int(time.time()-t0)}s ✓")
-            break
-        time.sleep(5)
+    try:
+        shell_send(shell, "controller-mode enable\nyes\n")
+    except (paramiko.SSHException, OSError, EOFError):
+        print(f"     SSH socket closed — controller-mode enable accepted, rebooting")
+        client.close()
+        went_down = True
+
+    if not went_down:
+        time.sleep(8)
+        out = read_shell(shell, 5)
+        print(f"     Output: {out[-200:]}")
+        if "Failed" in out or "Abort" in out:
+            print(f"     controller-mode enable command failed")
+            client.close()
+            return False
+        shell_send(shell, "\n")
+        time.sleep(3)
+        out = read_shell(shell, 3)
+        print(f"     After extra Enter: {out[-100:]}")
+        client.close()
+
+        # Wait for router to go DOWN first (proves the command actually worked)
+        print(f"     Router rebooting — waiting for disconnect...")
+        t0 = time.time()
+        for i in range(60):
+            if i % 6 == 0 and i > 0:
+                print(f"     still connected after {i*5}s...")
+            try:
+                c = paramiko.SSHClient()
+                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                c.connect(ROUTER_IP, username="admin", password="C1sco12345",
+                          look_for_keys=False, allow_agent=False, timeout=5)
+                c.close()
+            except:
+                went_down = True
+                print(f"     Router went down after {int(time.time()-t0)}s ✓")
+                break
+            time.sleep(5)
 
     if not went_down:
         print(f"     Router never disconnected after 5min — command may have failed")
@@ -497,9 +529,16 @@ def phase_controller_mode():
         print(f"     Router did not come back after {secs}s")
         return False
 
-    # Wait for SD-WAN to initialize then verify control connections
+    # Wait for SD-WAN control connections
     time.sleep(30)
-    for attempt in range(30):
+    return _wait_sdwan_tunnels()
+    return False
+
+
+def _wait_sdwan_tunnels(timeout=480):
+    """Wait for 3 SD-WAN control connections to come up."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
             c2, s2 = router_shell()
             router_enable(s2)
@@ -516,8 +555,7 @@ def phase_controller_mode():
         except:
             pass
         time.sleep(15)
-
-    print(f"     Not enough control connections up after {30 + 30*15}s")
+    print(f"     Not enough control connections up after {timeout}s")
     return False
 
 
