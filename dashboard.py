@@ -1094,7 +1094,7 @@ function renderTable(pods) {
       <td style="text-align:center"><span style="color:${vpnColor};font-size:18px;line-height:1" title="${p.vpn_detail || ''}">&#x25cf;</span></td>
       <td style="font-size:11px;color:#667788">${serial}</td>
       <td class="device-col" style="font-size:18px;line-height:1;color:${p.sdwan_online === 'yes' ? '#00e68a' : '#ff4757'}">&#x25cf;</td>
-      <td style="font-size:11px;color:#667788;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.scc_org||''}">${p.scc_org ? '<span style="color:#02c8ff">&#x25cf;</span> ' + p.scc_org.replace(/\.app\.us\.cdo\.cisco\.com.*/, '') : '<span style="color:#667788">—</span>'}</td>
+      <td style="font-size:11px;color:#667788;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.scc_org||''}">${p.scc_org ? '<span style="color:#02c8ff">&#x25cf;</span> ' + (p.scc_org.match(/pseudoco-(\d+)--/) ? p.scc_org.match(/pseudoco-(\d+)--/)[1] : p.scc_org) : '<span style="color:#667788">—</span>'}</td>
       <td>${pipeLabel}</td>
       <td style="display:flex;gap:4px;flex-wrap:wrap;">
         <button class="btn-start" onclick="connectVpn('${p.pod_id}')">Connect VPN</button>
