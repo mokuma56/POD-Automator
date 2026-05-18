@@ -42,9 +42,11 @@ if not SERIAL:
                     break
         client.close()
     except Exception as e:
-        print(f"  Warning: could not detect serial: {e}")
+        print(f"  Failed: could not detect serial — {e}")
+        sys.exit(1)
 if not SERIAL:
-    SERIAL = "FJC300412NA"
+    print("  Failed: could not detect serial from router")
+    sys.exit(1)
 
 print(f"  Using serial: {SERIAL}")
 onboard_router.SERIAL = SERIAL
