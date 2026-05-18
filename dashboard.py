@@ -1695,7 +1695,7 @@ async function recheckAd(podId) {
 async function rerunAd(podId) {
   if (!confirm('This will run ADDuoTenantUserProvisioning.ps1 on Jumphost1 via WinRM. Are you sure?')) return;
   const grid = document.getElementById('ad-grid');
-  grid.innerHTML = '<div style="padding:20px;color:#ff4757;font-size:13px;">⚠ Re-run PS1 started — check Live Logs tab for progress...</div>';
+  grid.innerHTML = '<div style="padding:20px;color:#ff4757;font-size:13px;">⚠ Re-run AD Automation started — check Live Logs tab for progress...</div>';
   const r = await fetch('/api/ad/rerun/' + podId, { method: 'POST' });
   const d = await r.json();
   if (d.status !== 'ok') {
