@@ -401,45 +401,55 @@ def api_vpn_connect(pod_id):
 @app.route("/api/run-pod/<pod_id>", methods=["POST"])
 def run_pod(pod_id):
     """Run the pipeline for a single POD (VPN must already be connected)."""
-    import subprocess
+    import subprocess, os, tempfile
+    from docker.generate import generate_compose, read_db
+    pods = read_db(status_filter=())
+    p = next((p for p in pods if p["pod_id"] == pod_id), None)
+    if not p:
+        return jsonify({"status": "error", "message": f"POD {pod_id} not found in DB"})
+    compose = generate_compose(p)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False)
+    tmp.write(compose)
+    tmp.close()
     try:
         r = subprocess.run(
-            ["docker", "compose", "-p", pod_id.lower(), "restart", "pipeline"],
+            ["docker", "compose", "-p", pod_id.lower(), "-f", tmp.name, "up", "-d", "pipeline"],
             capture_output=True, text=True, timeout=30
         )
-        if r.returncode == 0:
-            return jsonify({"status": "ok", "message": f"Pipeline started for {pod_id}"})
-        return jsonify({"status": "error", "message": r.stderr[:300] or r.stdout[:300]})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)[:300]})
+        return jsonify({
+            "status": "ok" if r.returncode == 0 else "error",
+            "message": f"Pipeline started for {pod_id}" if r.returncode == 0 else (r.stderr[:300] or r.stdout[:300])
+        })
+    finally:
+        os.unlink(tmp.name)
 
 @app.route("/api/run-all", methods=["POST"])
 def run_all():
     """Run pipeline containers for all PODs with connected VPNs."""
-    import subprocess, json
-    conn = _db()
-    rows = conn.execute("SELECT pod_id FROM pods").fetchall()
-    conn.close()
+    import subprocess, os, tempfile
+    from docker.generate import generate_compose, read_db
+    pods = read_db(status_filter=())
+    if not pods:
+        return jsonify({"status": "error", "message": "No PODs found in DB"})
     results = []
-    for row in rows:
-        pod_id = row["pod_id"]
+    for p in pods:
+        pod_id = p["pod_id"]
+        compose = generate_compose(p)
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False)
+        tmp.write(compose)
+        tmp.close()
         try:
             r = subprocess.run(
-                ["docker", "compose", "-p", pod_id.lower(), "ps", "--format=json"],
-                capture_output=True, text=True, timeout=8
+                ["docker", "compose", "-p", pod_id.lower(), "-f", tmp.name, "up", "-d", "pipeline"],
+                capture_output=True, text=True, timeout=30
             )
-            if r.returncode == 0 and r.stdout.strip():
-                lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
-                has_vpn = any("vpn" in json.loads(l).get("Service","") for l in lines)
-                if has_vpn:
-                    subprocess.run(
-                        ["docker", "compose", "-p", pod_id.lower(), "restart", "pipeline"],
-                        capture_output=True, timeout=30
-                    )
-                    results.append(f"{pod_id} started")
-        except:
-            pass
-    return jsonify({"status": "ok", "message": "; ".join(results) if results else "No PODs with VPN found"})
+            if r.returncode == 0:
+                results.append(f"{pod_id} started")
+            else:
+                results.append(f"{pod_id} error: {(r.stderr or r.stdout)[:100]}")
+        finally:
+            os.unlink(tmp.name)
+    return jsonify({"status": "ok", "message": "; ".join(results) if results else "No PODs processed"})
 
 @app.route("/api/vpn/disconnect/<pod_id>", methods=["POST"])
 def api_vpn_disconnect(pod_id):
@@ -558,8 +568,8 @@ DASHBOARD_HTML = """
   .badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; }
   .badge.pass { background: #003d2a; color: #00e68a; }
   .badge.fail { background: #3d0000; color: #ff4757; }
-  .badge.pending { background: #2a1f00; color: #ffa502; }
-  .badge.running { background: #001f3d; color: #02c8ff; }
+  .badge.pending { background: #3d0000; color: #ff4444; }
+  .badge.running { background: #3d2200; color: #ffa500; }
   .badge.skipped { background: #1a2d4a; color: #667788; }
   .pod-id { font-weight: 600; color: #02c8ff; cursor: pointer; }
   .pod-id:hover { text-decoration: underline; }
