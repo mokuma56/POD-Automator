@@ -171,18 +171,18 @@ def api_logs(pod_id):
     return jsonify([dict(l) for l in logs])
 
 SWITCH_CHECKS = {
-    "border_spine": {"name": "Border Spine", "checks": [
+    "border_spine": {"name": "Border Spine", "ip": "198.18.128.24", "checks": [
         "OSPF neighbors (expect 2)",
         "VRF (expect Mgmt-vrf only)",
         "Version (expect 17.12.x)",
         "VLAN (expect default + VLAN 5)",
     ]},
-    "leaf1": {"name": "Leaf 1", "checks": [
+    "leaf1": {"name": "Leaf 1", "ip": "198.18.128.22", "checks": [
         "VRF (expect Mgmt-vrf only)",
         "Version (expect 17.12.x)",
         "VLAN (expect default only)",
     ]},
-    "leaf2": {"name": "Leaf 2", "checks": [
+    "leaf2": {"name": "Leaf 2", "ip": "198.18.128.23", "checks": [
         "VRF (expect Mgmt-vrf only)",
         "Version (expect 17.12.x)",
         "VLAN (expect default only)",
@@ -213,6 +213,7 @@ def api_switches(pod_id):
         # Extract MODEL prefix and re-align check indices
         model = ""
         check_parts = step.get("parts", [])[:]
+        model = ""
         if check_parts and check_parts[0].startswith("MODEL:"):
             model = check_parts[0].replace("MODEL: ", "")
             check_parts = check_parts[1:]  # remove MODEL prefix, shift indices
@@ -239,6 +240,7 @@ def api_switches(pod_id):
         switch_data.append({
             "name": info["name"],
             "model": model,
+            "ip": info.get("ip", ""),
             "host": key,
             "checks": checks,
             "passed": passed,
@@ -246,19 +248,21 @@ def api_switches(pod_id):
             "total": len(checks),
         })
 
-    # Add connectivity test
+    # Add connectivity test — show per-switch labels
     ct = results.get("connectivity_test", {})
     conn_checks = []
     if ct.get("status") == "completed" and ct.get("parts"):
         for p in ct["parts"]:
+            sw_name = p.split("(")[0].replace("PASS: ", "").replace("FAIL: ", "").strip() if "(" in p else ""
+            label = f"{sw_name} -> Ping Catalyst Center" if sw_name else "Ping Catalyst Center"
             if p.startswith("PASS"):
-                conn_checks.append({"label": "Ping Catalyst Center", "status": "pass", "result": p.replace("PASS: ", "")})
+                conn_checks.append({"label": label, "status": "pass", "result": "Success"})
             elif p.startswith("FAIL"):
-                conn_checks.append({"label": "Ping Catalyst Center", "status": "fail", "result": p.replace("FAIL: ", "")})
+                conn_checks.append({"label": label, "status": "fail", "result": "Failed"})
     elif ct.get("status") == "running":
         conn_checks.append({"label": "Ping Catalyst Center", "status": "na", "result": "testing..."})
     elif ct.get("status") == "failed":
-        conn_checks.append({"label": "Ping Catalyst Center", "status": "fail", "result": "connectivity failed"})
+        conn_checks.append({"label": "Ping Catalyst Center", "status": "fail", "result": "Failed"})
     else:
         conn_checks.append({"label": "Ping Catalyst Center", "status": "na", "result": "pending"})
 
@@ -287,9 +291,11 @@ def api_switches_recheck(pod_id):
 
     conn = _db()
     row = conn.execute("SELECT * FROM pods WHERE pod_id = ?", (pod_id,)).fetchone()
-    conn.close()
     if not row:
+        conn.close()
         return jsonify({"status": "error", "message": "POD not found"}), 404
+    router_ip = row["router_ip"]
+    conn.close()
 
     dp_id = pod_id.lower()
     # Verify VPN container is running
@@ -310,7 +316,7 @@ def api_switches_recheck(pod_id):
                     func_call = f"onboard_router.run_switch_checks('{step_name}')"
                 script = (
                     "import sys; sys.path.insert(0, '.'); import onboard_router; "
-                    f"onboard_router.ROUTER_IP = '{row['router_ip']}'; "
+                    f"onboard_router.ROUTER_IP = '{router_ip}'; "
                     f"ok, result = {func_call}; "
                     "print(repr((ok, result)))"
                 )
@@ -320,18 +326,19 @@ def api_switches_recheck(pod_id):
                     "--entrypoint", "python3",
                     "pod-automator:latest", "-c", script
                 ], capture_output=True, text=True, timeout=120)
-                # Parse the printed repr
+                # Parse the printed repr (last line of stdout)
                 stdout = result.stdout.strip()
                 stderr = result.stderr.strip()
-                if stdout.startswith("("):
+                last_line = stdout.splitlines()[-1] if stdout else ""
+                if last_line.startswith("("):
                     try:
-                        ok_val, result_val = eval(stdout)
+                        ok_val, result_val = eval(last_line)
                         if stderr:
                             result_val += f" | {stderr}"
-                    except:
-                        ok_val, result_val = False, stdout[:200]
+                    except Exception as e2:
+                        ok_val, result_val = False, f"parse error: {e2}"
                 else:
-                    ok_val, result_val = False, stdout[:200] or stderr[:200]
+                    ok_val, result_val = False, f"no tuple in output: {stdout[:200]}"
 
                 status = "completed" if ok_val else "failed"
                 conn2 = _db()
@@ -366,7 +373,9 @@ def api_switches_recheck(pod_id):
             conn3.commit()
             conn3.close()
         except Exception as e:
+            import traceback
             log(pod_id, f"Re-check error: {e}")
+            log(pod_id, traceback.format_exc())
 
     t = threading.Thread(target=_recheck, daemon=True)
     t.start()
@@ -741,7 +750,10 @@ DASHBOARD_HTML = """
   .switch-card-title .role-tag.border { background: #1a0a3d; color: #a855f7; }
   .switch-card-title .role-tag.leaf { background: #0a2a1a; color: #22c55e; }
   .switch-card-title .role-tag.cc { background: #0a1a3d; color: #3b82f6; }
-  .switch-card-title .device-name { color: #e0e6ed; font-size: 13px; font-weight: 600; }
+  .switch-card-title .device-name { color: #e0e6ed; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .switch-card-title .device-name:hover { color: #60a5fa; text-decoration: underline; }
+  .toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #1a2332; color: #e0e6ed; padding: 10px 20px; border-radius: 8px; border: 1px solid #2a3a4a; font-size: 12px; z-index: 9999; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+  .toast.show { opacity: 1; }
   .switch-card-title .device-model { color: #667788; font-size: 10px; margin-left: auto; }
   .switch-bar { height: 4px; background: #1a2d4a; border-radius: 2px; margin-bottom: 8px; overflow: hidden; }
   .switch-bar-fill { height: 100%; border-radius: 2px; transition: width 0.5s; }
@@ -835,6 +847,7 @@ DASHBOARD_HTML = """
       <div class="log-box" id="log-box">Waiting for logs...</div>
     </div>
     <div class="tab-content" id="tab-switches">
+      <div id="toast" class="toast"></div>
       <div class="switch-grid" id="switch-grid">
         <div style="color:#667788;font-size:13px;">Select a POD to load switch verification results</div>
       </div>
@@ -1189,16 +1202,25 @@ async function loadSwitches(podId) {
 
     const roleLabel = sw.name === 'Catalyst Center' ? 'CC' : sw.name.includes('Border') ? 'Spine' : 'Leaf';
 
+    const sshCmd = sw.ip ? `docker exec -it vpn-${escHtml(podId)} ssh netadmin@${sw.ip}` : '';
+    const escapedCmd = sshCmd.replace(/'/g, "\\'");
     return `<div class="switch-card ${allDevicePass ? 'pass' : hasAnyFail ? 'fail' : ''}">
       <div class="switch-card-title">
         <span class="role-tag ${roleClass(sw.name)}">${roleLabel}</span>
-        <span class="device-name">${escHtml(sw.name)}</span>
+        <span class="device-name" onclick="${escapedCmd ? `copySsh('${escapedCmd}')` : ''}" title="${sshCmd ? 'Click to copy SSH command' : ''}">${escHtml(sw.name)}</span>
         <span class="device-model">${escHtml(sw.model || '')}</span>
       </div>
       <div class="switch-bar"><div class="switch-bar-fill" style="width:${devicePct}%;background:${barColor}"></div></div>
       ${checksHtml}
     </div>`;
   }).join('');
+}
+
+function copySsh(cmd) {
+  navigator.clipboard.writeText(cmd).then(() => {
+    const t = document.getElementById('toast');
+    if (t) { t.textContent = 'SSH command copied! Paste in your terminal'; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2500); }
+  }).catch(() => {});
 }
 
 async function recheckSwitches(podId) {
