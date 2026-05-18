@@ -34,6 +34,7 @@ services:
       ROUTER_PASS: {{router_pass}}
     volumes:
       - {{pod_id}}-bootstrap:/pipeline/data/bootstrap
+      - {{host_data}}:/pipeline/host-data
     restart: "no"
 
 volumes:

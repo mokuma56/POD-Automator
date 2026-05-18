@@ -78,7 +78,7 @@ else:
 
 # ── Run the pipeline (mirrors onboard_router.py's main) ─────────
 pod_id = os.environ.get("POD_ID", f"POD-{SERIAL}")
-DB_PATH = os.path.expanduser("~/sw_projects/pod_automator/data/pod_state.db")
+DB_PATH = "/pipeline/host-data/pod_state.db"
 
 print(f"\nOnboarding {onboard_router.UUID} for {pod_id}\n{'='*40}")
 

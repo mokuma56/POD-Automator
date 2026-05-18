@@ -50,6 +50,7 @@ def read_csv(path):
             merged = dict(DEFAULTS)
             merged.update({k: v for k, v in row.items() if v})
             merged["serial"] = merged["router_serial"]
+            merged["host_data"] = str(PROJECT_ROOT / "data")
             pods.append(merged)
     return pods
 
@@ -84,6 +85,7 @@ def read_db(status_filter=("pending", "available", "ready", "")):
         merged["router_serial"] = d.get("router_serial", "")
         merged["serial"] = merged["router_serial"]
         merged["session_id"] = d.get("session_id", "")
+        merged["host_data"] = str(PROJECT_ROOT / "data")
         if not merged["router_ip"]:
             try:
                 n = int(d["pod_id"].replace("POD-", ""))
