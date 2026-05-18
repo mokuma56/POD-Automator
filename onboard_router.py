@@ -67,12 +67,27 @@ def read_shell(shell, timeout=5):
     return out.decode(errors="replace")
 
 
+def shell_send(shell, cmd, timeout=5):
+    """Send all bytes reliably, retrying partial sends."""
+    data = cmd.encode()
+    end = time.time() + timeout
+    sent = 0
+    while sent < len(data) and time.time() < end:
+        n = shell.send(data[sent:])
+        if n == 0:
+            time.sleep(0.3)
+        sent += n
+    if sent < len(data):
+        raise RuntimeError(f"shell_send: only sent {sent}/{len(data)} bytes within {timeout}s")
+    return sent
+
+
 def router_enable(shell):
     read_shell(shell, 2)
-    shell.send("enable\n")
+    shell_send(shell, "enable\n")
     time.sleep(1)
     read_shell(shell, 1)
-    shell.send("C1sco12345\n")
+    shell_send(shell, "C1sco12345\n")
     time.sleep(2)
     read_shell(shell, 2)
 
@@ -354,10 +369,10 @@ def phase_copy_bootstrap():
         try:
             client, shell = router_shell()
             router_enable(shell)
-            shell.send("terminal length 0\n"); time.sleep(1); read_shell(shell, 1)
+            shell_send(shell, "terminal length 0\n"); time.sleep(1); read_shell(shell, 1)
 
             src = f"http://{vpn_ip}:{http_port}/ciscosdwan.cfg"
-            shell.send(f"copy {src} bootflash:ciscosdwan.cfg\n")
+            shell_send(shell, f"copy {src} bootflash:ciscosdwan.cfg\n")
             time.sleep(3)
             all_out = ""
             for i in range(20):
@@ -373,7 +388,7 @@ def phase_copy_bootstrap():
                         try:
                             c2, s2 = router_shell()
                             router_enable(s2)
-                            s2.send("dir bootflash:ciscosdwan.cfg\n"); time.sleep(3)
+                            shell_send(s2, "dir bootflash:ciscosdwan.cfg\n"); time.sleep(3)
                             vout = read_shell(s2, 3)
                             c2.close()
                             if str(expected_size) in vout.replace(",", ""):
@@ -383,7 +398,7 @@ def phase_copy_bootstrap():
                     print("     Size mismatch, proceed anyway")
                     return True
                 if "?" in out.lower() or any(kw in out.lower() for kw in ("confirm", "over write", "destination")):
-                    shell.send("\n")
+                    shell_send(shell, "\n")
             print(f"     HTTP copy result: {all_out[-200:]}")
         except Exception as e:
             print(f"     Attempt {attempt+1}: {e}")
@@ -427,7 +442,7 @@ def phase_controller_mode():
             time.sleep(3)
 
     # Verify bootstrap
-    shell.send("dir bootflash:ciscosdwan.cfg\n")
+    shell_send(shell, "dir bootflash:ciscosdwan.cfg\n")
     time.sleep(3)
     out = read_shell(shell, 3)
     found = "ciscosdwan.cfg" in out
@@ -440,21 +455,52 @@ def phase_controller_mode():
         client, shell = router_shell()
         router_enable(shell)
 
-    # Enable controller mode
-    shell.send("controller-mode enable\n")
-    time.sleep(3)
-    out = read_shell(shell, 5)
-    print(f"     Controller-mode: {out[-150:]}")
+    # Enable controller mode (retry if confirmation prompt not seen)
+    for cmd_attempt in range(3):
+        shell_send(shell, "controller-mode enable\n")
+        time.sleep(3)
+        out = read_shell(shell, 5)
+        print(f"     Controller-mode: {out[-150:]}")
 
-    if "confirm" in out.lower():
-        shell.send("yes\n")
-        time.sleep(2)
-        out = read_shell(shell, 3)
-        print(f"     Confirmed: {out[-100:]}")
+        if "confirm" in out.lower() and ("reload" in out.lower() or "erase" in out.lower()):
+            shell_send(shell, "yes\n")
+            time.sleep(2)
+            out = read_shell(shell, 3)
+            print(f"     Confirmed: {out[-100:]}")
+            break
+        else:
+            print(f"     No confirmation prompt seen (attempt {cmd_attempt+1})")
+            time.sleep(2)
+    else:
+        print("     Failed to trigger controller-mode enable after 3 attempts")
+        client.close()
+        return False
     client.close()
 
-    # Wait for router to reboot and come back
-    print(f"     Router rebooting...")
+    # Wait for router to go DOWN first (proves the command actually worked)
+    print(f"     Router rebooting — waiting for disconnect...")
+    t0 = time.time()
+    went_down = False
+    for i in range(60):
+        if i % 6 == 0:
+            print(f"     still connected after {i*5}s...")
+        try:
+            c = paramiko.SSHClient()
+            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c.connect(ROUTER_IP, username="admin", password="C1sco12345",
+                      look_for_keys=False, allow_agent=False, timeout=5)
+            c.close()
+        except:
+            went_down = True
+            print(f"     Router went down after {int(time.time()-t0)}s ✓")
+            break
+        time.sleep(5)
+
+    if not went_down:
+        print(f"     Router never disconnected after 5min — command may have failed")
+        return False
+
+    # Wait for router to come back
     ok, secs = _wait_router_online(600)
     if not ok:
         print(f"     Router did not come back after {secs}s")
@@ -466,7 +512,7 @@ def phase_controller_mode():
         try:
             c2, s2 = router_shell()
             router_enable(s2)
-            s2.send("show sdwan control connections | include up\n")
+            shell_send(s2, "show sdwan control connections | include up\n")
             time.sleep(5)
             out = read_shell(s2, 5)
             c2.close()

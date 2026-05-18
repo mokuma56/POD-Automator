@@ -22,27 +22,33 @@ if not SERIAL and len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
     SERIAL = sys.argv[1]
 if not SERIAL:
     print("  No SERIAL provided — detecting from router...")
-    try:
-        import paramiko
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            onboard_router.ROUTER_IP, username=os.getenv("ROUTER_USER", "admin"),
-            password=os.getenv("ROUTER_PASS", "C1sco12345"),
-            look_for_keys=False, allow_agent=False, timeout=15
-        )
-        _, stdout, _ = client.exec_command("show inventory", timeout=10)
-        for line in stdout.read().decode().splitlines():
-            if "Chassis" in line or "chassis" in line.lower():
-                continue
-            if "SN:" in line:
-                serial = line.split("SN:")[-1].strip().split()[0]
-                if serial:
-                    SERIAL = serial
-                    break
-        client.close()
-    except Exception as e:
-        print(f"  Failed: could not detect serial — {e}")
+    last_err = None
+    for attempt in range(3):
+        try:
+            import paramiko
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                onboard_router.ROUTER_IP, username=os.getenv("ROUTER_USER", "admin"),
+                password=os.getenv("ROUTER_PASS", "C1sco12345"),
+                look_for_keys=False, allow_agent=False, timeout=30
+            )
+            _, stdout, _ = client.exec_command("show inventory", timeout=15)
+            for line in stdout.read().decode().splitlines():
+                if "SN:" in line:
+                    serial = line.split("SN:")[-1].strip().split()[0]
+                    if serial:
+                        SERIAL = serial
+                        break
+            client.close()
+            if SERIAL:
+                break
+        except Exception as e:
+            last_err = e
+            print(f"  Attempt {attempt+1}: {e}")
+            time.sleep(5)
+    if not SERIAL:
+        print(f"  Failed: could not detect serial — {last_err}")
         sys.exit(1)
 if not SERIAL:
     print("  Failed: could not detect serial from router")
