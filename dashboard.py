@@ -678,6 +678,7 @@ DASHBOARD_HTML = """
     <thead>
       <tr>
         <th>POD</th>
+        <th>Session</th>
         <th>Status</th>
         <th>VPN</th>
         <th>Serial</th>
@@ -821,6 +822,7 @@ function renderTable(pods) {
     const vpnLabel = vpn === 'connected' ? 'Connected' : vpn === 'connecting' ? 'Connecting' : 'Offline';
     return `<tr>
       <td class="pod-id" onclick="showPipeline('${p.pod_id}')">${p.pod_id}</td>
+      <td style="font-size:11px;color:#667788">${p.session_id || ''}</td>
       <td><span class="badge ${p.status === 'ready' ? 'pass' : p.status === 'pending' ? 'pending' : 'fail'}">${p.status || 'pending'}</span></td>
       <td style="text-align:center"><span style="color:${vpnColor};font-size:18px;line-height:1" title="${p.vpn_detail || ''}">&#x25cf;</span></td>
       <td style="font-size:11px;color:#667788">${serial}</td>
