@@ -503,19 +503,30 @@ def vpn_connect_pod(pod_id):
 
 @app.route("/api/vpn/connect/<pod_id>", methods=["POST"])
 def api_vpn_connect(pod_id):
+    """Reconnect VPN: teardown then bring up fresh (picks up latest image)."""
     import subprocess
     dp_id = pod_id.lower()
-    r = subprocess.run(
-        ["docker", "compose", "-p", dp_id, "ps", "--format=json"],
-        capture_output=True, text=True, timeout=8
+    # Tear down existing container if any
+    subprocess.run(
+        ["docker", "compose", "-p", dp_id, "down", "vpn"],
+        capture_output=True, timeout=30
     )
-    if r.returncode == 0 and r.stdout.strip():
-        subprocess.run(
-            ["docker", "compose", "-p", dp_id, "restart", "vpn"],
-            capture_output=True, timeout=30
+    # Bring up fresh via generate.py
+    try:
+        r = subprocess.run(
+            [sys.executable, "docker/generate.py", "--db", "--up", "--pod", pod_id, "--vpn-only"],
+            capture_output=True, text=True, timeout=300,
+            cwd=os.path.dirname(os.path.abspath(__file__))
         )
-        return jsonify({"status": "ok", "message": "Docker VPN restarted"})
-    return jsonify({"status": "error", "message": f"No Docker stack found for {pod_id}"})
+        output = (r.stdout + r.stderr)[:2000]
+        return jsonify({
+            "status": "ok" if r.returncode == 0 else "error",
+            "output": output
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"status": "error", "output": "Timed out after 300s"})
+    except Exception as e:
+        return jsonify({"status": "error", "output": str(e)[:500]})
 
 @app.route("/api/run-pod/<pod_id>", methods=["POST"])
 def run_pod(pod_id):
