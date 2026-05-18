@@ -26,6 +26,7 @@ DEFAULTS = {
     "vmanage_ip": "198.18.133.10",
     "vmanage_user": "admin",
     "vmanage_pass": "C1sco12345",
+    "router_ip": "198.18.133.25",
     "router_user": "admin",
     "router_pass": "C1sco12345",
 }
@@ -81,18 +82,11 @@ def read_db(status_filter=("pending", "available", "ready", "")):
         merged["vpn_host"] = d["vpn_host"]
         merged["vpn_user"] = d["vpn_user"]
         merged["vpn_pass"] = d["vpn_pass"]
-        merged["router_ip"] = d.get("router_ip", "")
+        merged["router_ip"] = d.get("router_ip", "") or DEFAULTS["router_ip"]
         merged["router_serial"] = d.get("router_serial", "")
         merged["serial"] = merged["router_serial"]
         merged["session_id"] = d.get("session_id", "")
         merged["host_data"] = str(PROJECT_ROOT / "data")
-        if not merged["router_ip"]:
-            try:
-                n = int(d["pod_id"].replace("POD-", ""))
-                merged["router_ip"] = f"198.18.133.{21 + n}"
-            except ValueError:
-                print(f"  WARNING: {d['pod_id']} has no router_ip, skipping")
-                continue
         pods.append(merged)
     return pods
 
