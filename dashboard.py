@@ -1,6 +1,6 @@
 """POD Dashboard — upload events CSV, start pipelines, monitor live progress."""
 
-import sqlite3, json, threading, csv, io, os, time, sys
+import sqlite3, json, threading, csv, io, os, time, sys, subprocess
 from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request
 
@@ -380,6 +380,15 @@ def api_switches_recheck(pod_id):
     t = threading.Thread(target=_recheck, daemon=True)
     t.start()
     return jsonify({"status": "ok", "message": "Switch re-check started for " + pod_id})
+
+
+@app.route("/api/ssh/terminal/<pod_id>/<ip>", methods=["POST"])
+def api_ssh_terminal(pod_id, ip):
+    """Opens macOS Terminal.app with SSH to switch via docker exec through VPN container."""
+    cmd = f"docker exec -it vpn-{pod_id} sshpass -p 'C1sco12345' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null netadmin@{ip}"
+    script = f'tell app "Terminal" to do script "{cmd}"'
+    subprocess.Popen(["osascript", "-e", script])
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/upload-event", methods=["POST"])
@@ -1202,12 +1211,11 @@ async function loadSwitches(podId) {
 
     const roleLabel = sw.name === 'Catalyst Center' ? 'CC' : sw.name.includes('Border') ? 'Spine' : 'Leaf';
 
-    const sshCmd = sw.ip ? `docker exec -it vpn-${escHtml(podId)} ssh netadmin@${sw.ip}` : '';
-    const escapedCmd = sshCmd.replace(/'/g, "\\'");
+
     return `<div class="switch-card ${allDevicePass ? 'pass' : hasAnyFail ? 'fail' : ''}">
       <div class="switch-card-title">
         <span class="role-tag ${roleClass(sw.name)}">${roleLabel}</span>
-        <span class="device-name" onclick="${escapedCmd ? `copySsh('${escapedCmd}')` : ''}" title="${sshCmd ? 'Click to copy SSH command' : ''}">${escHtml(sw.name)}</span>
+        <span class="device-name" onclick="${sw.ip ? `openTerminal('${escHtml(podId)}','${sw.ip}')` : ''}" title="${sw.ip ? 'Click to open SSH terminal' : ''}">${escHtml(sw.name)}</span>
         <span class="device-model">${escHtml(sw.model || '')}</span>
       </div>
       <div class="switch-bar"><div class="switch-bar-fill" style="width:${devicePct}%;background:${barColor}"></div></div>
@@ -1216,11 +1224,13 @@ async function loadSwitches(podId) {
   }).join('');
 }
 
-function copySsh(cmd) {
-  navigator.clipboard.writeText(cmd).then(() => {
-    const t = document.getElementById('toast');
-    if (t) { t.textContent = 'SSH command copied! Paste in your terminal'; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2500); }
-  }).catch(() => {});
+async function openTerminal(podId, ip) {
+  const t = document.getElementById('toast');
+  if (t) { t.textContent = 'Opening Terminal...'; t.classList.add('show'); }
+  try {
+    await fetch('/api/ssh/terminal/' + podId + '/' + ip, { method: 'POST' });
+  } catch(e) {}
+  if (t) setTimeout(() => t.classList.remove('show'), 2000);
 }
 
 async function recheckSwitches(podId) {

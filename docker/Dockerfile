@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     net-tools \
     openssh-client \
+    sshpass \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /pipeline
