@@ -735,6 +735,114 @@ CDFMC_AUTOMATION_PASS = "C1sco12345"
 CDFMC_LAB_DIR = "/home/cisco/Documents/elevateLab"
 
 
+AD_DC_IP      = "198.18.5.102"
+AD_DC_USER    = "administrator"
+AD_DC_PASS    = "C1sco12345"
+AD_BASE_DN    = "DC=corp,DC=pseudoco,DC=com"
+AD_TARGET_USERS = ["Kit", "Lee", "Pat", "Nik"]
+AD_DEFAULT_DOMAIN = "@corp.pseudoco.com"
+
+# Jumphost1 (where ADDuoTenantUserProvisioning.ps1 lives)
+JUMPHOST_IP   = "198.18.133.36"
+JUMPHOST_USER = "administrator"
+JUMPHOST_PASS = "C1sco12345"
+AD_PS1_PATH   = r"C:\Scripts\ADDuoTenantUserProvisioning.ps1"
+
+
+def _ad_query_users():
+    """Query Kit/Lee/Pat/Nik from AD via LDAP. Returns list of dicts with cn/mail/upn."""
+    try:
+        from ldap3 import Server, Connection, NTLM, ALL
+    except ImportError:
+        raise RuntimeError("ldap3 not installed — run: pip install ldap3")
+
+    srv = Server(AD_DC_IP, get_info=ALL)
+    conn = Connection(srv, user=f"corp.pseudoco.com\\{AD_DC_USER}",
+                      password=AD_DC_PASS, authentication=NTLM, auto_bind=True)
+    results = []
+    for name in AD_TARGET_USERS:
+        conn.search(AD_BASE_DN,
+                    f"(&(objectClass=user)(cn={name}))",
+                    attributes=["cn", "mail", "userPrincipalName", "sAMAccountName"])
+        for e in conn.entries:
+            mail = str(e.mail) if e.mail else ""
+            upn  = str(e.userPrincipalName) if e.userPrincipalName else ""
+            results.append({
+                "cn":   str(e.cn),
+                "sam":  str(e.sAMAccountName),
+                "mail": mail,
+                "upn":  upn,
+            })
+    conn.unbind()
+    return results
+
+
+def phase_ad_verify():
+    """
+    Query AD for Kit/Lee/Pat/Nik.
+    PASS  = none of the 4 users still have @corp.pseudoco.com email.
+    FAIL  = one or more still have the default @corp.pseudoco.com domain.
+    Returns (ok, result_string).
+    """
+    print(f"     Querying AD at {AD_DC_IP} for users: {AD_TARGET_USERS}...")
+    try:
+        users = _ad_query_users()
+    except Exception as e:
+        return False, f"AD query failed: {e}"
+
+    if not users:
+        return False, "AD query returned no results for Kit/Lee/Pat/Nik"
+
+    lines = []
+    failed = []
+    for u in users:
+        email = u["mail"] or u["upn"] or "(no email)"
+        status = "FAIL" if email.lower().endswith(AD_DEFAULT_DOMAIN) else "OK"
+        lines.append(f"{u['cn']}={email} [{status}]")
+        if status == "FAIL":
+            failed.append(u["cn"])
+
+    summary = " | ".join(lines)
+    if failed:
+        return False, f"NOT updated ({', '.join(failed)} still @corp.pseudoco.com) | {summary}"
+    return True, f"All updated | {summary}"
+
+
+def phase_ad_rerun():
+    """
+    Connect to Jumphost1 via WinRM and run ADDuoTenantUserProvisioning.ps1,
+    then re-verify AD.
+    Returns (ok, result_string).
+    """
+    print(f"     Connecting to Jumphost1 {JUMPHOST_IP} via WinRM to run PS1...")
+    try:
+        import winrm as _winrm
+    except ImportError:
+        raise RuntimeError("pywinrm not installed — run: pip install pywinrm")
+
+    try:
+        s = _winrm.Session(
+            f"http://{JUMPHOST_IP}:5985/wsman",
+            auth=(JUMPHOST_USER, JUMPHOST_PASS),
+            transport="ntlm",
+        )
+        r = s.run_ps(f"& '{AD_PS1_PATH}'")
+        stdout = r.std_out.decode(errors="replace").strip()
+        stderr = r.std_err.decode(errors="replace").strip()
+        print(f"     PS1 stdout: {stdout[:300]}")
+        if stderr:
+            print(f"     PS1 stderr: {stderr[:200]}")
+        if r.status_code != 0:
+            return False, f"PS1 exited {r.status_code}: {stderr[:300] or stdout[:300]}"
+    except Exception as e:
+        return False, f"WinRM to Jumphost1 failed: {e}"
+
+    # Re-verify after running script
+    print("     Re-verifying AD after PS1 run...")
+    ok, result = phase_ad_verify()
+    return ok, f"PS1 ran OK | {result}"
+
+
 def phase_cdfmc_check():
     """
     1. SSH to the Terraform-Automation Ubuntu PC (via VPN).

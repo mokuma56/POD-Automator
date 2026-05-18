@@ -577,6 +577,112 @@ def api_cdfmc_redeploy(pod_id):
 
     threading.Thread(target=_redeploy, daemon=True).start()
     return jsonify({"status": "ok", "message": "Reset & Redeploy started for " + pod_id})
+
+
+# ---------------------------------------------------------------------------
+# AD Verification endpoints
+# ---------------------------------------------------------------------------
+
+def _run_ad_phase(pod_id, phase_fn_name):
+    """Run an onboard_router AD phase inside the POD's VPN container, return (ok, result)."""
+    import subprocess
+    script = (
+        "import sys; sys.path.insert(0, '.'); import onboard_router; "
+        f"ok, result = onboard_router.{phase_fn_name}(); "
+        "print(repr((ok, result)))"
+    )
+    res = subprocess.run([
+        "docker", "run", "--rm",
+        "--network", f"container:vpn-{pod_id}",
+        "--entrypoint", "python3",
+        "pod-automator:latest", "-c", script
+    ], capture_output=True, text=True, timeout=180)
+    stdout = res.stdout.strip()
+    last_line = stdout.splitlines()[-1] if stdout else ""
+    if last_line.startswith("("):
+        try:
+            return eval(last_line)
+        except Exception:
+            pass
+    return False, res.stderr.strip()[:300] or "no output"
+
+
+def _persist_ad_step(pod_id, ok, result, step="ad_verify"):
+    c = _db()
+    status = "completed" if ok else "failed"
+    c.execute(
+        "INSERT OR REPLACE INTO pipeline_steps "
+        "(pod_id, step_name, status, started_at, completed_at, result) "
+        "VALUES (?, ?, ?, datetime('now'), datetime('now'), ?)",
+        (pod_id, step, status, str(result)[:500])
+    )
+    c.commit(); c.close()
+
+
+@app.route("/api/ad/status/<pod_id>")
+def api_ad_status(pod_id):
+    """Return latest ad_verify step status for a POD."""
+    c = _db()
+    row = c.execute(
+        "SELECT status, result, completed_at FROM pipeline_steps "
+        "WHERE pod_id=? AND step_name='ad_verify' ORDER BY completed_at DESC LIMIT 1",
+        (pod_id,)
+    ).fetchone()
+    c.close()
+    if not row:
+        return jsonify({"status": "pending", "result": "", "completed_at": ""})
+    return jsonify({"status": row["status"], "result": row["result"],
+                    "completed_at": row["completed_at"]})
+
+
+@app.route("/api/ad/recheck/<pod_id>", methods=["POST"])
+def api_ad_recheck(pod_id):
+    """Re-run AD verification (read-only LDAP query) inside POD VPN namespace."""
+    import threading
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container not running for {pod_id}"}), 400
+
+    def _check():
+        ok, result = _run_ad_phase(pod_id, "phase_ad_verify")
+        _persist_ad_step(pod_id, ok, result, "ad_verify")
+
+    threading.Thread(target=_check, daemon=True).start()
+    return jsonify({"status": "ok", "message": f"AD re-check started for {pod_id}"})
+
+
+@app.route("/api/ad/rerun/<pod_id>", methods=["POST"])
+def api_ad_rerun(pod_id):
+    """Run ADDuoTenantUserProvisioning.ps1 on Jumphost1 via WinRM, then re-verify."""
+    import threading
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container not running for {pod_id}"}), 400
+
+    def _rerun():
+        def _live_log(msg):
+            try:
+                c = _db()
+                c.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
+                c.commit(); c.close()
+            except Exception:
+                pass
+
+        _live_log("[AD] Running ADDuoTenantUserProvisioning.ps1 on Jumphost1...")
+        ok, result = _run_ad_phase(pod_id, "phase_ad_rerun")
+        _live_log(f"[AD] Result: {'✓ OK' if ok else '✗ FAILED'} — {str(result)[:300]}")
+        _persist_ad_step(pod_id, ok, result, "ad_verify")
+
+    threading.Thread(target=_rerun, daemon=True).start()
+    return jsonify({"status": "ok", "message": f"AD re-run started for {pod_id}"})
+
+
 def api_ssh_terminal(pod_id, ip):
     """Opens macOS Terminal.app with SSH to switch via docker exec through VPN container."""
     cmd = f"docker exec -it vpn-{pod_id} sshpass -p 'C1sco12345' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null netadmin@{ip}"
@@ -1055,6 +1161,7 @@ DASHBOARD_HTML = """
       <button class="tab-btn" onclick="switchTab(this, 'logs')">Live Logs</button>
       <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches</button>
       <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
+      <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
     </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
@@ -1071,6 +1178,11 @@ DASHBOARD_HTML = """
     <div class="tab-content" id="tab-cdfmc">
       <div id="cdfmc-grid" style="padding:16px;">
         <div style="color:#667788;font-size:13px;">Select a POD to load cdFMC status</div>
+      </div>
+    </div>
+    <div class="tab-content" id="tab-ad">
+      <div id="ad-grid" style="padding:16px;">
+        <div style="color:#667788;font-size:13px;">Select a POD to load AD verification status</div>
       </div>
     </div>
   </div>
@@ -1293,10 +1405,11 @@ async function showPipeline(podId) {
   document.getElementById('detail-pod-id').textContent = podId;
   panel.style.display = 'block';
 
-  loadSteps(podId);
-  loadLogs(podId);
-  loadSwitches(podId);
-  loadCdfmc(podId);
+   loadSteps(podId);
+   loadLogs(podId);
+   loadSwitches(podId);
+   loadCdfmc(podId);
+   loadAd(podId);
 
   // Start elapsed timer
   if (timerInterval) clearInterval(timerInterval);
@@ -1516,6 +1629,80 @@ async function redeployCdfmc(podId) {
   if (d.status !== 'ok') {
     grid.innerHTML = '<div style="padding:20px;color:#ff4757;font-size:13px;">Error: ' + (d.message || 'unknown') + '</div>';
   }
+}
+
+async function loadAd(podId) {
+  const grid = document.getElementById('ad-grid');
+  if (!grid) return;
+  const r = await fetch('/api/ad/status/' + podId);
+  const d = await r.json();
+
+  const status = d.status || 'pending';
+  const result = d.result || '';
+  const ts     = d.completed_at || '';
+
+  const statusIcon  = status === 'completed' ? '✓' : status === 'failed' ? '✗' : '…';
+  const statusColor = status === 'completed' ? '#2ed573' : status === 'failed' ? '#ff4757' : '#ffa502';
+
+  // Parse user rows from result string  e.g. "All updated | Kit=kit@rtp04... [OK] | Lee=... [OK]"
+  const userRows = result.split('|').filter(p => p.includes('=')).map(p => {
+    const m = p.trim().match(/^(\w+)=([^\s\[]+)\s*\[(\w+)\]$/);
+    if (!m) return `<tr><td colspan="3" style="color:#667788">${escHtml(p.trim())}</td></tr>`;
+    const [, name, email, st] = m;
+    const color = st === 'OK' ? '#2ed573' : '#ff4757';
+    return `<tr>
+      <td style="padding:6px 10px;color:#e0e8f0">${escHtml(name)}</td>
+      <td style="padding:6px 10px;color:#02c8ff;font-family:monospace">${escHtml(email)}</td>
+      <td style="padding:6px 10px;color:${color};font-weight:600">${st}</td>
+    </tr>`;
+  }).join('');
+
+  const summary = result.split('|')[0].trim();
+
+  grid.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+      <span style="font-size:22px;color:${statusColor}">${statusIcon}</span>
+      <span style="font-size:15px;font-weight:600;color:#e0e8f0">AD User Verification</span>
+      <button onclick="recheckAd('${podId}')" style="margin-left:auto;padding:5px 14px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:6px;cursor:pointer;font-size:12px;">⟳ Re-check</button>
+      <button onclick="rerunAd('${podId}')" style="padding:5px 14px;background:#1a2a3a;border:1px solid #ff4757;color:#ff4757;border-radius:6px;cursor:pointer;font-size:12px;">⚠ Re-run PS1</button>
+    </div>
+    <div style="background:#0d1f2d;border-radius:8px;padding:14px;margin-bottom:14px;">
+      <div style="font-size:11px;color:#667788;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Status</div>
+      <div style="font-size:13px;color:${statusColor}">${escHtml(summary || (status === 'pending' ? 'Not checked yet' : result))}</div>
+      ${ts ? `<div style="font-size:11px;color:#445566;margin-top:4px">Last checked: ${ts}</div>` : ''}
+    </div>
+    ${userRows ? `
+    <div style="background:#0d1f2d;border-radius:8px;overflow:hidden;">
+      <table style="width:100%;border-collapse:collapse;">
+        <thead><tr style="border-bottom:1px solid #1a3a5a">
+          <th style="padding:6px 10px;color:#667788;font-size:11px;text-align:left;text-transform:uppercase">User</th>
+          <th style="padding:6px 10px;color:#667788;font-size:11px;text-align:left;text-transform:uppercase">Email in AD</th>
+          <th style="padding:6px 10px;color:#667788;font-size:11px;text-align:left;text-transform:uppercase">Status</th>
+        </tr></thead>
+        <tbody>${userRows}</tbody>
+      </table>
+    </div>` : ''}
+  `;
+}
+
+async function recheckAd(podId) {
+  const grid = document.getElementById('ad-grid');
+  grid.innerHTML = '<div style="padding:20px;color:#ffa502;font-size:13px;">⟳ Running AD re-check...</div>';
+  await fetch('/api/ad/recheck/' + podId, { method: 'POST' });
+  setTimeout(() => loadAd(podId), 8000);
+}
+
+async function rerunAd(podId) {
+  if (!confirm('This will run ADDuoTenantUserProvisioning.ps1 on Jumphost1 via WinRM. Are you sure?')) return;
+  const grid = document.getElementById('ad-grid');
+  grid.innerHTML = '<div style="padding:20px;color:#ff4757;font-size:13px;">⚠ Re-run PS1 started — check Live Logs tab for progress...</div>';
+  const r = await fetch('/api/ad/rerun/' + podId, { method: 'POST' });
+  const d = await r.json();
+  if (d.status !== 'ok') {
+    grid.innerHTML = '<div style="padding:20px;color:#ff4757;font-size:13px;">Error: ' + (d.message || 'unknown') + '</div>';
+    return;
+  }
+  setTimeout(() => loadAd(podId), 15000);
 }
 
 function escHtml(s) {
