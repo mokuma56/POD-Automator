@@ -64,12 +64,15 @@ def read_db(status_filter=("pending", "available", "ready", "")):
         return []
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT * FROM pods WHERE status IN ({}) ORDER BY pod_id".format(
-            ",".join("?" for _ in status_filter)
-        ),
-        list(status_filter)
-    ).fetchall()
+    if status_filter:
+        rows = conn.execute(
+            "SELECT * FROM pods WHERE status IN ({}) ORDER BY pod_id".format(
+                ",".join("?" for _ in status_filter)
+            ),
+            list(status_filter)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM pods ORDER BY pod_id").fetchall()
     conn.close()
 
     pods = []
