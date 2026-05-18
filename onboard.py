@@ -58,18 +58,6 @@ print(f"  Using serial: {SERIAL}")
 onboard_router.SERIAL = SERIAL
 onboard_router.UUID = f"C8231-G2-{SERIAL}"
 
-# Write serial to dashboard DB
-try:
-    subprocess.run([sys.executable, "-c", f"""
-import sqlite3
-conn = sqlite3.connect('{DB_PATH}')
-conn.execute('UPDATE pods SET router_serial=?, updated_at=datetime(\'now\') WHERE pod_id=?', ('{SERIAL}', '{pod_id}'))
-conn.commit()
-conn.close()
-"""])
-except Exception:
-    pass
-
 csv_row = onboard_router.read_csv_values()
 onboard_router.SYSTEM_IP = csv_row.get("System IP", "100.100.100.105")
 onboard_router.SITE_ID = int(csv_row.get("Site Id", 105))
@@ -99,6 +87,17 @@ else:
 # ── Run the pipeline (mirrors onboard_router.py's main) ─────────
 pod_id = os.environ.get("POD_ID", f"POD-{SERIAL}")
 DB_PATH = "/pipeline/host-data/pod_state.db"
+
+# Write serial to dashboard DB now that pod_id and DB_PATH are defined
+try:
+    import sqlite3 as _sqlite3
+    _c = _sqlite3.connect(DB_PATH)
+    _c.execute("UPDATE pods SET router_serial=?, updated_at=datetime('now') WHERE pod_id=?",
+               (SERIAL, pod_id))
+    _c.commit(); _c.close()
+    print(f"  Serial {SERIAL} written to DB for {pod_id}")
+except Exception as _e:
+    print(f"  Warning: could not write serial to DB: {_e}")
 
 print(f"\nOnboarding {onboard_router.UUID} for {pod_id}\n{'='*40}")
 
