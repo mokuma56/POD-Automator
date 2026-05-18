@@ -249,7 +249,7 @@ def action_generate(pods, out_dir):
         path = out / f"{p['pod_id'].lower()}.yml"
         path.write_text(generate_compose(p))
         print(f"  {path}")
-    print(f"\nLaunch: for f in {out_dir}/*.yml; do docker compose -f \"$f\" up -d; done")
+    print(f"\nLaunch: for f in {out_dir}/*.yml; do docker compose -p \"$(basename \"$f\" .yml)\" -f \"$f\" up -d; done")
 
 
 # ── Main ─────────────────────────────────────────────────────
