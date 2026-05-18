@@ -728,7 +728,128 @@ def phase_connectivity_test():
     return True, " | ".join(results)
 
 
-# ---- Main ----
+# Ubuntu automation PC — fixed address in all dCloud sessions
+CDFMC_AUTOMATION_HOST = "198.18.134.12"
+CDFMC_AUTOMATION_USER = "cisco"
+CDFMC_AUTOMATION_PASS = "C1sco12345"
+CDFMC_LAB_DIR = "/home/cisco/Documents/elevateLab"
+
+
+def phase_cdfmc_check():
+    """
+    1. SSH to the Terraform-Automation Ubuntu PC (via VPN).
+    2. Read terraform.tasks.logs — verify 'Full infrastructure deployed'.
+    3. Read terraform.tfvars  — extract cdfmc_host (SCC org).
+    4. Hit the SCC/cdFMC API to confirm FTD device is Online.
+    Returns (ok, result_string).
+    """
+    import re as _re
+
+    print(f"     Connecting to automation PC {CDFMC_AUTOMATION_HOST}...")
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            CDFMC_AUTOMATION_HOST,
+            username=CDFMC_AUTOMATION_USER,
+            password=CDFMC_AUTOMATION_PASS,
+            look_for_keys=False, allow_agent=False, timeout=15,
+        )
+    except Exception as e:
+        return False, f"SSH to automation PC failed: {e}"
+
+    def _run(cmd):
+        _, out, err = client.exec_command(cmd, timeout=20)
+        return out.read().decode(errors="replace").strip()
+
+    # --- 1. Check terraform log for success ---
+    log_tail = _run(f"tail -30 {CDFMC_LAB_DIR}/terraform.tasks.logs")
+    deployed = "Full infrastructure deployed" in log_tail
+    print(f"     Terraform log: {'✓ deployed' if deployed else '✗ not deployed'}")
+
+    # --- 2. Extract cdfmc_host / scc_org from tfvars ---
+    tfvars_raw = _run(f"cat {CDFMC_LAB_DIR}/terraform.tfvars")
+    scc_org = ""
+    scc_token = ""
+    scc_host = ""
+    device_name = "hqftdv"
+    for line in tfvars_raw.splitlines():
+        line = line.strip()
+        m = _re.match(r'^cdfmc_host\s*=\s*"([^"]+)"', line)
+        if m:
+            scc_org = m.group(1)
+        m = _re.match(r'^scc_token\s*=\s*"([^"]+)"', line)
+        if m:
+            scc_token = m.group(1)
+        m = _re.match(r'^scc_host\s*=\s*"([^"]+)"', line)
+        if m:
+            scc_host = m.group(1)
+        m = _re.match(r'^device_name\s*=\s*\["([^"]+)"', line)
+        if m:
+            device_name = m.group(1)
+    print(f"     SCC org: {scc_org or '(not found)'}")
+
+    # --- 3. Verify FTD online via cdFMC API — run on Ubuntu PC (has internet) ---
+    ftd_online = False
+    ftd_status = "unknown"
+    if scc_token and scc_org:
+        DOMAIN = "e276abec-e0f2-11e3-8169-6d9ed49b625f"
+        url = f"https://{scc_org}/api/fmc_config/v1/domain/{DOMAIN}/devices/devicerecords?limit=50"
+        # Run the API call on the Ubuntu PC (has internet access to SCC cloud)
+        check_script = f"""
+import urllib.request, json, ssl, sys
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+with open('{CDFMC_LAB_DIR}/terraform.tfvars') as f:
+    lines = f.read()
+token = [l.split('=',1)[1].strip().strip('"') for l in lines.splitlines() if l.strip().startswith('scc_token')][0]
+cdfmc = [l.split('=',1)[1].strip().strip('"') for l in lines.splitlines() if l.strip().startswith('cdfmc_host')][0]
+DOMAIN = 'e276abec-e0f2-11e3-8169-6d9ed49b625f'
+def get(url):
+    req = urllib.request.Request(url, headers={{'Authorization': 'Bearer ' + token}})
+    return json.loads(urllib.request.urlopen(req, context=ctx, timeout=15).read())
+items = get(f'https://{{cdfmc}}/api/fmc_config/v1/domain/{{DOMAIN}}/devices/devicerecords?limit=50').get('items', [])
+for i in items:
+    d = get(f'https://{{cdfmc}}/api/fmc_config/v1/domain/{{DOMAIN}}/devices/devicerecords/{{i["id"]}}')
+    print(d.get('name',''), d.get('isConnected',''), d.get('deploymentStatus',''), d.get('healthStatus',''))
+"""
+        try:
+            client2 = paramiko.SSHClient()
+            client2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client2.connect(
+                CDFMC_AUTOMATION_HOST,
+                username=CDFMC_AUTOMATION_USER,
+                password=CDFMC_AUTOMATION_PASS,
+                look_for_keys=False, allow_agent=False, timeout=15,
+            )
+            # Write script to a temp file then run it
+            sftp = client2.open_sftp()
+            with sftp.open("/tmp/_cdfmc_check.py", "w") as f:
+                f.write(check_script)
+            sftp.close()
+            _, out2, _ = client2.exec_command("python3 /tmp/_cdfmc_check.py", timeout=30)
+            api_out = out2.read().decode(errors="replace").strip()
+            client2.close()
+            print(f"     FTD devices: {api_out or '(none)'}")
+            for line in api_out.splitlines():
+                parts = line.split()
+                if parts and "hqftd" in parts[0].lower():
+                    connected   = parts[1] if len(parts) > 1 else ""
+                    deploy_stat = parts[2] if len(parts) > 2 else ""
+                    health      = parts[3] if len(parts) > 3 else ""
+                    ftd_online = str(connected).lower() == "true"
+                    ftd_status = f"{parts[0]} connected={connected} deployed={deploy_stat} health={health}"
+            if not ftd_status or ftd_status == "unknown":
+                ftd_status = api_out[:120] or "no devices returned"
+        except Exception as e:
+            ftd_status = f"API error: {e}"
+            print(f"     cdFMC API error: {e}")
+    else:
+        ftd_status = "no token/host"
+
+    ok = deployed and bool(scc_org) and ftd_online
+    result = f"scc_org={scc_org} | deployed={'yes' if deployed else 'no'} | ftd={ftd_status}"
+    print(f"     {'✓' if ok else '✗'} {result}")
+    return ok, result
 if __name__ == "__main__":
     pod_id = os.environ.get("POD_ID", f"POD-{SERIAL}")
     print(f"\nOnboarding {UUID} for {pod_id}\n{'='*40}")

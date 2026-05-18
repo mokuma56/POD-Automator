@@ -62,10 +62,16 @@ def _migrate():
             jump_host TEXT DEFAULT '',
             session_id TEXT DEFAULT '',
             notes TEXT DEFAULT '',
+            scc_org TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Migration: add scc_org if upgrading from older schema
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN scc_org TEXT DEFAULT ''")
+    except Exception:
+        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pipeline_steps (
             pod_id TEXT, step_name TEXT, status TEXT, started_at TEXT,
@@ -377,7 +383,97 @@ def api_switches_recheck(pod_id):
     return jsonify({"status": "ok", "message": "Switch re-check started for " + pod_id})
 
 
-@app.route("/api/ssh/terminal/<pod_id>/<ip>", methods=["POST"])
+@app.route("/api/cdfmc/<pod_id>", methods=["GET"])
+def api_cdfmc_status(pod_id):
+    """Return current cdFMC step result parsed into structured fields."""
+    conn = _db()
+    row = conn.execute(
+        "SELECT status, result FROM pipeline_steps WHERE pod_id=? AND step_name='cdfmc_check'",
+        (pod_id,)
+    ).fetchone()
+    scc_org = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+    conn.close()
+
+    result = dict(
+        step_status=row["status"] if row else "pending",
+        step_result=row["result"] if row else "",
+        scc_org=(scc_org["scc_org"] if scc_org else "") or "",
+        deployed="unknown",
+        ftd_status="",
+    )
+    if row and row["result"]:
+        r = row["result"]
+        import re as _re
+        m = _re.search(r"deployed=(yes|no)", r)
+        if m:
+            result["deployed"] = m.group(1)
+        m = _re.search(r"ftd=(.+)$", r)
+        if m:
+            result["ftd_status"] = m.group(1).strip()
+        if not result["scc_org"]:
+            m = _re.search(r"scc_org=([^\s|]+)", r)
+            if m:
+                result["scc_org"] = m.group(1)
+    return jsonify(result)
+
+
+@app.route("/api/cdfmc/recheck/<pod_id>", methods=["POST"])
+def api_cdfmc_recheck(pod_id):
+    """Re-run the cdFMC check inside the POD's VPN namespace."""
+    import subprocess, threading
+
+    conn = _db()
+    row = conn.execute("SELECT router_ip FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"status": "error", "message": "POD not found"}), 404
+
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": "VPN container not running for " + pod_id}), 400
+
+    def _recheck():
+        script = (
+            "import sys; sys.path.insert(0, '.'); import onboard_router; "
+            f"onboard_router.ROUTER_IP = '{row['router_ip']}'; "
+            "ok, result = onboard_router.phase_cdfmc_check(); "
+            "print(repr((ok, result)))"
+        )
+        res = subprocess.run([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-c", script
+        ], capture_output=True, text=True, timeout=120)
+        stdout = res.stdout.strip()
+        last_line = stdout.splitlines()[-1] if stdout else ""
+        ok_val, result_val = False, "no output"
+        if last_line.startswith("("):
+            try:
+                ok_val, result_val = eval(last_line)
+            except Exception as e:
+                result_val = f"parse error: {e}"
+        status = "completed" if ok_val else "failed"
+        conn2 = _db()
+        conn2.execute(
+            "INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, completed_at, result) "
+            "VALUES (?, 'cdfmc_check', ?, datetime('now'), datetime('now'), ?)",
+            (pod_id, status, str(result_val)[:500])
+        )
+        # Parse and persist scc_org
+        import re as _re
+        m = _re.search(r"scc_org=([^\s|]+)", str(result_val))
+        if m:
+            conn2.execute("UPDATE pods SET scc_org=?, updated_at=datetime('now') WHERE pod_id=?",
+                          (m.group(1), pod_id))
+        conn2.commit()
+        conn2.close()
+
+    threading.Thread(target=_recheck, daemon=True).start()
+    return jsonify({"status": "ok", "message": "cdFMC re-check started for " + pod_id})
 def api_ssh_terminal(pod_id, ip):
     """Opens macOS Terminal.app with SSH to switch via docker exec through VPN container."""
     cmd = f"docker exec -it vpn-{pod_id} sshpass -p 'C1sco12345' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null netadmin@{ip}"
@@ -830,6 +926,7 @@ DASHBOARD_HTML = """
         <th>VPN</th>
         <th>Serial</th>
         <th>SD-WAN</th>
+        <th>SCC Org</th>
         <th>Pipeline</th>
         <th>Actions</th>
         <th>Notes</th>
@@ -854,6 +951,7 @@ DASHBOARD_HTML = """
       <button class="tab-btn active" onclick="switchTab(this, 'steps')">Pipeline Steps</button>
       <button class="tab-btn" onclick="switchTab(this, 'logs')">Live Logs</button>
       <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches</button>
+      <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
     </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
@@ -865,6 +963,11 @@ DASHBOARD_HTML = """
       <div id="toast" class="toast"></div>
       <div class="switch-grid" id="switch-grid">
         <div style="color:#667788;font-size:13px;">Select a POD to load switch verification results</div>
+      </div>
+    </div>
+    <div class="tab-content" id="tab-cdfmc">
+      <div id="cdfmc-grid" style="padding:16px;">
+        <div style="color:#667788;font-size:13px;">Select a POD to load cdFMC status</div>
       </div>
     </div>
   </div>
@@ -886,6 +989,7 @@ const PIPELINE_ORDER = [
   "verify_leaf1",
   "verify_leaf2",
   "connectivity_test",
+  "cdfmc_check",
 ];
 
 async function handleFile(file) {
@@ -990,6 +1094,7 @@ function renderTable(pods) {
       <td style="text-align:center"><span style="color:${vpnColor};font-size:18px;line-height:1" title="${p.vpn_detail || ''}">&#x25cf;</span></td>
       <td style="font-size:11px;color:#667788">${serial}</td>
       <td class="device-col" style="font-size:18px;line-height:1;color:${p.sdwan_online === 'yes' ? '#00e68a' : '#ff4757'}">&#x25cf;</td>
+      <td style="font-size:11px;color:#667788;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.scc_org||''}">${p.scc_org ? '<span style="color:#02c8ff">&#x25cf;</span> ' + p.scc_org.replace(/\.app\.us\.cdo\.cisco\.com.*/, '') : '<span style="color:#667788">—</span>'}</td>
       <td>${pipeLabel}</td>
       <td style="display:flex;gap:4px;flex-wrap:wrap;">
         <button class="btn-start" onclick="connectVpn('${p.pod_id}')">Connect VPN</button>
@@ -1088,6 +1193,7 @@ async function showPipeline(podId) {
   loadSteps(podId);
   loadLogs(podId);
   loadSwitches(podId);
+  loadCdfmc(podId);
 
   // Start elapsed timer
   if (timerInterval) clearInterval(timerInterval);
@@ -1245,6 +1351,56 @@ async function recheckSwitches(podId) {
   const r = await fetch('/api/switches/recheck/' + podId, { method: 'POST' });
   const data = await r.json();
   setTimeout(() => loadSwitches(podId), 5000);
+}
+
+async function loadCdfmc(podId) {
+  const grid = document.getElementById('cdfmc-grid');
+  if (!grid) return;
+  const r = await fetch('/api/cdfmc/' + podId);
+  const d = await r.json();
+  const deployed = d.deployed;
+  const ftd = d.ftd_status || '—';
+  const scc = d.scc_org || '—';
+  const stepStatus = d.step_status || 'pending';
+  const stepResult = d.step_result || '';
+
+  const statusColor = stepStatus === 'completed' ? '#00e68a' : stepStatus === 'failed' ? '#ff4757' : '#ffa502';
+  const statusIcon  = stepStatus === 'completed' ? '✓' : stepStatus === 'failed' ? '✗' : '⟳';
+  const deployedBadge = deployed === 'yes'
+    ? '<span class="badge pass">Deployed</span>'
+    : deployed === 'no'
+    ? '<span class="badge fail">Not Deployed</span>'
+    : '<span class="badge pending">Unknown</span>';
+
+  grid.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+      <span style="font-size:22px;color:${statusColor}">${statusIcon}</span>
+      <span style="font-size:15px;font-weight:600;color:#e0e8f0">cdFMC / Terraform Automation</span>
+      <button onclick="recheckCdfmc('${podId}')" style="margin-left:auto;padding:5px 14px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:6px;cursor:pointer;font-size:12px;">⟳ Re-check</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+      <div style="background:#0d1f2d;border-radius:8px;padding:14px;">
+        <div style="font-size:11px;color:#667788;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Terraform Deploy</div>
+        <div>${deployedBadge}</div>
+      </div>
+      <div style="background:#0d1f2d;border-radius:8px;padding:14px;">
+        <div style="font-size:11px;color:#667788;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">SCC Org</div>
+        <div style="font-size:12px;color:#02c8ff;word-break:break-all">${scc}</div>
+      </div>
+    </div>
+    <div style="background:#0d1f2d;border-radius:8px;padding:14px;margin-bottom:12px;">
+      <div style="font-size:11px;color:#667788;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">FTD Device Status</div>
+      <div style="font-size:12px;color:#e0e8f0">${ftd}</div>
+    </div>
+    ${stepResult ? '<div style="background:#0a1520;border-radius:6px;padding:10px;font-size:11px;color:#667788;font-family:monospace;word-break:break-all">' + escHtml(stepResult) + '</div>' : ''}
+  `;
+}
+
+async function recheckCdfmc(podId) {
+  const grid = document.getElementById('cdfmc-grid');
+  grid.innerHTML = '<div style="padding:20px;color:#ffa502;font-size:13px;">⟳ Running cdFMC re-check...</div>';
+  await fetch('/api/cdfmc/recheck/' + podId, { method: 'POST' });
+  setTimeout(() => loadCdfmc(podId), 5000);
 }
 
 function escHtml(s) {
