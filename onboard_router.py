@@ -414,6 +414,9 @@ def _wait_router_online(timeout=600):
     t0 = time.time()
     for i in range(int(timeout / 10)):
         time.sleep(10)
+        elapsed = int(time.time() - t0)
+        if elapsed > 0 and elapsed % 30 == 0:
+            print(f"     waiting for router... {elapsed}s elapsed")
         try:
             c = paramiko.SSHClient()
             c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -421,7 +424,7 @@ def _wait_router_online(timeout=600):
                       look_for_keys=False, allow_agent=False, timeout=8)
             c.close()
             waited = int(time.time() - t0)
-            print(f"     Router online after {waited}s")
+            print(f"     Router online after {waited}s ✓")
             return True, waited
         except:
             pass
@@ -530,14 +533,19 @@ def phase_controller_mode():
         return False
 
     # Wait for SD-WAN control connections
-    time.sleep(30)
+    print(f"     Waiting for SD-WAN to initialize...")
+    for i in range(30):
+        if i > 0 and i % 10 == 0:
+            print(f"     waiting for SD-WAN... {i}s")
+        time.sleep(1)
     return _wait_sdwan_tunnels()
     return False
 
 
 def _wait_sdwan_tunnels(timeout=480):
     """Wait for 3 SD-WAN control connections to come up."""
-    deadline = time.time() + timeout
+    t0 = time.time()
+    deadline = t0 + timeout
     while time.time() < deadline:
         try:
             c2, s2 = router_shell()
@@ -548,7 +556,8 @@ def _wait_sdwan_tunnels(timeout=480):
             c2.close()
             up_lines = [l for l in out.splitlines() if "up" in l.lower() and "control" not in l.lower()]
             n_up = len(up_lines)
-            print(f"     Control connections up: {n_up}")
+            elapsed = int(time.time() - t0)
+            print(f"     Control connections up: {n_up} ({elapsed}s)")
             if n_up >= 3:
                 print(f"     SD-WAN connected ({n_up} tunnels) ✅")
                 return True
