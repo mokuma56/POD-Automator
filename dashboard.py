@@ -474,6 +474,109 @@ def api_cdfmc_recheck(pod_id):
 
     threading.Thread(target=_recheck, daemon=True).start()
     return jsonify({"status": "ok", "message": "cdFMC re-check started for " + pod_id})
+
+
+@app.route("/api/cdfmc/redeploy/<pod_id>", methods=["POST"])
+def api_cdfmc_redeploy(pod_id):
+    """SSH to automation PC and run cli.py reset then cli.py deploy. Streams output to pipeline_logs."""
+    import subprocess, threading
+
+    conn = _db()
+    row = conn.execute("SELECT * FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"status": "error", "message": "POD not found"}), 404
+
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": "VPN container not running for " + pod_id}), 400
+
+    def _live_log(msg):
+        try:
+            c = _db()
+            c.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
+            c.commit(); c.close()
+        except Exception:
+            pass
+
+    def _redeploy():
+        import paramiko as _p
+        _live_log("[cdFMC] Starting Reset & Redeploy on automation PC...")
+        try:
+            client = _p.SSHClient()
+            client.set_missing_host_key_policy(_p.AutoAddPolicy())
+            client.connect("198.18.134.12", username="cisco", password="C1sco12345",
+                           look_for_keys=False, allow_agent=False, timeout=15)
+        except Exception as e:
+            _live_log(f"[cdFMC] SSH to automation PC failed: {e}")
+            return
+
+        lab_dir = "/home/cisco/Documents/elevateLab"
+        for label, cmd in [("reset", f"cd {lab_dir} && ./cli.py reset 2>&1"),
+                           ("deploy", f"cd {lab_dir} && ./cli.py deploy 2>&1")]:
+            _live_log(f"[cdFMC] Running cli.py {label}...")
+            try:
+                _, stdout, _ = client.exec_command(cmd, timeout=1200)
+                for line in iter(stdout.readline, ""):
+                    line = line.rstrip()
+                    if line:
+                        _live_log(f"[cdFMC/{label}] {line}")
+                rc = stdout.channel.recv_exit_status()
+                if rc != 0:
+                    _live_log(f"[cdFMC] cli.py {label} exited with code {rc}")
+                    client.close()
+                    return
+                _live_log(f"[cdFMC] cli.py {label} completed ✓")
+            except Exception as e:
+                _live_log(f"[cdFMC] Error during {label}: {e}")
+                client.close()
+                return
+
+        client.close()
+        _live_log("[cdFMC] Reset & Redeploy finished — running verification check...")
+
+        # Auto re-check after deploy
+        import sys, os
+        script = (
+            "import sys; sys.path.insert(0, '.'); import onboard_router; "
+            f"onboard_router.ROUTER_IP = '{row['router_ip']}'; "
+            "ok, result = onboard_router.phase_cdfmc_check(); "
+            "print(repr((ok, result)))"
+        )
+        res = subprocess.run([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-c", script
+        ], capture_output=True, text=True, timeout=120)
+        stdout = res.stdout.strip()
+        last_line = stdout.splitlines()[-1] if stdout else ""
+        ok_val, result_val = False, "no output"
+        if last_line.startswith("("):
+            try:
+                ok_val, result_val = eval(last_line)
+            except Exception:
+                pass
+        status = "completed" if ok_val else "failed"
+        c2 = _db()
+        c2.execute(
+            "INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, completed_at, result) "
+            "VALUES (?, 'cdfmc_check', ?, datetime('now'), datetime('now'), ?)",
+            (pod_id, status, str(result_val)[:500])
+        )
+        import re as _re
+        m = _re.search(r"scc_org=([^\s|]+)", str(result_val))
+        if m:
+            c2.execute("UPDATE pods SET scc_org=?, updated_at=datetime('now') WHERE pod_id=?",
+                       (m.group(1), pod_id))
+        c2.commit(); c2.close()
+        _live_log(f"[cdFMC] Verification: {'✓ OK' if ok_val else '✗ FAILED'} — {str(result_val)[:200]}")
+
+    threading.Thread(target=_redeploy, daemon=True).start()
+    return jsonify({"status": "ok", "message": "Reset & Redeploy started for " + pod_id})
 def api_ssh_terminal(pod_id, ip):
     """Opens macOS Terminal.app with SSH to switch via docker exec through VPN container."""
     cmd = f"docker exec -it vpn-{pod_id} sshpass -p 'C1sco12345' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null netadmin@{ip}"
@@ -1377,6 +1480,7 @@ async function loadCdfmc(podId) {
       <span style="font-size:22px;color:${statusColor}">${statusIcon}</span>
       <span style="font-size:15px;font-weight:600;color:#e0e8f0">cdFMC / Terraform Automation</span>
       <button onclick="recheckCdfmc('${podId}')" style="margin-left:auto;padding:5px 14px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:6px;cursor:pointer;font-size:12px;">⟳ Re-check</button>
+      <button onclick="redeployCdfmc('${podId}')" style="padding:5px 14px;background:#1a2a3a;border:1px solid #ff4757;color:#ff4757;border-radius:6px;cursor:pointer;font-size:12px;">⚠ Reset &amp; Redeploy</button>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
       <div style="background:#0d1f2d;border-radius:8px;padding:14px;">
@@ -1401,6 +1505,17 @@ async function recheckCdfmc(podId) {
   grid.innerHTML = '<div style="padding:20px;color:#ffa502;font-size:13px;">⟳ Running cdFMC re-check...</div>';
   await fetch('/api/cdfmc/recheck/' + podId, { method: 'POST' });
   setTimeout(() => loadCdfmc(podId), 5000);
+}
+
+async function redeployCdfmc(podId) {
+  if (!confirm('This will run cli.py reset then cli.py deploy on the automation PC (~15 min). Are you sure?')) return;
+  const grid = document.getElementById('cdfmc-grid');
+  grid.innerHTML = '<div style="padding:20px;color:#ff4757;font-size:13px;">⚠ Reset &amp; Redeploy started — check Live Logs tab for progress (~15 min)...</div>';
+  const r = await fetch('/api/cdfmc/redeploy/' + podId, { method: 'POST' });
+  const d = await r.json();
+  if (d.status !== 'ok') {
+    grid.innerHTML = '<div style="padding:20px;color:#ff4757;font-size:13px;">Error: ' + (d.message || 'unknown') + '</div>';
+  }
 }
 
 function escHtml(s) {
