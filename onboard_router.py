@@ -752,15 +752,20 @@ AD_PS1_PATH   = r"C:\Scripts\ADDuoTenantUserProvisioning.ps1"
 def _ad_query_users():
     """Query Kit/Lee/Pat/Nik from AD via LDAP. Returns list of dicts with cn/mail/upn."""
     try:
-        from ldap3 import Server, Connection, SIMPLE, ALL
+        from ldap3 import Server, Connection, SIMPLE, NONE
     except ImportError:
         raise RuntimeError("ldap3 not installed — run: pip install ldap3")
 
-    srv = Server(AD_DC_IP, get_info=ALL)
+    # get_info=NONE avoids fetching the full AD schema which hangs on some DCs
+    srv = Server(AD_DC_IP, connect_timeout=8, get_info=NONE)
     conn = Connection(srv,
-                      user=f"CN={AD_DC_USER},CN=Users,DC=corp,DC=pseudoco,DC=com",
+                      user=f"{AD_DC_USER}@corp.pseudoco.com",
                       password=AD_DC_PASS,
-                      authentication=SIMPLE, auto_bind=True)
+                      authentication=SIMPLE,
+                      receive_timeout=10)
+    conn.bind()
+    if not conn.bound:
+        raise RuntimeError(f"LDAP bind failed: {conn.result}")
     results = []
     for name in AD_TARGET_USERS:
         conn.search(AD_BASE_DN,
