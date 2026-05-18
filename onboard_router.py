@@ -579,22 +579,15 @@ def run_switch_checks(step_name):
 
     parts = []
 
-    # Get model
-    out = switch_cmd(shell, "show ver | i Cisco IOS")
+    # Get model via show inventory
+    out = switch_cmd(shell, "show inventory")
     model = ""
     for line in out.splitlines():
-        if "Cisco IOS Software" in line:
-            continue
-        if "Model Number" in line:
-            model = line.split()[-1]
-        if "Switch Ports Model" in line:
-            pass
-    for line in out.splitlines():
-        if "Model Number" in line:
-            model = line.split()[-1]
-        if "C9300" in line or "C8200" in line or "C8300" in line:
-            model = line.split()[-1]
-    parts.append(f"MODEL: {model}")
+        if line.strip().startswith("PID:"):
+            model = line.split(",")[0].replace("PID: ", "").strip()
+            break
+    if model:
+        parts.append(f"MODEL: {model}")
 
     if step_name == "verify_border_spine":
         # OSPF neighbors
