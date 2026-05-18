@@ -6,6 +6,18 @@ Usage: uv run --directory ~/sw_projects/pod_automator python3 onboard_router.py 
 import csv, json, os, sys, time, paramiko, requests, subprocess, urllib3
 urllib3.disable_warnings()
 
+# Upgrade config — overridden by dashboard before calling phase functions
+GOLDEN_VERSION_SWITCH = "17.12.1"
+GOLDEN_VERSION_ROUTER = "17.18.2"
+UPGRADE_IMAGE_SWITCH  = "cat9k_iosxe.17.12.01.SPA.bin"
+UPGRADE_IMAGE_ROUTER  = ""
+
+UBUNTU_HOST = "198.18.134.12"
+UBUNTU_USER = "cisco"
+UBUNTU_PASS = "C1sco12345"
+UBUNTU_IMAGE_DIR = "/home/cisco"
+UBUNTU_HTTP_PORT = 8088
+
 SERIAL = "FJC300412NA"
 for a in sys.argv[1:]:
     if not a.startswith("--"):
@@ -733,6 +745,384 @@ CDFMC_AUTOMATION_HOST = "198.18.134.12"
 CDFMC_AUTOMATION_USER = "cisco"
 CDFMC_AUTOMATION_PASS = "C1sco12345"
 CDFMC_LAB_DIR = "/home/cisco/Documents/elevateLab"
+
+
+
+
+# ---------------------------------------------------------------------------
+# Version comparison utility
+# ---------------------------------------------------------------------------
+
+def _parse_version(ver_str):
+    """Parse a version string like '17.12.1' or '17.12.01' into a tuple of ints."""
+    import re
+    parts = re.findall(r'\d+', ver_str)
+    return tuple(int(p) for p in parts[:3]) if parts else (0, 0, 0)
+
+
+def _version_needs_upgrade(current_str, golden_str):
+    """
+    Returns True if current < golden (upgrade needed).
+    Returns False if current >= golden (skip — never downgrade).
+    """
+    current = _parse_version(current_str)
+    golden  = _parse_version(golden_str)
+    return current < golden
+
+
+def _detect_version_from_show(output):
+    """Extract version string from 'show version' output."""
+    import re
+    for line in output.splitlines():
+        m = re.search(r'Cisco IOS XE Software.*?Version\s+([\d.]+)', line)
+        if m:
+            return m.group(1)
+        m = re.search(r'Version\s+([\d.]+)', line)
+        if m and re.match(r'\d+\.\d+', m.group(1)):
+            return m.group(1)
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Ubuntu HTTP server helpers
+# ---------------------------------------------------------------------------
+
+def _ubuntu_ensure_http_server():
+    """Start python3 http.server on Ubuntu PC if not already running. Returns True on success."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(UBUNTU_HOST, username=UBUNTU_USER, password=UBUNTU_PASS,
+                   look_for_keys=False, allow_agent=False, timeout=15)
+    # Check if already running
+    _, out, _ = client.exec_command(f"pgrep -f 'http.server {UBUNTU_HTTP_PORT}'", timeout=5)
+    if out.read().strip():
+        print(f"     HTTP server already running on Ubuntu PC port {UBUNTU_HTTP_PORT}")
+        client.close()
+        return True
+    # Start it
+    client.exec_command(
+        f"cd {UBUNTU_IMAGE_DIR} && nohup python3 -m http.server {UBUNTU_HTTP_PORT} "
+        f"> /tmp/http_server_{UBUNTU_HTTP_PORT}.log 2>&1 &", timeout=5
+    )
+    time.sleep(2)
+    _, out, _ = client.exec_command(f"pgrep -f 'http.server {UBUNTU_HTTP_PORT}'", timeout=5)
+    running = bool(out.read().strip())
+    client.close()
+    print(f"     HTTP server {'started' if running else 'FAILED to start'} on Ubuntu PC:{UBUNTU_HTTP_PORT}")
+    return running
+
+
+def _ubuntu_stop_http_server():
+    """Stop the http.server on Ubuntu PC."""
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(UBUNTU_HOST, username=UBUNTU_USER, password=UBUNTU_PASS,
+                       look_for_keys=False, allow_agent=False, timeout=10)
+        client.exec_command(f"pkill -f 'http.server {UBUNTU_HTTP_PORT}'", timeout=5)
+        client.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Switch upgrade
+# ---------------------------------------------------------------------------
+
+def phase_switch_upgrade(switch_key):
+    """
+    Upgrade a single switch to GOLDEN_VERSION_SWITCH if its current version is older.
+    Never downgrades. switch_key must be one of the SWITCHES dict keys.
+    Returns (ok, result_string).
+    """
+    info = SWITCHES.get(switch_key)
+    if not info:
+        return False, f"Unknown switch key: {switch_key}"
+
+    ip   = info["ip"]
+    name = info["name"]
+
+    print(f"     [{name}] Connecting to check version...")
+    try:
+        client, shell = ssh_switch(ip)
+    except Exception as e:
+        return False, f"SSH to {name} ({ip}) failed: {e}"
+
+    ver_out = switch_cmd(shell, "show version", timeout=8)
+    client.close()
+
+    current = _detect_version_from_show(ver_out)
+    if not current:
+        return False, f"Could not detect version on {name} ({ip})"
+
+    print(f"     [{name}] Current: {current}  Golden: {GOLDEN_VERSION_SWITCH}")
+
+    if not _version_needs_upgrade(current, GOLDEN_VERSION_SWITCH):
+        return True, f"Version OK ({current} >= {GOLDEN_VERSION_SWITCH}) — no upgrade needed"
+
+    # --- Upgrade needed ---
+    print(f"     [{name}] Upgrade needed: {current} -> {GOLDEN_VERSION_SWITCH}")
+    image = UPGRADE_IMAGE_SWITCH
+    http_url = f"http://{UBUNTU_HOST}:{UBUNTU_HTTP_PORT}/{image}"
+
+    # 1. Ensure HTTP server is running on Ubuntu PC
+    print(f"     Starting HTTP server on Ubuntu PC...")
+    if not _ubuntu_ensure_http_server():
+        return False, "Failed to start HTTP server on Ubuntu PC"
+
+    # 2. SSH back to switch and copy image
+    print(f"     [{name}] Copying image from {http_url} to flash: (~10 min)...")
+    try:
+        client, shell = ssh_switch(ip)
+    except Exception as e:
+        return False, f"SSH to {name} failed before copy: {e}"
+
+    # Copy image — long timeout, print progress dots
+    shell.send(f"copy {http_url} flash:{image}\n")
+    time.sleep(2)
+    # Accept destination filename prompt
+    shell.send("\n")
+    copy_out = b""
+    deadline = time.time() + 900  # 15 min max
+    last_print = time.time()
+    while time.time() < deadline:
+        if shell.recv_ready():
+            chunk = shell.recv(8192)
+            copy_out += chunk
+            decoded = chunk.decode(errors="replace")
+            if any(x in decoded for x in ["bytes copied", "Error", "error", "failed", "#"]):
+                if "bytes copied" in decoded or "#" in decoded:
+                    break
+        if time.time() - last_print > 30:
+            elapsed = int(time.time() - (deadline - 900))
+            print(f"     [{name}] Copying... {elapsed}s elapsed")
+            last_print = time.time()
+        time.sleep(1)
+
+    copy_result = copy_out.decode(errors="replace")
+    if "bytes copied" not in copy_result and "Error" in copy_result:
+        client.close()
+        return False, f"Image copy failed on {name}: {copy_result[-300:]}"
+
+    print(f"     [{name}] Image copied. Running software install...")
+
+    # 3. Install, activate, commit
+    shell.send(f"software install add file flash:{image} activate commit\n")
+    time.sleep(3)
+    # Confirm any prompts
+    shell.send("\n")
+    install_out = b""
+    deadline2 = time.time() + 1800  # 30 min max for install + reload
+    last_print = time.time()
+    reloading = False
+    while time.time() < deadline2:
+        if shell.recv_ready():
+            chunk = shell.recv(8192)
+            install_out += chunk
+            decoded = chunk.decode(errors="replace")
+            if "reload" in decoded.lower() or "restarting" in decoded.lower():
+                reloading = True
+                print(f"     [{name}] Switch reloading...")
+                break
+            if "FAILED" in decoded or "failed" in decoded.lower():
+                client.close()
+                return False, f"Install failed on {name}: {decoded[-300:]}"
+        if time.time() - last_print > 30:
+            elapsed = int(time.time() - (deadline2 - 1800))
+            print(f"     [{name}] Installing... {elapsed}s elapsed")
+            last_print = time.time()
+        time.sleep(1)
+
+    client.close()
+
+    # 4. Wait for switch to come back online
+    print(f"     [{name}] Waiting for reload to complete...")
+    time.sleep(60)  # Give it a minute before polling
+    back_up = False
+    poll_deadline = time.time() + 1200  # 20 min max
+    while time.time() < poll_deadline:
+        try:
+            tc, ts = ssh_switch(ip)
+            ver_check = switch_cmd(ts, "show version", timeout=8)
+            tc.close()
+            new_ver = _detect_version_from_show(ver_check)
+            if new_ver:
+                back_up = True
+                print(f"     [{name}] Back online — version: {new_ver}")
+                break
+        except Exception:
+            elapsed = int(poll_deadline - time.time())
+            print(f"     [{name}] Still reloading... ({elapsed}s remaining)")
+            time.sleep(30)
+
+    if not back_up:
+        return False, f"Timed out waiting for {name} to come back after upgrade"
+
+    # 5. Verify new version meets golden
+    if _version_needs_upgrade(new_ver, GOLDEN_VERSION_SWITCH):
+        return False, f"Upgrade completed but version {new_ver} still < {GOLDEN_VERSION_SWITCH}"
+
+    return True, f"Upgraded {name}: {current} -> {new_ver} (golden: {GOLDEN_VERSION_SWITCH})"
+
+
+# ---------------------------------------------------------------------------
+# Router upgrade
+# ---------------------------------------------------------------------------
+
+def phase_router_upgrade():
+    """
+    Upgrade the Secure Router (C8231-G2) to GOLDEN_VERSION_ROUTER if older.
+    Never downgrades. After upgrade waits for SD-WAN tunnels to re-establish.
+    Returns (ok, result_string).
+    """
+    image = UPGRADE_IMAGE_ROUTER
+    if not image:
+        return False, "No router image configured"
+
+    print(f"     Connecting to router {ROUTER_IP} to check version...")
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(ROUTER_IP, username="admin", password="C1sco12345",
+                       look_for_keys=False, allow_agent=False, timeout=20)
+        shell = client.invoke_shell(width=200, height=50)
+        time.sleep(2); shell.recv(4096)
+        shell.send("terminal length 0\n"); time.sleep(2); shell.recv(4096)
+    except Exception as e:
+        return False, f"SSH to router {ROUTER_IP} failed: {e}"
+
+    def rcmd(cmd, t=10):
+        shell.send(cmd + "\n"); time.sleep(1)
+        out = b""
+        dl = time.time() + t
+        while time.time() < dl:
+            if shell.recv_ready(): out += shell.recv(8192); time.sleep(0.3)
+            else: time.sleep(0.2)
+        return out.decode(errors="replace")
+
+    ver_out = rcmd("show version", t=10)
+    client.close()
+
+    current = _detect_version_from_show(ver_out)
+    if not current:
+        return False, f"Could not detect router version"
+
+    print(f"     Router current: {current}  Golden: {GOLDEN_VERSION_ROUTER}")
+
+    if not _version_needs_upgrade(current, GOLDEN_VERSION_ROUTER):
+        return True, f"Router version OK ({current} >= {GOLDEN_VERSION_ROUTER}) — no upgrade needed"
+
+    print(f"     Router upgrade needed: {current} -> {GOLDEN_VERSION_ROUTER}")
+    http_url = f"http://{UBUNTU_HOST}:{UBUNTU_HTTP_PORT}/{image}"
+
+    # 1. Ensure HTTP server running
+    print(f"     Starting HTTP server on Ubuntu PC...")
+    if not _ubuntu_ensure_http_server():
+        return False, "Failed to start HTTP server on Ubuntu PC"
+
+    # 2. Copy image to bootflash
+    print(f"     Copying image to router bootflash: (~10-15 min)...")
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(ROUTER_IP, username="admin", password="C1sco12345",
+                       look_for_keys=False, allow_agent=False, timeout=20)
+        shell = client.invoke_shell(width=200, height=50)
+        time.sleep(2); shell.recv(4096)
+        shell.send("terminal length 0\n"); time.sleep(2); shell.recv(4096)
+    except Exception as e:
+        return False, f"SSH to router failed before copy: {e}"
+
+    shell.send(f"copy {http_url} bootflash:{image}\n")
+    time.sleep(2); shell.send("\n")
+    copy_out = b""
+    deadline = time.time() + 1200
+    last_print = time.time()
+    while time.time() < deadline:
+        if shell.recv_ready():
+            chunk = shell.recv(8192)
+            copy_out += chunk
+            decoded = chunk.decode(errors="replace")
+            if "bytes copied" in decoded or ("Error" in decoded and "#" in decoded):
+                break
+        if time.time() - last_print > 30:
+            print(f"     Router copy... {int(time.time()-(deadline-1200))}s elapsed")
+            last_print = time.time()
+        time.sleep(1)
+
+    if "bytes copied" not in copy_out.decode(errors="replace"):
+        client.close()
+        return False, f"Router image copy failed: {copy_out.decode(errors='replace')[-300:]}"
+
+    print(f"     Router image copied. Running software install...")
+
+    # 3. Install activate commit
+    shell.send(f"software install add file bootflash:{image} activate commit\n")
+    time.sleep(3); shell.send("\n")
+    install_out = b""
+    deadline2 = time.time() + 1800
+    last_print = time.time()
+    while time.time() < deadline2:
+        if shell.recv_ready():
+            chunk = shell.recv(8192)
+            install_out += chunk
+            decoded = chunk.decode(errors="replace")
+            if "reload" in decoded.lower() or "restarting" in decoded.lower():
+                print(f"     Router reloading...")
+                break
+            if "FAILED" in decoded or "install failed" in decoded.lower():
+                client.close()
+                return False, f"Router install failed: {decoded[-300:]}"
+        if time.time() - last_print > 30:
+            print(f"     Router installing... {int(time.time()-(deadline2-1800))}s elapsed")
+            last_print = time.time()
+        time.sleep(1)
+    client.close()
+
+    # 4. Wait for router to come back and SD-WAN tunnels to restore
+    print(f"     Waiting for router reload (~15 min)...")
+    time.sleep(90)
+    back_up = False
+    new_ver = ""
+    poll_deadline = time.time() + 1500
+    while time.time() < poll_deadline:
+        try:
+            c2 = paramiko.SSHClient()
+            c2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c2.connect(ROUTER_IP, username="admin", password="C1sco12345",
+                       look_for_keys=False, allow_agent=False, timeout=15)
+            sh2 = c2.invoke_shell(width=200, height=50)
+            time.sleep(2); sh2.recv(4096)
+            sh2.send("terminal length 0\n"); time.sleep(2); sh2.recv(4096)
+            sh2.send("show version\n"); time.sleep(3)
+            vout = b""
+            dl = time.time() + 8
+            while time.time() < dl:
+                if sh2.recv_ready(): vout += sh2.recv(8192); time.sleep(0.3)
+                else: time.sleep(0.2)
+            c2.close()
+            new_ver = _detect_version_from_show(vout.decode(errors="replace"))
+            if new_ver:
+                back_up = True
+                print(f"     Router back online — version: {new_ver}")
+                break
+        except Exception:
+            print(f"     Router still reloading... ({int(poll_deadline-time.time())}s remaining)")
+            time.sleep(30)
+
+    if not back_up:
+        return False, "Timed out waiting for router to come back after upgrade"
+
+    # 5. Wait for SD-WAN tunnels
+    print(f"     Waiting for SD-WAN tunnels to re-establish...")
+    ok, tunnel_result = _wait_sdwan_tunnels(timeout=600)
+    if not ok:
+        return False, f"Router upgraded to {new_ver} but SD-WAN tunnels not up: {tunnel_result}"
+
+    if _version_needs_upgrade(new_ver, GOLDEN_VERSION_ROUTER):
+        return False, f"Upgrade done but version {new_ver} still < {GOLDEN_VERSION_ROUTER}"
+
+    return True, f"Router upgraded: {current} -> {new_ver} (golden: {GOLDEN_VERSION_ROUTER}) | {tunnel_result}"
 
 
 AD_DC_IP      = "198.18.5.102"
