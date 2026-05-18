@@ -267,6 +267,103 @@ def api_switches(pod_id):
 
     return jsonify(switch_data)
 
+
+SWITCH_RECHECK_RUNNERS = {}
+
+
+@app.route("/api/switches/recheck/<pod_id>", methods=["POST"])
+def api_switches_recheck(pod_id):
+    """Re-run switch checks inside the POD's VPN namespace."""
+    import subprocess, threading
+
+    conn = _db()
+    row = conn.execute("SELECT * FROM pods WHERE pod_id = ?", (pod_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"status": "error", "message": "POD not found"}), 404
+
+    dp_id = pod_id.lower()
+    # Verify VPN container is running
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": "VPN container not running for " + pod_id}), 400
+
+    def _recheck():
+        try:
+            switches = ["verify_border_spine", "verify_leaf1", "verify_leaf2", "connectivity_test"]
+            for step_name in switches:
+                if step_name == "connectivity_test":
+                    func_call = "onboard_router.phase_connectivity_test()"
+                else:
+                    func_call = f"onboard_router.run_switch_checks('{step_name}')"
+                script = (
+                    "import sys; sys.path.insert(0, '.'); import onboard_router; "
+                    f"onboard_router.ROUTER_IP = '{row['router_ip']}'; "
+                    f"ok, result = {func_call}; "
+                    "print(repr((ok, result)))"
+                )
+                result = subprocess.run([
+                    "docker", "run", "--rm",
+                    "--network", f"container:vpn-{pod_id}",
+                    "--entrypoint", "python3",
+                    "pod-automator:latest", "-c", script
+                ], capture_output=True, text=True, timeout=120)
+                # Parse the printed repr
+                stdout = result.stdout.strip()
+                stderr = result.stderr.strip()
+                if stdout.startswith("("):
+                    try:
+                        ok_val, result_val = eval(stdout)
+                        if stderr:
+                            result_val += f" | {stderr}"
+                    except:
+                        ok_val, result_val = False, stdout[:200]
+                else:
+                    ok_val, result_val = False, stdout[:200] or stderr[:200]
+
+                status = "completed" if ok_val else "failed"
+                conn2 = _db()
+                conn2.execute("""INSERT OR REPLACE INTO pipeline_steps
+                    (pod_id, step_name, status, started_at, completed_at, result)
+                    VALUES (?, ?, ?, COALESCE((SELECT started_at FROM pipeline_steps WHERE pod_id=? AND step_name=?), datetime('now')),
+                            datetime('now'), ?)""",
+                    (pod_id, step_name, status, pod_id, step_name, str(result_val)[:500]))
+                conn2.execute("UPDATE pods SET updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
+                conn2.commit()
+                conn2.close()
+
+            # Update notes if all switches passed
+            conn3 = _db()
+            steps = conn3.execute(
+                "SELECT step_name, status FROM pipeline_steps WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test')",
+                (pod_id,)
+            ).fetchall()
+            switch_statuses = {s["step_name"]: s["status"] for s in steps}
+            all_ok = all(v == "completed" for v in switch_statuses.values())
+            if all_ok:
+                # Check if full pipeline is complete too
+                pipe_steps = conn3.execute(
+                    "SELECT step_name, status FROM pipeline_steps WHERE pod_id=?",
+                    (pod_id,)
+                ).fetchall()
+                all_done = all(s["status"] == "completed" for s in pipe_steps)
+                if all_done:
+                    conn3.execute("UPDATE pods SET notes='POD READY', sdwan_online='yes', status='ready', updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
+                else:
+                    conn3.execute("UPDATE pods SET notes='Switches OK', updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
+            conn3.commit()
+            conn3.close()
+        except Exception as e:
+            log(pod_id, f"Re-check error: {e}")
+
+    t = threading.Thread(target=_recheck, daemon=True)
+    t.start()
+    return jsonify({"status": "ok", "message": "Switch re-check started for " + pod_id})
+
+
 @app.route("/api/upload-event", methods=["POST"])
 def upload_event():
     if "file" not in request.files:
@@ -767,14 +864,25 @@ async function load() {
   if (detailId) showPipeline(detailId);
 }
 
+function isFullyReady(p) {
+  // All pipeline steps + sdwan = yes + switch checks passed
+  const phases = PIPELINE_ORDER;
+  for (let i = 0; i < phases.length; i++) {
+    if (p[phases[i]] !== 'completed') return false;
+  }
+  return p.sdwan_online === 'yes';
+}
+
 function renderStats(pods) {
   const total = pods.length;
-  const ready = pods.filter(p => p.sdwan_online === 'yes').length;
+  const fullyReady = pods.filter(p => isFullyReady(p)).length;
+  const sdwanOk = pods.filter(p => p.sdwan_online === 'yes').length;
   const running = pods.filter(p => p.status === 'running' || p.status === 'in_progress').length;
   const pending = pods.filter(p => p.status === 'pending').length;
 
   document.getElementById('summary').innerHTML =
-    `<div class="stat-card green"><div class="num">${ready}</div><div class="label">Ready</div></div>` +
+    `<div class="stat-card green"><div class="num">${fullyReady}</div><div class="label">Fully Ready</div></div>` +
+    `<div class="stat-card" style="border-left:3px solid #00e68a"><div class="num">${sdwanOk}</div><div class="label">SD-WAN Online</div></div>` +
     `<div class="stat-card yellow"><div class="num">${running}</div><div class="label">Running</div></div>` +
     `<div class="stat-card red"><div class="num">${pending}</div><div class="label">Pending</div></div>` +
     `<div class="stat-card"><div class="num">${total}</div><div class="label">Total</div></div>`;
@@ -820,13 +928,17 @@ function renderTable(pods) {
     const vpn = p.vpn_status || 'disconnected';
     const vpnColor = vpn === 'connected' ? '#00e68a' : vpn === 'connecting' ? '#ffa502' : '#ff4757';
     const vpnLabel = vpn === 'connected' ? 'Connected' : vpn === 'connecting' ? 'Connecting' : 'Offline';
+    const readyAll = isFullyReady(p);
+    const readyBadge = readyAll ? '<span class="badge pass">READY</span>'
+      : p.sdwan_online === 'yes' ? '<span class="badge running">Partial</span>'
+      : '<span class="badge pending">Pending</span>';
     return `<tr>
       <td class="pod-id" onclick="showPipeline('${p.pod_id}')">${p.pod_id}</td>
       <td style="font-size:11px;color:#667788">${p.session_id || ''}</td>
-      <td><span class="badge ${p.status === 'ready' ? 'pass' : p.status === 'pending' ? 'pending' : 'fail'}">${p.status || 'pending'}</span></td>
+      <td>${readyBadge}</td>
       <td style="text-align:center"><span style="color:${vpnColor};font-size:18px;line-height:1" title="${p.vpn_detail || ''}">&#x25cf;</span></td>
       <td style="font-size:11px;color:#667788">${serial}</td>
-      <td class="device-col">${badge(p.sdwan_online, 'Online')}</td>
+      <td class="device-col" style="font-size:18px;line-height:1;color:${p.sdwan_online === 'yes' ? '#00e68a' : '#ff4757'}">&#x25cf;</td>
       <td>${pipeLabel}</td>
       <td style="display:flex;gap:4px;flex-wrap:wrap;">
         <button class="btn-start" onclick="connectVpn('${p.pod_id}')">Connect VPN</button>
@@ -1006,18 +1118,33 @@ async function loadSwitches(podId) {
     return;
   }
 
-  grid.innerHTML = data.map(sw => {
+  const hasFail = data.some(sw => (sw.checks || []).some(c => c.status === 'fail'));
+  const recheckBtn = hasFail
+    ? `<button class="btn-reconnect" onclick="recheckSwitches('${podId}')" style="background:#ff4757;border-color:#ff4757;color:#fff;margin-bottom:12px;">&#x21bb; Re-check Switches</button>`
+    : '';
+
+  grid.innerHTML = recheckBtn + data.map(sw => {
+    const hasAnyFail = (sw.checks || []).some(c => c.status === 'fail');
     const checksHtml = (sw.checks || []).map(c =>
       `<div class="switch-check">
         <span class="check-label">${escHtml(c.label)}</span>
         <span class="check-result ${c.status === 'pass' ? 'check-pass' : c.status === 'fail' ? 'check-fail' : 'check-na'}">${c.status === 'pass' ? '✓' : c.status === 'fail' ? '✗' : '—'} ${escHtml(c.result)}</span>
       </div>`
     ).join('');
-    return `<div class="switch-card">
+    return `<div class="switch-card" style="${hasAnyFail ? 'border-left:3px solid #ff4757' : ''}">
       <h4>${escHtml(sw.name)} <span style="font-weight:normal;font-size:11px;color:#667788">${escHtml(sw.model || '')}</span></h4>
       ${checksHtml}
     </div>`;
   }).join('');
+}
+
+async function recheckSwitches(podId) {
+  const grid = document.getElementById('switch-grid');
+  grid.innerHTML = '<div style="color:#ffa502;font-size:13px;">Running switch re-check...</div>';
+  const r = await fetch('/api/switches/recheck/' + podId, { method: 'POST' });
+  const data = await r.json();
+  // Reload after a short delay to let the checks run
+  setTimeout(() => loadSwitches(podId), 5000);
 }
 
 function escHtml(s) {
