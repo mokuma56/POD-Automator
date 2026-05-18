@@ -50,6 +50,7 @@ def read_csv(path):
                 continue
             merged = dict(DEFAULTS)
             merged.update({k: v for k, v in row.items() if v})
+            merged["router_ip"] = DEFAULTS["router_ip"]
             merged["serial"] = merged["router_serial"]
             merged["host_data"] = str(PROJECT_ROOT / "data")
             pods.append(merged)
@@ -82,7 +83,7 @@ def read_db(status_filter=("pending", "available", "ready", "")):
         merged["vpn_host"] = d["vpn_host"]
         merged["vpn_user"] = d["vpn_user"]
         merged["vpn_pass"] = d["vpn_pass"]
-        merged["router_ip"] = d.get("router_ip", "") or DEFAULTS["router_ip"]
+        merged["router_ip"] = DEFAULTS["router_ip"]
         merged["router_serial"] = d.get("router_serial", "")
         merged["serial"] = merged["router_serial"]
         merged["session_id"] = d.get("session_id", "")
