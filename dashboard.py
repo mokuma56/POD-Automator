@@ -178,13 +178,13 @@ SWITCH_CHECKS = {
         "VLAN (expect default + VLAN 5)",
     ]},
     "leaf1": {"name": "Leaf 1", "checks": [
-        "Version (expect 17.12.x)",
         "VRF (expect Mgmt-vrf only)",
+        "Version (expect 17.12.x)",
         "VLAN (expect default only)",
     ]},
     "leaf2": {"name": "Leaf 2", "checks": [
-        "Version (expect 17.12.x)",
         "VRF (expect Mgmt-vrf only)",
+        "Version (expect 17.12.x)",
         "VLAN (expect default only)",
     ]},
 }
@@ -210,10 +210,17 @@ def api_switches(pod_id):
     for key, info in SWITCH_CHECKS.items():
         step_name = f"verify_{key}"
         step = results.get(step_name, {})
+        # Extract MODEL prefix and re-align check indices
+        model = ""
+        check_parts = step.get("parts", [])[:]
+        if check_parts and check_parts[0].startswith("MODEL:"):
+            model = check_parts[0].replace("MODEL: ", "")
+            check_parts = check_parts[1:]  # remove MODEL prefix, shift indices
+
         checks = []
         for i, label in enumerate(info["checks"]):
-            if step.get("status") == "completed" and i < len(step.get("parts", [])):
-                part = step["parts"][i]
+            if step.get("status") == "completed" and i < len(check_parts):
+                part = check_parts[i]
                 if part.startswith("PASS"):
                     checks.append({"label": label, "status": "pass", "result": part.replace("PASS: ", "")})
                 elif part.startswith("FAIL"):
@@ -227,19 +234,16 @@ def api_switches(pod_id):
             else:
                 checks.append({"label": label, "status": "na", "result": "pending"})
 
-        # Add model from step parts if available
-        model = ""
-        if step.get("parts"):
-            for p in step["parts"]:
-                if p.startswith("MODEL:"):
-                    model = p.replace("MODEL: ", "")
-                    break
-
+        passed = sum(1 for c in checks if c["status"] == "pass")
+        failed = sum(1 for c in checks if c["status"] == "fail")
         switch_data.append({
             "name": info["name"],
             "model": model,
             "host": key,
             "checks": checks,
+            "passed": passed,
+            "failed": failed,
+            "total": len(checks),
         })
 
     # Add connectivity test
@@ -258,11 +262,16 @@ def api_switches(pod_id):
     else:
         conn_checks.append({"label": "Ping Catalyst Center", "status": "na", "result": "pending"})
 
+    ct_passed = sum(1 for c in conn_checks if c["status"] == "pass")
+    ct_failed = sum(1 for c in conn_checks if c["status"] == "fail")
     switch_data.append({
         "name": "Catalyst Center",
         "model": "198.18.5.100",
         "host": "connectivity",
         "checks": conn_checks,
+        "passed": ct_passed,
+        "failed": ct_failed,
+        "total": len(conn_checks),
     })
 
     return jsonify(switch_data)
@@ -722,17 +731,36 @@ DASHBOARD_HTML = """
                    font-size: 11px; font-weight: 700; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
   .progress-label { font-size: 12px; color: #8899aa; margin-bottom: 6px; }
 
-  .switch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
-  .switch-card { background: #0a1628; border-radius: 8px; padding: 14px; }
-  .switch-card h4 { color: #02c8ff; font-size: 14px; margin: 0 0 8px 0; }
+  .switch-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .switch-header .device-role { font-size: 11px; font-weight: 700; text-transform: uppercase;
+                                 letter-spacing: 1px; padding: 2px 8px; border-radius: 4px; }
+  .switch-header .device-role.border { background: #1a0a3d; color: #a855f7; }
+  .switch-header .device-role.leaf { background: #0a2a1a; color: #22c55e; }
+  .switch-header .device-role.cc { background: #0a1a3d; color: #3b82f6; }
+  .switch-header .device-model { font-size: 11px; color: #667788; }
+  .switch-header .device-ip { font-size: 11px; color: #445566; margin-left: auto; }
+  .switch-summary-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .switch-summary-bar .bar-bg { flex: 1; height: 6px; background: #1a2d4a; border-radius: 3px; overflow: hidden; }
+  .switch-summary-bar .bar-fill-pass { height: 100%; background: #00e68a; border-radius: 3px; transition: width 0.5s; }
+  .switch-summary-bar .bar-fill-fail { height: 100%; background: #ff4757; border-radius: 3px; }
+  .switch-summary-bar .bar-text { font-size: 11px; color: #8899aa; white-space: nowrap; }
+  .switch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+  .switch-card { background: #0a1628; border-radius: 10px; padding: 16px; border: 1px solid #1a2d4a;
+                 transition: border-color 0.2s; }
+  .switch-card.fail { border-color: #3d0000; }
+  .switch-card.pass { border-color: #003d2a; }
+  .switch-card h4 { color: #e0e6ed; font-size: 14px; margin: 0; font-weight: 600; }
+  .switch-card .subtitle { font-size: 11px; color: #667788; margin-left: 8px; }
   .switch-check { display: flex; justify-content: space-between; align-items: center;
-                   padding: 4px 0; font-size: 12px; border-bottom: 1px solid #112240; }
+                   padding: 5px 0; font-size: 12px; border-bottom: 1px solid #112240; }
   .switch-check:last-child { border-bottom: none; }
-  .switch-check .check-label { color: #8899aa; }
-  .switch-check .check-result { font-weight: 600; }
+  .switch-check .check-label { color: #c0c8d0; }
+  .switch-check .check-label .check-icon { margin-right: 6px; font-size: 13px; }
+  .switch-check .check-result { font-weight: 600; font-size: 11px; }
   .check-pass { color: #00e68a; }
   .check-fail { color: #ff4757; }
-  .check-na { color: #667788; }
+  .check-na { color: #445566; }
+  .switch-grid-empty { color: #8899aa; font-size: 13px; text-align: center; padding: 40px; }
 
   .log-box { background: #0a1628; border-radius: 6px; padding: 12px; max-height: 400px; overflow-y: auto;
              font-family: 'SF Mono', 'Menlo', monospace; font-size: 12px; line-height: 1.5; }
@@ -1108,31 +1136,77 @@ async function loadLogs(podId) {
   logPollId = setInterval(() => loadLogs(podId), 2000);
 }
 
+function roleClass(name) {
+  if (name.includes('Border')) return 'border';
+  if (name.includes('Leaf')) return 'leaf';
+  if (name.includes('Catalyst')) return 'cc';
+  return '';
+}
+
 async function loadSwitches(podId) {
   const r = await fetch('/api/switches/' + podId);
   const data = await r.json();
   const grid = document.getElementById('switch-grid');
 
   if (!data || data.length === 0) {
-    grid.innerHTML = '<div style="color:#8899aa;font-size:13px;">No switch data for this POD</div>';
+    grid.innerHTML = '<div class="switch-grid-empty">No switch data for this POD</div>';
     return;
   }
 
   const hasFail = data.some(sw => (sw.checks || []).some(c => c.status === 'fail'));
-  const recheckBtn = hasFail
-    ? `<button class="btn-reconnect" onclick="recheckSwitches('${podId}')" style="background:#ff4757;border-color:#ff4757;color:#fff;margin-bottom:12px;">&#x21bb; Re-check Switches</button>`
-    : '';
+  const allPass = data.every(sw => (sw.checks || []).every(c => c.status === 'pass'));
 
-  grid.innerHTML = recheckBtn + data.map(sw => {
+  const recheckBtn = `<button class="btn-reconnect" onclick="recheckSwitches('${podId}')" style="${hasFail ? 'background:#ff4757;border-color:#ff4757;color:#fff' : 'background:#1a2d4a;border-color:#667788;color:#8899aa'};">&#x21bb; Re-check</button>`;
+
+  const totalChecks = data.reduce((s, sw) => s + (sw.checks || []).length, 0);
+  const totalPass = data.reduce((s, sw) => s + (sw.passed || 0), 0);
+  const totalFail = data.reduce((s, sw) => s + (sw.failed || 0), 0);
+  const pct = totalChecks > 0 ? Math.round(totalPass / totalChecks * 100) : 0;
+
+  const summaryHtml = `
+    <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap;">
+      <div style="font-size:14px;font-weight:600;color:${allPass ? '#00e68a' : hasFail ? '#ff4757' : '#8899aa'}">
+        ${allPass ? '✓ All checks passed' : hasFail ? `✗ ${totalFail} check${totalFail > 1 ? 's' : ''} failed` : '— pending'}
+      </div>
+      <div style="flex:1;min-width:120px;">
+        <div style="background:#1a2d4a;border-radius:4px;height:8px;overflow:hidden;">
+          <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#ff4757,#ffa502,#00e68a);border-radius:4px;transition:width 0.5s;"></div>
+        </div>
+      </div>
+      <div style="font-size:12px;color:#667788;white-space:nowrap;">${totalPass}/${totalChecks}</div>
+      ${recheckBtn}
+    </div>`;
+
+  grid.innerHTML = summaryHtml + data.map(sw => {
     const hasAnyFail = (sw.checks || []).some(c => c.status === 'fail');
-    const checksHtml = (sw.checks || []).map(c =>
-      `<div class="switch-check">
-        <span class="check-label">${escHtml(c.label)}</span>
-        <span class="check-result ${c.status === 'pass' ? 'check-pass' : c.status === 'fail' ? 'check-fail' : 'check-na'}">${c.status === 'pass' ? '✓' : c.status === 'fail' ? '✗' : '—'} ${escHtml(c.result)}</span>
-      </div>`
-    ).join('');
-    return `<div class="switch-card" style="${hasAnyFail ? 'border-left:3px solid #ff4757' : ''}">
-      <h4>${escHtml(sw.name)} <span style="font-weight:normal;font-size:11px;color:#667788">${escHtml(sw.model || '')}</span></h4>
+    const allDevicePass = (sw.checks || []).every(c => c.status === 'pass');
+    const devicePct = sw.total > 0 ? Math.round((sw.passed || 0) / sw.total * 100) : 0;
+
+    const checksHtml = (sw.checks || []).map(c => {
+      const icon = c.status === 'pass' ? '✓' : c.status === 'fail' ? '✗' : '○';
+      const iconColor = c.status === 'pass' ? '#00e68a' : c.status === 'fail' ? '#ff4757' : '#445566';
+      return `<div class="switch-check">
+        <span class="check-label"><span class="check-icon" style="color:${iconColor}">${icon}</span>${escHtml(c.label)}</span>
+        <span class="check-result ${c.status === 'pass' ? 'check-pass' : c.status === 'fail' ? 'check-fail' : 'check-na'}">${escHtml(c.result)}</span>
+      </div>`;
+    }).join('');
+
+    const statusIcon = allDevicePass ? '✓' : hasAnyFail ? '✗' : '○';
+    const statusColor = allDevicePass ? '#00e68a' : hasAnyFail ? '#ff4757' : '#667788';
+
+    return `<div class="switch-card ${allDevicePass ? 'pass' : hasAnyFail ? 'fail' : ''}">
+      <div class="switch-header">
+        <span class="device-role ${roleClass(sw.name)}">${sw.name === 'Catalyst Center' ? 'Connectivity' : sw.name.includes('Border') ? 'Border Spine' : 'Leaf'}</span>
+        <h4 style="color:${statusColor}">${statusIcon} ${escHtml(sw.name)}</h4>
+        <span class="device-model">${escHtml(sw.model || '')}</span>
+        <span class="device-ip">${sw.host === 'connectivity' ? '198.18.5.100' : sw.host === 'verify_border_spine' ? '198.18.128.24' : '198.18.128.2' + (sw.host === 'verify_leaf1' ? '2' : '3')}</span>
+      </div>
+      <div class="switch-summary-bar">
+        <div class="bar-bg">
+          <div class="bar-fill-pass" style="width:${devicePct}%"></div>
+        </div>
+        <span class="bar-text">${sw.passed || 0}/${sw.total}</span>
+      </div>
       ${checksHtml}
     </div>`;
   }).join('');
@@ -1140,10 +1214,9 @@ async function loadSwitches(podId) {
 
 async function recheckSwitches(podId) {
   const grid = document.getElementById('switch-grid');
-  grid.innerHTML = '<div style="color:#ffa502;font-size:13px;">Running switch re-check...</div>';
+  grid.innerHTML = '<div class="switch-grid-empty" style="color:#ffa502;">⟳ Running switch re-check...</div>';
   const r = await fetch('/api/switches/recheck/' + podId, { method: 'POST' });
   const data = await r.json();
-  // Reload after a short delay to let the checks run
   setTimeout(() => loadSwitches(podId), 5000);
 }
 

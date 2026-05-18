@@ -111,6 +111,17 @@ conn.execute("INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, 
     ('{pod_id}', '{step_name}', '{status}', '''{result.replace("'", "''")}'''))
 conn.commit()"""], timeout=5)
 
+def live_log(msg):
+    subprocess.run([
+        sys.executable, "-c", f"""
+import sqlite3
+conn = sqlite3.connect('{DB_PATH}')
+conn.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)",
+    ('{pod_id}', '''{msg.replace("'", "''")}'''))
+conn.commit()
+conn.close()
+"""], timeout=5)
+
 s = onboard_router.vmanage_session()
 steps = [
     ("verify_router",      lambda: True),
@@ -131,7 +142,9 @@ steps = [
 ]
 
 for step_name, func in steps:
-    print(f"\n{step_name}...")
+    log_line = f"▶ {step_name}..."
+    print(log_line)
+    live_log(log_line)
     report_step(step_name, "running")
     try:
         ret = func()
@@ -140,13 +153,19 @@ for step_name, func in steps:
         else:
             ok, result = ret, ""
         if not ok:
-            print(f"FAILED at {step_name}")
+            log_line = f"✗ {step_name} FAILED: {str(result)[:200]}"
+            print(log_line)
+            live_log(log_line)
             report_step(step_name, "failed", str(result)[:200])
             sys.exit(1)
+        log_line = f"✓ {step_name} OK"
+        print(f"  {log_line}")
+        live_log(log_line)
         report_step(step_name, "completed", str(result)[:200] or "OK")
-        print(f"  OK")
     except Exception as e:
-        print(f"FAILED at {step_name}: {e}")
+        log_line = f"✗ {step_name} FAILED: {str(e)[:200]}"
+        print(log_line)
+        live_log(log_line)
         report_step(step_name, "failed", str(e)[:200])
         sys.exit(1)
 
