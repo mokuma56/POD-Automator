@@ -14,32 +14,27 @@ app = Flask(__name__)
 
 # ---- VPN status check ---- #
 def check_pod_vpn(pod_id):
-    """Check VPN status for a POD — Docker container only."""
+    """Check VPN status for a POD — inspect container directly."""
     import subprocess, json
-    proj_name = pod_id.lower()
+    container_name = f"vpn-{pod_id}"
     try:
         r = subprocess.run(
-            ["docker", "compose", "-p", proj_name, "ps", "--format=json"],
+            ["docker", "inspect", container_name, "--format", "{{json .State}}"],
             capture_output=True, text=True, timeout=8
         )
         if r.returncode == 0 and r.stdout.strip():
-            lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
-            for line in lines:
-                try:
-                    data = json.loads(line)
-                    if data.get("Service") == "vpn":
-                        state = data.get("Status", data.get("State", ""))
-                        health = data.get("Health", "")
-                        if health == "healthy":
-                            return {"status": "connected", "detail": "Docker VPN healthy"}
-                        elif "Up" in state:
-                            if health in ("starting", ""):
-                                return {"status": "connecting", "detail": "Docker VPN starting"}
-                            return {"status": "connected", "detail": "Docker VPN up"}
-                        else:
-                            return {"status": "disconnected", "detail": f"Docker: {state[:40]}"}
-                except json.JSONDecodeError:
-                    pass
+            data = json.loads(r.stdout.strip())
+            status = data.get("Status", "")
+            health = data.get("Health", {})
+            h = health.get("Status", "") if isinstance(health, dict) else ""
+            if status == "running":
+                if h == "healthy":
+                    return {"status": "connected", "detail": "Docker VPN healthy"}
+                elif h in ("starting", ""):
+                    return {"status": "connecting", "detail": "Docker VPN starting"}
+                return {"status": "connected", "detail": "Docker VPN up"}
+            else:
+                return {"status": "disconnected", "detail": f"Docker: {status[:80]}"}
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return {"status": "disconnected", "detail": "No Docker VPN container"}
