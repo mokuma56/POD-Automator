@@ -403,7 +403,7 @@ def run_pod(pod_id):
     """Run the pipeline for a single POD (VPN must already be connected)."""
     import subprocess, os, tempfile
     from docker.generate import generate_compose, read_db
-    pods = read_db(status_filter=())
+    pods = read_db(status_filter=("pending", "available", "ready", "running", "in_progress", ""))
     p = next((p for p in pods if p["pod_id"] == pod_id), None)
     if not p:
         return jsonify({"status": "error", "message": f"POD {pod_id} not found in DB"})
@@ -428,7 +428,7 @@ def run_all():
     """Run pipeline containers for all PODs with connected VPNs."""
     import subprocess, os, tempfile
     from docker.generate import generate_compose, read_db
-    pods = read_db(status_filter=())
+    pods = read_db(status_filter=("pending", "available", "ready", "running", "in_progress", ""))
     if not pods:
         return jsonify({"status": "error", "message": "No PODs found in DB"})
     results = []
