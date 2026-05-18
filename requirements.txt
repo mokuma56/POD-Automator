@@ -2,3 +2,5 @@ flask>=3.1
 paramiko>=3.0
 requests>=2.31
 urllib3>=2.0
+ldap3>=2.9
+pywinrm>=0.4
