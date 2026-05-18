@@ -484,7 +484,7 @@ def phase_controller_mode():
 
     went_down = False
     try:
-        shell_send(shell, "controller-mode enable\nyes\n")
+        shell_send(shell, "controller-mode enable\n\n")
     except (paramiko.SSHException, OSError, EOFError):
         print(f"     SSH socket closed — controller-mode enable accepted, rebooting")
         client.close()
