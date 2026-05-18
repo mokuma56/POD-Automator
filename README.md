@@ -1,13 +1,21 @@
 # POD Automator
 
-Automate Cisco SD-WAN router (C8231-G2) onboarding in dCloud lab environments. Upload an event CSV, connect per-POD VPNs, launch pipelines, and monitor progress — all from a web dashboard.
+Automate Cisco SD-WAN router (C8231-G2) onboarding in dCloud lab environments.
+Upload an event CSV, connect per-POD VPNs, launch pipelines, and monitor progress
+— all from a web dashboard.
 
 ## Features
 
-- **Per-POD Docker VPN isolation** — each POD gets its own OpenConnect tunnel in Docker
-- **15-step pipeline** — Quick Connect → License → Associate → Variables → Deploy → Bootstrap → HTTP Copy → Controller-Mode → Verification
-- **Web dashboard** — upload CSV, connect VPNs, monitor live logs per POD
-- **Switch verification** — confirms Border Spine, Leaf 1, Leaf 2 connectivity
+- **Per-POD Docker VPN isolation** — each POD gets its own OpenConnect tunnel
+- **15-step pipeline** — Quick Connect → License → Associate → Variables → Deploy
+  → Bootstrap → HTTP Copy → Controller-Mode → Verification
+- **Web dashboard** — upload CSV, per-POD Connect VPN / Reconnect VPN / Run / Disconnect
+  buttons, live logs, switch verification cards
+- **Switch verification** — inline SSH checks for Border Spine, Leaf 1, Leaf 2,
+  plus Catalyst Center connectivity
+- **Clickable SSH** — click a switch name to open macOS Terminal.app with SSH
+  connected through the Docker VPN (password automated via `sshpass`)
+- **Switch model detection** — model numbers shown on cards (e.g. C9300-48UB)
 
 ## Quick Start
 
@@ -19,7 +27,8 @@ Automate Cisco SD-WAN router (C8231-G2) onboarding in dCloud lab environments. U
 ### Start Dashboard
 
 ```bash
-python3 dashboard.py
+cd pod-automator
+uv run python3 dashboard.py
 # Open http://localhost:5050
 # Upload EventsDetails.csv → see per-POD cards
 ```
@@ -28,7 +37,7 @@ python3 dashboard.py
 
 1. **Connect All VPN** — spins up Docker stacks with OpenConnect per POD
 2. Wait for VPN dots to turn green
-3. **Run All POD Automation** — starts the pipeline in each POD
+3. **Run All POD Automation** — starts the 15-step pipeline in each POD
 
 Per-POD retry buttons available if a pipeline fails (VPN stays up).
 
@@ -36,8 +45,34 @@ Per-POD retry buttons available if a pipeline fails (VPN stays up).
 
 ```
 Upload CSV → Connect All VPN → Wait for green dots → Run All POD Automation
-                                                  ↘ Run per-POD if one fails
+                                ↘ Reconnect VPN (if one drops)
+                                      ↘ Re-check (re-run switch checks)
 ```
+
+### Per-POD Actions
+
+| Button | Action |
+|--------|--------|
+| **Connect VPN** | Generates compose file & starts VPN container via `generate.py --db --up --pod <id> --vpn-only` |
+| **Reconnect VPN** | Tears down then brings up VPN fresh (picks up latest Docker image) |
+| **Run Automation** | Starts the 15-step pipeline (VPN must be green) |
+| **Disconnect VPN** | Tears down the Docker compose stack |
+
+### Switch Cards
+
+Click any switch name (Border Spine, Leaf 1, Leaf 2) to open macOS Terminal.app
+with SSH to that switch through the Docker VPN. No password prompt —
+`sshpass` feeds `C1sco12345` automatically (credentials: `netadmin` / `C1sco12345`).
+
+Model numbers (C9300-48UB, C9300-48P, C9300-48U) are extracted from
+`show inventory` PID fields.
+
+Catalyst Center connectivity shows per-switch labels:
+- "Border Spine -> Ping Catalyst Center"
+- "Leaf 1 -> Ping Catalyst Center"
+- "Leaf 2 -> Ping Catalyst Center"
+
+Results show "Success" (green) or "Failed" (red).
 
 ## Pipeline Phases
 
@@ -86,7 +121,8 @@ Router IP is auto-derived as `198.18.133.{21 + pod_num}`.
 
 ### Config Group ID
 
-Hardcoded in `onboard_router.py` as `ae290e0f-7bc4-40f7-9bfa-23b1e7b2a71a` (PseudocoBranches).
+Hardcoded in `onboard_router.py` as `ae290e0f-7bc4-40f7-9bfa-23b1e7b2a71a`
+(PseudocoBranches).
 
 ### License Tag
 
@@ -95,47 +131,95 @@ Smart Account: `dCloud Cisco Internal Account`
 Virtual Account: `dCloud-Pseudoco-Campus`
 Billing: Prepaid
 
-> **Note**: The old MSLA API returns HTTP 200 but does NOT enable SD-WAN controller mode.
-> Always use the WAN Advantage license via `POST /dataservice/v1/licensing/assign-licenses`.
+> **Note**: The old MSLA API returns HTTP 200 but does NOT enable SD-WAN
+> controller mode. Always use the WAN Advantage license via
+> `POST /dataservice/v1/licensing/assign-licenses`.
+
+### Switch Credentials
+
+All switches: `netadmin` / `C1sco12345`
 
 ## Project Structure
 
 ```
 pod-automator/
-├── dashboard.py              # Flask web UI — upload CSV, connect VPNs, monitor
-├── onboard_router.py         # Core 15-step pipeline (DO NOT CHANGE without asking)
-├── onboard.py                # Docker entrypoint — imports onboard_router
-├── docker-compose.yml        # Builds the pod-automator Docker image
+├── dashboard.py                # Flask web UI — upload CSV, VPN/POD controls, switch cards
+├── onboard_router.py           # Core 15-step pipeline (DO NOT CHANGE without asking)
+├── onboard.py                  # Docker entrypoint — imports onboard_router
 ├── docker/
-│   ├── Dockerfile                 # python:3.14-slim + openconnect + iproute2
-│   ├── compose-template.yml       # Per-POD compose stack template
-│   ├── generate.py                # Orchestrator: launch/status/teardown PODs
-│   ├── launch.sh                  # Shortcut: launch all PODs from DB
-│   ├── status.sh                  # Shortcut: show POD status
-│   └── stop.sh                    # Shortcut: teardown all PODs
+│   ├── Dockerfile                    # python:3.14-slim + openconnect + sshpass + iproute2
+│   ├── compose-template.yml          # Per-POD compose stack template (vpn + pipeline)
+│   ├── generate.py                   # Orchestrator: launch/status/teardown PODs
+│   ├── launch.sh                     # Shortcut: launch all PODs from DB
+│   ├── status.sh                     # Shortcut: show POD status
+│   └── stop.sh                       # Shortcut: teardown all PODs
 ├── data/
-│   ├── pod_state.db               # SQLite DB (pods, pipeline_steps, pipeline_logs)
-│   └── bootstrap/                 # Generated bootstrap configs (gitignored)
+│   ├── pod_state.db                  # SQLite DB (pods, pipeline_steps, pipeline_logs)
+│   └── bootstrap/                    # Generated bootstrap configs (gitignored)
 ├── PseudocoBranches_Config-Group-Template.csv  # 34 CG variables
 ├── requirements.txt
-└── pyproject.toml
+├── pyproject.toml
+└── README.md
 ```
 
-## Docker Multi-POD Details
+## Docker Multi-POD Architecture
 
-Each POD runs in an isolated Docker Compose stack:
+Each POD runs in an isolated Docker Compose stack with the project name
+matching the POD ID (e.g. `pod-4`):
 
 ```
 pod-X/
-├── vpn (pod-automator:latest)        ──┐  OpenConnect VPN tunnel
-└── pipeline (pod-automator:latest)   ──┘  network_mode: service:vpn
+├── vpn (pod-automator:latest)       ──┐  OpenConnect VPN tunnel
+└── pipeline (pod-automator:latest)  ──┘  network_mode: service:vpn
 ```
 
-`network_mode: service:vpn` routes all pipeline traffic through its POD's VPN tunnel.
-No IP conflicts between PODs — each has its own network namespace.
+`network_mode: service:vpn` routes all pipeline traffic through its POD's
+VPN tunnel. No IP conflicts between PODs — each has its own network namespace.
 
-Bootstrap is copied via HTTP: the pipeline starts a Python HTTP server on its `tun0` IP,
-and the router downloads the config from that server.
+Bootstrap is copied via HTTP: the pipeline starts a Python HTTP server on
+its `tun0` IP, and the router downloads the config from that server.
+
+The image includes `sshpass` for automated SSH password entry when opening
+terminal sessions to switches.
+
+### Container Network Access
+
+Switch IPs (198.18.128.22–24) are only reachable from within the Docker
+VPN containers. The dashboard opens Terminal.app via osascript, running:
+
+```bash
+docker exec -it vpn-POD-<N> sshpass -p 'C1sco12345' \
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  netadmin@<switch-ip>
+```
+
+### VPN Status Detection
+
+Uses `docker inspect vpn-{pod_id}` directly (not `docker compose ps`) —
+works regardless of how the container was started or whether the compose
+file still exists.
+
+## CLI Usage
+
+```bash
+# Launch all pending PODs from DB
+uv run python3 docker/generate.py --db --up
+
+# Launch a single POD
+uv run python3 docker/generate.py --db --up --pod POD-4
+
+# VPN only (no pipeline)
+uv run python3 docker/generate.py --db --up --pod POD-4 --vpn-only
+
+# Teardown
+uv run python3 docker/generate.py --db --down --pod POD-4
+
+# Show status
+uv run python3 docker/generate.py --db --status
+
+# Write compose files to a directory (deploy manually)
+uv run python3 docker/generate.py --db --generate /tmp/compose_gen
+```
 
 ## Security Notes
 
