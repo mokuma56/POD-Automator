@@ -12,17 +12,43 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import onboard_router
 
 # ── Override config from environment ────────────────────────────
+onboard_router.ROUTER_IP = os.getenv("ROUTER_IP", "198.18.133.25")
+onboard_router.VMANAGE = f"https://{os.getenv('VMANAGE', '198.18.133.10')}"
+onboard_router.CG_ID = os.getenv("CG_ID", "ae290e0f-7bc4-40f7-9bfa-23b1e7b2a71a")
+
+# Auto-detect serial from router if not provided
 SERIAL = os.getenv("SERIAL", "")
 if not SERIAL and len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
     SERIAL = sys.argv[1]
 if not SERIAL:
+    print("  No SERIAL provided — detecting from router...")
+    try:
+        import paramiko
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            onboard_router.ROUTER_IP, username=os.getenv("ROUTER_USER", "admin"),
+            password=os.getenv("ROUTER_PASS", "C1sco12345"),
+            look_for_keys=False, allow_agent=False, timeout=15
+        )
+        _, stdout, _ = client.exec_command("show inventory", timeout=10)
+        for line in stdout.read().decode().splitlines():
+            if "Chassis" in line or "chassis" in line.lower():
+                continue
+            if "SN:" in line:
+                serial = line.split("SN:")[-1].strip().split()[0]
+                if serial:
+                    SERIAL = serial
+                    break
+        client.close()
+    except Exception as e:
+        print(f"  Warning: could not detect serial: {e}")
+if not SERIAL:
     SERIAL = "FJC300412NA"
 
+print(f"  Using serial: {SERIAL}")
 onboard_router.SERIAL = SERIAL
 onboard_router.UUID = f"C8231-G2-{SERIAL}"
-onboard_router.ROUTER_IP = os.getenv("ROUTER_IP", "198.18.133.25")
-onboard_router.VMANAGE = f"https://{os.getenv('VMANAGE', '198.18.133.10')}"
-onboard_router.CG_ID = os.getenv("CG_ID", "ae290e0f-7bc4-40f7-9bfa-23b1e7b2a71a")
 
 csv_row = onboard_router.read_csv_values()
 onboard_router.SYSTEM_IP = csv_row.get("System IP", "100.100.100.105")

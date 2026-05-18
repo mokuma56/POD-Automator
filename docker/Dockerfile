@@ -15,9 +15,15 @@ ENV VMANAGE=198.18.133.10 \
     VMANAGE_USER=admin \
     VMANAGE_PASS=C1sco12345 \
     ROUTER_USER=admin \
-    ROUTER_PASS=C1sco12345
+    ROUTER_PASS=C1sco12345 \
+    PYTHONUNBUFFERED=1
 
 COPY onboard.py onboard_router.py PseudocoBranches_Config-Group-Template.csv ./
 COPY data/ ./data/
+
+# onboard_router.py has hardcoded ~/sw_projects/pod_automator/ paths
+RUN mkdir -p /root/sw_projects/pod_automator/data && \
+    ln -s /pipeline/PseudocoBranches_Config-Group-Template.csv /root/sw_projects/pod_automator/ && \
+    ln -s /pipeline/data /root/sw_projects/pod_automator/data
 
 ENTRYPOINT ["python3", "onboard.py"]
