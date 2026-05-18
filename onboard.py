@@ -58,6 +58,18 @@ print(f"  Using serial: {SERIAL}")
 onboard_router.SERIAL = SERIAL
 onboard_router.UUID = f"C8231-G2-{SERIAL}"
 
+# Write serial to dashboard DB
+try:
+    subprocess.run([sys.executable, "-c", f"""
+import sqlite3
+conn = sqlite3.connect('{DB_PATH}')
+conn.execute('UPDATE pods SET router_serial=?, updated_at=datetime(\'now\') WHERE pod_id=?', ('{SERIAL}', '{pod_id}'))
+conn.commit()
+conn.close()
+"""])
+except Exception:
+    pass
+
 csv_row = onboard_router.read_csv_values()
 onboard_router.SYSTEM_IP = csv_row.get("System IP", "100.100.100.105")
 onboard_router.SITE_ID = int(csv_row.get("Site Id", 105))
@@ -137,6 +149,19 @@ for step_name, func in steps:
         print(f"FAILED at {step_name}: {e}")
         report_step(step_name, "failed", str(e)[:200])
         sys.exit(1)
+
+# Mark SD-WAN online and POD fully ready in dashboard
+try:
+    subprocess.run([sys.executable, "-c", f"""
+import sqlite3
+conn = sqlite3.connect('{DB_PATH}')
+conn.execute("UPDATE pods SET sdwan_online='yes', status='ready', notes='POD READY', updated_at=datetime('now') WHERE pod_id=?", ('{pod_id}',))
+conn.commit()
+conn.close()
+"""], timeout=5)
+    print("  Dashboard: sdwan_online=yes, status=ready, notes=POD READY")
+except Exception as e:
+    print(f"  Warning: could not update dashboard DB: {e}")
 
 print(f"\n{'='*40}")
 print(f"Pipeline complete for {pod_id}")

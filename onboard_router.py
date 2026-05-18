@@ -455,26 +455,17 @@ def phase_controller_mode():
         client, shell = router_shell()
         router_enable(shell)
 
-    # Enable controller mode (retry if confirmation prompt not seen)
-    for cmd_attempt in range(3):
-        shell_send(shell, "controller-mode enable\n")
-        time.sleep(3)
-        out = read_shell(shell, 5)
-        print(f"     Controller-mode: {out[-150:]}")
-
-        if "confirm" in out.lower() and ("reload" in out.lower() or "erase" in out.lower()):
-            shell_send(shell, "yes\n")
-            time.sleep(2)
-            out = read_shell(shell, 3)
-            print(f"     Confirmed: {out[-100:]}")
-            break
-        else:
-            print(f"     No confirmation prompt seen (attempt {cmd_attempt+1})")
-            time.sleep(2)
-    else:
-        print("     Failed to trigger controller-mode enable after 3 attempts")
-        client.close()
-        return False
+    # Enable controller mode
+    # Strategy: send command+confirmation together in one write, then detect
+    # reboot (router goes offline) as proof it worked.
+    shell_send(shell, "controller-mode enable\nyes\n")
+    time.sleep(8)
+    out = read_shell(shell, 5)
+    print(f"     Output: {out[-200:]}")
+    shell_send(shell, "\n")
+    time.sleep(3)
+    out = read_shell(shell, 3)
+    print(f"     After extra Enter: {out[-100:]}")
     client.close()
 
     # Wait for router to go DOWN first (proves the command actually worked)
