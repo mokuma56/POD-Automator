@@ -142,7 +142,11 @@ steps = [
 ]
 
 # Steps that should NOT halt the pipeline on failure — record as skipped/warn and continue
+# controller_mode_enable and verify_online are soft-fail so switch checks always run
+# even if the router fails to come up (e.g. vBond/vSmart down)
 SOFT_FAIL_STEPS = {
+    "controller_mode_enable",
+    "verify_online",
     "verify_border_spine",
     "verify_leaf1",
     "verify_leaf2",
