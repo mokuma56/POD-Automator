@@ -1242,7 +1242,8 @@ DASHBOARD_HTML = """
   .badge.fail { background: #3d0000; color: #ff4757; }
   .badge.pending { background: #3d0000; color: #ff4444; }
   .badge.running { background: #3d2200; color: #ffa500; }
-  .badge.skipped { background: #1a2d4a; color: #667788; }
+  .badge.skipped { background: #3d2200; color: #ffa502; }
+  .badge.warn { background: #3d2200; color: #ffa502; }
   .pod-id { font-weight: 600; color: #02c8ff; cursor: pointer; }
   .pod-id:hover { text-decoration: underline; }
   .notes { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1301,6 +1302,7 @@ DASHBOARD_HTML = """
   .switch-card { background: #0a1628; border-radius: 8px; padding: 12px; border: 1px solid #1a2d4a; }
   .switch-card.fail { border-color: #3d0000; }
   .switch-card.pass { border-color: #003d2a; }
+  .switch-card.warn { border-color: #3d2200; }
   .switch-card-title { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
   .switch-card-title .role-tag { font-size: 10px; font-weight: 700; text-transform: uppercase;
                                   letter-spacing: 0.5px; padding: 1px 6px; border-radius: 3px; }
@@ -1523,7 +1525,7 @@ async function load() {
 }
 
 function isFullyReady(p) {
-  // All pipeline steps + sdwan = yes + switch checks passed
+  // All pipeline steps completed (not skipped) + sdwan online
   const phases = PIPELINE_ORDER;
   for (let i = 0; i < phases.length; i++) {
     if (p[phases[i]] !== 'completed') return false;
@@ -1531,19 +1533,26 @@ function isFullyReady(p) {
   return p.sdwan_online === 'yes';
 }
 
+function hasSkippedSteps(p) {
+  return PIPELINE_ORDER.some(k => p[k] === 'skipped');
+}
+
 function renderStats(pods) {
   const total = pods.length;
-  const fullyReady = pods.filter(p => isFullyReady(p)).length;
-  const sdwanOk = pods.filter(p => p.sdwan_online === 'yes').length;
-  const running = pods.filter(p => p.status === 'running' || p.status === 'in_progress').length;
-  const pending = pods.filter(p => p.status === 'pending').length;
+  const fullyReady  = pods.filter(p => isFullyReady(p)).length;
+  const sdwanOk     = pods.filter(p => p.sdwan_online === 'yes').length;
+  // Derive running/partial/pending from step data (p.status stays 'pending' during run)
+  const running = pods.filter(p => PIPELINE_ORDER.some(k => p[k] === 'running')).length;
+  const partial = pods.filter(p => !isFullyReady(p) && p.sdwan_online === 'yes').length;
+  const pending = pods.filter(p => p.status === 'pending' && !PIPELINE_ORDER.some(k => p[k] === 'running') && p.sdwan_online !== 'yes').length;
 
   document.getElementById('summary').innerHTML =
-    `<div class="stat-card green"><div class="num">${fullyReady}</div><div class="label">Fully Ready</div></div>` +
-    `<div class="stat-card" style="border-left:3px solid #00e68a"><div class="num">${sdwanOk}</div><div class="label">SD-WAN Online</div></div>` +
-    `<div class="stat-card yellow"><div class="num">${running}</div><div class="label">Running</div></div>` +
-    `<div class="stat-card red"><div class="num">${pending}</div><div class="label">Pending</div></div>` +
-    `<div class="stat-card"><div class="num">${total}</div><div class="label">Total</div></div>`;
+    '<div class="stat-card green"><div class="num">' + fullyReady + '</div><div class="label">Fully Ready</div></div>' +
+    '<div class="stat-card" style="border-left:3px solid #00e68a"><div class="num">' + sdwanOk + '</div><div class="label">SD-WAN Online</div></div>' +
+    '<div class="stat-card yellow"><div class="num">' + running + '</div><div class="label">Running</div></div>' +
+    '<div class="stat-card" style="border-left:3px solid #02c8ff"><div class="num">' + partial + '</div><div class="label">Partial</div></div>' +
+    '<div class="stat-card red"><div class="num">' + pending + '</div><div class="label">Pending</div></div>' +
+    '<div class="stat-card"><div class="num">' + total + '</div><div class="label">Total</div></div>';
 }
 
 function badge(val, yesLabel) {
@@ -1563,16 +1572,18 @@ function pipelineBadge(val) {
 
 function pipelinePhase(p) {
   const phases = PIPELINE_ORDER;
-  let done = 0;
+  let done = 0, skipped = 0;
   for (let i = 0; i < phases.length; i++) {
     const v = p[phases[i]];
-    if (v === 'completed' || v === 'skipped') done++;
-    if (v === 'running') return { pct: Math.round(done / phases.length * 100), text: `${i+1}/${phases.length} running` };
-    if (v === 'failed')  return { pct: Math.round(done / phases.length * 100), text: `${i+1}/${phases.length} failed` };
+    if (v === 'completed') done++;
+    if (v === 'skipped')   { done++; skipped++; }
+    if (v === 'running') return { pct: Math.round(done / phases.length * 100), text: (i+1) + '/' + phases.length + ' running', state: 'running', skipped };
+    if (v === 'failed')  return { pct: Math.round(done / phases.length * 100), text: (i+1) + '/' + phases.length + ' failed',  state: 'failed',  skipped };
   }
   const pct = Math.round(done / phases.length * 100);
-  const txt = done === phases.length ? `${phases.length}/${phases.length} done` : `${done+1}/${phases.length} pending`;
-  return { pct, text: txt };
+  if (done === phases.length && skipped === 0) return { pct, text: phases.length + '/' + phases.length + ' done', state: 'done', skipped: 0 };
+  if (done === phases.length && skipped > 0)  return { pct, text: phases.length + '/' + phases.length + ' (' + skipped + ' warn)', state: 'warn', skipped };
+  return { pct, text: (done + 1) + '/' + phases.length + ' pending', state: 'pending', skipped };
 }
 
 function renderTable(pods) {
@@ -1580,15 +1591,23 @@ function renderTable(pods) {
   tbody.innerHTML = pods.map(p => {
     const pipe = pipelinePhase(p);
     const serial = p.router_serial || '-';
-    const barColor = pipe.pct === 100 ? '#00e68a' : pipe.text.includes('fail') ? '#ff4757' : '#02c8ff';
-    const miniBar = pipe.pct > 0 ? `<div class="progress-mini"><div class="progress-mini-fill" style="width:${pipe.pct}%;background:${barColor}"></div></div>` : '';
-    const pipeLabel = `${miniBar}<span class="badge ${pipe.pct === 100 ? 'pass' : pipe.text.includes('fail') ? 'fail' : pipe.text.includes('running') ? 'running' : 'pending'}">${pipe.text}</span>`;
+    const barColor = pipe.state === 'done' ? '#00e68a'
+                   : pipe.state === 'warn' ? '#ffa502'
+                   : pipe.state === 'failed' ? '#ff4757'
+                   : pipe.state === 'running' ? '#02c8ff' : '#334455';
+    const badgeClass = pipe.state === 'done' ? 'pass'
+                     : pipe.state === 'warn' ? 'warn'
+                     : pipe.state === 'failed' ? 'fail'
+                     : pipe.state === 'running' ? 'running' : 'pending';
+    const miniBar = pipe.pct > 0 ? '<div class="progress-mini"><div class="progress-mini-fill" style="width:' + pipe.pct + '%;background:' + barColor + '"></div></div>' : '';
+    const pipeLabel = miniBar + '<span class="badge ' + badgeClass + '">' + pipe.text + '</span>';
     const vpn = p.vpn_status || 'disconnected';
     const vpnColor = vpn === 'connected' ? '#00e68a' : vpn === 'connecting' ? '#ffa502' : '#ff4757';
-    const vpnLabel = vpn === 'connected' ? 'Connected' : vpn === 'connecting' ? 'Connecting' : 'Offline';
     const readyAll = isFullyReady(p);
-    const readyBadge = readyAll ? '<span class="badge pass">READY</span>'
-      : p.sdwan_online === 'yes' ? '<span class="badge running">Partial</span>'
+    const hasWarn  = hasSkippedSteps(p);
+    const readyBadge = readyAll    ? '<span class="badge pass">READY</span>'
+      : hasWarn && p.sdwan_online === 'yes' ? '<span class="badge warn">WARN</span>'
+      : p.sdwan_online === 'yes'            ? '<span class="badge running">Partial</span>'
       : '<span class="badge pending">Pending</span>';
     return `<tr>
       <td class="pod-id" onclick="showPipeline('${p.pod_id}')">${p.pod_id}</td>
@@ -1714,9 +1733,10 @@ async function loadSteps(podId) {
   const steps = await r.json();
 
   const total = PIPELINE_ORDER.length;
-  const done = steps.filter(s => s.status === 'completed' || s.status === 'skipped').length;
+  const done    = steps.filter(s => s.status === 'completed' || s.status === 'skipped').length;
+  const skipped = steps.filter(s => s.status === 'skipped').length;
   const running = steps.some(s => s.status === 'running');
-  const failed = steps.some(s => s.status === 'failed');
+  const failed  = steps.some(s => s.status === 'failed');
   const pct = Math.round(done / total * 100);
 
   const firstStep = steps.length > 0 ? steps[0].started_at : null;
@@ -1724,11 +1744,15 @@ async function loadSteps(podId) {
 
   // Progress bar
   const fill = document.getElementById('progress-bar-fill');
-  const txt = document.getElementById('progress-text');
-  const lbl = document.getElementById('progress-label-text');
-  if (fill) fill.style.width = pct + '%';
-  if (txt) txt.textContent = pct + '% (' + done + '/' + total + ')';
-  if (lbl) lbl.textContent = failed ? 'Failed at ' + done + '/' + total : running ? 'Running — ' + done + '/' + total : done === total ? 'Complete!' : 'Pending — ' + done + '/' + total;
+  const txt  = document.getElementById('progress-text');
+  const lbl  = document.getElementById('progress-label-text');
+  const barColor = failed ? '#ff4757' : skipped > 0 ? '#ffa502' : running ? '#02c8ff' : done === total ? '#00e68a' : '#667788';
+  if (fill) { fill.style.width = pct + '%'; fill.style.background = barColor; }
+  if (txt)  txt.textContent = pct + '% (' + done + '/' + total + (skipped ? ', ' + skipped + ' warn' : '') + ')';
+  if (lbl)  lbl.textContent = failed ? 'Failed at ' + done + '/' + total
+                             : skipped > 0 && done === total ? 'Done with ' + skipped + ' warning(s)'
+                             : running ? 'Running — ' + done + '/' + total
+                             : done === total ? 'Complete!' : 'Pending — ' + done + '/' + total;
 
   const grid = document.getElementById('pipeline-grid');
   grid.innerHTML = PIPELINE_ORDER.map(name => {
@@ -1738,15 +1762,16 @@ async function loadSteps(podId) {
     const idx = PIPELINE_ORDER.indexOf(name) + 1;
     const label = name.replace(/_/g, ' ');
     const duration = formatDur(step?.started_at, step?.completed_at);
-    const durHtml = duration ? `<div class="step-dur">${duration}</div>` : '';
-    return `<div class="step-card">
-      <div class="step-num">Phase ${idx}/${total}</div>
-      <div class="step-name">${label}</div>
-      ${pipelineBadge(st)}
-      <div class="step-result">${result}</div>
-      ${durHtml}
-      <span class="started-at" data-time="${step?.started_at || ''}" style="display:none"></span>
-    </div>`;
+    const durHtml = duration ? '<div class="step-dur">' + duration + '</div>' : '';
+    const cardBorder = st === 'skipped' ? 'border-left:3px solid #ffa502;' : st === 'failed' ? 'border-left:3px solid #ff4757;' : '';
+    return '<div class="step-card" style="' + cardBorder + '">' +
+      '<div class="step-num">Phase ' + idx + '/' + total + '</div>' +
+      '<div class="step-name">' + label + '</div>' +
+      pipelineBadge(st) +
+      '<div class="step-result">' + result + '</div>' +
+      durHtml +
+      '<span class="started-at" data-time="' + (step?.started_at || '') + '" style="display:none"></span>' +
+      '</div>';
   }).join('');
 }
 
@@ -1829,15 +1854,17 @@ async function loadSwitches(podId) {
     const roleLabel = sw.name === 'Catalyst Center' ? 'CC' : sw.name.includes('Border') ? 'Spine' : 'Leaf';
 
 
-    return `<div class="switch-card ${allDevicePass ? 'pass' : hasAnyFail ? 'fail' : ''}">
-      <div class="switch-card-title">
-        <span class="role-tag ${roleClass(sw.name)}">${roleLabel}</span>
-        <span class="device-name" onclick="${sw.ip ? `openTerminal('${escHtml(podId)}','${sw.ip}')` : ''}" title="${sw.ip ? 'Click to open SSH terminal' : ''}">${escHtml(sw.name)}</span>
-        <span class="device-model">${escHtml(sw.model || '')}</span>
-      </div>
-      <div class="switch-bar"><div class="switch-bar-fill" style="width:${devicePct}%;background:${barColor}"></div></div>
-      ${checksHtml}
-    </div>`;
+    return '<div class="switch-card ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
+      '<div class="switch-card-title">' +
+        '<span class="role-tag ' + roleClass(sw.name) + '">' + roleLabel + '</span>' +
+        '<span class="device-name" onclick="' + (sw.ip ? 'openTerminal(' + JSON.stringify(podId) + ',' + JSON.stringify(sw.ip) + ')' : '') + '" title="' + (sw.ip ? 'Click to open SSH terminal' : '') + '">' + escHtml(sw.name) + '</span>' +
+        '<span class="device-model">' + escHtml(sw.model || '') + '</span>' +
+        (sw.step_status === 'skipped' ? '<span class="badge warn" style="margin-left:auto">WARN</span>' : '') +
+      '</div>' +
+      (sw.step_status === 'skipped' ? '<div style="font-size:11px;color:#ffa502;margin-bottom:6px;">⚠ Verification skipped — switch unreachable during pipeline. Click Re-check Switches to retry.</div>' : '') +
+      '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + devicePct + '%;background:' + barColor + '"></div></div>' +
+      checksHtml +
+      '</div>';
   }).join('');
 }
 
