@@ -1415,14 +1415,14 @@ DASHBOARD_HTML = """
   <table>
     <thead>
       <tr id="sort-header">
-        <th data-col="pod_id">POD <span class="sort-icon">⇅</span></th>
-        <th data-col="session_id">Session <span class="sort-icon">⇅</span></th>
-        <th data-col="status">Status <span class="sort-icon">⇅</span></th>
-        <th data-col="vpn_status">VPN <span class="sort-icon">⇅</span></th>
+        <th>POD</th>
+        <th>Session</th>
+        <th data-col="status" style="cursor:pointer;user-select:none">Status <span id="status-sort-icon">⇅</span></th>
+        <th>VPN</th>
         <th>Serial</th>
-        <th data-col="sdwan_online">SD-WAN <span class="sort-icon">⇅</span></th>
+        <th>SD-WAN</th>
         <th>SCC Org</th>
-        <th data-col="pipeline">Pipeline <span class="sort-icon">⇅</span></th>
+        <th>Pipeline</th>
         <th>Actions</th>
         <th>Notes</th>
       </tr>
@@ -1523,22 +1523,12 @@ async function load() {
   renderStats(pods);
   renderTable(pods);
   updateSortHeaders();
-  // Wire sort click handlers once
   if (!document.getElementById('sort-header').dataset.bound) {
     document.getElementById('sort-header').dataset.bound = '1';
-    document.querySelectorAll('#sort-header th[data-col]').forEach(th => {
-      th.style.cursor = 'pointer';
-      th.style.userSelect = 'none';
-      th.addEventListener('click', () => {
-        if (sortCol === th.dataset.col) {
-          sortDir = sortDir === 'asc' ? 'desc' : 'asc';
-        } else {
-          sortCol = th.dataset.col;
-          sortDir = 'asc';
-        }
-        updateSortHeaders();
-        load();
-      });
+    document.querySelector('#sort-header th[data-col="status"]').addEventListener('click', () => {
+      statusSortDir = statusSortDir === 'asc' ? 'desc' : 'asc';
+      updateSortHeaders();
+      renderTable(pods);
     });
   }
   const detailId = document.getElementById('detail-pod-id').textContent;
@@ -1608,16 +1598,11 @@ function pipelinePhase(p) {
 }
 
 // ── Sort state ───────────────────────────────────────────────────
-let sortCol = 'pod_id';
-let sortDir = 'asc';
+let statusSortDir = null; // null=unsorted, 'asc', 'desc'
 
 function statusRank(p) {
-  // Use only reliable DB fields — status and sdwan_online
-  // ready + sdwan = 0 (top), ready no sdwan = 1, pending+sdwan = 2, pending = 3
-  if (p.status === 'ready' && p.sdwan_online === 'yes') return 0;
-  if (p.status === 'ready') return 1;
-  if (p.sdwan_online === 'yes') return 2;
-  return 3;
+  if (p.status === 'ready') return 0;
+  return 1;
 }
 
 function podNum(p) {
@@ -1626,44 +1611,18 @@ function podNum(p) {
 }
 
 function sortPods(pods) {
-  pods.sort((a, b) => {
-    let av, bv;
-    if (sortCol === 'pod_id') {
-      av = podNum(a); bv = podNum(b);
-    } else if (sortCol === 'session_id') {
-      av = a.session_id || ''; bv = b.session_id || '';
-    } else if (sortCol === 'status') {
-      av = statusRank(a); bv = statusRank(b);
-    } else if (sortCol === 'vpn_status') {
-      const rank = v => v === 'connected' ? 0 : v === 'connecting' ? 1 : 2;
-      av = rank(a.vpn_status); bv = rank(b.vpn_status);
-    } else if (sortCol === 'sdwan_online') {
-      av = a.sdwan_online === 'yes' ? 0 : 1;
-      bv = b.sdwan_online === 'yes' ? 0 : 1;
-    } else if (sortCol === 'pipeline') {
-      av = statusRank(a); bv = statusRank(b);
-    } else {
-      av = podNum(a); bv = podNum(b);
-    }
-    if (av < bv) return sortDir === 'asc' ? -1 : 1;
-    if (av > bv) return sortDir === 'asc' ? 1 : -1;
+  if (!statusSortDir) return pods;
+  return [...pods].sort((a, b) => {
+    const ra = statusRank(a), rb = statusRank(b);
+    if (ra !== rb) return statusSortDir === 'asc' ? ra - rb : rb - ra;
     return 0;
   });
-  return pods;
 }
 
 function updateSortHeaders() {
-  document.querySelectorAll('#sort-header th[data-col]').forEach(th => {
-    const icon = th.querySelector('.sort-icon');
-    if (!icon) return;
-    if (th.dataset.col === sortCol) {
-      icon.textContent = sortDir === 'asc' ? '↑' : '↓';
-      th.style.color = '#02c8ff';
-    } else {
-      icon.textContent = '⇅';
-      th.style.color = '';
-    }
-  });
+  const icon = document.getElementById('status-sort-icon');
+  if (!icon) return;
+  icon.textContent = statusSortDir === 'asc' ? '↑' : statusSortDir === 'desc' ? '↓' : '⇅';
 }
 
 function renderTable(pods) {
