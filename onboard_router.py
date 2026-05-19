@@ -721,7 +721,8 @@ def run_switch_checks(step_name):
         else:
             parts.append(f"FAIL: {n_count} OSPF neighbors (expected 2)")
 
-        # VRF
+        # VRF — skip header, prompt, and interface continuation lines (indented with >2 spaces)
+        # VRF name lines are indented by exactly 2 spaces; interface continuations by more
         out = switch_cmd(shell, "show vrf")
         vrf_lines = [
             l.strip() for l in out.splitlines()
@@ -729,6 +730,8 @@ def run_switch_checks(step_name):
             and "show vrf" not in l.lower()
             and not l.strip().endswith("#")
             and not l.strip().endswith(">")
+            and not l.strip().startswith("Name")
+            and not (len(l) - len(l.lstrip()) > 2)  # skip deep-indented interface continuation lines
         ]
         has_mgmt = any("Mgmt-vrf" in l for l in vrf_lines)
         extra_vrfs = [l for l in vrf_lines if "Mgmt-vrf" not in l and "Default" not in l]
@@ -758,13 +761,16 @@ def run_switch_checks(step_name):
     else:
         # Leaf switches
         # Skip OSPF — just check VRF, version, VLAN
+        # VRF name lines are indented 2 spaces; interface continuations are indented more — skip those
         out = switch_cmd(shell, "show vrf")
         vrf_lines = [
             l.strip() for l in out.splitlines()
-            if l.strip() and not l.startswith("Name")
+            if l.strip()
+            and not l.strip().startswith("Name")
             and "show vrf" not in l.lower()
             and not l.strip().endswith("#")
             and not l.strip().endswith(">")
+            and not (len(l) - len(l.lstrip()) > 2)  # skip deep-indented interface continuation lines
         ]
         extra_vrfs = [l for l in vrf_lines if "Mgmt-vrf" not in l and "Default" not in l]
         parts.append(f"PASS: VRF OK (Mgmt-vrf only)" if not extra_vrfs else f"FAIL: extra VRFs {extra_vrfs}")
