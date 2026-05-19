@@ -1601,8 +1601,10 @@ function pipelinePhase(p) {
 let statusSortDir = null; // null=unsorted, 'asc', 'desc'
 
 function statusRank(p) {
-  if (p.status === 'ready') return 0;
-  return 1;
+  if (p.status !== 'ready') return 2;  // pending
+  const hasSkipped = PIPELINE_ORDER.some(k => p[k] === 'skipped');
+  if (hasSkipped) return 1;            // ready but warn
+  return 0;                            // fully ready
 }
 
 function podNum(p) {
