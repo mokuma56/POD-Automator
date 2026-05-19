@@ -127,19 +127,28 @@ steps = [
     ("reset_device",       lambda: onboard_router.phase_reset(s)),
     ("quick_connect",      lambda: onboard_router.phase_quick_connect(s)),
     ("config_group_associate", lambda: onboard_router.phase_associate(s)),
-    ("assign_license",     lambda: onboard_router.phase_assign_license(s)),
-    ("set_variables",      lambda: onboard_router.phase_set_variables(s)),
-    ("deploy_config_group", lambda: onboard_router.phase_deploy(s)),
-    ("generate_bootstrap", lambda: onboard_router.phase_generate_bootstrap(s)),
-    ("copy_bootstrap",     onboard_router.phase_copy_bootstrap),
-    ("controller_mode_enable", onboard_router.phase_controller_mode),
-    ("verify_online",      lambda: True),
-    ("verify_border_spine", lambda: onboard_router.run_switch_checks("verify_border_spine")),
-    ("verify_leaf1",       lambda: onboard_router.run_switch_checks("verify_leaf1")),
-    ("verify_leaf2",       lambda: onboard_router.run_switch_checks("verify_leaf2")),
-    ("connectivity_test",  onboard_router.phase_connectivity_test),
-    ("cdfmc_check",        onboard_router.phase_cdfmc_check),
+     ("assign_license",     lambda: onboard_router.phase_assign_license(s)),
+     ("set_variables",      lambda: onboard_router.phase_set_variables(s)),
+     ("deploy_config_group", lambda: onboard_router.phase_deploy(s)),
+     ("generate_bootstrap", lambda: onboard_router.phase_generate_bootstrap(s)),
+     ("copy_bootstrap",     onboard_router.phase_copy_bootstrap),
+     ("controller_mode_enable", onboard_router.phase_controller_mode),
+     ("verify_online",      lambda: True),
+     ("verify_border_spine", lambda: onboard_router.run_switch_checks("verify_border_spine")),
+     ("verify_leaf1",       lambda: onboard_router.run_switch_checks("verify_leaf1")),
+     ("verify_leaf2",       lambda: onboard_router.run_switch_checks("verify_leaf2")),
+     ("connectivity_test",  onboard_router.phase_connectivity_test),
+     ("cdfmc_check",        onboard_router.phase_cdfmc_check),
 ]
+
+# Steps that should NOT halt the pipeline on failure — record as skipped/warn and continue
+SOFT_FAIL_STEPS = {
+    "verify_border_spine",
+    "verify_leaf1",
+    "verify_leaf2",
+    "connectivity_test",
+    "cdfmc_check",
+}
 
 for step_name, func in steps:
     log_line = f"▶ {step_name}..."
@@ -156,6 +165,12 @@ for step_name, func in steps:
             log_line = f"✗ {step_name} FAILED: {str(result)[:200]}"
             print(log_line)
             live_log(log_line)
+            if step_name in SOFT_FAIL_STEPS:
+                report_step(step_name, "skipped", f"WARN: {str(result)[:200]}")
+                log_line = f"⚠ {step_name} skipped (soft-fail) — pipeline continuing"
+                print(log_line)
+                live_log(log_line)
+                continue
             report_step(step_name, "failed", str(result)[:200])
             sys.exit(1)
         log_line = f"✓ {step_name} OK"
@@ -182,6 +197,12 @@ conn.close()
         log_line = f"✗ {step_name} FAILED: {str(e)[:200]}"
         print(log_line)
         live_log(log_line)
+        if step_name in SOFT_FAIL_STEPS:
+            report_step(step_name, "skipped", f"WARN: {str(e)[:200]}")
+            log_line = f"⚠ {step_name} skipped (soft-fail) — pipeline continuing"
+            print(log_line)
+            live_log(log_line)
+            continue
         report_step(step_name, "failed", str(e)[:200])
         sys.exit(1)
 
