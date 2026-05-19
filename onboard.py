@@ -177,6 +177,21 @@ for step_name, func in steps:
         print(f"  {log_line}")
         live_log(log_line)
         report_step(step_name, "completed", str(result)[:200] or "OK")
+        # As soon as controller_mode_enable succeeds, mark SD-WAN online immediately.
+        # This ensures the green dot is set even if a later soft-fail step causes
+        # an early exit before the final status=ready write at the bottom.
+        if step_name == "controller_mode_enable":
+            try:
+                subprocess.run([sys.executable, "-c", f"""
+import sqlite3
+conn = sqlite3.connect('{DB_PATH}')
+conn.execute("UPDATE pods SET sdwan_online='yes', updated_at=datetime('now') WHERE pod_id=?", ('{pod_id}',))
+conn.commit()
+conn.close()
+"""], timeout=5)
+                print("  Dashboard: sdwan_online=yes")
+            except Exception:
+                pass
         # Extract and persist scc_org from cdfmc_check result
         if step_name == "cdfmc_check" and isinstance(result, str) and "scc_org=" in result:
             import re as _re
