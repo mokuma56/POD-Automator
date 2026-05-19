@@ -849,8 +849,9 @@ def api_upgrade_config_set():
 
 @app.route("/api/upgrade/upload-image", methods=["POST"])
 def api_upgrade_upload_image():
-    """Receive a .bin image and SCP it to the Ubuntu automation PC via an active VPN container."""
-    import tempfile, shutil, subprocess as _sp
+    """Receive a .bin image and save it locally to data/images/.
+    At upgrade time the pipeline container will check Ubuntu PC first,
+    and only copy from here if the file is not already there."""
     if "file" not in request.files:
         return jsonify({"status": "error", "message": "No file provided"}), 400
     f = request.files["file"]
@@ -859,65 +860,18 @@ def api_upgrade_upload_image():
         return jsonify({"status": "error", "message": "File must be a .bin image"}), 400
 
     filename = f.filename
-    tmp = Path(tempfile.mkdtemp()) / filename
-    f.save(str(tmp))
+    images_dir = Path(__file__).parent / "data" / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    local_path = images_dir / filename
+    f.save(str(local_path))
 
-    # Find an active VPN container to proxy the upload through
-    def _find_vpn_container():
-        try:
-            out = _sp.check_output(["docker", "ps", "--filter", "name=vpn-POD-",
-                                    "--format", "{{.Names}}"], text=True).strip()
-            for name in out.splitlines():
-                if name.strip():
-                    return name.strip()
-        except Exception:
-            pass
-        return None
+    # Update DB
+    c = _db()
+    c.execute("UPDATE upgrade_config SET image_filename=?, image_path=?, updated_at=datetime('now') WHERE device_type=?",
+              (filename, f"/home/cisco/{filename}", device_type))
+    c.commit(); c.close()
 
-    def _upload():
-        try:
-            vpn_container = _find_vpn_container()
-            if not vpn_container:
-                raise Exception("No active VPN container found — connect a VPN first")
-
-            # Copy file into the VPN container then SCP to Ubuntu PC from inside it
-            remote_tmp = f"/tmp/{filename}"
-            _sp.check_call(["docker", "cp", str(tmp), f"{vpn_container}:{remote_tmp}"])
-
-            # SCP from container to Ubuntu PC
-            scp_cmd = (
-                f"import paramiko, os; "
-                f"t=paramiko.Transport(('198.18.134.12',22)); "
-                f"t.connect(username='cisco',password='C1sco12345'); "
-                f"s=paramiko.SFTPClient.from_transport(t); "
-                f"s.put('{remote_tmp}','/home/cisco/{filename}'); "
-                f"s.close(); t.close(); "
-                f"os.unlink('{remote_tmp}'); "
-                f"print('OK')"
-            )
-            result = _sp.check_output(
-                ["docker", "exec", vpn_container, "python3", "-c", scp_cmd],
-                text=True, timeout=300
-            ).strip()
-            if result != "OK":
-                raise Exception(f"Upload via container failed: {result}")
-
-            tmp.unlink(missing_ok=True)
-            # Update DB
-            c = _db()
-            c.execute("UPDATE upgrade_config SET image_filename=?, image_path=?, updated_at=datetime('now') WHERE device_type=?",
-                      (filename, f"/home/cisco/{filename}", device_type))
-            c.commit(); c.close()
-        except Exception as e:
-            tmp.unlink(missing_ok=True)
-            raise e
-
-    try:
-        _upload()
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    return jsonify({"status": "ok", "filename": filename, "remote_path": f"/home/cisco/{filename}"})
+    return jsonify({"status": "ok", "filename": filename, "local_path": str(local_path)})
 
 
 @app.route("/api/upgrade/switch/<pod_id>/<switch_key>", methods=["POST"])
