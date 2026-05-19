@@ -4,10 +4,8 @@ services:
     container_name: vpn-{{pod_id}}
     cap_add: [NET_ADMIN, SYS_ADMIN]
     devices: [/dev/net/tun]
-    entrypoint: ["/bin/sh"]
-    command:
-      - -c
-      - echo "{{vpn_pass}}" | openconnect --interface tun0 --user "{{vpn_user}}" --passwd-on-stdin "{{vpn_host}}"
+    entrypoint: ["/bin/sh", "/vpn-entrypoint.sh"]
+    command: ["{{vpn_host}}", "{{vpn_user}}", "{{vpn_pass}}"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('{{vmanage_ip}}', 443), timeout=3).close()"]
