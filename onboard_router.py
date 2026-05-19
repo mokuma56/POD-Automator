@@ -504,18 +504,35 @@ def phase_controller_mode():
 
     if not went_down:
         time.sleep(8)
-        out = read_shell(shell, 5)
+        try:
+            out = read_shell(shell, 5)
+        except (paramiko.SSHException, OSError, EOFError):
+            print(f"     SSH socket closed during read — controller-mode enable accepted, rebooting")
+            client.close()
+            went_down = True
+
+    if not went_down:
+        out = out if 'out' in dir() else ''
         print(f"     Output: {out[-200:]}")
         if "Failed" in out or "Abort" in out:
             print(f"     controller-mode enable command failed")
             client.close()
             return False
-        shell_send(shell, "\n")
-        time.sleep(3)
-        out = read_shell(shell, 3)
-        print(f"     After extra Enter: {out[-100:]}")
-        client.close()
+        try:
+            shell_send(shell, "\n")
+            time.sleep(3)
+            out = read_shell(shell, 3)
+            print(f"     After extra Enter: {out[-100:]}")
+        except (paramiko.SSHException, OSError, EOFError):
+            print(f"     SSH socket closed after confirmation — rebooting")
+            went_down = True
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
+    if not went_down:
         # Wait for router to go DOWN first (proves the command actually worked)
         print(f"     Router rebooting — waiting for disconnect...")
         t0 = time.time()
@@ -551,7 +568,6 @@ def phase_controller_mode():
             print(f"     waiting for SD-WAN... {i}s")
         time.sleep(1)
     return _wait_sdwan_tunnels()
-    return False
 
 
 def _wait_sdwan_tunnels(timeout=480):
