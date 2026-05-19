@@ -303,10 +303,47 @@ def api_switches(pod_id):
 SWITCH_RECHECK_RUNNERS = {}
 
 
+def _ensure_pipeline_container(pod_id):
+    """Ensure the pipeline container is running for the given POD.
+    Launches it via docker compose if not already running. Returns (ok, message)."""
+    import os, tempfile
+    from docker.generate import generate_compose, read_db
+
+    # Check if already running
+    r = subprocess.run(
+        ["docker", "inspect", f"pipeline-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode == 0 and r.stdout.strip() == "running":
+        return True, "already running"
+
+    # Not running — launch it
+    pods = read_db(status_filter=("pending", "available", "ready", "running", "in_progress", ""))
+    p = next((x for x in pods if x["pod_id"] == pod_id), None)
+    if not p:
+        return False, f"POD {pod_id} not found in DB"
+
+    compose = generate_compose(p)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False)
+    tmp.write(compose)
+    tmp.close()
+    try:
+        r2 = subprocess.run(
+            ["docker", "compose", "-p", pod_id.lower(), "-f", tmp.name, "up", "-d", "pipeline"],
+            capture_output=True, text=True, timeout=30
+        )
+        if r2.returncode == 0:
+            time.sleep(3)  # give container a moment to start
+            return True, "launched"
+        return False, (r2.stderr or r2.stdout)[:300]
+    finally:
+        os.unlink(tmp.name)
+
+
 @app.route("/api/switches/recheck/<pod_id>", methods=["POST"])
 def api_switches_recheck(pod_id):
     """Re-run switch checks inside the POD's VPN namespace."""
-    import subprocess, threading
+    import threading
 
     conn = _db()
     row = conn.execute("SELECT * FROM pods WHERE pod_id = ?", (pod_id,)).fetchone()
@@ -316,14 +353,9 @@ def api_switches_recheck(pod_id):
     router_ip = row["router_ip"]
     conn.close()
 
-    dp_id = pod_id.lower()
-    # Verify VPN container is running
-    r = subprocess.run(
-        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
-        capture_output=True, text=True, timeout=8
-    )
-    if r.returncode != 0 or r.stdout.strip() != "running":
-        return jsonify({"status": "error", "message": "VPN container not running for " + pod_id}), 400
+    ok, msg = _ensure_pipeline_container(pod_id)
+    if not ok:
+        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
 
     def _recheck():
         try:
@@ -438,7 +470,7 @@ def api_cdfmc_status(pod_id):
 @app.route("/api/cdfmc/recheck/<pod_id>", methods=["POST"])
 def api_cdfmc_recheck(pod_id):
     """Re-run the cdFMC check inside the POD's VPN namespace."""
-    import subprocess, threading
+    import threading
 
     conn = _db()
     row = conn.execute("SELECT router_ip FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
@@ -446,12 +478,9 @@ def api_cdfmc_recheck(pod_id):
     if not row:
         return jsonify({"status": "error", "message": "POD not found"}), 404
 
-    r = subprocess.run(
-        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
-        capture_output=True, text=True, timeout=8
-    )
-    if r.returncode != 0 or r.stdout.strip() != "running":
-        return jsonify({"status": "error", "message": "VPN container not running for " + pod_id}), 400
+    ok, msg = _ensure_pipeline_container(pod_id)
+    if not ok:
+        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
 
     def _recheck():
         script = (
@@ -497,7 +526,7 @@ def api_cdfmc_recheck(pod_id):
 @app.route("/api/cdfmc/redeploy/<pod_id>", methods=["POST"])
 def api_cdfmc_redeploy(pod_id):
     """SSH to automation PC and run cli.py reset then cli.py deploy. Streams output to pipeline_logs."""
-    import subprocess, threading
+    import threading
 
     conn = _db()
     row = conn.execute("SELECT * FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
@@ -505,12 +534,9 @@ def api_cdfmc_redeploy(pod_id):
     if not row:
         return jsonify({"status": "error", "message": "POD not found"}), 404
 
-    r = subprocess.run(
-        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
-        capture_output=True, text=True, timeout=8
-    )
-    if r.returncode != 0 or r.stdout.strip() != "running":
-        return jsonify({"status": "error", "message": "VPN container not running for " + pod_id}), 400
+    ok, msg = _ensure_pipeline_container(pod_id)
+    if not ok:
+        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
 
     def _live_log(msg):
         try:
@@ -676,12 +702,9 @@ def api_ad_recheck(pod_id):
 def api_ad_rerun(pod_id):
     """Run ADDuoTenantUserProvisioning.ps1 on Jumphost1 via WinRM, then re-verify."""
     import threading
-    r = subprocess.run(
-        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
-        capture_output=True, text=True, timeout=8
-    )
-    if r.returncode != 0 or r.stdout.strip() != "running":
-        return jsonify({"status": "error", "message": f"VPN container not running for {pod_id}"}), 400
+    ok, msg = _ensure_pipeline_container(pod_id)
+    if not ok:
+        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
 
     def _rerun():
         def _live_log(msg):
@@ -878,12 +901,9 @@ def api_upgrade_upload_image():
 def api_upgrade_switch(pod_id, switch_key):
     """Run switch upgrade for a specific switch in a POD."""
     import threading
-    r = subprocess.run(
-        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
-        capture_output=True, text=True, timeout=8
-    )
-    if r.returncode != 0 or r.stdout.strip() != "running":
-        return jsonify({"status": "error", "message": f"VPN not running for {pod_id}"}), 400
+    ok, msg = _ensure_pipeline_container(pod_id)
+    if not ok:
+        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
 
     c = _db()
     cfg = c.execute("SELECT * FROM upgrade_config WHERE device_type='switch'").fetchone()
@@ -939,12 +959,9 @@ def api_upgrade_switch(pod_id, switch_key):
 def api_upgrade_router(pod_id):
     """Run router upgrade for a POD."""
     import threading
-    r = subprocess.run(
-        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
-        capture_output=True, text=True, timeout=8
-    )
-    if r.returncode != 0 or r.stdout.strip() != "running":
-        return jsonify({"status": "error", "message": f"VPN not running for {pod_id}"}), 400
+    ok, msg = _ensure_pipeline_container(pod_id)
+    if not ok:
+        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
 
     c = _db()
     cfg = c.execute("SELECT * FROM upgrade_config WHERE device_type='router'").fetchone()
@@ -1085,7 +1102,7 @@ def run_all():
     """Run pipeline containers for all PODs with connected VPNs."""
     import subprocess, os, tempfile
     from docker.generate import generate_compose, read_db
-    pods = read_db(status_filter=("pending", "available", "ready", "running", "in_progress", ""))
+    pods = read_db(status_filter=("pending", "available", "running", "in_progress", ""))
     if not pods:
         return jsonify({"status": "error", "message": "No PODs found in DB"})
     results = []
