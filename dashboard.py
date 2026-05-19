@@ -1072,6 +1072,18 @@ def api_vpn_connect(pod_id):
     except Exception as e:
         return jsonify({"status": "error", "output": str(e)[:500]})
 
+@app.route("/api/delete-pod/<pod_id>", methods=["POST"])
+def delete_pod(pod_id):
+    """Delete a POD and all its data from the DB."""
+    conn = _db()
+    conn.execute("DELETE FROM pipeline_steps WHERE pod_id=?", (pod_id,))
+    conn.execute("DELETE FROM pipeline_logs WHERE pod_id=?", (pod_id,))
+    conn.execute("DELETE FROM pods WHERE pod_id=?", (pod_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok", "message": f"{pod_id} deleted"})
+
+
 @app.route("/api/run-pod/<pod_id>", methods=["POST"])
 def run_pod(pod_id):
     """Run the pipeline for a single POD (VPN must already be connected)."""
@@ -1665,9 +1677,10 @@ function renderTable(pods) {
       <td>${pipeLabel}</td>
       <td style="display:flex;gap:4px;flex-wrap:wrap;">
         <button class="btn-start" onclick="connectVpn('${p.pod_id}')">Connect VPN</button>
-        <button class="btn-reconnect" onclick="runPod('${p.pod_id}')" style="background:#7c3aed;border-color:#7c3aed;color:#fff;">&#9654; Run Automation</button>
-        <button class="btn-reconnect" onclick="reconnectVpn('${p.pod_id}')">Reconnect VPN</button>
-        <button class="btn-reconnect" onclick="disconnectVpn('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;">Disconnect VPN</button>
+         <button class="btn-reconnect" onclick="runPod('${p.pod_id}')" style="background:#7c3aed;border-color:#7c3aed;color:#fff;">&#9654; Run Automation</button>
+         <button class="btn-reconnect" onclick="reconnectVpn('${p.pod_id}')">Reconnect VPN</button>
+         <button class="btn-reconnect" onclick="disconnectVpn('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;">Disconnect VPN</button>
+         <button class="btn-reconnect" onclick="deletePod('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;background:#2a0a0a;" title="Delete POD from DB">&#x1F5D1;</button>
       </td>
       <td class="notes" title="${(p.notes||'').replace(/"/g,'&quot;')}">${p.notes || '-'}</td>
     </tr>`;
@@ -1682,6 +1695,17 @@ async function runPod(podId) {
   status.textContent = data.message || 'Done';
   setTimeout(() => status.textContent = '', 8000);
   load();
+}
+
+async function deletePod(podId) {
+  if (!confirm('Delete ' + podId + ' from the dashboard? This cannot be undone.')) return;
+  const r = await fetch('/api/delete-pod/' + podId, { method: 'POST' });
+  const data = await r.json();
+  if (data.status === 'ok') {
+    load();
+  } else {
+    alert('Error: ' + (data.message || 'Unknown error'));
+  }
 }
 
 async function runAllPods() {
