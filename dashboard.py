@@ -1612,15 +1612,12 @@ let sortCol = 'pod_id';
 let sortDir = 'asc';
 
 function statusRank(p) {
-  // Fine-grained rank so grouping is visible when sorted
-  // 0=failed, 1=running, 2=warn(skipped+sdwan), 3=ready(all pass), 4=partial(sdwan no steps), 5=pending
-  const pipe = pipelinePhase(p);
-  if (pipe.state === 'failed')  return 0;
-  if (pipe.state === 'running') return 1;
-  if (pipe.state === 'warn')    return 2;  // sdwan up + skipped steps
-  if (pipe.state === 'done')    return 3;  // fully ready
-  if (p.sdwan_online === 'yes') return 4;  // sdwan up but incomplete
-  return 5;                                // pending / not started
+  // Use only reliable DB fields — status and sdwan_online
+  // ready + sdwan = 0 (top), ready no sdwan = 1, pending+sdwan = 2, pending = 3
+  if (p.status === 'ready' && p.sdwan_online === 'yes') return 0;
+  if (p.status === 'ready') return 1;
+  if (p.sdwan_online === 'yes') return 2;
+  return 3;
 }
 
 function podNum(p) {
