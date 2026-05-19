@@ -101,27 +101,40 @@ except Exception as _e:
 
 print(f"\nOnboarding {onboard_router.UUID} for {pod_id}\n{'='*40}")
 
-def report_step(step_name, status, result=""):
-    subprocess.run([
-        sys.executable, "-c", f"""
-import sqlite3
-conn = sqlite3.connect('{DB_PATH}')
-conn.execute("INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, completed_at, result) VALUES (?, ?, ?, datetime('now'), ?)",
-    ('{pod_id}', '{step_name}', '{status}', '''{result.replace("'", "''")}'''))
-conn.commit()"""], timeout=5)
+# ── Load existing step state and pod flags from DB ───────────────
+def _load_state():
+    try:
+        import sqlite3 as _sq
+        c = _sq.connect(DB_PATH)
+        rows = c.execute(
+            "SELECT step_name, status FROM pipeline_steps WHERE pod_id=?", (pod_id,)
+        ).fetchall()
+        pod_row = c.execute(
+            "SELECT sdwan_online FROM pods WHERE pod_id=?", (pod_id,)
+        ).fetchone()
+        c.close()
+        completed = {r[0] for r in rows if r[1] == "completed"}
+        sdwan_online = (pod_row["sdwan_online"] if pod_row and isinstance(pod_row, dict)
+                        else (pod_row[0] if pod_row else "")) == "yes"
+        return completed, sdwan_online
+    except Exception as e:
+        print(f"  Warning: could not load state: {e}")
+        return set(), False
 
-def live_log(msg):
-    subprocess.run([
-        sys.executable, "-c", f"""
-import sqlite3
-conn = sqlite3.connect('{DB_PATH}')
-conn.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)",
-    ('{pod_id}', '''{msg.replace("'", "''")}'''))
-conn.commit()
-conn.close()
-"""], timeout=5)
+_completed_steps, _sdwan_online = _load_state()
 
-s = onboard_router.vmanage_session()
+# SD-WAN router steps — skip entirely if SD-WAN is already online
+SDWAN_STEPS = {
+    "verify_router", "reset_device", "quick_connect", "config_group_associate",
+    "assign_license", "set_variables", "deploy_config_group", "generate_bootstrap",
+    "copy_bootstrap", "controller_mode_enable", "verify_online",
+}
+
+if _sdwan_online:
+    print("  SD-WAN already online — skipping router onboarding steps")
+else:
+    s = onboard_router.vmanage_session()
+
 steps = [
     ("verify_router",      lambda: True),
     ("reset_device",       lambda: onboard_router.phase_reset(s)),
@@ -155,6 +168,16 @@ SOFT_FAIL_STEPS = {
 }
 
 for step_name, func in steps:
+    # Skip SD-WAN router steps if SD-WAN is already online
+    if _sdwan_online and step_name in SDWAN_STEPS:
+        print(f"  ↷ {step_name} skipped (SD-WAN already online)")
+        continue
+
+    # Skip steps already completed in a previous run
+    if step_name in _completed_steps:
+        print(f"  ↷ {step_name} skipped (already completed)")
+        continue
+
     log_line = f"▶ {step_name}..."
     print(log_line)
     live_log(log_line)
