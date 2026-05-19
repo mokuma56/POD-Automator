@@ -288,10 +288,40 @@ def phase_assign_license(s):
 
 
 def phase_deploy(s):
-    r = s.post(
-        f"{VMANAGE}/dataservice/v1/config-group/{CG_ID}/device/deploy",
-        json={"devices": [{"id": UUID}]}, timeout=10
-    )
+    # Check if device is already In Sync — skip the deploy POST entirely
+    try:
+        devs = s.get(f"{VMANAGE}/dataservice/system/device/vedges", timeout=15).json().get("data", [])
+        dev = next((d for d in devs if UUID in d.get("uuid", "")), None)
+        if dev and dev.get("configStatusMessage", "") == "In Sync":
+            print(f"  5. Deploy: already In Sync — skipping deploy POST")
+            return True
+    except Exception as e:
+        print(f"  5. Deploy: pre-check failed ({e}) — proceeding with deploy")
+
+    # POST deploy with retry on timeout
+    r = None
+    for attempt in range(3):
+        try:
+            r = s.post(
+                f"{VMANAGE}/dataservice/v1/config-group/{CG_ID}/device/deploy",
+                json={"devices": [{"id": UUID}]}, timeout=30
+            )
+            break
+        except Exception as e:
+            print(f"  5. Deploy POST attempt {attempt+1} failed: {e}")
+            if attempt == 2:
+                # Last resort: re-check if it's In Sync despite the timeout
+                try:
+                    devs = s.get(f"{VMANAGE}/dataservice/system/device/vedges", timeout=15).json().get("data", [])
+                    dev = next((d for d in devs if UUID in d.get("uuid", "")), None)
+                    if dev and dev.get("configStatusMessage", "") == "In Sync":
+                        print(f"  5. Deploy: timed out but vManage shows In Sync — proceeding")
+                        return True
+                except Exception:
+                    pass
+                return False
+            time.sleep(5)
+
     if r.status_code != 200:
         print(f"  5. Deploy: ❌ {r.status_code} {r.text[:200]}")
         return False
@@ -301,28 +331,45 @@ def phase_deploy(s):
         task_id = ""
     print(f"  5. Deploy: ✅ task={task_id[:60]}")
 
-    # Poll until deployment completes
-    if task_id:
-        for i in range(60):
-            time.sleep(5)
-            tr = s.get(f"{VMANAGE}/dataservice/device/action/status/{task_id}", timeout=10)
-            if tr.status_code != 200:
-                continue
-            status = tr.json().get("status", "")
-            if not status:
-                status = tr.json().get("data", [{}])[0].get("status", "")
-            if "done" in status.lower() or "scheduled" in status.lower():
-                activity = tr.json().get("data", [{}])[0].get("currentActivity", "")
-                print(f"     Deploy status: {status} — {activity[:200]}")
-                print(f"     Proceeding (waited {(i+1)*5}s)")
+    # Poll until deployment completes — also check In Sync as early-exit
+    for i in range(60):
+        time.sleep(5)
+        # Short-circuit: if device is already In Sync no need to wait for task
+        try:
+            devs = s.get(f"{VMANAGE}/dataservice/system/device/vedges", timeout=10).json().get("data", [])
+            dev = next((d for d in devs if UUID in d.get("uuid", "")), None)
+            if dev and dev.get("configStatusMessage", "") == "In Sync":
+                print(f"     Deploy: device In Sync after {(i+1)*5}s — done")
                 return True
-            elif status.lower() in ("error", "fail", "failure"):
-                detail = tr.json().get("data", [{}])[0].get("details", "") or tr.json().get("details", "")
-                print(f"     Deploy failed: {detail[:200]}")
-                return False
-            if i % 6 == 0:
-                print(f"     Deploy action status: {status}...")
-        print("     Deploy still in progress, proceeding anyway")
+        except Exception:
+            pass
+        if task_id:
+            try:
+                tr = s.get(f"{VMANAGE}/dataservice/device/action/status/{task_id}", timeout=10)
+                if tr.status_code == 200:
+                    status = tr.json().get("status", "") or tr.json().get("data", [{}])[0].get("status", "")
+                    if "done" in status.lower() or "scheduled" in status.lower():
+                        activity = tr.json().get("data", [{}])[0].get("currentActivity", "")
+                        print(f"     Deploy status: {status} — {activity[:200]}")
+                        return True
+                    elif status.lower() in ("error", "fail", "failure"):
+                        detail = tr.json().get("data", [{}])[0].get("details", "") or tr.json().get("details", "")
+                        print(f"     Deploy failed: {detail[:200]}")
+                        return False
+                    if i % 6 == 0:
+                        print(f"     Deploy action status: {status}...")
+            except Exception:
+                pass
+    print("     Deploy poll timed out — checking In Sync one final time")
+    try:
+        devs = s.get(f"{VMANAGE}/dataservice/system/device/vedges", timeout=15).json().get("data", [])
+        dev = next((d for d in devs if UUID in d.get("uuid", "")), None)
+        if dev and dev.get("configStatusMessage", "") == "In Sync":
+            print(f"     Final check: device In Sync — proceeding")
+            return True
+    except Exception:
+        pass
+    print("     Deploy still in progress, proceeding anyway")
     return True
 
 
