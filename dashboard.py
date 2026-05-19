@@ -2336,5 +2336,90 @@ loadUpgradeConfig();
 </html>
 """
 
+def _sdwan_health_monitor():
+    """Background thread — polls vManage every 60s for each POD with sdwan_online=yes.
+    Checks for at least 3 control connections (vBond + vSmart x2).
+    Updates sdwan_online to 'yes' or 'no' in the DB."""
+    import requests as _requests
+    CHECK_INTERVAL = 60  # seconds between full poll cycles
+
+    def _check_pod(pod):
+        pod_id  = pod["pod_id"]
+        vmanage = f"https://{os.environ.get('VMANAGE', '198.18.133.10')}"
+        serial  = pod.get("router_serial", "")
+        if not serial:
+            return  # no serial yet — can't check
+
+        # Run check inside the POD's VPN container
+        script = f"""
+import sys, requests, urllib3
+urllib3.disable_warnings()
+s = requests.Session()
+s.verify = False
+try:
+    r = s.post('{vmanage}/j_security_check',
+        data={{'j_username':'admin','j_password':'C1sco12345'}}, timeout=10)
+    tok = s.get('{vmanage}/dataservice/client/token', timeout=10).text.strip()
+    if tok: s.headers['X-XSRF-TOKEN'] = tok
+    devs = s.get('{vmanage}/dataservice/system/device/vedges', timeout=10).json().get('data', [])
+    dev  = next((d for d in devs if d.get('serialNumber','').upper() == '{serial}'.upper()), None)
+    if not dev:
+        print('not_found')
+        sys.exit(0)
+    uuid = dev.get('uuid','')
+    conns = s.get(f'{vmanage}/dataservice/device/control/connections?deviceId={{uuid}}', timeout=10).json().get('data', [])
+    up = [c for c in conns if str(c.get('state','')).lower() == 'up']
+    print(f'up={{len(up)}}')
+except Exception as e:
+    print(f'error={{e}}')
+"""
+        try:
+            r = subprocess.run(
+                ["docker", "run", "--rm",
+                 "--network", f"container:vpn-{pod_id}",
+                 "--entrypoint", "python3",
+                 "pod-automator:latest", "-c", script],
+                capture_output=True, text=True, timeout=30
+            )
+            out = r.stdout.strip().splitlines()
+            last = out[-1] if out else ""
+            if last.startswith("up="):
+                up_count = int(last.split("=")[1])
+                online = "yes" if up_count >= 3 else "no"
+            elif last == "not_found":
+                online = "no"
+            else:
+                return  # error — don't update, keep last known state
+        except Exception:
+            return  # timeout or docker error — keep last known state
+
+        conn = _db()
+        current = conn.execute("SELECT sdwan_online FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if current and current["sdwan_online"] != online:
+            conn.execute("UPDATE pods SET sdwan_online=?, updated_at=datetime('now') WHERE pod_id=?",
+                         (online, pod_id))
+            conn.commit()
+            print(f"[sdwan-monitor] {pod_id}: sdwan_online -> {online} (control tunnels up={up_count if 'up_count' in dir() else '?'})")
+        conn.close()
+
+    while True:
+        try:
+            conn = _db()
+            pods = conn.execute("SELECT * FROM pods WHERE sdwan_online='yes'").fetchall()
+            conn.close()
+            for pod in pods:
+                # Only check if VPN container is healthy
+                r = subprocess.run(
+                    ["docker", "inspect", f"vpn-{pod['pod_id']}", "--format", "{{.State.Health.Status}}"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r.stdout.strip() == "healthy":
+                    _check_pod(dict(pod))
+        except Exception as e:
+            print(f"[sdwan-monitor] error: {e}")
+        time.sleep(CHECK_INTERVAL)
+
+
 if __name__ == "__main__":
+    threading.Thread(target=_sdwan_health_monitor, daemon=True).start()
     app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False)
