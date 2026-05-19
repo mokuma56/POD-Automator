@@ -2071,24 +2071,32 @@ async function loadUpgrade(podId) {
     if (vm) currentVer = vm[1];
 
     const noImage = !imageFile;
-    const btnDisabled = noImage || status === 'running' ? 'opacity:0.4;cursor:not-allowed' : 'cursor:pointer';
-    const btnClick = noImage || status === 'running' ? '' : `onclick="runUpgrade('${podId}','${apiPath}','${label}')"`;
+    const canRun = !noImage && status !== 'running';
+    const btnStyle = 'width:100%;padding:6px;background:#1a2a3a;border:1px solid ' + (noImage ? '#334' : '#ffa502') + ';color:' + (noImage ? '#445' : '#ffa502') + ';border-radius:4px;font-size:12px;' + (canRun ? 'cursor:pointer' : 'opacity:0.4;cursor:not-allowed') + ';';
+    const btnId = 'upg-btn-' + stepKey;
 
-    return `
-      <div style="background:#0d1f2d;border-radius:8px;padding:14px;">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-          <span style="color:${color};font-size:16px">${icon}</span>
-          <span style="color:#e0e8f0;font-size:13px;font-weight:600">${label}</span>
-          <span style="margin-left:auto;font-size:11px;color:#667788">Golden: ${golden || '—'}</span>
-        </div>
-        ${result ? `<div style="font-size:11px;color:${color};margin-bottom:8px;word-break:break-all">${escHtml(result.substring(0,150))}</div>` : ''}
-        ${noImage ? '<div style="font-size:11px;color:#ff4757;margin-bottom:8px;">⚠ No image uploaded — use the upload card above</div>' : ''}
-        <button ${btnClick}
-          style="width:100%;padding:6px;background:#1a2a3a;border:1px solid ${noImage ? '#334' : '#ffa502'};
-                 color:${noImage ? '#445' : '#ffa502'};border-radius:4px;font-size:12px;${btnDisabled}">
-          ${status === 'running' ? '⟳ Upgrading...' : '⬆ Run Upgrade'}
-        </button>
-      </div>`;
+    const html = [
+      '<div style="background:#0d1f2d;border-radius:8px;padding:14px;">',
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">',
+      '<span style="color:' + color + ';font-size:16px">' + icon + '</span>',
+      '<span style="color:#e0e8f0;font-size:13px;font-weight:600">' + label + '</span>',
+      '<span style="margin-left:auto;font-size:11px;color:#667788">Golden: ' + (golden || '\u2014') + '</span>',
+      '</div>',
+      result ? '<div style="font-size:11px;color:' + color + ';margin-bottom:8px;word-break:break-all">' + escHtml(result.substring(0,150)) + '</div>' : '',
+      noImage ? '<div style="font-size:11px;color:#ff4757;margin-bottom:8px;">\u26a0 No image uploaded \u2014 use the upload card above</div>' : '',
+      '<button id="' + btnId + '" style="' + btnStyle + '">',
+      status === 'running' ? '\u27f3 Upgrading...' : '\u2b06 Run Upgrade',
+      '</button></div>'
+    ].join('');
+
+    // Attach click handler after render (avoids inline onclick quoting issues)
+    if (canRun) {
+      setTimeout(function() {
+        const btn = document.getElementById(btnId);
+        if (btn) btn.onclick = function() { runUpgrade(podId, apiPath, label); };
+      }, 0);
+    }
+    return html;
   }
 
   const switchCards = [
@@ -2135,6 +2143,8 @@ async function runUpgrade(podId, apiPath, label) {
   }, 30000);
   loadUpgrade(podId);
 }
+
+function escHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
