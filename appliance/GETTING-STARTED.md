@@ -171,8 +171,11 @@ Full automation takes **15–25 minutes** per POD.
 ### Configure golden versions
 At the top of the dashboard, the **Software Upgrade Images** card lets you:
 1. Set the **golden version** (target version) for switches and router
-2. Upload a `.bin` image — the file is transferred to the Ubuntu PC
-   (`198.18.134.12`) and served via HTTP during upgrades
+2. Upload a `.bin` image — the file is saved locally to `data/images/`
+   on the appliance. At upgrade time, the pipeline checks whether the
+   image already exists on the Ubuntu PC (`198.18.134.12:/home/cisco/`):
+   - **Already there** (e.g. pre-staged manually) → used directly, no copy
+   - **Not there** → copied from `data/images/` through that POD's VPN tunnel
 
 ### Run an upgrade
 1. Open a POD's detail panel → **Upgrade** tab

@@ -10,6 +10,7 @@ pods.csv
 data/pod_state.db
 data/bootstrap/*.cfg
 data/*.har
+data/images/*.bin
 *.db
 dist/
 build/
