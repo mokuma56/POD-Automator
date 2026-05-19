@@ -856,6 +856,46 @@ def _detect_version_from_show(output):
 # Ubuntu HTTP server helpers
 # ---------------------------------------------------------------------------
 
+def _ubuntu_ensure_image(image):
+    """Ensure image exists on Ubuntu PC. If not, copy from local mounted images dir.
+    Returns True if image is ready, False on failure."""
+    local_image_path = f"/pipeline/host-data/images/{image}"
+    remote_image_path = f"{UBUNTU_IMAGE_DIR}/{image}"
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(UBUNTU_HOST, username=UBUNTU_USER, password=UBUNTU_PASS,
+                   look_for_keys=False, allow_agent=False, timeout=15)
+
+    # Check if already on Ubuntu PC
+    _, out, _ = client.exec_command(f"test -f {remote_image_path} && echo EXISTS", timeout=5)
+    if out.read().strip():
+        print(f"     Image {image} already on Ubuntu PC — skipping copy")
+        client.close()
+        return True
+
+    # Not on Ubuntu PC — copy from local mounted images dir via SFTP
+    print(f"     Image {image} not on Ubuntu PC — copying from local images dir...")
+    import os
+    if not os.path.exists(local_image_path):
+        client.close()
+        print(f"     ERROR: {local_image_path} not found — upload the image via the dashboard first")
+        return False
+
+    try:
+        sftp = client.open_sftp()
+        sftp.put(local_image_path, remote_image_path)
+        sftp.close()
+        print(f"     Image copied to Ubuntu PC successfully")
+    except Exception as e:
+        client.close()
+        print(f"     ERROR copying image to Ubuntu PC: {e}")
+        return False
+
+    client.close()
+    return True
+
+
 def _ubuntu_ensure_http_server():
     """Start python3 http.server on Ubuntu PC if not already running. Returns True on success."""
     client = paramiko.SSHClient()
@@ -934,7 +974,11 @@ def phase_switch_upgrade(switch_key):
     image = UPGRADE_IMAGE_SWITCH
     http_url = f"http://{UBUNTU_HOST}:{UBUNTU_HTTP_PORT}/{image}"
 
-    # 1. Ensure HTTP server is running on Ubuntu PC
+    # 1. Ensure image is on Ubuntu PC (copy from local if needed)
+    if not _ubuntu_ensure_image(image):
+        return False, f"Image {image} not available on Ubuntu PC and not found locally"
+
+    # 2. Ensure HTTP server is running on Ubuntu PC
     print(f"     Starting HTTP server on Ubuntu PC...")
     if not _ubuntu_ensure_http_server():
         return False, "Failed to start HTTP server on Ubuntu PC"
@@ -1084,12 +1128,16 @@ def phase_router_upgrade():
     print(f"     Router upgrade needed: {current} -> {GOLDEN_VERSION_ROUTER}")
     http_url = f"http://{UBUNTU_HOST}:{UBUNTU_HTTP_PORT}/{image}"
 
-    # 1. Ensure HTTP server running
+    # 1. Ensure image is on Ubuntu PC (copy from local if needed)
+    if not _ubuntu_ensure_image(image):
+        return False, f"Image {image} not available on Ubuntu PC and not found locally"
+
+    # 2. Ensure HTTP server running
     print(f"     Starting HTTP server on Ubuntu PC...")
     if not _ubuntu_ensure_http_server():
         return False, "Failed to start HTTP server on Ubuntu PC"
 
-    # 2. Copy image to bootflash
+    # 3. Copy image to bootflash
     print(f"     Copying image to router bootflash: (~10-15 min)...")
     try:
         client = paramiko.SSHClient()
