@@ -32,7 +32,9 @@ def check_pod_vpn(pod_id):
                     return {"status": "connected", "detail": "Docker VPN healthy"}
                 elif h in ("starting", ""):
                     return {"status": "connecting", "detail": "Docker VPN starting"}
-                return {"status": "connected", "detail": "Docker VPN up"}
+                elif h == "unhealthy":
+                    return {"status": "disconnected", "detail": "Docker VPN unhealthy"}
+                return {"status": "connecting", "detail": "Docker VPN up"}
             else:
                 return {"status": "disconnected", "detail": f"Docker: {status[:80]}"}
     except (subprocess.TimeoutExpired, FileNotFoundError):
