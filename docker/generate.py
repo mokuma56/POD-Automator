@@ -186,6 +186,24 @@ def action_down(pods):
             print(f" ❌ {e}")
         time.sleep(0.3)
 
+    # Reset DB state for all torn-down PODs
+    try:
+        import sqlite3 as _sqlite3
+        db_path = Path(__file__).parent.parent / "data" / "pod_state.db"
+        if db_path.exists():
+            pod_ids = [p["pod_id"] for p in pods]
+            conn = _sqlite3.connect(str(db_path))
+            conn.execute("PRAGMA journal_mode=WAL")
+            for pod_id in pod_ids:
+                conn.execute("DELETE FROM pipeline_steps WHERE pod_id=?", (pod_id,))
+                conn.execute("DELETE FROM pipeline_logs WHERE pod_id=?", (pod_id,))
+                conn.execute("UPDATE pods SET status='pending', updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
+            conn.commit()
+            conn.close()
+            print(f"  DB state reset for {len(pod_ids)} POD(s) ✅")
+    except Exception as e:
+        print(f"  DB reset failed: {e}")
+
 
 def action_status(pods):
     for p in pods:
