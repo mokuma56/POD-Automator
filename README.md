@@ -10,12 +10,13 @@ Upload a session CSV, connect per-POD VPNs, and run parallel pipelines across an
 ## What It Does
 
 ### SD-WAN Router Onboarding (C8231-G2)
-Runs a 16-step automated pipeline that takes a factory-reset C8231-G2 router through
+Runs the first 11 steps of the pipeline to take a factory-reset C8231-G2 router through
 the full SD-WAN onboarding process on vManage — Quick Connect, license assignment,
 config group association, variable injection, config deploy, bootstrap generation,
 bootstrap delivery, and controller-mode enable. Each step is tracked individually
 in the dashboard with live logs, retry capability, and soft-fail handling so the
-pipeline continues even if non-critical steps fail.
+pipeline continues even if non-critical steps fail. The remaining 5 steps cover
+switch verification, connectivity testing, and cdFMC validation.
 
 ### Per-POD VPN Isolation
 Each POD runs inside its own Docker Compose stack with a dedicated OpenConnect VPN
