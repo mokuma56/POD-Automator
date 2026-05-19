@@ -1235,6 +1235,8 @@ DASHBOARD_HTML = """
   th { text-align: left; padding: 8px; background: #112240;
        color: #8899aa; font-weight: 600; text-transform: uppercase; font-size: 11px;
        position: sticky; top: 0; }
+  th[data-col]:hover { color: #02c8ff; background: #162a45; }
+  .sort-icon { font-size: 10px; opacity: 0.6; margin-left: 3px; }
   td { padding: 8px; border-bottom: 1px solid #1a2d4a; }
   tr:hover td { background: #1a2d4a; }
   .badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; }
@@ -1412,15 +1414,15 @@ DASHBOARD_HTML = """
 
   <table>
     <thead>
-      <tr>
-        <th>POD</th>
-        <th>Session</th>
-        <th>Status</th>
-        <th>VPN</th>
+      <tr id="sort-header">
+        <th data-col="pod_id">POD <span class="sort-icon">⇅</span></th>
+        <th data-col="session_id">Session <span class="sort-icon">⇅</span></th>
+        <th data-col="status">Status <span class="sort-icon">⇅</span></th>
+        <th data-col="vpn_status">VPN <span class="sort-icon">⇅</span></th>
         <th>Serial</th>
-        <th>SD-WAN</th>
+        <th data-col="sdwan_online">SD-WAN <span class="sort-icon">⇅</span></th>
         <th>SCC Org</th>
-        <th>Pipeline</th>
+        <th data-col="pipeline">Pipeline <span class="sort-icon">⇅</span></th>
         <th>Actions</th>
         <th>Notes</th>
       </tr>
@@ -1520,6 +1522,25 @@ async function load() {
   const pods = await r.json();
   renderStats(pods);
   renderTable(pods);
+  updateSortHeaders();
+  // Wire sort click handlers once
+  if (!document.getElementById('sort-header').dataset.bound) {
+    document.getElementById('sort-header').dataset.bound = '1';
+    document.querySelectorAll('#sort-header th[data-col]').forEach(th => {
+      th.style.cursor = 'pointer';
+      th.style.userSelect = 'none';
+      th.addEventListener('click', () => {
+        if (sortCol === th.dataset.col) {
+          sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+          sortCol = th.dataset.col;
+          sortDir = 'asc';
+        }
+        updateSortHeaders();
+        renderTable(pods);
+      });
+    });
+  }
   const detailId = document.getElementById('detail-pod-id').textContent;
   if (detailId) showPipeline(detailId);
 }
@@ -1586,9 +1607,71 @@ function pipelinePhase(p) {
   return { pct, text: (done + 1) + '/' + phases.length + ' pending', state: 'pending', skipped };
 }
 
+// ── Sort state ───────────────────────────────────────────────────
+let sortCol = 'pod_id';
+let sortDir = 'asc';
+
+function statusRank(p) {
+  // Group order: failed/skipped → running → partial/warn → ready → pending
+  const pipe = pipelinePhase(p);
+  if (pipe.state === 'failed') return 0;
+  if (pipe.state === 'running') return 1;
+  if (pipe.state === 'warn') return 2;
+  if (pipe.state === 'done') return 3;
+  return 4;
+}
+
+function podNum(p) {
+  const m = (p.pod_id || '').match(/(\d+)$/);
+  return m ? parseInt(m[1]) : 9999;
+}
+
+function sortPods(pods) {
+  pods.sort((a, b) => {
+    let av, bv;
+    if (sortCol === 'pod_id') {
+      av = podNum(a); bv = podNum(b);
+    } else if (sortCol === 'session_id') {
+      av = a.session_id || ''; bv = b.session_id || '';
+    } else if (sortCol === 'status') {
+      av = statusRank(a); bv = statusRank(b);
+    } else if (sortCol === 'vpn_status') {
+      const rank = v => v === 'connected' ? 0 : v === 'connecting' ? 1 : 2;
+      av = rank(a.vpn_status); bv = rank(b.vpn_status);
+    } else if (sortCol === 'sdwan_online') {
+      av = a.sdwan_online === 'yes' ? 0 : 1;
+      bv = b.sdwan_online === 'yes' ? 0 : 1;
+    } else if (sortCol === 'pipeline') {
+      av = statusRank(a); bv = statusRank(b);
+    } else {
+      av = podNum(a); bv = podNum(b);
+    }
+    if (av < bv) return sortDir === 'asc' ? -1 : 1;
+    if (av > bv) return sortDir === 'asc' ? 1 : -1;
+    return podNum(a) - podNum(b); // stable secondary sort by POD number
+  });
+  return pods;
+}
+
+function updateSortHeaders() {
+  document.querySelectorAll('#sort-header th[data-col]').forEach(th => {
+    const icon = th.querySelector('.sort-icon');
+    if (!icon) return;
+    if (th.dataset.col === sortCol) {
+      icon.textContent = sortDir === 'asc' ? '↑' : '↓';
+      th.style.color = '#02c8ff';
+    } else {
+      icon.textContent = '⇅';
+      th.style.color = '';
+    }
+  });
+}
+
 function renderTable(pods) {
+  // Apply current sort
+  const sorted = sortPods([...pods]);
   const tbody = document.getElementById('pod-rows');
-  tbody.innerHTML = pods.map(p => {
+  tbody.innerHTML = sorted.map(p => {
     const pipe = pipelinePhase(p);
     const serial = p.router_serial || '-';
     const barColor = pipe.state === 'done' ? '#00e68a'
