@@ -849,8 +849,8 @@ def api_upgrade_config_set():
 
 @app.route("/api/upgrade/upload-image", methods=["POST"])
 def api_upgrade_upload_image():
-    """Receive a .bin image and SCP it to the Ubuntu automation PC."""
-    import tempfile, shutil
+    """Receive a .bin image and SCP it to the Ubuntu automation PC via an active VPN container."""
+    import tempfile, shutil, subprocess as _sp
     if "file" not in request.files:
         return jsonify({"status": "error", "message": "No file provided"}), 400
     f = request.files["file"]
@@ -862,20 +862,51 @@ def api_upgrade_upload_image():
     tmp = Path(tempfile.mkdtemp()) / filename
     f.save(str(tmp))
 
+    # Find an active VPN container to proxy the upload through
+    def _find_vpn_container():
+        try:
+            out = _sp.check_output(["docker", "ps", "--filter", "name=vpn-POD-",
+                                    "--format", "{{.Names}}"], text=True).strip()
+            for name in out.splitlines():
+                if name.strip():
+                    return name.strip()
+        except Exception:
+            pass
+        return None
+
     def _upload():
         try:
-            import paramiko as _p
-            transport = _p.Transport(("198.18.134.12", 22))
-            transport.connect(username="cisco", password="C1sco12345")
-            sftp = _p.SFTPClient.from_transport(transport)
-            remote_path = f"/home/cisco/{filename}"
-            sftp.put(str(tmp), remote_path)
-            sftp.close(); transport.close()
+            vpn_container = _find_vpn_container()
+            if not vpn_container:
+                raise Exception("No active VPN container found — connect a VPN first")
+
+            # Copy file into the VPN container then SCP to Ubuntu PC from inside it
+            remote_tmp = f"/tmp/{filename}"
+            _sp.check_call(["docker", "cp", str(tmp), f"{vpn_container}:{remote_tmp}"])
+
+            # SCP from container to Ubuntu PC
+            scp_cmd = (
+                f"import paramiko, os; "
+                f"t=paramiko.Transport(('198.18.134.12',22)); "
+                f"t.connect(username='cisco',password='C1sco12345'); "
+                f"s=paramiko.SFTPClient.from_transport(t); "
+                f"s.put('{remote_tmp}','/home/cisco/{filename}'); "
+                f"s.close(); t.close(); "
+                f"os.unlink('{remote_tmp}'); "
+                f"print('OK')"
+            )
+            result = _sp.check_output(
+                ["docker", "exec", vpn_container, "python3", "-c", scp_cmd],
+                text=True, timeout=300
+            ).strip()
+            if result != "OK":
+                raise Exception(f"Upload via container failed: {result}")
+
             tmp.unlink(missing_ok=True)
-            # Update DB with new image info
+            # Update DB
             c = _db()
-            c.execute("""UPDATE upgrade_config SET image_filename=?, image_path=?, updated_at=datetime('now')
-                         WHERE device_type=?""", (filename, remote_path, device_type))
+            c.execute("UPDATE upgrade_config SET image_filename=?, image_path=?, updated_at=datetime('now') WHERE device_type=?",
+                      (filename, f"/home/cisco/{filename}", device_type))
             c.commit(); c.close()
         except Exception as e:
             tmp.unlink(missing_ok=True)
