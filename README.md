@@ -3,7 +3,7 @@
 Automates the Hardware POD stack for the Cisco One Experience Lab. Fully orchestrates
 multi-POD SD-WAN onboarding, switch baseline verification, software upgrades, cdFMC
 deployment verification, and Active Directory validation — all from a single web dashboard.
-Upload a session CSV, connect per-POD VPNs, and run parallel pipelines across up to 16 PODs.
+Upload a session CSV, connect per-POD VPNs, and run parallel pipelines across any number of PODs.
 
 ---
 
