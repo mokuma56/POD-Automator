@@ -1084,6 +1084,18 @@ def delete_pod(pod_id):
     return jsonify({"status": "ok", "message": f"{pod_id} deleted"})
 
 
+@app.route("/api/pod-assigned/<pod_id>", methods=["POST"])
+def pod_assigned(pod_id):
+    """Update the assigned_to field for a POD."""
+    data = request.get_json(force=True)
+    assigned_to = data.get("assigned_to", "")
+    conn = _db()
+    conn.execute("UPDATE pods SET assigned_to=?, updated_at=datetime('now') WHERE pod_id=?", (assigned_to, pod_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+
 @app.route("/api/run-pod/<pod_id>", methods=["POST"])
 def run_pod(pod_id):
     """Run the pipeline for a single POD (VPN must already be connected)."""
@@ -1435,11 +1447,12 @@ DASHBOARD_HTML = """
         <th>VPN</th>
         <th>Serial</th>
         <th>SD-WAN</th>
-        <th>SCC Org</th>
-        <th>Pipeline</th>
-        <th>Actions</th>
-        <th>Notes</th>
-      </tr>
+         <th>SCC Org</th>
+         <th>Pipeline</th>
+         <th>Actions</th>
+         <th>Assigned</th>
+         <th>Notes</th>
+       </tr>
     </thead>
     <tbody id="pod-rows"></tbody>
   </table>
@@ -1682,7 +1695,8 @@ function renderTable(pods) {
          <button class="btn-reconnect" onclick="disconnectVpn('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;">Disconnect VPN</button>
          <button class="btn-reconnect" onclick="deletePod('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;background:#2a0a0a;" title="Delete POD from DB">&#x1F5D1;</button>
       </td>
-      <td class="notes" title="${(p.notes||'').replace(/"/g,'&quot;')}">${p.notes || '-'}</td>
+      <td><input type="text" value="${p.assigned_to||''}" placeholder="CCO ID" style="background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:3px 7px;width:100px;font-size:12px;" onchange="saveAssigned('${p.pod_id}', this.value)" /></td>
+     <td class="notes" title="${(p.notes||'').replace(/"/g,'&quot;')}">${p.notes || '-'}</td>
     </tr>`;
   }).join('');
 }
@@ -1706,6 +1720,14 @@ async function deletePod(podId) {
   } else {
     alert('Error: ' + (data.message || 'Unknown error'));
   }
+}
+
+async function saveAssigned(podId, value) {
+  await fetch('/api/pod-assigned/' + podId, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({assigned_to: value})
+  });
 }
 
 async function runAllPods() {
