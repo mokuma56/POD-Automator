@@ -1537,7 +1537,7 @@ async function load() {
           sortDir = 'asc';
         }
         updateSortHeaders();
-        renderTable(pods);
+        load();
       });
     });
   }
@@ -1612,13 +1612,15 @@ let sortCol = 'pod_id';
 let sortDir = 'asc';
 
 function statusRank(p) {
-  // Group order: failed/skipped → running → partial/warn → ready → pending
+  // Fine-grained rank so grouping is visible when sorted
+  // 0=failed, 1=running, 2=warn(skipped+sdwan), 3=ready(all pass), 4=partial(sdwan no steps), 5=pending
   const pipe = pipelinePhase(p);
-  if (pipe.state === 'failed') return 0;
+  if (pipe.state === 'failed')  return 0;
   if (pipe.state === 'running') return 1;
-  if (pipe.state === 'warn') return 2;
-  if (pipe.state === 'done') return 3;
-  return 4;
+  if (pipe.state === 'warn')    return 2;  // sdwan up + skipped steps
+  if (pipe.state === 'done')    return 3;  // fully ready
+  if (p.sdwan_online === 'yes') return 4;  // sdwan up but incomplete
+  return 5;                                // pending / not started
 }
 
 function podNum(p) {
