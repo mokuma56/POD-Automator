@@ -1648,7 +1648,7 @@ function sortPods(pods) {
     }
     if (av < bv) return sortDir === 'asc' ? -1 : 1;
     if (av > bv) return sortDir === 'asc' ? 1 : -1;
-    return podNum(a) - podNum(b); // stable secondary sort by POD number
+    return 0;
   });
   return pods;
 }
