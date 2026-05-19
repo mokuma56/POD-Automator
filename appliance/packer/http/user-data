@@ -1,0 +1,92 @@
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # ── Network ──────────────────────────────────────────────────────────────
+  network:
+    network:
+      version: 2
+      ethernets:
+        ens32:
+          dhcp4: true
+          dhcp-identifier: mac
+        ens33:
+          dhcp4: true
+          optional: true
+
+  # ── Storage ──────────────────────────────────────────────────────────────
+  storage:
+    layout:
+      name: lvm
+    config:
+      - type: disk
+        id: disk0
+        match:
+          size: largest
+        ptable: gpt
+        wipe: superblock
+      - type: partition
+        id: bios-boot
+        device: disk0
+        size: 1M
+        flag: bios_grub
+      - type: partition
+        id: boot-part
+        device: disk0
+        size: 1G
+      - type: partition
+        id: root-part
+        device: disk0
+        size: -1   # rest of disk
+      - type: format
+        id: boot-fs
+        fstype: ext4
+        volume: boot-part
+      - type: format
+        id: root-fs
+        fstype: ext4
+        volume: root-part
+      - type: mount
+        id: root-mount
+        device: root-fs
+        path: /
+      - type: mount
+        id: boot-mount
+        device: boot-fs
+        path: /boot
+
+  # ── Identity ─────────────────────────────────────────────────────────────
+  identity:
+    hostname: pod-automator
+    username: podmgr
+    # Password: C1sco12345  (mkpasswd --method=SHA-512)
+    password: "$6$rounds=4096$podmgr$VBkSuMeGCTbVJ0Wp8I6XjIxHD7LByH0qIcL9zA2GcgHWVMYiRiHa/M7XLg5bH2V5SWl.j8iGJ7ZD1WUiHJo1/"
+
+  # ── SSH ───────────────────────────────────────────────────────────────────
+  ssh:
+    install-server: true
+    allow-pw: true
+    authorized-keys: []
+
+  # ── Packages ─────────────────────────────────────────────────────────────
+  packages:
+    - curl
+    - git
+    - ca-certificates
+    - open-vm-tools      # VMware guest tools
+    - net-tools
+
+  # ── Late commands ─────────────────────────────────────────────────────────
+  late-commands:
+    # Allow podmgr to sudo without password (needed for install.sh and service)
+    - echo 'podmgr ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/podmgr
+    - chmod 440 /target/etc/sudoers.d/podmgr
+    # Disable swap for Docker performance
+    - swapoff -a || true
+    - sed -i '/swap/d' /target/etc/fstab || true
+
+  user-data:
+    disable_root: false
