@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openconnect \
@@ -20,11 +20,13 @@ ENV VMANAGE=198.18.133.10 \
     PYTHONUNBUFFERED=1
 
 COPY onboard.py onboard_router.py PseudocoBranches_Config-Group-Template.csv ./
+COPY docker/vpn-entrypoint.sh /vpn-entrypoint.sh
 COPY data/ ./data/
 
 # onboard_router.py has hardcoded ~/sw_projects/pod_automator/ paths
 RUN mkdir -p /root/sw_projects/pod_automator/data && \
     ln -s /pipeline/PseudocoBranches_Config-Group-Template.csv /root/sw_projects/pod_automator/ && \
-    ln -s /pipeline/data /root/sw_projects/pod_automator/data
+    ln -s /pipeline/data /root/sw_projects/pod_automator/data && \
+    chmod +x /vpn-entrypoint.sh
 
 ENTRYPOINT ["python3", "onboard.py"]
