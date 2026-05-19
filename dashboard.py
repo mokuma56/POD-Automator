@@ -702,10 +702,23 @@ def api_ad_rerun(pod_id):
 
 
 def api_ssh_terminal(pod_id, ip):
-    """Opens macOS Terminal.app with SSH to switch via docker exec through VPN container."""
-    cmd = f"docker exec -it vpn-{pod_id} sshpass -p 'C1sco12345' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null netadmin@{ip}"
-    script = f'tell app "Terminal" to do script "{cmd}"'
-    subprocess.Popen(["osascript", "-e", script])
+    """Opens macOS Terminal.app with SSH to switch via docker exec through VPN container.
+    Writes a temp shell script to avoid quoting issues with sshpass inside osascript."""
+    import tempfile, stat
+    script_content = (
+        "#!/bin/bash\n"
+        f"docker exec -it vpn-{pod_id} sshpass -p 'C1sco12345' "
+        f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"netadmin@{ip}\n"
+        "echo ''\n"
+        "read -p 'Press Enter to close...'\n"
+    )
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False, prefix='pod_ssh_')
+    tmp.write(script_content)
+    tmp.close()
+    os.chmod(tmp.name, stat.S_IRWXU)
+    apple_script = f'tell application "Terminal" to do script "{tmp.name}"'
+    subprocess.Popen(["osascript", "-e", apple_script])
     return jsonify({"status": "ok"})
 
 
