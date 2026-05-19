@@ -1,0 +1,7 @@
+# Packer build output (OVA, VMDK, manifest) — do not commit
+output-*
+*.ova
+*.vmdk
+*.ovf
+*.mf
+packer_cache/
