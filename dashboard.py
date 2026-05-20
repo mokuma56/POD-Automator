@@ -843,6 +843,7 @@ def upload_event():
     vpn_pass_col = _col("vpn_pass", "password", "vpn password", "vpn-password", "pass")
     session_col = _col("session_id", "session id", "session", "session_id", "sessionid")
     router_ip_col = _col("router_ip", "router ip", "router-ip", "router_ip", "device ip", "device_ip")
+    assigned_col = _col("assigned_to", "assigned", "cco id", "cco_id", "attendee", "student")
 
     for row in rows:
         pod_num = None
@@ -874,6 +875,7 @@ def upload_event():
         vpn_user = row.get(vpn_user_col, "") if vpn_user_col else ""
         vpn_pass = row.get(vpn_pass_col, "") if vpn_pass_col else ""
         session_id = row.get(session_col, "") if session_col else ""
+        assigned_to = (row.get(assigned_col, "").strip() if assigned_col else "")
 
         router_ip = row.get(router_ip_col, "") if router_ip_col else ""
         if not router_ip:
@@ -886,16 +888,24 @@ def upload_event():
         conn = _db()
         existing = conn.execute("SELECT pod_id FROM pods WHERE pod_id = ?", (pod_id,)).fetchone()
         if existing:
-            conn.execute("""UPDATE pods SET status='pending', device_data=?, router_serial=?,
-                vpn_host=?, vpn_user=?, vpn_pass=?, router_ip=?, session_id=?,
-                notes='Imported from event CSV', updated_at=datetime('now')
-                WHERE pod_id=?""",
-                (json.dumps(device_data), router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, pod_id))
+            # Only overwrite assigned_to if CSV provides a non-blank value
+            if assigned_to:
+                conn.execute("""UPDATE pods SET status='pending', device_data=?, router_serial=?,
+                    vpn_host=?, vpn_user=?, vpn_pass=?, router_ip=?, session_id=?, assigned_to=?,
+                    notes='Imported from event CSV', updated_at=datetime('now')
+                    WHERE pod_id=?""",
+                    (json.dumps(device_data), router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, assigned_to, pod_id))
+            else:
+                conn.execute("""UPDATE pods SET status='pending', device_data=?, router_serial=?,
+                    vpn_host=?, vpn_user=?, vpn_pass=?, router_ip=?, session_id=?,
+                    notes='Imported from event CSV', updated_at=datetime('now')
+                    WHERE pod_id=?""",
+                    (json.dumps(device_data), router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, pod_id))
         else:
             conn.execute("""INSERT INTO pods
-                (pod_id, status, device_data, router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, notes)
-                VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, 'Imported from event CSV')""",
-                (pod_id, json.dumps(device_data), router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id))
+                (pod_id, status, device_data, router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, assigned_to, notes)
+                VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 'Imported from event CSV')""",
+                (pod_id, json.dumps(device_data), router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, assigned_to))
         conn.execute("DELETE FROM pipeline_steps WHERE pod_id = ?", (pod_id,))
         conn.commit()
         conn.close()
