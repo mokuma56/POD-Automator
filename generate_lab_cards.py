@@ -188,6 +188,126 @@ def _truncate(c: canvas.Canvas, text: str, font: str, size: float, max_w: float)
     return text + "…"
 
 
+def _draw_summary_page(c: canvas.Canvas, pods: list, page_num: int, total_pages: int):
+    """Draw a single proctor summary page — one row per POD."""
+    # Page background
+    c.setFillColor(C_BG)
+    c.rect(0, 0, PAGE_W, PAGE_H, stroke=0, fill=1)
+
+    # Page header strip
+    c.setFillColor(colors.HexColor("#060d16"))
+    c.rect(0, PAGE_H - 0.22 * inch, PAGE_W, 0.22 * inch, stroke=0, fill=1)
+    c.setFillColor(C_LABEL)
+    c.setFont(FONT_REG, 6.5)
+    c.drawString(MARGIN, PAGE_H - 0.15 * inch, "CISCO CONFIDENTIAL — FOR PROCTOR USE ONLY")
+    c.drawRightString(PAGE_W - MARGIN, PAGE_H - 0.15 * inch, f"Page {page_num} of {total_pages}")
+
+    # Title block
+    TITLE_Y = PAGE_H - 0.22 * inch - 0.55 * inch
+    c.setFillColor(C_CARD_BORDER)
+    c.setFont(FONT_BOLD, 16)
+    title = "Cisco One Experience Lab — Proctor Summary"
+    c.drawCentredString(PAGE_W / 2, TITLE_Y, title)
+
+    # Accent line under title
+    c.setStrokeColor(C_CARD_BORDER)
+    c.setLineWidth(1.5)
+    c.line(MARGIN, TITLE_Y - 0.08 * inch, PAGE_W - MARGIN, TITLE_Y - 0.08 * inch)
+
+    # ── Table geometry ────────────────────────────────────────────────────
+    TABLE_TOP  = TITLE_Y - 0.22 * inch
+    ROW_H      = 0.30 * inch
+    HDR_H      = 0.34 * inch
+    COL_PAD    = 0.10 * inch
+    TABLE_W    = PAGE_W - 2 * MARGIN
+
+    # Column definitions: (header label, proportional width)
+    cols = [
+        ("POD #",       0.08),
+        ("Session #",   0.12),
+        ("CCO ID",      0.14),
+        ("VPN Host",    0.30),
+        ("VPN Username",0.18),
+        ("VPN Password",0.18),
+    ]
+    total_w = sum(w for _, w in cols)
+    col_widths = [TABLE_W * (w / total_w) for _, w in cols]
+    col_headers = [h for h, _ in cols]
+
+    # Column x positions
+    col_x = [MARGIN]
+    for cw in col_widths[:-1]:
+        col_x.append(col_x[-1] + cw)
+
+    # ── Header row ────────────────────────────────────────────────────────
+    c.setFillColor(C_HEADER_BG)
+    c.roundRect(MARGIN, TABLE_TOP - HDR_H, TABLE_W, HDR_H, radius=5, stroke=0, fill=1)
+
+    c.setFillColor(C_HEADER_TEXT)
+    c.setFont(FONT_BOLD, 9)
+    for i, header in enumerate(col_headers):
+        c.drawString(col_x[i] + COL_PAD, TABLE_TOP - HDR_H + (HDR_H - 9) / 2 + 1, header)
+
+    # ── Data rows ─────────────────────────────────────────────────────────
+    row_fields = [
+        lambda p: p.get("pod_id", ""),
+        lambda p: p.get("session_id", ""),
+        lambda p: p.get("assigned_to", "") or "—",
+        lambda p: p.get("vpn_host", ""),
+        lambda p: p.get("vpn_username", ""),
+        lambda p: p.get("vpn_password", ""),
+    ]
+
+    for r, pod in enumerate(pods):
+        ry = TABLE_TOP - HDR_H - (r + 1) * ROW_H
+
+        # Alternating row background
+        if r % 2 == 0:
+            c.setFillColor(C_CARD_BG)
+        else:
+            c.setFillColor(C_ROW_ALT)
+        c.rect(MARGIN, ry, TABLE_W, ROW_H, stroke=0, fill=1)
+
+        # Row divider
+        c.setStrokeColor(C_DIVIDER)
+        c.setLineWidth(0.4)
+        c.line(MARGIN, ry + ROW_H, MARGIN + TABLE_W, ry + ROW_H)
+
+        text_y = ry + (ROW_H - 9) / 2 + 1
+
+        for i, fn in enumerate(row_fields):
+            val = str(fn(pod))
+            # POD column gets Cisco blue bold treatment
+            if i == 0:
+                c.setFillColor(C_POD_NUM)
+                c.setFont(FONT_BOLD, 9)
+            else:
+                c.setFillColor(C_VALUE)
+                c.setFont(FONT_REG, 9)
+            val_str = _truncate(c, val, FONT_BOLD if i == 0 else FONT_REG, 9,
+                                col_widths[i] - COL_PAD * 2)
+            c.drawString(col_x[i] + COL_PAD, text_y, val_str)
+
+    # Table outer border
+    total_rows = len(pods)
+    table_h = HDR_H + total_rows * ROW_H
+    c.setStrokeColor(C_CARD_BORDER)
+    c.setLineWidth(1.2)
+    c.roundRect(MARGIN, TABLE_TOP - table_h, TABLE_W, table_h, radius=5, stroke=1, fill=0)
+
+    # Vertical column dividers
+    c.setStrokeColor(C_DIVIDER)
+    c.setLineWidth(0.4)
+    for i in range(1, len(col_x)):
+        c.line(col_x[i], TABLE_TOP - table_h, col_x[i], TABLE_TOP)
+
+    # Footer note
+    c.setFillColor(C_TAGLINE)
+    c.setFont(FONT_OBLIQ, 7.5)
+    note = "Proctor reference only — do not distribute to participants"
+    c.drawCentredString(PAGE_W / 2, MARGIN, note)
+
+
 def generate_pdf(pods: list) -> bytes:
     """
     Generate the lab detail PDF.
@@ -203,6 +323,8 @@ def generate_pdf(pods: list) -> bytes:
     c.setAuthor("Cisco One Experience Lab Automator")
 
     per_page = COLS * ROWS  # 4
+    card_pages = (len(pods) + per_page - 1) // per_page
+    total_pages = card_pages + 1  # +1 for summary page
 
     for page_start in range(0, len(pods), per_page):
         page_pods = pods[page_start: page_start + per_page]
@@ -218,14 +340,15 @@ def generate_pdf(pods: list) -> bytes:
         c.setFont(FONT_REG, 6.5)
         c.drawString(MARGIN, PAGE_H - 0.15 * inch, "CISCO CONFIDENTIAL — FOR PROCTOR USE ONLY")
         page_num = page_start // per_page + 1
-        total_pages = (len(pods) + per_page - 1) // per_page
-        pn = f"Page {page_num} of {total_pages}"
-        c.drawRightString(PAGE_W - MARGIN, PAGE_H - 0.15 * inch, pn)
+        c.drawRightString(PAGE_W - MARGIN, PAGE_H - 0.15 * inch, f"Page {page_num} of {total_pages}")
 
         for i, pod in enumerate(page_pods):
             _draw_card(c, i, pod)
 
         c.showPage()
+
+    # Final page — proctor summary table
+    _draw_summary_page(c, pods, total_pages, total_pages)
 
     c.save()
     return buf.getvalue()
