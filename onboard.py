@@ -88,6 +88,35 @@ else:
 pod_id = os.environ.get("POD_ID", f"POD-{SERIAL}")
 DB_PATH = "/pipeline/host-data/pod_state.db"
 
+# ── Pipeline helpers ─────────────────────────────────────────────
+def live_log(msg):
+    """Write a log line to the pipeline_logs table."""
+    try:
+        import sqlite3 as _sq
+        c = _sq.connect(DB_PATH)
+        c.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
+        c.commit(); c.close()
+    except Exception:
+        pass
+
+def report_step(step_name, status, result=""):
+    """Write a step status update to pipeline_steps table."""
+    try:
+        import sqlite3 as _sq
+        c = _sq.connect(DB_PATH)
+        c.execute("""
+            INSERT OR REPLACE INTO pipeline_steps
+                (pod_id, step_name, status, started_at, completed_at, result)
+            VALUES (?, ?, ?,
+                COALESCE((SELECT started_at FROM pipeline_steps WHERE pod_id=? AND step_name=?), datetime('now')),
+                CASE WHEN ? IN ('completed','failed','skipped') THEN datetime('now') ELSE NULL END,
+                ?)
+        """, (pod_id, step_name, status, pod_id, step_name, status, result))
+        c.execute("UPDATE pods SET updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
+        c.commit(); c.close()
+    except Exception as e:
+        print(f"  Warning: report_step failed: {e}")
+
 # Write serial to dashboard DB now that pod_id and DB_PATH are defined
 try:
     import sqlite3 as _sqlite3
