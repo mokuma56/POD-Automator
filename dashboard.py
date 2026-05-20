@@ -880,11 +880,7 @@ def upload_event():
 
         router_ip = row.get(router_ip_col, "") if router_ip_col else ""
         if not router_ip:
-            try:
-                n = int(pod_num)
-                router_ip = f"198.18.133.{21 + n}"
-            except ValueError:
-                router_ip = ""
+            router_ip = "198.18.133.25"  # all PODs share the same router IP, isolated by per-POD VPN
 
         conn = _db()
         existing = conn.execute("SELECT pod_id FROM pods WHERE pod_id = ?", (pod_id,)).fetchone()
