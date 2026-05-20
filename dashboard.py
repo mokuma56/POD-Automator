@@ -1749,7 +1749,7 @@ function renderTable(pods) {
       : '<span class="badge pending">Pending</span>';
     return `<tr>
       <td class="pod-id" onclick="showPipeline('${p.pod_id}')">
-        ${p.pod_number ? '<span style="color:#00bceb;font-weight:700">POD-' + p.pod_number + '</span><br><span style="color:#445566;font-size:10px">' + p.pod_id + '</span>' : p.pod_id}
+        ${p.pod_number ? '<span style="color:#00bceb;font-weight:700">POD-' + p.pod_number + '</span><br><span style="color:#445566;font-size:10px">ID:' + p.pod_id.replace('POD-','') + '</span>' : p.pod_id}
       </td>
       <td><input type="text" value="${p.assigned_to||''}" placeholder="CCO ID" style="background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:3px 7px;width:100px;font-size:12px;" onchange="saveAssigned('${p.pod_id}', this.value)" /></td>
       <td style="font-size:11px;color:#667788">${p.session_id || ''}</td>
@@ -1873,7 +1873,7 @@ async function showPipeline(podId) {
   // Show confirmed POD number if available, with pod_id as sub-label
   const podData = window._lastPods ? window._lastPods.find(p => p.pod_id === podId) : null;
   const podLabel = (podData && podData.pod_number)
-    ? 'POD-' + podData.pod_number + ' \u2014 ' + podId
+    ? 'POD-' + podData.pod_number + ' (ID:' + podData.pod_id.replace('POD-','') + ')'
     : podId;
   document.getElementById('detail-pod-id').textContent = podLabel;
   panel.style.display = 'block';
