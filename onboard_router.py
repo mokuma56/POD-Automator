@@ -1363,31 +1363,49 @@ def phase_cdfmc_check():
     2. Read terraform.tasks.logs — verify 'Full infrastructure deployed'.
     3. Read terraform.tfvars  — extract cdfmc_host (SCC org).
     4. Hit the SCC/cdFMC API to confirm FTD device is Online.
+    Retries up to 10 times (2 min apart) to handle Terraform still running.
     Returns (ok, result_string).
     """
     import re as _re
 
-    print(f"     Connecting to automation PC {CDFMC_AUTOMATION_HOST}...")
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            CDFMC_AUTOMATION_HOST,
-            username=CDFMC_AUTOMATION_USER,
-            password=CDFMC_AUTOMATION_PASS,
-            look_for_keys=False, allow_agent=False, timeout=15,
-        )
-    except Exception as e:
-        return False, f"SSH to automation PC failed: {e}"
+    MAX_ATTEMPTS = 10
+    RETRY_WAIT   = 120  # seconds between retries
 
-    def _run(cmd):
-        _, out, err = client.exec_command(cmd, timeout=20)
-        return out.read().decode(errors="replace").strip()
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"     cdFMC check attempt {attempt}/{MAX_ATTEMPTS} — connecting to {CDFMC_AUTOMATION_HOST}...")
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                CDFMC_AUTOMATION_HOST,
+                username=CDFMC_AUTOMATION_USER,
+                password=CDFMC_AUTOMATION_PASS,
+                look_for_keys=False, allow_agent=False, timeout=15,
+            )
+        except Exception as e:
+            print(f"     SSH to automation PC failed: {e}")
+            if attempt < MAX_ATTEMPTS:
+                print(f"     Retrying in {RETRY_WAIT}s...")
+                time.sleep(RETRY_WAIT)
+                continue
+            return False, f"SSH to automation PC failed: {e}"
 
-    # --- 1. Check terraform log for success ---
-    log_tail = _run(f"tail -30 {CDFMC_LAB_DIR}/terraform.tasks.logs")
-    deployed = "Full infrastructure deployed" in log_tail
-    print(f"     Terraform log: {'✓ deployed' if deployed else '✗ not deployed'}")
+        def _run(cmd):
+            _, out, err = client.exec_command(cmd, timeout=20)
+            return out.read().decode(errors="replace").strip()
+
+        # --- 1. Check terraform log for success ---
+        log_tail = _run(f"tail -30 {CDFMC_LAB_DIR}/terraform.tasks.logs")
+        deployed = "Full infrastructure deployed" in log_tail
+        print(f"     Terraform log: {'✓ deployed' if deployed else '✗ not deployed yet'}")
+
+        if not deployed:
+            client.close()
+            if attempt < MAX_ATTEMPTS:
+                print(f"     Terraform not done yet — retrying in {RETRY_WAIT}s...")
+                time.sleep(RETRY_WAIT)
+                continue
+            return False, "Terraform deployment not complete after max retries"
 
     # --- 2. Extract cdfmc_host / scc_org from tfvars ---
     tfvars_raw = _run(f"cat {CDFMC_LAB_DIR}/terraform.tfvars")
