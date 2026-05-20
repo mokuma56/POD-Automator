@@ -2070,7 +2070,7 @@ async function loadSwitches(podId) {
     return '<div class="switch-card ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
       '<div class="switch-card-title">' +
         '<span class="role-tag ' + roleClass(sw.name) + '">' + roleLabel + '</span>' +
-        '<span class="device-name" onclick="' + (sw.ip ? 'openTerminal(' + JSON.stringify(podId) + ',' + JSON.stringify(sw.ip) + ')' : '') + '" title="' + (sw.ip ? 'Click to open SSH terminal' : '') + '">' + escHtml(sw.name) + '</span>' +
+        '<span class="device-name"' + (sw.ip ? ' data-pod-id="' + escHtml(podId) + '" data-ip="' + escHtml(sw.ip) + '"' : '') + ' title="' + (sw.ip ? 'Click to open SSH terminal' : '') + '">' + escHtml(sw.name) + '</span>' +
         '<span class="device-model">' + escHtml(sw.model || '') + '</span>' +
         (sw.step_status === 'running' ? '<span class="badge" style="margin-left:auto;background:#02c8ff22;color:#02c8ff;border:1px solid #02c8ff55;">⟳ checking</span>' : '') +
         (sw.step_status === 'skipped' ? '<span class="badge warn" style="margin-left:auto">WARN</span>' : '') +
@@ -2080,6 +2080,11 @@ async function loadSwitches(podId) {
       checksHtml +
       '</div>';
   }).join('');
+
+  // Attach click handlers after innerHTML set (avoids inline onclick double-quote quoting issues)
+  grid.querySelectorAll('.device-name[data-ip]').forEach(el => {
+    el.addEventListener('click', () => openTerminal(el.dataset.podId, el.dataset.ip));
+  });
 }
 
 async function openTerminal(podId, ip) {
