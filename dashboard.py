@@ -65,6 +65,8 @@ def _migrate():
             session_id TEXT DEFAULT '',
             notes TEXT DEFAULT '',
             scc_org TEXT DEFAULT '',
+            assigned_to TEXT DEFAULT '',
+            pod_number TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -72,6 +74,15 @@ def _migrate():
     # Migration: add scc_org if upgrading from older schema
     try:
         conn.execute("ALTER TABLE pods ADD COLUMN scc_org TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN assigned_to TEXT DEFAULT ''")
+    except Exception:
+        pass
+    # Migration: add pod_number — AD-confirmed authoritative POD number
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN pod_number TEXT DEFAULT ''")
     except Exception:
         pass
     conn.execute("""
@@ -180,6 +191,7 @@ def api_generate_lab_pdf():
         p = dict(p)
         pods.append({
             "pod_id":       p.get("pod_id", ""),
+            "pod_number":   p.get("pod_number", ""),
             "session_id":   p.get("session_id", ""),
             "scc_org":      p.get("scc_org", ""),
             "assigned_to":  p.get("assigned_to", ""),
@@ -1561,6 +1573,7 @@ DASHBOARD_HTML = """
 
 <script>
 const PIPELINE_ORDER = [
+  "detect_pod_number",
   "verify_router",
   "reset_device",
   "quick_connect",
@@ -1601,6 +1614,7 @@ async function handleFile(file) {
 async function load() {
   const r = await fetch('/api/pods');
   const pods = await r.json();
+  window._lastPods = pods;  // cache for detail panel POD# display
   renderStats(pods);
   renderTable(pods);
   updateSortHeaders();
@@ -1734,7 +1748,9 @@ function renderTable(pods) {
       : p.sdwan_online === 'yes'            ? '<span class="badge running">Partial</span>'
       : '<span class="badge pending">Pending</span>';
     return `<tr>
-      <td class="pod-id" onclick="showPipeline('${p.pod_id}')">${p.pod_id}</td>
+      <td class="pod-id" onclick="showPipeline('${p.pod_id}')">
+        ${p.pod_number ? '<span style="color:#00bceb;font-weight:700">POD-' + p.pod_number + '</span><br><span style="color:#445566;font-size:10px">' + p.pod_id + '</span>' : p.pod_id}
+      </td>
       <td><input type="text" value="${p.assigned_to||''}" placeholder="CCO ID" style="background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:3px 7px;width:100px;font-size:12px;" onchange="saveAssigned('${p.pod_id}', this.value)" /></td>
       <td style="font-size:11px;color:#667788">${p.session_id || ''}</td>
       <td>${readyBadge}</td>
@@ -1854,7 +1870,12 @@ function formatDur(start, end) {
 
 async function showPipeline(podId) {
   const panel = document.getElementById('detail-panel');
-  document.getElementById('detail-pod-id').textContent = podId;
+  // Show confirmed POD number if available, with pod_id as sub-label
+  const podData = window._lastPods ? window._lastPods.find(p => p.pod_id === podId) : null;
+  const podLabel = (podData && podData.pod_number)
+    ? 'POD-' + podData.pod_number + ' \u2014 ' + podId
+    : podId;
+  document.getElementById('detail-pod-id').textContent = podLabel;
   panel.style.display = 'block';
 
    loadSteps(podId);

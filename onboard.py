@@ -136,6 +136,7 @@ else:
     s = onboard_router.vmanage_session()
 
 steps = [
+    ("detect_pod_number",  onboard_router.phase_detect_pod_number),
     ("verify_router",      lambda: True),
     ("reset_device",       lambda: onboard_router.phase_reset(s)),
     ("quick_connect",      lambda: onboard_router.phase_quick_connect(s)),
@@ -158,6 +159,7 @@ steps = [
 # controller_mode_enable and verify_online are soft-fail so switch checks always run
 # even if the router fails to come up (e.g. vBond/vSmart down)
 SOFT_FAIL_STEPS = {
+    "detect_pod_number",   # soft-fail — AD may not be provisioned yet; pipeline must continue
     "controller_mode_enable",
     "verify_online",
     "verify_border_spine",
@@ -174,7 +176,9 @@ for step_name, func in steps:
         continue
 
     # Skip steps already completed in a previous run
-    if step_name in _completed_steps:
+    # detect_pod_number always re-runs so it self-corrects if AD was not yet provisioned
+    ALWAYS_RERUN = {"detect_pod_number"}
+    if step_name in _completed_steps and step_name not in ALWAYS_RERUN:
         print(f"  ↷ {step_name} skipped (already completed)")
         continue
 
