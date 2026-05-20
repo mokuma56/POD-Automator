@@ -788,6 +788,7 @@ def api_ad_rerun(pod_id):
     return jsonify({"status": "ok", "message": f"AD re-run started for {pod_id}"})
 
 
+@app.route("/api/ssh/terminal/<pod_id>/<ip>", methods=["POST"])
 def api_ssh_terminal(pod_id, ip):
     """Opens macOS Terminal.app with SSH to switch via docker exec through VPN container.
     Writes a temp shell script to avoid quoting issues with sshpass inside osascript."""
