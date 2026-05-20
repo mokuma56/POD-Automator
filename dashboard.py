@@ -1379,6 +1379,9 @@ DASHBOARD_HTML = """
   .step-card .step-name { font-size: 12px; margin: 4px 0; font-weight: 600; }
   .step-card .step-result { font-size: 10px; color: #667788; word-break: break-all; max-height: 40px; overflow: hidden; }
   .step-dur { font-size: 11px; color: #02c8ff; margin-top: 4px; }
+  .step-reboot-bar-bg { background: #0f2236; border-radius: 4px; height: 5px; margin-top: 6px; overflow: hidden; }
+  .step-reboot-bar-fill { height: 5px; border-radius: 4px; background: linear-gradient(90deg, #00bceb, #00e68a); transition: width 1s linear; }
+  .step-reboot-eta { font-size: 10px; color: #667788; margin-top: 3px; }
   .elapsed-timer { font-size: 13px; color: #00e68a; font-weight: normal; margin-left: 12px; }
   .timer-label { color: #667788; margin-right: 4px; }
 
@@ -1524,7 +1527,7 @@ DASHBOARD_HTML = """
 
   <div class="detail-panel" id="detail-panel">
     <div class="detail-header">
-      <h3><span id="detail-pod-id"></span> <span id="elapsed-timer" class="elapsed-timer"></span></h3>
+      <h3><span id="detail-pod-id" data-pod-id=""></span> <span id="elapsed-timer" class="elapsed-timer"></span></h3>
       <span class="close-btn" onclick="closeDetail()">&#x2715; Close</span>
     </div>
     <div class="progress-wrap" id="progress-wrap">
@@ -1626,7 +1629,8 @@ async function load() {
       renderTable(pods);
     });
   }
-  const detailId = document.getElementById('detail-pod-id').textContent;
+  const detailEl = document.getElementById('detail-pod-id');
+  const detailId = detailEl ? detailEl.dataset.podId : '';
   if (detailId) showPipeline(detailId);
 }
 
@@ -1870,12 +1874,13 @@ function formatDur(start, end) {
 
 async function showPipeline(podId) {
   const panel = document.getElementById('detail-panel');
-  // Show confirmed POD number if available, with pod_id as sub-label
   const podData = window._lastPods ? window._lastPods.find(p => p.pod_id === podId) : null;
   const podLabel = (podData && podData.pod_number)
     ? 'POD-' + podData.pod_number + ' (ID:' + podData.pod_id.replace('POD-','') + ')'
     : podId;
-  document.getElementById('detail-pod-id').textContent = podLabel;
+  const el = document.getElementById('detail-pod-id');
+  el.textContent = podLabel;
+  el.dataset.podId = podId;  // always store the real pod_id separately
   panel.style.display = 'block';
 
    loadSteps(podId);
@@ -1929,6 +1934,10 @@ async function loadSteps(podId) {
                              : running ? 'Running — ' + done + '/' + total
                              : done === total ? 'Complete!' : 'Pending — ' + done + '/' + total;
 
+  // Estimated duration for controller_mode_enable (router reboot into SD-WAN mode)
+  // Based on observed run 2026-05-20: 534s. Round up to 540s for comfort.
+  const CTRL_MODE_EST_SECS = 540;
+
   const grid = document.getElementById('pipeline-grid');
   grid.innerHTML = PIPELINE_ORDER.map(name => {
     const step = steps.find(s => s.step_name === name);
@@ -1939,12 +1948,30 @@ async function loadSteps(podId) {
     const duration = formatDur(step?.started_at, step?.completed_at);
     const durHtml = duration ? '<div class="step-dur">' + duration + '</div>' : '';
     const cardBorder = st === 'skipped' ? 'border-left:3px solid #ffa502;' : st === 'failed' ? 'border-left:3px solid #ff4757;' : '';
+
+    // Live elapsed + progress bar for controller_mode_enable while running
+    let rebootHtml = '';
+    if (name === 'controller_mode_enable' && st === 'running' && step?.started_at) {
+      const elapsedSec = Math.floor((Date.now() - new Date(step.started_at + 'Z').getTime()) / 1000);
+      const pct = Math.min(99, Math.round(elapsedSec / CTRL_MODE_EST_SECS * 100));
+      const remaining = Math.max(0, CTRL_MODE_EST_SECS - elapsedSec);
+      const remStr = remaining > 0 ? '~' + Math.ceil(remaining / 60) + 'm remaining' : 'any moment now...';
+      const elStr = elapsedSec >= 60
+        ? Math.floor(elapsedSec/60) + 'm ' + (elapsedSec%60) + 's elapsed'
+        : elapsedSec + 's elapsed';
+      rebootHtml =
+        '<div class="step-dur" style="color:#ffa502">' + elStr + '</div>' +
+        '<div class="step-reboot-bar-bg"><div class="step-reboot-bar-fill" style="width:' + pct + '%"></div></div>' +
+        '<div class="step-reboot-eta">' + pct + '% \u2014 ' + remStr + '</div>';
+    }
+
     return '<div class="step-card" style="' + cardBorder + '">' +
       '<div class="step-num">Phase ' + idx + '/' + total + '</div>' +
       '<div class="step-name">' + label + '</div>' +
       pipelineBadge(st) +
       '<div class="step-result">' + result + '</div>' +
       durHtml +
+      rebootHtml +
       '<span class="started-at" data-time="' + (step?.started_at || '') + '" style="display:none"></span>' +
       '</div>';
   }).join('');
@@ -2394,7 +2421,9 @@ function switchTab(btn, name) {
 
 function closeDetail() {
   document.getElementById('detail-panel').style.display = 'none';
-  document.getElementById('detail-pod-id').textContent = '';
+  const el = document.getElementById('detail-pod-id');
+  el.textContent = '';
+  el.dataset.podId = '';
   if (logPollId) clearInterval(logPollId);
 }
 
