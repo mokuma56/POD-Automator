@@ -1291,6 +1291,62 @@ def _ad_query_users():
     return results
 
 
+def phase_detect_pod_number():
+    """
+    Query AD for Kit/Lee/Pat/Nik and extract the authoritative POD number
+    from their email subdomain (e.g. nik@rtp16.corp.pseudoco.com → POD# 16).
+
+    Writes the confirmed number to pods.pod_number in the DB.
+    Soft-fail: if AD is unreachable or users not yet provisioned, returns
+    (False, reason) so the pipeline continues without blocking.
+    """
+    import re, sqlite3
+
+    DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    POD_ID  = os.environ.get("POD_ID", "")
+
+    try:
+        users = _ad_query_users()
+    except Exception as e:
+        return False, f"AD query failed — POD# unconfirmed: {e}"
+
+    if not users:
+        return False, "AD returned no users for Kit/Lee/Pat/Nik — POD not yet provisioned"
+
+    detected = None
+    evidence = []
+    for u in users:
+        mail = u.get("mail", "")
+        # Match rtp<N> or sjc<N> subdomain pattern: user@rtp16.corp.pseudoco.com
+        m = re.search(r'@[a-z]+(\d+)\.corp\.pseudoco\.com', mail, re.I)
+        if m:
+            detected = m.group(1)
+            evidence.append(f"{u['sam']}={mail}")
+            break  # all 4 users should match the same number; first hit is enough
+
+    if not detected:
+        # Users exist but still have default @corp.pseudoco.com — not yet provisioned
+        sample = users[0].get("mail", "?") if users else "?"
+        return False, f"AD users found but email not yet POD-specific (e.g. {sample}) — run AD automation first"
+
+    # Persist to DB
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        if POD_ID:
+            conn.execute(
+                "UPDATE pods SET pod_number=?, updated_at=datetime('now') WHERE pod_id=?",
+                (detected, POD_ID)
+            )
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        # DB write failed — still return success with the detected number
+        return True, f"POD# detected: {detected} (via {', '.join(evidence)}) — WARNING: DB write failed: {e}"
+
+    return True, f"POD# confirmed: {detected} (via {', '.join(evidence)})"
+
+
 def phase_ad_verify():
     """
     Query AD for Kit/Lee/Pat/Nik.

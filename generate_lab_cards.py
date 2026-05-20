@@ -93,7 +93,10 @@ def _draw_card(c: canvas.Canvas, idx: int, pod: dict):
     c.roundRect(x + PAD, BADGE_Y, BADGE_W, BADGE_H, radius=4, stroke=0, fill=1)
     c.setFillColor(C_HEADER_TEXT)
     c.setFont(FONT_BOLD, 10)
-    pod_label = f"POD {pod.get('pod_id','').replace('POD-','')}"
+    # POD badge — use AD-confirmed pod_number if available, fall back to pod_id
+    raw_id = pod.get('pod_id', '')
+    pod_num = pod.get('pod_number', '') or raw_id.replace('POD-', '')
+    pod_label = f"POD {pod_num}"
     pod_lw = c.stringWidth(pod_label, FONT_BOLD, 10)
     c.drawString(x + PAD + (BADGE_W - pod_lw) / 2,
                  BADGE_Y + (BADGE_H - 10) / 2 + 1, pod_label)
@@ -250,7 +253,7 @@ def _draw_summary_page(c: canvas.Canvas, pods: list, page_num: int, total_pages:
 
     # ── Data rows ─────────────────────────────────────────────────────────
     row_fields = [
-        lambda p: p.get("pod_id", ""),
+        lambda p: ("POD-" + p.get("pod_number")) if p.get("pod_number") else p.get("pod_id", ""),
         lambda p: p.get("session_id", ""),
         lambda p: p.get("assigned_to", "") or "—",
         lambda p: p.get("vpn_host", ""),
