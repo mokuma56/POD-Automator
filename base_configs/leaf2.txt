@@ -1,53 +1,80 @@
-! Site_105-Leaf-2 Base Config
-! Catalyst 9300 - Leaf switch
+service password-encryption
 !
-hostname Site_105-Leaf-2
+hostname Site_105-Leaf2
 !
-ip domain name dcloud.cisco.com
+ip domain name corp.pseudoco.com
+!
 no ip domain lookup
+!
 vrf definition Mgmt-vrf
+ !
  address-family ipv4
  exit-address-family
+ !
  address-family ipv6
  exit-address-family
-exit
+ exit
 !
-no logging console
+!
 aaa new-model
+!
 aaa authentication login default local
 aaa authorization exec default local
 aaa authorization network default local
 !
-vtp mode transparent
 ip routing
-system mtu 9100
-ip multicast-routing
+!
+vtp mode transparent
+!
+ip multicast-routing 
 ip name-server 198.18.5.102
+ip domain lookup source-interface Loopback0
+ip domain name dcloud.cisco.com
+ip dhcp relay information option vpn
+ip dhcp relay information option
+ip dhcp relay override giaddr link-selection
+ip dhcp compatibility suboption link-selection standard
+ip dhcp compatibility suboption server-override standard
+!
+!
+ip dhcp snooping information option 
+!
+ip dhcp snooping vlan 10,101-102
+no ip dhcp snooping information option
+ip dhcp snooping
+ip dhcp snooping information option
+!
 !
 license boot level network-advantage addon dna-advantage
 license smart transport off
+!
+system mtu 9100
 !
 spanning-tree mode rapid-pvst
 spanning-tree extend system-id
 !
 enable password C1sco12345
+!
 username admin privilege 15 password C1sco12345
 username netadmin privilege 15 password C1sco12345
 username dnacadmin privilege 15 password C1sco12345
+!
 !
 interface Loopback0
  ip address 172.30.255.2 255.255.255.255
  ip pim sparse-mode
  ip ospf 1 area 0
 !
+!
 interface GigabitEthernet0/0
  vrf forwarding Mgmt-vrf
- ip address 198.18.128.23 255.255.255.0
- no shutdown
+ ip address 198.18.128.23 255.255.192.0
+ No shutdown
  negotiation auto
 !
-interface GigabitEthernet1/0/1
- description Border-Spine
+!
+interface GigabitEthernet1/0/48
+ description Spine Uplink
  no switchport
  ip address 172.30.254.3 255.255.255.254
  ip pim sparse-mode
@@ -55,40 +82,26 @@ interface GigabitEthernet1/0/1
  ip ospf 1 area 0
  no shutdown
 !
-interface GigabitEthernet1/0/2
- description Leaf-1
- no switchport
- ip address 172.30.254.5 255.255.255.254
- ip pim sparse-mode
- ip ospf network point-to-point
- ip ospf 1 area 0
- no shutdown
 !
-vlan 5
- name DNAC-Discovery
-!
-interface Vlan5
- description Underlay for Discovery
- ip address 192.168.255.9 255.255.255.254
- no shutdown
-!
-ip route 0.0.0.0 0.0.0.0 192.168.255.8
-!
-interface GigabitEthernet1/0/48
+interface AppGigabitEthernet1/0/1
+ switchport trunk allowed vlan 1,10
  switchport mode trunk
- cts manual
-  policy static sgt 2
- no cts role-based enforcement
- no shutdown
 !
 router ospf 1
  router-id 172.30.255.2
 !
-ip route vrf Mgmt-vrf 0.0.0.0 0.0.0.0 198.18.128.1
-ip ssh version 2
-ip ssh source-interface Loopback0
+ip dhcp snooping information option
 !
-ip radius source-interface Loopback0
+ip http client source-interface Loopback0
+ip tftp source-interface GigabitEthernet 0/0
+no ip tftp blocksize
+ip route vrf Mgmt-vrf 0.0.0.0 0.0.0.0 198.18.128.1
+ip ssh source-interface Loopback0
+ip ssh version 2
+!
+ip http authentication local
+!
+ip radius source-interface Loopback0 
 logging source-interface Loopback0
 logging host 198.18.5.100
 !
@@ -96,6 +109,8 @@ snmp-server community public RO
 snmp-server community private RW
 snmp-server community dcloud RW
 snmp-server trap-source Loopback0
+snmp-server host 198.18.5.100 version 2c dcloud
+!
 !
 line con 0
  stopbits 1
@@ -110,7 +125,15 @@ line vty 5 31
 ntp source GigabitEthernet0/0
 ntp server vrf Mgmt-vrf 198.18.128.1
 !
+interface GigabitEthernet1/0/10
+ shutdown
+!
+interface GigabitEthernet1/0/11
+ shutdown
+!
 no vlan 10,101,102
+!
+Exit
 !
 crypto key generate rsa modulus 2048
 !

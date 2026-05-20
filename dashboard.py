@@ -167,6 +167,33 @@ def api_pods():
     conn.close()
     return jsonify(result)
 
+@app.route("/api/generate-lab-pdf")
+def api_generate_lab_pdf():
+    """Generate and stream a Cisco-branded lab details PDF (4 cards per page)."""
+    import generate_lab_cards
+    from flask import Response
+    conn = _db()
+    pods_raw = conn.execute("SELECT * FROM pods ORDER BY pod_id").fetchall()
+    conn.close()
+    pods = []
+    for p in pods_raw:
+        p = dict(p)
+        pods.append({
+            "pod_id":       p.get("pod_id", ""),
+            "session_id":   p.get("session_id", ""),
+            "scc_org":      p.get("scc_org", ""),
+            "assigned_to":  p.get("assigned_to", ""),
+            "vpn_host":     p.get("vpn_host", ""),
+            "vpn_username": p.get("vpn_user", ""),
+            "vpn_password": p.get("vpn_pass", ""),
+        })
+    pdf_bytes = generate_lab_cards.generate_pdf(pods)
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=cisco_lab_details.pdf"}
+    )
+
 @app.route("/api/pipeline/<pod_id>")
 def api_pipeline(pod_id):
     conn = _db()
@@ -267,6 +294,7 @@ def api_switches(pod_id):
             "passed": passed,
             "failed": failed,
             "total": len(checks),
+            "step_status": step.get("status", "pending"),
         })
 
     # Add connectivity test — show per-switch labels
@@ -297,6 +325,7 @@ def api_switches(pod_id):
         "passed": ct_passed,
         "failed": ct_failed,
         "total": len(conn_checks),
+        "step_status": ct.get("status", "pending"),
     })
 
     return jsonify(switch_data)
@@ -355,13 +384,26 @@ def api_switches_recheck(pod_id):
     router_ip = row["router_ip"]
     conn.close()
 
-    ok, msg = _ensure_pipeline_container(pod_id)
-    if not ok:
-        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
+    # Verify VPN container is running — switch recheck uses docker run --rm
+    # against the VPN network namespace directly, no pipeline container needed
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
 
     def _recheck():
         try:
             switches = ["verify_border_spine", "verify_leaf1", "verify_leaf2", "connectivity_test"]
+            # Mark ALL steps as running upfront so UI shows spinner with 0/4 done
+            _c = _db()
+            for step_name in switches:
+                _c.execute("INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, completed_at, result) VALUES (?, ?, 'running', datetime('now'), NULL, '')", (pod_id, step_name))
+            _c.execute("UPDATE pods SET updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
+            _c.commit()
+            _c.close()
+
             for step_name in switches:
                 if step_name == "connectivity_test":
                     func_call = "onboard_router.phase_connectivity_test()"
@@ -429,6 +471,14 @@ def api_switches_recheck(pod_id):
             import traceback
             log(pod_id, f"Re-check error: {e}")
             log(pod_id, traceback.format_exc())
+            # Reset any steps stuck in 'running' back to 'failed' so UI doesn't loop forever
+            _c = _db()
+            _c.execute(
+                "UPDATE pipeline_steps SET status='failed', result='Re-check error: ' || ? WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test') AND status='running'",
+                (str(e)[:200], pod_id)
+            )
+            _c.commit()
+            _c.close()
 
     t = threading.Thread(target=_recheck, daemon=True)
     t.start()
@@ -1437,6 +1487,7 @@ DASHBOARD_HTML = """
     <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
     <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
     <button class="btn-start-all" id="btn-docker-down" onclick="dockerDown()" style="background:#ff4757;color:#fff;">&#9632; Teardown All</button>
+    <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
     <span id="docker-status" style="font-size:12px;color:#667788;"></span>
   </div>
 
@@ -1444,6 +1495,7 @@ DASHBOARD_HTML = """
     <thead>
       <tr id="sort-header">
         <th>POD</th>
+        <th>Assigned</th>
         <th>Session</th>
         <th data-col="status" style="cursor:pointer;user-select:none">Status <span id="status-sort-icon">⇅</span></th>
         <th>VPN</th>
@@ -1452,7 +1504,6 @@ DASHBOARD_HTML = """
          <th>SCC Org</th>
          <th>Pipeline</th>
          <th>Actions</th>
-         <th>Assigned</th>
          <th>Notes</th>
        </tr>
     </thead>
@@ -1526,6 +1577,7 @@ const PIPELINE_ORDER = [
   "verify_leaf2",
   "connectivity_test",
   "cdfmc_check",
+  "ad_verify",
 ];
 
 async function handleFile(file) {
@@ -1683,6 +1735,7 @@ function renderTable(pods) {
       : '<span class="badge pending">Pending</span>';
     return `<tr>
       <td class="pod-id" onclick="showPipeline('${p.pod_id}')">${p.pod_id}</td>
+      <td><input type="text" value="${p.assigned_to||''}" placeholder="CCO ID" style="background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:3px 7px;width:100px;font-size:12px;" onchange="saveAssigned('${p.pod_id}', this.value)" /></td>
       <td style="font-size:11px;color:#667788">${p.session_id || ''}</td>
       <td>${readyBadge}</td>
       <td style="text-align:center"><span style="color:${vpnColor};font-size:18px;line-height:1" title="${p.vpn_detail || ''}">&#x25cf;</span></td>
@@ -1697,8 +1750,7 @@ function renderTable(pods) {
          <button class="btn-reconnect" onclick="disconnectVpn('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;">Disconnect VPN</button>
          <button class="btn-reconnect" onclick="deletePod('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;background:#2a0a0a;" title="Delete POD from DB">&#x1F5D1;</button>
       </td>
-      <td><input type="text" value="${p.assigned_to||''}" placeholder="CCO ID" style="background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:3px 7px;width:100px;font-size:12px;" onchange="saveAssigned('${p.pod_id}', this.value)" /></td>
-     <td class="notes" title="${(p.notes||'').replace(/"/g,'&quot;')}">${p.notes || '-'}</td>
+      <td class="notes" title="${(p.notes||'').replace(/"/g,'&quot;')}">${p.notes || '-'}</td>
     </tr>`;
   }).join('');
 }
@@ -1812,13 +1864,8 @@ async function showPipeline(podId) {
    loadAd(podId);
    loadUpgrade(podId);
 
-  // Start elapsed timer
-  if (timerInterval) clearInterval(timerInterval);
-  timerInterval = setInterval(() => {
-    const el = document.getElementById('pipeline-grid');
-    const firstCard = el ? el.querySelector('.step-card .started-at') : null;
-    if (firstCard) updateTimer(firstCard.getAttribute('data-time'));
-  }, 1000);
+  // Elapsed timer is managed by loadSteps based on running state
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
 async function loadSteps(podId) {
@@ -1829,20 +1876,34 @@ async function loadSteps(podId) {
   const done    = steps.filter(s => s.status === 'completed' || s.status === 'skipped').length;
   const skipped = steps.filter(s => s.status === 'skipped').length;
   const running = steps.some(s => s.status === 'running');
-  const failed  = steps.some(s => s.status === 'failed');
-  const pct = Math.round(done / total * 100);
+  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify']);
+  const hardFailed = steps.some(s => s.status === 'failed' && !SOFT_FAIL.has(s.step_name));
+  const softFailed = steps.some(s => s.status === 'failed' && SOFT_FAIL.has(s.step_name));
+  const allAccountedFor = steps.length > 0 && steps.every(s => s.status === 'completed' || s.status === 'skipped' || s.status === 'failed');
+  const pct = Math.min(100, Math.round(done / total * 100));
 
   const firstStep = steps.length > 0 ? steps[0].started_at : null;
-  updateTimer(firstStep);
+  // Only show elapsed timer while pipeline is actively running
+  if (running) {
+    updateTimer(firstStep);
+    if (!timerInterval) {
+      timerInterval = setInterval(() => updateTimer(firstStep), 1000);
+    }
+  } else {
+    const el = document.getElementById('elapsed-timer');
+    if (el) el.innerHTML = '';
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+  }
 
   // Progress bar
   const fill = document.getElementById('progress-bar-fill');
   const txt  = document.getElementById('progress-text');
   const lbl  = document.getElementById('progress-label-text');
-  const barColor = failed ? '#ff4757' : skipped > 0 ? '#ffa502' : running ? '#02c8ff' : done === total ? '#00e68a' : '#667788';
+  const barColor = hardFailed ? '#ff4757' : (softFailed && allAccountedFor && !running) ? '#ffa502' : running ? '#02c8ff' : done === total ? '#00e68a' : '#667788';
   if (fill) { fill.style.width = pct + '%'; fill.style.background = barColor; }
   if (txt)  txt.textContent = pct + '% (' + done + '/' + total + (skipped ? ', ' + skipped + ' warn' : '') + ')';
-  if (lbl)  lbl.textContent = failed ? 'Failed at ' + done + '/' + total
+  if (lbl)  lbl.textContent = hardFailed ? 'Failed at ' + done + '/' + total
+                             : (softFailed && allAccountedFor && !running) ? 'Complete — check warnings'
                              : skipped > 0 && done === total ? 'Done with ' + skipped + ' warning(s)'
                              : running ? 'Running — ' + done + '/' + total
                              : done === total ? 'Complete!' : 'Pending — ' + done + '/' + total;
@@ -1918,7 +1979,7 @@ async function loadSwitches(podId) {
   const summaryHtml = `
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
       <div style="font-size:13px;font-weight:600;color:${allPass ? '#00e68a' : hasFail ? '#ff4757' : '#8899aa'}">
-        ${allPass ? '✓ All passed' : hasFail ? `✗ ${totalFail} fail` : '— pending'}
+        ${allPass ? '✓ All passed' : hasFail ? ('✗ ' + totalFail + ' fail') : '— pending'}
       </div>
       <div style="flex:1;min-width:80px;">
         <div style="background:#1a2d4a;border-radius:3px;height:6px;overflow:hidden;">
@@ -1952,6 +2013,7 @@ async function loadSwitches(podId) {
         '<span class="role-tag ' + roleClass(sw.name) + '">' + roleLabel + '</span>' +
         '<span class="device-name" onclick="' + (sw.ip ? 'openTerminal(' + JSON.stringify(podId) + ',' + JSON.stringify(sw.ip) + ')' : '') + '" title="' + (sw.ip ? 'Click to open SSH terminal' : '') + '">' + escHtml(sw.name) + '</span>' +
         '<span class="device-model">' + escHtml(sw.model || '') + '</span>' +
+        (sw.step_status === 'running' ? '<span class="badge" style="margin-left:auto;background:#02c8ff22;color:#02c8ff;border:1px solid #02c8ff55;">⟳ checking</span>' : '') +
         (sw.step_status === 'skipped' ? '<span class="badge warn" style="margin-left:auto">WARN</span>' : '') +
       '</div>' +
       (sw.step_status === 'skipped' ? '<div style="font-size:11px;color:#ffa502;margin-bottom:6px;">⚠ Verification skipped — switch unreachable during pipeline. Click Re-check Switches to retry.</div>' : '') +
@@ -1971,11 +2033,30 @@ async function openTerminal(podId, ip) {
 }
 
 async function recheckSwitches(podId) {
-  const grid = document.getElementById('switch-grid');
-  grid.innerHTML = '<div class="switch-grid-empty" style="color:#ffa502;">⟳ Running switch re-check...</div>';
-  const r = await fetch('/api/switches/recheck/' + podId, { method: 'POST' });
-  const data = await r.json();
-  setTimeout(() => loadSwitches(podId), 5000);
+  await fetch('/api/switches/recheck/' + podId, { method: 'POST' });
+  let attempts = 0;
+  const maxAttempts = 40;
+
+  async function doPoll() {
+    attempts++;
+    try {
+      const switchNames = ['verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test'];
+      const r2 = await fetch('/api/pipeline/' + podId);
+      const steps = await r2.json();
+      const switchSteps = steps.filter(s => switchNames.includes(s.step_name));
+      const anyRunning = switchSteps.some(s => s.status === 'running');
+      // Always reload the cards so user sees live updates
+      await loadSwitches(podId);
+      loadSteps(podId);
+      if (anyRunning && attempts < maxAttempts) {
+        setTimeout(doPoll, 4000);
+      }
+    } catch(e) {
+      loadSwitches(podId);
+    }
+  }
+
+  setTimeout(doPoll, 2000);
 }
 
 async function loadCdfmc(podId) {
@@ -2336,90 +2417,5 @@ loadUpgradeConfig();
 </html>
 """
 
-def _sdwan_health_monitor():
-    """Background thread — polls vManage every 60s for each POD with sdwan_online=yes.
-    Checks for at least 3 control connections (vBond + vSmart x2).
-    Updates sdwan_online to 'yes' or 'no' in the DB."""
-    import requests as _requests
-    CHECK_INTERVAL = 60  # seconds between full poll cycles
-
-    def _check_pod(pod):
-        pod_id  = pod["pod_id"]
-        vmanage = f"https://{os.environ.get('VMANAGE', '198.18.133.10')}"
-        serial  = pod.get("router_serial", "")
-        if not serial:
-            return  # no serial yet — can't check
-
-        # Run check inside the POD's VPN container
-        script = f"""
-import sys, requests, urllib3
-urllib3.disable_warnings()
-s = requests.Session()
-s.verify = False
-try:
-    r = s.post('{vmanage}/j_security_check',
-        data={{'j_username':'admin','j_password':'C1sco12345'}}, timeout=10)
-    tok = s.get('{vmanage}/dataservice/client/token', timeout=10).text.strip()
-    if tok: s.headers['X-XSRF-TOKEN'] = tok
-    devs = s.get('{vmanage}/dataservice/system/device/vedges', timeout=10).json().get('data', [])
-    dev  = next((d for d in devs if d.get('serialNumber','').upper() == '{serial}'.upper()), None)
-    if not dev:
-        print('not_found')
-        sys.exit(0)
-    uuid = dev.get('uuid','')
-    conns = s.get(f'{vmanage}/dataservice/device/control/connections?deviceId={{uuid}}', timeout=10).json().get('data', [])
-    up = [c for c in conns if str(c.get('state','')).lower() == 'up']
-    print(f'up={{len(up)}}')
-except Exception as e:
-    print(f'error={{e}}')
-"""
-        try:
-            r = subprocess.run(
-                ["docker", "run", "--rm",
-                 "--network", f"container:vpn-{pod_id}",
-                 "--entrypoint", "python3",
-                 "pod-automator:latest", "-c", script],
-                capture_output=True, text=True, timeout=30
-            )
-            out = r.stdout.strip().splitlines()
-            last = out[-1] if out else ""
-            if last.startswith("up="):
-                up_count = int(last.split("=")[1])
-                online = "yes" if up_count >= 3 else "no"
-            elif last == "not_found":
-                online = "no"
-            else:
-                return  # error — don't update, keep last known state
-        except Exception:
-            return  # timeout or docker error — keep last known state
-
-        conn = _db()
-        current = conn.execute("SELECT sdwan_online FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
-        if current and current["sdwan_online"] != online:
-            conn.execute("UPDATE pods SET sdwan_online=?, updated_at=datetime('now') WHERE pod_id=?",
-                         (online, pod_id))
-            conn.commit()
-            print(f"[sdwan-monitor] {pod_id}: sdwan_online -> {online} (control tunnels up={up_count if 'up_count' in dir() else '?'})")
-        conn.close()
-
-    while True:
-        try:
-            conn = _db()
-            pods = conn.execute("SELECT * FROM pods WHERE sdwan_online='yes'").fetchall()
-            conn.close()
-            for pod in pods:
-                # Only check if VPN container is healthy
-                r = subprocess.run(
-                    ["docker", "inspect", f"vpn-{pod['pod_id']}", "--format", "{{.State.Health.Status}}"],
-                    capture_output=True, text=True, timeout=5
-                )
-                if r.stdout.strip() == "healthy":
-                    _check_pod(dict(pod))
-        except Exception as e:
-            print(f"[sdwan-monitor] error: {e}")
-        time.sleep(CHECK_INTERVAL)
-
-
 if __name__ == "__main__":
-    threading.Thread(target=_sdwan_health_monitor, daemon=True).start()
     app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False)
