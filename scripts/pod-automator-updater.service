@@ -1,0 +1,12 @@
+[Unit]
+Description=POD Automator — Git Auto-Updater
+After=network.target
+
+[Service]
+Type=oneshot
+User=pod-automator
+WorkingDirectory=/opt/pod-automator
+Environment="PATH=/home/pod-automator/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/pod-automator/scripts/git-update.sh
+StandardOutput=journal
+StandardError=journal

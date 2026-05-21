@@ -1,0 +1,11 @@
+[Unit]
+Description=POD Automator — Git Auto-Updater Timer
+Requires=pod-automator-updater.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=pod-automator-updater.service
+
+[Install]
+WantedBy=timers.target
