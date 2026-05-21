@@ -188,10 +188,12 @@ def api_pods():
         p["vpn_detail"] = vpn["detail"]
         # Add SCC checklist all-confirmed flag
         ALL_SCC_KEYS = [
-            "access_policy_rules", "network_tunnel_groups", "zta_profiles",
-            "epp_posture_profiles", "dlp_rules", "private_resources",
-            "dns_servers", "ravpn_ip_pool", "ise_pxgrid", "epp_manual",
-            "duo_saml", "te_integration",
+            # 8 automated
+            "access_policy_rules", "logging_settings", "network_tunnel_groups",
+            "zta_profiles", "private_resources", "dns_servers",
+            "ravpn_profiles", "epp_posture_profiles",
+            # 4 manual
+            "dlp_rules", "ravpn_ip_pool", "ise_pxgrid", "duo_saml",
         ]
         try:
             scc_rows = conn.execute(
@@ -2557,19 +2559,19 @@ function escHtml(s) {
 // ── SCC Reset Checklist ──────────────────────────────────────────
 const SCC_AUTO_ITEMS = [
   { key: 'access_policy_rules',   label: 'Access Policy Rules cleared' },
+  { key: 'logging_settings',      label: 'Logging Settings reset' },
   { key: 'network_tunnel_groups', label: 'Network Tunnel Groups cleared' },
   { key: 'zta_profiles',          label: 'ZTA Profiles reset to default' },
+  { key: 'private_resources',     label: 'Private Resources & Resource Groups cleared' },
+  { key: 'dns_servers',           label: 'DNS Servers cleared' },
+  { key: 'ravpn_profiles',        label: 'RAVPN Profiles cleared' },
   { key: 'epp_posture_profiles',  label: 'EPP Posture Profiles cleared' },
 ];
 const SCC_MANUAL_ITEMS = [
-  { key: 'dlp_rules',        label: 'DLP Rules cleared' },
-  { key: 'private_resources',label: 'Private Resources & Resource Groups cleared' },
-  { key: 'dns_servers',      label: 'DNS Servers reset' },
-  { key: 'ravpn_ip_pool',    label: 'RAVPN Profiles & IP Pools cleared' },
-  { key: 'ise_pxgrid',       label: 'ISE / pxGrid integration removed' },
-  { key: 'epp_manual',       label: 'EPP Policies manually verified' },
-  { key: 'duo_saml',         label: 'Duo / DuoSSO SAML metadata removed' },
-  { key: 'te_integration',   label: 'Thousand Eyes integration reset' },
+  { key: 'dlp_rules',    label: 'DLP Rules cleared' },
+  { key: 'ravpn_ip_pool',label: 'RAVPN IP Pools cleared' },
+  { key: 'ise_pxgrid',   label: 'ISE / pxGrid integration removed' },
+  { key: 'duo_saml',     label: 'Duo / DuoSSO SAML metadata removed' },
 ];
 
 async function loadSccChecklist(podId) {
