@@ -30,7 +30,10 @@ VMANAGE = "https://198.18.133.10"
 ROUTER_IP = "198.18.133.25"
 SYSTEM_IP = "100.100.100.105"
 SITE_ID = 105
-BOOTSTRAP_PATH = os.path.expanduser("~/sw_projects/pod_automator/data/bootstrap/ciscosdwan.cfg")
+BOOTSTRAP_PATH = os.environ.get(
+    "BOOTSTRAP_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bootstrap", "ciscosdwan.cfg")
+)
 
 
 def vmanage_session():
