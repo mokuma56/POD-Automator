@@ -188,11 +188,12 @@ def api_pods():
         p["vpn_detail"] = vpn["detail"]
         # Add SCC checklist all-confirmed flag
         ALL_SCC_KEYS = [
-            # 8 automated
-            "access_policy_rules", "logging_settings", "network_tunnel_groups",
+            # 6 automated
+            "access_policy_rules", "network_tunnel_groups",
             "zta_profiles", "private_resources", "dns_servers",
-            "ravpn_profiles", "epp_posture_profiles",
-            # 5 manual
+            "epp_posture_profiles",
+            # 7 manual
+            "logging_settings", "ravpn_profiles",
             "dlp_rules", "ravpn_ip_pool", "duo_saml", "ise_pxgrid", "te_integration",
         ]
         try:
@@ -847,12 +848,31 @@ def api_scc_recheck(pod_id):
     return jsonify({"status": "ok", "message": f"SCC re-check started for {pod_id}"})
 
 
+@app.route("/api/scc/run-check-sync/<pod_id>", methods=["POST"])
+def api_scc_run_check_sync(pod_id):
+    """Run phase_scc_reset_check directly on the host (public internet access for api.sse.cisco.com).
+    Called by the pipeline container via host.docker.internal when inside Docker."""
+    import sys, os as _os
+    sys.path.insert(0, str(Path(__file__).parent))
+    _os.environ["POD_ID"] = pod_id
+    _os.environ["DB_PATH"] = str(Path(__file__).parent / "data" / "pod_state.db")
+    _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
+    try:
+        import importlib, onboard_router
+        importlib.reload(onboard_router)
+        ok, result = onboard_router.phase_scc_reset_check()
+        return jsonify({"ok": ok, "result": result})
+    except Exception as e:
+        return jsonify({"ok": False, "result": str(e)}), 500
+
+
 @app.route("/api/scc/confirm/<pod_id>/<item_key>", methods=["POST"])
 def api_scc_confirm(pod_id, item_key):
     """Mark a manual SCC checklist item as confirmed by proctor."""
     data = request.get_json(silent=True) or {}
     confirmed_by = data.get("confirmed_by", "proctor")
     MANUAL_ITEMS = {
+        "logging_settings", "ravpn_profiles",
         "dlp_rules", "private_resources", "dns_servers",
         "ravpn_ip_pool", "ise_pxgrid", "epp_manual",
         "duo_saml", "te_integration",
@@ -2560,8 +2580,6 @@ function escHtml(s) {
 const SCC_AUTO_ITEMS = [
   { key: 'access_policy_rules',  label: 'Access Policy Rules cleared',
     desc: 'Secure Access → Secure → Access Policy. Delete all configured policies.' },
-  { key: 'logging_settings',     label: 'Logging disabled',
-    desc: 'Secure Access → Secure → Access Policy. Edit "For all Internet access" — disable Logging.' },
   { key: 'network_tunnel_groups',label: 'Network Tunnel Groups cleared',
     desc: 'Secure Access → Connect → Network Connections → Network Tunnel Groups. Delete Router and Firewall tunnel groups.' },
   { key: 'zta_profiles',         label: 'ZTA Profile deleted',
@@ -2570,12 +2588,14 @@ const SCC_AUTO_ITEMS = [
     desc: 'Secure Access → Resources → Private Resources. Delete Contractor and Intranet resources.' },
   { key: 'dns_servers',          label: 'DNS Servers cleared',
     desc: 'Secure Access → Resources → DNS Servers. Delete PseudoCo DNS.' },
-  { key: 'ravpn_profiles',       label: 'RAVPN Profile deleted',
-    desc: 'Secure Access → Connect → End User Connectivity → Virtual Private Network. Delete PseudoCo_RA_VPN_Profile.' },
   { key: 'epp_posture_profiles', label: 'EPP Posture Profile deleted',
     desc: 'Secure Access → Secure → Endpoint Posture Profile. Delete PseudoCo Windows profile.' },
 ];
 const SCC_MANUAL_ITEMS = [
+  { key: 'logging_settings',  label: 'Logging disabled',
+    desc: 'Secure Access → Secure → Access Policy. Edit "For all Internet access" — disable Logging.' },
+  { key: 'ravpn_profiles',    label: 'RAVPN Profile deleted',
+    desc: 'Secure Access → Connect → End User Connectivity → Virtual Private Network. Delete PseudoCo_RA_VPN_Profile.' },
   { key: 'dlp_rules',     label: 'DLP Policy cleared',
     desc: 'Secure Access → Secure → Data Loss Prevention Policy. Delete configured policy.' },
   { key: 'ravpn_ip_pool', label: 'RAVPN IP Pool deleted',

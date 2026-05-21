@@ -4,6 +4,9 @@ services:
     container_name: vpn-{{pod_id}}
     cap_add: [NET_ADMIN, SYS_ADMIN]
     devices: [/dev/net/tun]
+    dns:
+      - 64.102.6.247
+      - 173.37.137.85
     entrypoint: ["/bin/sh", "/vpn-entrypoint.sh"]
     command: ["{{vpn_host}}", "{{vpn_user}}", "{{vpn_pass}}"]
     restart: unless-stopped
@@ -30,6 +33,8 @@ services:
       ROUTER_IP: {{router_ip}}
       ROUTER_USER: {{router_user}}
       ROUTER_PASS: {{router_pass}}
+      DB_PATH: /pipeline/host-data/pod_state.db
+      SCC_KEYS_DIR: /pipeline/host-data/scc_keys
     volumes:
       - {{pod_id}}-bootstrap:/pipeline/data/bootstrap
       - {{host_data}}:/pipeline/host-data

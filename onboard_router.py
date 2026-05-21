@@ -1575,6 +1575,7 @@ def _scc_token(key_id: str, key_secret: str) -> str:
 
 def _scc_org_number_from_pod() -> str:
     """Extract org number from scc_org stored in DB (e.g. 'pseudoco-523--...' → '523')."""
+    import re as _re
     db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     pod_id  = os.environ.get("POD_ID", "")
     try:
@@ -1584,7 +1585,7 @@ def _scc_org_number_from_pod() -> str:
         row = c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         c.close()
         if row and row["scc_org"]:
-            m = _re.search(r"pseudoco-(\d+)--", row["scc_org"])
+            m = _re.search(r"pseudoco-(\d+)--", row["scc_org"]) or _re.search(r"pseudoco-(\d+)", row["scc_org"])
             if m:
                 return m.group(1)
             # Fallback: if scc_org is already just a number
@@ -1597,16 +1598,17 @@ def _scc_org_number_from_pod() -> str:
 
 def phase_scc_reset_check():
     """
-    Automated SCC reset verification (8 of 12 checklist items).
+    Automated SCC reset verification (6 of 13 checklist items).
     Reads scc_keys_<org>.json, authenticates, and checks/resets:
       1. access_policy_rules   — no non-default rules
-      2. logging_settings      — reset to default (no custom destinations)
-      3. network_tunnel_groups — no NTGs
-      4. zta_profiles          — only default-profile remains
-      5. private_resources     — no private resources or resource groups
-      6. dns_servers           — no custom DNS server configs
-      7. ravpn_profiles        — no RAVPN profiles
-      8. epp_posture_profiles  — no non-system-defined profiles
+      2. network_tunnel_groups — no NTGs
+      3. zta_profiles          — only default-profile remains
+      4. private_resources     — no private resources or resource groups
+      5. dns_servers           — no custom DNS server configs
+      6. epp_posture_profiles  — no non-system-defined profiles
+
+    logging_settings and ravpn_profiles moved to manual checklist
+    (require browser session auth — no public API equivalent).
 
     Persists each item to scc_checklist table.
     Returns (ok, result_string).
@@ -1616,10 +1618,29 @@ def phase_scc_reset_check():
     db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     pod_id  = os.environ.get("POD_ID", "")
 
+    # SCC API calls require public internet (api.sse.cisco.com).
+    # When running inside a Docker container (VPN network), DNS for public hosts
+    # is blocked by the tunnel. Delegate to the dashboard host process instead.
+    if os.path.exists("/.dockerenv"):
+        import urllib.request, json as _json
+        dashboard_url = os.environ.get("DASHBOARD_URL", "http://192.168.65.254:5050")
+        try:
+            req = urllib.request.Request(
+                f"{dashboard_url}/api/scc/run-check-sync/{pod_id}",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                data=b"{}",
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = _json.loads(resp.read())
+            return data.get("ok", False), data.get("result", "no result from host")
+        except Exception as e:
+            return False, f"Host delegation failed: {e}"
+
     ALL_KEYS = (
-        "access_policy_rules", "logging_settings", "network_tunnel_groups",
+        "access_policy_rules", "network_tunnel_groups",
         "zta_profiles", "private_resources", "dns_servers",
-        "ravpn_profiles", "epp_posture_profiles",
+        "epp_posture_profiles",
     )
 
     def _persist(item_key, status, detail=""):
@@ -1680,34 +1701,7 @@ def phase_scc_reset_check():
         _persist("access_policy_rules", "failed", str(e))
         results["access_policy_rules"] = (False, str(e))
 
-    # 2. Logging settings — check no custom log destinations configured
-    try:
-        r = requests.get("https://api.sse.cisco.com/admin/v2/logging",
-                         headers=hdrs, timeout=15)
-        if r.ok:
-            data = r.json()
-            # Custom destinations = any enabled log targets (s3, siem, etc.)
-            destinations = data.get("data", data) if isinstance(data, dict) else data
-            if isinstance(destinations, list):
-                custom = [d for d in destinations if d.get("enabled", False)]
-            elif isinstance(destinations, dict):
-                # Some APIs return a single object with enabled flag
-                custom = [destinations] if destinations.get("enabled", False) else []
-            else:
-                custom = []
-            ok2 = (len(custom) == 0)
-            detail = (f"{len(custom)} active log destination(s)" if custom else "no custom logging") \
-                     + ("" if ok2 else " — disable custom log destinations")
-        else:
-            ok2 = False
-            detail = f"API error {r.status_code}: {r.text[:100]}"
-        _persist("logging_settings", "completed" if ok2 else "failed", detail)
-        results["logging_settings"] = (ok2, detail)
-    except Exception as e:
-        _persist("logging_settings", "failed", str(e))
-        results["logging_settings"] = (False, str(e))
-
-    # 3. Network tunnel groups — expect 0
+    # 2. Network tunnel groups — expect 0
     try:
         r = requests.get("https://api.sse.cisco.com/deployments/v2/networktunnelgroups",
                          headers=hdrs, timeout=15)
@@ -1775,27 +1769,7 @@ def phase_scc_reset_check():
         _persist("dns_servers", "failed", str(e))
         results["dns_servers"] = (False, str(e))
 
-    # 7. RAVPN profiles — expect 0 (prod.sse-ravpn-config.vpnp.umbrella.com)
-    try:
-        r = requests.get(
-            f"https://prod.sse-ravpn-config.vpnp.umbrella.com/v1/orgs/{org_id}/profiles",
-            headers=hdrs, timeout=15)
-        if r.ok:
-            data = r.json()
-            profiles = data.get("data", data) if isinstance(data, dict) else data
-            count = len(profiles) if isinstance(profiles, list) else 0
-            ok7 = (count == 0)
-            detail = f"{count} RAVPN profile(s)" + ("" if ok7 else " — delete all RAVPN profiles")
-        else:
-            ok7 = False
-            detail = f"API error {r.status_code}: {r.text[:100]}"
-        _persist("ravpn_profiles", "completed" if ok7 else "failed", detail)
-        results["ravpn_profiles"] = (ok7, detail)
-    except Exception as e:
-        _persist("ravpn_profiles", "failed", str(e))
-        results["ravpn_profiles"] = (False, str(e))
-
-    # 8. EPP posture profiles — no non-system-defined profiles
+    # 6. EPP posture profiles — no non-system-defined profiles
     try:
         r = requests.get(
             f"https://api.umbrella.com/v1/organizations/{org_id}/postureprofiles",
