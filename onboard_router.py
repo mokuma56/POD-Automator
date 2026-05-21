@@ -1592,12 +1592,16 @@ def _scc_org_number_from_pod() -> str:
 
 def phase_scc_reset_check():
     """
-    Automated SCC reset verification (4 of 12 checklist items).
-    Reads scc_keys_<org>.json, authenticates, and checks:
+    Automated SCC reset verification (8 of 12 checklist items).
+    Reads scc_keys_<org>.json, authenticates, and checks/resets:
       1. access_policy_rules   — no non-default rules
-      2. network_tunnel_groups — no NTGs
-      3. zta_profiles          — only default-profile remains
-      4. epp_posture_profiles  — no non-system-defined profiles
+      2. logging_settings      — reset to default (no custom destinations)
+      3. network_tunnel_groups — no NTGs
+      4. zta_profiles          — only default-profile remains
+      5. private_resources     — no private resources or resource groups
+      6. dns_servers           — no custom DNS server configs
+      7. ravpn_profiles        — no RAVPN profiles
+      8. epp_posture_profiles  — no non-system-defined profiles
 
     Persists each item to scc_checklist table.
     Returns (ok, result_string).
@@ -1606,6 +1610,12 @@ def phase_scc_reset_check():
 
     db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     pod_id  = os.environ.get("POD_ID", "")
+
+    ALL_KEYS = (
+        "access_policy_rules", "logging_settings", "network_tunnel_groups",
+        "zta_profiles", "private_resources", "dns_servers",
+        "ravpn_profiles", "epp_posture_profiles",
+    )
 
     def _persist(item_key, status, detail=""):
         if not pod_id:
@@ -1624,7 +1634,7 @@ def phase_scc_reset_check():
     org_num = _scc_org_number_from_pod()
     if not org_num:
         msg = "Could not determine SCC org number from pod_number — run detect_pod_number first"
-        for k in ("access_policy_rules", "network_tunnel_groups", "zta_profiles", "epp_posture_profiles"):
+        for k in ALL_KEYS:
             _persist(k, "skipped", msg)
         return False, msg
 
@@ -1632,7 +1642,7 @@ def phase_scc_reset_check():
         keys = _scc_load_keys(org_num)
     except FileNotFoundError as e:
         msg = str(e)
-        for k in ("access_policy_rules", "network_tunnel_groups", "zta_profiles", "epp_posture_profiles"):
+        for k in ALL_KEYS:
             _persist(k, "skipped", msg)
         return False, f"SCC keys missing for org {org_num} — generate keys first | {msg}"
 
@@ -1642,10 +1652,10 @@ def phase_scc_reset_check():
 
     try:
         token = _scc_token(key_id, key_secret)
-        hdrs  = {"Authorization": f"Bearer {token}"}
+        hdrs  = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     except Exception as e:
         msg = f"SCC auth failed: {e}"
-        for k in ("access_policy_rules", "network_tunnel_groups", "zta_profiles", "epp_posture_profiles"):
+        for k in ALL_KEYS:
             _persist(k, "failed", msg)
         return False, msg
 
@@ -1665,37 +1675,122 @@ def phase_scc_reset_check():
         _persist("access_policy_rules", "failed", str(e))
         results["access_policy_rules"] = (False, str(e))
 
-    # 2. Network tunnel groups — expect 0
+    # 2. Logging settings — check no custom log destinations configured
+    try:
+        r = requests.get("https://api.sse.cisco.com/admin/v2/logging",
+                         headers=hdrs, timeout=15)
+        if r.ok:
+            data = r.json()
+            # Custom destinations = any enabled log targets (s3, siem, etc.)
+            destinations = data.get("data", data) if isinstance(data, dict) else data
+            if isinstance(destinations, list):
+                custom = [d for d in destinations if d.get("enabled", False)]
+            elif isinstance(destinations, dict):
+                # Some APIs return a single object with enabled flag
+                custom = [destinations] if destinations.get("enabled", False) else []
+            else:
+                custom = []
+            ok2 = (len(custom) == 0)
+            detail = (f"{len(custom)} active log destination(s)" if custom else "no custom logging") \
+                     + ("" if ok2 else " — disable custom log destinations")
+        else:
+            ok2 = False
+            detail = f"API error {r.status_code}: {r.text[:100]}"
+        _persist("logging_settings", "completed" if ok2 else "failed", detail)
+        results["logging_settings"] = (ok2, detail)
+    except Exception as e:
+        _persist("logging_settings", "failed", str(e))
+        results["logging_settings"] = (False, str(e))
+
+    # 3. Network tunnel groups — expect 0
     try:
         r = requests.get("https://api.sse.cisco.com/deployments/v2/networktunnelgroups",
                          headers=hdrs, timeout=15)
         ntgs = r.json().get("data", r.json()) if r.ok else []
         count = len(ntgs) if isinstance(ntgs, list) else 0
-        ok2 = (count == 0)
-        detail = f"{count} NTG(s)" + ("" if ok2 else " — need to delete all NTGs")
-        _persist("network_tunnel_groups", "completed" if ok2 else "failed", detail)
-        results["network_tunnel_groups"] = (ok2, detail)
+        ok3 = (count == 0)
+        detail = f"{count} NTG(s)" + ("" if ok3 else " — need to delete all NTGs")
+        _persist("network_tunnel_groups", "completed" if ok3 else "failed", detail)
+        results["network_tunnel_groups"] = (ok3, detail)
     except Exception as e:
         _persist("network_tunnel_groups", "failed", str(e))
         results["network_tunnel_groups"] = (False, str(e))
 
-    # 3. ZTA profiles — only "default-profile" should remain
+    # 4. ZTA profiles — only "default-profile" should remain
     try:
         r = requests.get("https://api.sse.cisco.com/deployments/v2/ztna/profiles",
                          headers=hdrs, timeout=15)
         profiles = r.json().get("data", r.json()) if r.ok else []
         custom = [p for p in (profiles if isinstance(profiles, list) else [])
                   if str(p.get("profileId", "")) != "default-profile"]
-        ok3 = (len(custom) == 0)
+        ok4 = (len(custom) == 0)
         detail = (f"{len(custom)} custom ZTA profile(s)" if custom else "only default-profile") \
-                 + ("" if ok3 else " — delete custom profiles")
-        _persist("zta_profiles", "completed" if ok3 else "failed", detail)
-        results["zta_profiles"] = (ok3, detail)
+                 + ("" if ok4 else " — delete custom profiles")
+        _persist("zta_profiles", "completed" if ok4 else "failed", detail)
+        results["zta_profiles"] = (ok4, detail)
     except Exception as e:
         _persist("zta_profiles", "failed", str(e))
         results["zta_profiles"] = (False, str(e))
 
-    # 4. EPP posture profiles — delete any without "System defined" tag
+    # 5. Private resources + resource groups — expect 0 of each
+    try:
+        # Private resources
+        r_res = requests.get("https://api.sse.cisco.com/deployments/v2/privateresources",
+                             headers=hdrs, timeout=15)
+        resources = r_res.json().get("data", r_res.json()) if r_res.ok else []
+        res_count = len(resources) if isinstance(resources, list) else 0
+
+        # Resource groups
+        r_grp = requests.get("https://api.sse.cisco.com/deployments/v2/resourcegroups",
+                             headers=hdrs, timeout=15)
+        groups = r_grp.json().get("data", r_grp.json()) if r_grp.ok else []
+        grp_count = len(groups) if isinstance(groups, list) else 0
+
+        ok5 = (res_count == 0 and grp_count == 0)
+        detail = f"{res_count} resource(s), {grp_count} group(s)" \
+                 + ("" if ok5 else " — delete all private resources and groups")
+        _persist("private_resources", "completed" if ok5 else "failed", detail)
+        results["private_resources"] = (ok5, detail)
+    except Exception as e:
+        _persist("private_resources", "failed", str(e))
+        results["private_resources"] = (False, str(e))
+
+    # 6. DNS servers — expect none configured (api.umbrella.com)
+    try:
+        r = requests.get(
+            f"https://api.umbrella.com/v1/organizations/{org_id}/dnsservers",
+            headers=hdrs, timeout=15)
+        servers = r.json() if r.ok else []
+        count = len(servers) if isinstance(servers, list) else 0
+        ok6 = (count == 0)
+        detail = f"{count} custom DNS server(s)" + ("" if ok6 else " — remove all custom DNS servers")
+        _persist("dns_servers", "completed" if ok6 else "failed", detail)
+        results["dns_servers"] = (ok6, detail)
+    except Exception as e:
+        _persist("dns_servers", "failed", str(e))
+        results["dns_servers"] = (False, str(e))
+
+    # 7. RAVPN profiles — expect 0 (prod.sse-ravpn-config.vpnp.umbrella.com)
+    try:
+        r = requests.get(
+            f"https://prod.sse-ravpn-config.vpnp.umbrella.com/v1/orgs/{org_id}/profiles",
+            headers=hdrs, timeout=15)
+        if r.ok:
+            data = r.json()
+            profiles = data.get("data", data) if isinstance(data, dict) else data
+            count = len(profiles) if isinstance(profiles, list) else 0
+            ok7 = (count == 0)
+            detail = f"{count} RAVPN profile(s)" + ("" if ok7 else " — delete all RAVPN profiles")
+        else:
+            ok7 = False
+            detail = f"API error {r.status_code}: {r.text[:100]}"
+        _persist("ravpn_profiles", "completed" if ok7 else "failed", detail)
+        results["ravpn_profiles"] = (ok7, detail)
+    except Exception as e:
+        _persist("ravpn_profiles", "failed", str(e))
+        results["ravpn_profiles"] = (False, str(e))
+
+    # 8. EPP posture profiles — no non-system-defined profiles
     try:
         r = requests.get(
             f"https://api.umbrella.com/v1/organizations/{org_id}/postureprofiles",
@@ -1703,11 +1798,11 @@ def phase_scc_reset_check():
         profs = r.json() if r.ok else []
         custom = [p for p in (profs if isinstance(profs, list) else [])
                   if "System defined" not in (p.get("tags") or [])]
-        ok4 = (len(custom) == 0)
+        ok8 = (len(custom) == 0)
         detail = (f"{len(custom)} custom EPP profile(s)" if custom else "only system-defined") \
-                 + ("" if ok4 else " — delete custom profiles")
-        _persist("epp_posture_profiles", "completed" if ok4 else "failed", detail)
-        results["epp_posture_profiles"] = (ok4, detail)
+                 + ("" if ok8 else " — delete custom profiles")
+        _persist("epp_posture_profiles", "completed" if ok8 else "failed", detail)
+        results["epp_posture_profiles"] = (ok8, detail)
     except Exception as e:
         _persist("epp_posture_profiles", "failed", str(e))
         results["epp_posture_profiles"] = (False, str(e))
