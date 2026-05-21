@@ -196,6 +196,12 @@ pod-automator/
 │   ├── pod_state.db                      # SQLite: pods, pipeline_steps, pipeline_logs, upgrade_config
 │   ├── bootstrap/                        # Generated bootstrap configs (gitignored)
 │   └── images/                           # Uploaded firmware .bin files (gitignored)
+├── scripts/
+│   ├── ubuntu-setup.sh                   # One-command Ubuntu server setup (systemd + auto-update)
+│   ├── git-update.sh                     # Pull latest from GitHub, restart if changed
+│   ├── pod-automator.service             # systemd service unit for dashboard
+│   ├── pod-automator-updater.service     # systemd oneshot unit for git pull
+│   └── pod-automator-updater.timer       # systemd timer — triggers updater every 5 min
 ├── appliance/
 │   ├── install.sh                        # One-command Ubuntu appliance installer
 │   ├── GETTING-STARTED.md                # Deployment and usage guide
@@ -260,6 +266,98 @@ packer build pod-automator.pkr.hcl
 
 See `appliance/GETTING-STARTED.md` for full deployment options (OVA import,
 install script, Packer build), upgrade instructions, and troubleshooting.
+
+---
+
+## Ubuntu Server Deployment (Auto-Updating)
+
+Deploy on any Ubuntu 22.04/24.04 server so the dashboard runs as a system
+service and automatically pulls the latest code from GitHub every 5 minutes.
+Push from your Mac → server picks it up with no manual intervention.
+
+### Prerequisites
+
+- Ubuntu 22.04 or 24.04 server
+- `sudo` / root access
+- Docker installed (the setup script will install it if missing)
+- A GitHub Personal Access Token with `repo` scope for `mokuma56/POD-Automator`
+
+### One-Time Setup
+
+```bash
+# 1. SSH into the Ubuntu server as root (or a sudo user)
+ssh user@<server-ip>
+
+# 2. Set your GitHub token
+export GITHUB_TOKEN=ghp_YourPersonalAccessTokenHere
+
+# 3. Download and run the setup script
+curl -fsSL https://raw.githubusercontent.com/mokuma56/POD-Automator/main/scripts/ubuntu-setup.sh \
+  | sudo -E bash
+
+# 4. Store the token permanently so the auto-updater can pull
+sudo mkdir -p /etc/pod-automator
+echo "ghp_YourPersonalAccessTokenHere" | sudo tee /etc/pod-automator/github_token
+sudo chmod 600 /etc/pod-automator/github_token
+```
+
+The setup script will:
+- Install system dependencies (`git`, `docker`, `uv`, Python 3)
+- Clone the repo to `/opt/pod-automator`
+- Install Python dependencies via `uv sync`
+- Register and start the `pod-automator` systemd service
+- Register and start the `pod-automator-updater` timer (polls every 5 min)
+
+Dashboard will be available at `http://<server-ip>:5050` immediately.
+
+### Auto-Update Behaviour
+
+Every 5 minutes the updater timer runs `scripts/git-update.sh` which:
+1. Fetches `origin/main` from GitHub
+2. If new commits are detected — pulls, re-syncs deps if `pyproject.toml` changed, restarts the dashboard
+3. If already up-to-date — does nothing (no restart, no disruption)
+
+To force an immediate update at any time:
+```bash
+sudo systemctl start pod-automator-updater
+```
+
+### Useful Commands
+
+```bash
+# Dashboard status
+sudo systemctl status pod-automator
+
+# Live dashboard logs
+sudo journalctl -u pod-automator -f
+
+# Auto-updater last run
+sudo journalctl -u pod-automator-updater -n 20
+
+# Timer schedule
+sudo systemctl list-timers pod-automator-updater.timer
+
+# Restart dashboard manually
+sudo systemctl restart pod-automator
+
+# Stop everything
+sudo systemctl stop pod-automator pod-automator-updater.timer
+```
+
+### Development Workflow
+
+```
+Mac (develop) ──git push──► GitHub (mokuma56/POD-Automator)
+                                        │
+                                  (every 5 min)
+                                        ▼
+                             Ubuntu Server (auto-pull + restart)
+                             http://<server-ip>:5050
+```
+
+1. Develop and test locally on your Mac (`uv run python3 dashboard.py`)
+2. Push to GitHub (`git push`)
+3. Within 5 minutes the Ubuntu server picks up the change automatically
 
 ---
 
