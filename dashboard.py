@@ -1500,7 +1500,7 @@ DASHBOARD_HTML = """
   .tab-btn { background: #112240; color: #8899aa; border: none; border-radius: 4px 4px 0 0;
              padding: 6px 14px; font-size: 12px; cursor: pointer; }
   .tab-btn.active { background: #1a2d4a; color: #02c8ff; }
-  .tab-content { display: none; background: #112240; border-radius: 0 8px 8px 8px; padding: 16px; }
+  .tab-content { display: none; background: #112240; border-radius: 0 8px 8px 8px; padding: 16px; min-height: 300px; }
   .tab-content.active { display: block; }
 
   .pipeline-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
@@ -1704,7 +1704,7 @@ DASHBOARD_HTML = """
       </div>
     </div>
     <div class="tab-content" id="tab-scc">
-      <div id="scc-grid" style="padding:16px;">
+      <div id="scc-grid" style="min-height:260px;">
         <div style="color:#667788;font-size:13px;">Select a POD to load SCC reset checklist</div>
       </div>
     </div>
@@ -2576,7 +2576,7 @@ const SCC_MANUAL_ITEMS = [
 
 async function loadSccChecklist(podId) {
   const grid = document.getElementById('scc-grid');
-  grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading SCC checklist...</div>';
+  // Don't clear grid — update in place to avoid layout bounce
   const r = await fetch('/api/scc/status/' + podId);
   const items = await r.json();
   const map = {};
