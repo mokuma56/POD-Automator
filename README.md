@@ -89,6 +89,22 @@ Single-page Flask dashboard at `http://localhost:5050`:
 - **Clickable SSH** — click any switch name to open macOS Terminal.app with SSH
   connected through the Docker VPN (password automated via `sshpass`)
 
+### Knowledge Base & AI Assistant
+A searchable knowledge base built into the dashboard, powered by local semantic
+search (sentence-transformers) and an optional Ollama LLM for AI-assisted answers:
+- **Search** — semantic search across all published articles using vector embeddings
+- **Ask** — type a question; the system finds the most relevant articles and passes
+  them to a local Ollama model (`llama3.2`) to produce a grounded answer
+- **Paste Documentation** — paste any text (Cisco docs, release notes, runbooks) directly
+  into the dashboard and it is chunked, embedded, and made searchable immediately
+- **Auto-draft on failure** — when a pipeline step hard-fails, a draft KB article is
+  automatically created with the step name, error output, and POD context; proctors
+  review and publish it so future runs benefit from the captured knowledge
+- **Seed from AGENTS.md** — one-click import of all known issues, infrastructure notes,
+  and pipeline quirks from the central `AGENTS.md` file
+- **Update from chat** — paste documentation here in the OpenCode chat and it is
+  ingested directly into the KB via `kb_seed.ingest_text()`
+
 ---
 
 ## Pipeline Steps
@@ -180,6 +196,8 @@ pod-automator/
 ├── dashboard.py                          # Flask dashboard — all UI, API endpoints, tabs
 ├── onboard_router.py                     # All pipeline phase functions
 ├── onboard.py                            # Docker entrypoint — pipeline loop, soft-fail logic
+├── kb.py                                 # Knowledge base — SQLite + embeddings + Ollama RAG
+├── kb_seed.py                            # KB seeder — AGENTS.md import + ingest_text() API
 ├── base_configs/
 │   ├── border_spine.txt                  # Baseline config for C9300-48UB Border Spine
 │   ├── leaf1.txt                         # Baseline config for C9300-48P Leaf 1
@@ -193,7 +211,7 @@ pod-automator/
 │   ├── status.sh                         # Shortcut: --db --status
 │   └── stop.sh                           # Shortcut: --db --down
 ├── data/
-│   ├── pod_state.db                      # SQLite: pods, pipeline_steps, pipeline_logs, upgrade_config
+│   ├── pod_state.db                      # SQLite: pods, pipeline_steps, pipeline_logs, upgrade_config, knowledge_base
 │   ├── bootstrap/                        # Generated bootstrap configs (gitignored)
 │   └── images/                           # Uploaded firmware .bin files (gitignored)
 ├── scripts/
@@ -358,6 +376,66 @@ Mac (develop) ──git push──► GitHub (mokuma56/POD-Automator)
 1. Develop and test locally on your Mac (`uv run python3 dashboard.py`)
 2. Push to GitHub (`git push`)
 3. Within 5 minutes the Ubuntu server picks up the change automatically
+
+---
+
+## Knowledge Base Setup
+
+The Knowledge Base requires **Ollama** running on the proctor's local Mac.
+Search works without Ollama — only AI-assisted answers require it.
+
+### 1. Install Ollama (Mac)
+```bash
+brew install ollama
+# or
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+### 2. Start Ollama and pull the model
+```bash
+ollama serve &
+ollama pull llama3.2
+```
+
+### 3. Install Python dependencies
+```bash
+uv sync   # picks up sentence-transformers and ollama from pyproject.toml
+```
+
+### 4. Seed the KB from AGENTS.md
+```bash
+uv run python3 kb_seed.py seed
+```
+
+### 5. Use it
+- Open the dashboard → click any POD row → **Knowledge Base** tab
+- **Search bar** — semantic search across all published articles
+- **Ask bar** — natural language question answered by Ollama using KB context
+- **Paste Doc button** — paste any documentation text to add it to the KB
+- **Seed from AGENTS.md button** — re-import all known issues (idempotent)
+
+### Adding knowledge from the OpenCode chat
+Paste any documentation or issue description here in chat and say
+"add this to the KB" — it will be ingested via `kb_seed.ingest_text()`
+directly without going through the dashboard.
+
+### CLI
+```bash
+# Seed from AGENTS.md
+uv run python3 kb_seed.py seed
+
+# Check KB status
+uv run python3 kb.py status
+
+# Ask a question from the CLI
+uv run python3 kb.py ask "why does the router boot with no config"
+
+# Ingest a file
+uv run python3 kb_seed.py ingest path/to/doc.txt "My Doc Title" "tag1,tag2"
+
+# Rebuild all embeddings (after changing embed model)
+uv run python3 kb.py reembed
+```
 
 ---
 

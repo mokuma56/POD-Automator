@@ -11,6 +11,22 @@ import os, sys, time, subprocess, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import onboard_router
 
+# KB auto-draft on failure (best-effort — never blocks the pipeline)
+try:
+    import kb as _kb
+    _kb.ensure_kb_table()
+    _KB_OK = True
+except Exception:
+    _KB_OK = False
+
+def _kb_auto_draft(step_name, error_text, pod_id=""):
+    if not _KB_OK:
+        return
+    try:
+        _kb.auto_draft(step_name=step_name, error_text=error_text, pod_id=pod_id)
+    except Exception:
+        pass
+
 # ── Override config from environment ────────────────────────────
 onboard_router.ROUTER_IP = os.getenv("ROUTER_IP", "198.18.133.25")
 onboard_router.VMANAGE = f"https://{os.getenv('VMANAGE', '198.18.133.10')}"
@@ -236,6 +252,7 @@ for step_name, func in steps:
                 live_log(log_line)
                 continue
             report_step(step_name, "failed", str(result)[:200])
+            _kb_auto_draft(step_name, str(result), pod_id)
             sys.exit(1)
         log_line = f"✓ {step_name} OK"
         print(f"  {log_line}")
@@ -283,6 +300,7 @@ conn.close()
             live_log(log_line)
             continue
         report_step(step_name, "failed", str(e)[:200])
+        _kb_auto_draft(step_name, str(e), pod_id)
         sys.exit(1)
 
 # Mark SD-WAN online and POD fully ready in dashboard

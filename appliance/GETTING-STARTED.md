@@ -15,6 +15,7 @@ automates Cisco SD-WAN C8231-G2 router onboarding for dCloud lab sessions.
 | **AD Verify** | LDAP check that user accounts are correctly provisioned |
 | **cdFMC tab** | Terraform deploy status + FTD device verification |
 | **Upgrade tab** | Switch (C9300) and Router (C8231-G2) software upgrade |
+| **Knowledge Base** | Semantic search + Ollama AI assistant for lab issues |
 
 ---
 
@@ -228,6 +229,8 @@ systemctl restart pod-automator
 ├── dashboard.py          # Flask dashboard (all tabs, all API endpoints)
 ├── onboard.py            # Docker entrypoint — pipeline loop
 ├── onboard_router.py     # All phase functions (sdwan, ad, cdfmc, upgrade)
+├── kb.py                 # Knowledge base — SQLite + embeddings + Ollama RAG
+├── kb_seed.py            # KB seeder — AGENTS.md import + paste/file ingest
 ├── requirements.txt      # Python dependencies
 ├── docker/
 │   ├── Dockerfile        # pod-automator:latest image
@@ -247,6 +250,54 @@ systemctl restart pod-automator
             ├── user-data  # Ubuntu autoinstall config
             └── meta-data
 ```
+
+---
+
+## Knowledge Base & AI Assistant
+
+The Knowledge Base tab is available in every POD detail panel. It provides semantic
+search over lab documentation and AI-assisted answers powered by a local Ollama model.
+
+**Ollama runs on the proctor's Mac** — not on the appliance VM. Set it up once:
+
+```bash
+# Install Ollama
+brew install ollama          # macOS
+# or: curl -fsSL https://ollama.com/install.sh | sh
+
+# Start and pull the model
+ollama serve &
+ollama pull llama3.2
+
+# Seed the KB from known issues (AGENTS.md)
+cd ~/sw_projects/pod_automator
+uv run python3 kb_seed.py seed
+```
+
+Once Ollama is running, the Knowledge Base tab in the dashboard will show a green
+status dot and AI answers will be available.
+
+**Search works without Ollama** — semantic search (vector embeddings via
+`sentence-transformers`) runs locally on the Mac as part of the dashboard process.
+Only the AI answer generation requires Ollama.
+
+### Adding documentation
+
+| Method | How |
+|--------|-----|
+| **Paste Doc button** | Click in the KB tab, paste text, click Ingest |
+| **From OpenCode chat** | Paste content and say "add this to the KB" |
+| **CLI** | `uv run python3 kb_seed.py ingest path/to/file.txt` |
+| **Seed from AGENTS.md** | Click the Seed button in the KB tab (idempotent) |
+
+### Auto-draft on pipeline failure
+
+When any pipeline step hard-fails, a **draft KB article** is automatically created
+with the step name, error text, and POD ID. Proctors can:
+1. Open the KB tab → filter by **Drafts**
+2. Review the auto-generated article
+3. Fill in the resolution and root cause
+4. Click **Publish** to make it searchable for future runs
 
 ---
 
