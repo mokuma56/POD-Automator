@@ -812,6 +812,106 @@ def phase_connectivity_test():
     return True, " | ".join(results)
 
 
+# Switch key → base config filename + IP
+BASECONFIG_SWITCHES = {
+    "border_spine": {"ip": "198.18.128.24", "name": "Border Spine", "file": "border_spine.txt"},
+    "leaf1":        {"ip": "198.18.128.22", "name": "Leaf 1",        "file": "leaf1.txt"},
+    "leaf2":        {"ip": "198.18.128.23", "name": "Leaf 2",        "file": "leaf2.txt"},
+}
+
+def phase_baseconfig_verify(switch_key, log_fn=print):
+    """
+    Verify a switch has the expected base config.
+    Checks: hostname, management VRF present, key VLANs present.
+    Returns (ok, detail).
+    """
+    info = BASECONFIG_SWITCHES.get(switch_key)
+    if not info:
+        return False, f"Unknown switch key: {switch_key}"
+
+    expected_hostname = {
+        "border_spine": "Site_105-Border-Spine",
+        "leaf1":        "Site_105-Leaf1",
+        "leaf2":        "Site_105-Leaf2",
+    }.get(switch_key, "")
+
+    log_fn(f"  Verifying {info['name']} ({info['ip']})...")
+    try:
+        client, shell = ssh_switch(info["ip"])
+    except Exception as e:
+        return False, f"SSH failed: {e}"
+
+    checks = {}
+    try:
+        # Check hostname
+        out = switch_cmd(shell, "show run | include ^hostname", timeout=8)
+        hostname_ok = expected_hostname in out
+        checks["hostname"] = "OK" if hostname_ok else f"FAIL (got: {out.strip()[:60]})"
+
+        # Check Mgmt-vrf present
+        out = switch_cmd(shell, "show vrf | include Mgmt", timeout=8)
+        checks["Mgmt-vrf"] = "OK" if "Mgmt-vrf" in out else "MISSING"
+
+        # Check VLAN 10 present (common base VLAN)
+        out = switch_cmd(shell, "show vlan brief | include ^10 ", timeout=8)
+        checks["vlan10"] = "OK" if out.strip() else "MISSING"
+
+        # No EVPN NVE interface (should be gone after reset)
+        out = switch_cmd(shell, "show run | include ^interface nve", timeout=8)
+        checks["no_nve"] = "OK" if "nve" not in out.lower() else "STILL_PRESENT"
+
+        client.close()
+    except Exception as e:
+        client.close()
+        return False, f"Verify failed mid-check: {e}"
+
+    failed = [k for k, v in checks.items() if v != "OK"]
+    summary = "; ".join(f"{k}={v}" for k, v in checks.items())
+    ok = len(failed) == 0
+    return ok, summary
+
+
+def phase_baseconfig_reset(switch_key, log_fn=print):
+    """
+    Push the known-good base config for a switch via SSH.
+    Sends conf t, all config lines, end, write memory.
+    Returns (ok, detail).
+    """
+    info = BASECONFIG_SWITCHES.get(switch_key)
+    if not info:
+        return False, f"Unknown switch key: {switch_key}"
+
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "base_configs")
+    cfg_path = os.path.join(base_dir, info["file"])
+    if not os.path.exists(cfg_path):
+        return False, f"Base config not found: {cfg_path}"
+
+    with open(cfg_path) as f:
+        lines = [l.rstrip() for l in f.readlines()]
+
+    log_fn(f"  Connecting to {info['name']} ({info['ip']})...")
+    try:
+        client, shell = ssh_switch(info["ip"])
+    except Exception as e:
+        return False, f"SSH failed: {e}"
+
+    try:
+        log_fn(f"  Pushing {len(lines)} config lines...")
+        switch_cmd(shell, "conf t", timeout=3)
+        for line in lines:
+            switch_cmd(shell, line if line else " ", timeout=3)
+        switch_cmd(shell, "end", timeout=3)
+        out = switch_cmd(shell, "write memory", timeout=15)
+        ok = "[OK]" in out or "OK" in out or "Building" in out
+        detail = f"{'OK' if ok else 'WARN'}: {len(lines)} lines pushed, write memory {'OK' if ok else 'may have failed'}"
+        log_fn(f"  {detail}")
+        client.close()
+        return ok, detail
+    except Exception as e:
+        client.close()
+        return False, f"Config push failed: {e}"
+
+
 # Ubuntu automation PC — fixed address in all dCloud sessions
 CDFMC_AUTOMATION_HOST = "198.18.134.12"
 CDFMC_AUTOMATION_USER = "cisco"
