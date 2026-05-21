@@ -1574,17 +1574,22 @@ def _scc_token(key_id: str, key_secret: str) -> str:
 
 
 def _scc_org_number_from_pod() -> str:
-    """Derive org number from pod_number stored in DB (e.g. POD 14 → org 514)."""
+    """Extract org number from scc_org stored in DB (e.g. 'pseudoco-523--...' → '523')."""
     db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     pod_id  = os.environ.get("POD_ID", "")
     try:
         import sqlite3 as _sq
         c = _sq.connect(db_path)
         c.row_factory = _sq.Row
-        row = c.execute("SELECT pod_number FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        row = c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         c.close()
-        if row and row["pod_number"]:
-            return str(500 + int(row["pod_number"]))
+        if row and row["scc_org"]:
+            m = _re.search(r"pseudoco-(\d+)--", row["scc_org"])
+            if m:
+                return m.group(1)
+            # Fallback: if scc_org is already just a number
+            if row["scc_org"].isdigit():
+                return row["scc_org"]
     except Exception:
         pass
     return ""
