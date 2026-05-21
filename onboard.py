@@ -183,6 +183,7 @@ steps = [
      ("connectivity_test",  onboard_router.phase_connectivity_test),
      ("cdfmc_check",        onboard_router.phase_cdfmc_check),
      ("ad_verify",          onboard_router.phase_ad_verify),
+     ("scc_reset_check",    onboard_router.phase_scc_reset_check),
 ]
 
 # Steps that should NOT halt the pipeline on failure — record as skipped/warn and continue
@@ -198,6 +199,7 @@ SOFT_FAIL_STEPS = {
     "connectivity_test",
     "cdfmc_check",
     "ad_verify",
+    "scc_reset_check",
 }
 
 for step_name, func in steps:
