@@ -1,0 +1,18 @@
+[Unit]
+Description=POD Automator Dashboard
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=pod-automator
+WorkingDirectory=/opt/pod-automator
+Environment="PATH=/home/pod-automator/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/pod-automator/.local/bin/uv run python3 dashboard.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
