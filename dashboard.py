@@ -192,8 +192,8 @@ def api_pods():
             "access_policy_rules", "logging_settings", "network_tunnel_groups",
             "zta_profiles", "private_resources", "dns_servers",
             "ravpn_profiles", "epp_posture_profiles",
-            # 4 manual
-            "dlp_rules", "ravpn_ip_pool", "ise_pxgrid", "duo_saml",
+            # 5 manual
+            "dlp_rules", "ravpn_ip_pool", "duo_saml", "ise_pxgrid", "te_integration",
         ]
         try:
             scc_rows = conn.execute(
@@ -2558,20 +2558,34 @@ function escHtml(s) {
 
 // ── SCC Reset Checklist ──────────────────────────────────────────
 const SCC_AUTO_ITEMS = [
-  { key: 'access_policy_rules',   label: 'Access Policy Rules cleared' },
-  { key: 'logging_settings',      label: 'Logging Settings reset' },
-  { key: 'network_tunnel_groups', label: 'Network Tunnel Groups cleared' },
-  { key: 'zta_profiles',          label: 'ZTA Profiles reset to default' },
-  { key: 'private_resources',     label: 'Private Resources & Resource Groups cleared' },
-  { key: 'dns_servers',           label: 'DNS Servers cleared' },
-  { key: 'ravpn_profiles',        label: 'RAVPN Profiles cleared' },
-  { key: 'epp_posture_profiles',  label: 'EPP Posture Profiles cleared' },
+  { key: 'access_policy_rules',  label: 'Access Policy Rules cleared',
+    desc: 'Secure Access → Secure → Access Policy. Delete all configured policies.' },
+  { key: 'logging_settings',     label: 'Logging disabled',
+    desc: 'Secure Access → Secure → Access Policy. Edit "For all Internet access" — disable Logging.' },
+  { key: 'network_tunnel_groups',label: 'Network Tunnel Groups cleared',
+    desc: 'Secure Access → Connect → Network Connections → Network Tunnel Groups. Delete Router and Firewall tunnel groups.' },
+  { key: 'zta_profiles',         label: 'ZTA Profile deleted',
+    desc: 'Secure Access → Connect → End User Connectivity → Zero Trust Access. Delete PseudoCo ZTA Profile.' },
+  { key: 'private_resources',    label: 'Private Resources & Groups cleared',
+    desc: 'Secure Access → Resources → Private Resources. Delete Contractor and Intranet resources.' },
+  { key: 'dns_servers',          label: 'DNS Servers cleared',
+    desc: 'Secure Access → Resources → DNS Servers. Delete PseudoCo DNS.' },
+  { key: 'ravpn_profiles',       label: 'RAVPN Profile deleted',
+    desc: 'Secure Access → Connect → End User Connectivity → Virtual Private Network. Delete PseudoCo_RA_VPN_Profile.' },
+  { key: 'epp_posture_profiles', label: 'EPP Posture Profile deleted',
+    desc: 'Secure Access → Secure → Endpoint Posture Profile. Delete PseudoCo Windows profile.' },
 ];
 const SCC_MANUAL_ITEMS = [
-  { key: 'dlp_rules',    label: 'DLP Rules cleared' },
-  { key: 'ravpn_ip_pool',label: 'RAVPN IP Pools cleared' },
-  { key: 'ise_pxgrid',   label: 'ISE / pxGrid integration removed' },
-  { key: 'duo_saml',     label: 'Duo / DuoSSO SAML metadata removed' },
+  { key: 'dlp_rules',     label: 'DLP Policy cleared',
+    desc: 'Secure Access → Secure → Data Loss Prevention Policy. Delete configured policy.' },
+  { key: 'ravpn_ip_pool', label: 'RAVPN IP Pool deleted',
+    desc: 'Secure Access → Connect → End User Connectivity → Virtual Private Network. Click Manage under Regions and IP Pools — delete the configured IP Pool.' },
+  { key: 'duo_saml',      label: 'Duo / DuoSSO SAML profiles removed',
+    desc: 'Secure Access → Connect → Users, Groups, and Endpoint Devices → Configuration Management. Click Edit then Delete on both Duo and DuoSSO profiles (delete Duo first, DuoSSO should follow).' },
+  { key: 'ise_pxgrid',    label: 'ISE / pxGrid integration removed',
+    desc: 'SCC Platform Management → Platform Integrations. Delete the ISE/pxGrid integration.' },
+  { key: 'te_integration',label: 'ThousandEyes integration removed',
+    desc: 'Secure Access → Experience and Insights → Account Management. Delete ThousandEyes integration.' },
 ];
 
 async function loadSccChecklist(podId) {
@@ -2613,14 +2627,17 @@ async function loadSccChecklist(podId) {
           : () => sccConfirm(podId, item.key);
       }, 0);
     }
-    return '<div class="switch-check">'
-      + '<span class="check-label"><span class="check-icon" style="color:' + iconColor + '">' + icon + '</span>'
-      + escHtml(item.label)
+    return '<div class="switch-check" style="flex-direction:column;align-items:flex-start;padding:6px 0;">'
+      + '<div style="display:flex;align-items:center;width:100%;">'
+      + '<span class="check-icon" style="color:' + iconColor + ';flex-shrink:0;">' + icon + '</span>'
+      + '<span style="flex:1;font-size:13px;color:#e0e8f0;margin-left:4px;">' + escHtml(item.label)
       + (isManual ? ' <span style="font-size:10px;color:#445566;background:#112240;padding:1px 4px;border-radius:3px;">manual</span>' : '')
       + '</span>'
-      + '<span class="check-result ' + (done ? 'check-pass' : failed ? 'check-fail' : 'check-na') + '" style="display:flex;align-items:center;gap:6px;">'
+      + '<span class="check-result ' + (done ? 'check-pass' : failed ? 'check-fail' : 'check-na') + '" style="display:flex;align-items:center;gap:6px;flex-shrink:0;">'
       + escHtml(result) + confirmedBy + btnHtml
       + '</span>'
+      + '</div>'
+      + (item.desc ? '<div style="font-size:11px;color:#445566;margin-left:20px;margin-top:2px;line-height:1.4;">' + escHtml(item.desc) + '</div>' : '')
       + '</div>';
   }
 
@@ -2632,7 +2649,7 @@ async function loadSccChecklist(podId) {
     + '<div style="font-size:11px;color:#667788;white-space:nowrap;">' + completedCount + '/' + allItems.length + '</div>'
     + '<button id="scc-recheck-btn" class="btn-reconnect">&#x21bb; Re-check Auto</button>'
     + '</div>'
-    + (allDone ? '<div style="padding:8px 12px;background:#00e68a22;border:1px solid #00e68a;border-radius:6px;color:#00e68a;font-size:13px;margin-bottom:12px;">&#x2713; All 12 items confirmed — POD cleared</div>' : '')
+    + (allDone ? '<div style="padding:8px 12px;background:#00e68a22;border:1px solid #00e68a;border-radius:6px;color:#00e68a;font-size:13px;margin-bottom:12px;">&#x2713; All 13 items confirmed — POD cleared</div>' : '')
     // Auto card
     + '<div class="switch-card' + (SCC_AUTO_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : SCC_AUTO_ITEMS.some(i => (map[i.key]||{}).status==='failed') ? ' fail' : '') + '" style="margin-bottom:10px;">'
     + '<div class="switch-card-title"><span class="role-tag cc">AUTO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automated API Checks</span></div>'
