@@ -6,6 +6,14 @@ from flask import Flask, render_template_string, jsonify, request
 
 sys.path.insert(0, str(Path.home() / "sw_projects" / "pod_automator"))
 import onboard_router
+try:
+    import kb as _kb
+    import kb_seed as _kb_seed
+    _kb.ensure_kb_table(_kb.DB_PATH)
+    _KB_AVAILABLE = True
+except Exception as _kb_err:
+    _KB_AVAILABLE = False
+    _kb_err_msg = str(_kb_err)
 
 DATA_DIR = Path.home() / "sw_projects" / "pod_automator"
 DB_PATH = DATA_DIR / "data" / "pod_state.db"
@@ -1778,6 +1786,7 @@ DASHBOARD_HTML = """
       <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
       <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
       <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
+      <button class="tab-btn" onclick="switchTab(this, 'kb')">&#128218; Knowledge Base</button>
     </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
@@ -1814,6 +1823,12 @@ DASHBOARD_HTML = """
     <div class="tab-content" id="tab-fabric">
       <div id="fabric-grid" style="padding:16px;min-height:260px;">
         <div style="color:#667788;font-size:13px;">Select a POD to load EVPN Fabric status</div>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-kb">
+      <div id="kb-grid" style="padding:16px;min-height:300px;">
+        <div style="color:#667788;font-size:13px;">Loading knowledge base...</div>
       </div>
     </div>
   </div>
@@ -2807,6 +2822,9 @@ function switchTab(btn, name) {
     const podId = document.getElementById('detail-pod-id').dataset.podId;
     if (podId) loadFabricStatus(podId);
   }
+  if (name === 'kb') {
+    loadKbTab();
+  }
 }
 
 const FABRIC_STEPS = [
@@ -2957,10 +2975,395 @@ async function dockerDown() {
 load();
 setInterval(load, 5000);
 loadUpgradeConfig();
+
+// ── Knowledge Base ────────────────────────────────────────────────────────────
+let _kbCurrentId = null;
+
+async function loadKbTab() {
+  const grid = document.getElementById('kb-grid');
+  if (!grid) return;
+
+  // Status bar
+  let st = {};
+  try { const r = await fetch('/api/kb/status'); st = await r.json(); } catch(e) {}
+
+  const ollamaOk  = st.ollama && st.ollama.running;
+  const ollamaMsg = ollamaOk
+    ? '<span style="color:#2ecc71;">&#9679; Ollama running (' + (st.ollama.model||'') + ')</span>'
+    : '<span style="color:#e74c3c;">&#9679; Ollama offline &mdash; '
+      + '<a href="https://ollama.com/download" target="_blank" style="color:#00bceb;">Install Ollama</a>'
+      + ', then run: <code>ollama pull llama3.2</code></span>';
+
+  let html = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">'
+    + '<span style="font-size:20px;font-weight:700;color:#00bceb;">&#128218; Knowledge Base</span>'
+    + '<span style="font-size:12px;color:#8899aa;">'
+    + (st.published||0) + ' published &bull; ' + (st.drafts||0) + ' drafts'
+    + '</span>'
+    + '<span style="font-size:12px;">' + ollamaMsg + '</span>'
+    + '<button id="kb-seed-btn" style="margin-left:auto;background:#0d4f6e;color:#00bceb;border:1px solid #00bceb;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;">Seed from AGENTS.md</button>'
+    + '</div>';
+
+  // Ask bar
+  html += '<div style="display:flex;gap:8px;margin-bottom:16px;">'
+    + '<input id="kb-ask-input" type="text" placeholder="Ask a question about the lab..." '
+    + 'style="flex:1;background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:8px 12px;border-radius:4px;font-size:13px;">'
+    + '<button id="kb-ask-btn" style="background:#02c8ff;color:#000;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-weight:600;font-size:13px;">Ask</button>'
+    + '</div>'
+    + '<div id="kb-answer" style="display:none;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:12px;margin-bottom:16px;font-size:13px;color:#c9d1d9;white-space:pre-wrap;"></div>';
+
+  // Search + Add
+  html += '<div style="display:flex;gap:8px;margin-bottom:14px;">'
+    + '<input id="kb-search-input" type="text" placeholder="Search articles..." '
+    + 'style="flex:1;background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:7px 12px;border-radius:4px;font-size:12px;">'
+    + '<select id="kb-filter-status" style="background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
+    + '<option value="published">Published</option><option value="draft">Drafts</option><option value="">All</option>'
+    + '</select>'
+    + '<button id="kb-add-btn" style="background:#27ae60;color:#fff;border:none;padding:7px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">+ Add Article</button>'
+    + '<button id="kb-paste-btn" style="background:#8e44ad;color:#fff;border:none;padding:7px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#128203; Paste Doc</button>'
+    + '</div>';
+
+  html += '<div id="kb-articles-list"></div>';
+
+  // Edit / Paste modal
+  html += '<div id="kb-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center;">'
+    + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;width:660px;max-height:80vh;overflow-y:auto;">'
+    + '<div style="font-size:16px;font-weight:700;color:#00bceb;margin-bottom:12px;" id="kb-modal-title">Add Article</div>'
+    + '<input id="kb-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:13px;margin-bottom:8px;box-sizing:border-box;">'
+    + '<textarea id="kb-m-body" rows="12" placeholder="Body (markdown supported)" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;font-family:monospace;margin-bottom:8px;box-sizing:border-box;resize:vertical;"></textarea>'
+    + '<div style="display:flex;gap:8px;margin-bottom:8px;">'
+    + '<input id="kb-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 10px;border-radius:4px;font-size:12px;">'
+    + '<select id="kb-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 8px;border-radius:4px;font-size:12px;">'
+    + '<option>general</option><option>sdwan</option><option>pipeline-failure</option><option>infrastructure</option>'
+    + '<option>dashboard</option><option>upgrade</option><option>documentation</option></select>'
+    + '<select id="kb-m-status" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 8px;border-radius:4px;font-size:12px;">'
+    + '<option value="published">Published</option><option value="draft">Draft</option></select>'
+    + '</div>'
+    + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
+    + '<button id="kb-m-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;">Cancel</button>'
+    + '<button id="kb-m-save" style="background:#00bceb;color:#000;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:600;">Save</button>'
+    + '</div></div></div>';
+
+  // Paste-doc modal
+  html += '<div id="kb-paste-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center;">'
+    + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;width:680px;max-height:80vh;overflow-y:auto;">'
+    + '<div style="font-size:16px;font-weight:700;color:#8e44ad;margin-bottom:12px;">&#128203; Paste Documentation</div>'
+    + '<input id="kb-p-title" placeholder="Document title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:13px;margin-bottom:8px;box-sizing:border-box;">'
+    + '<textarea id="kb-p-body" rows="14" placeholder="Paste your documentation here (plain text or markdown)..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;font-family:monospace;margin-bottom:8px;box-sizing:border-box;resize:vertical;"></textarea>'
+    + '<div style="display:flex;gap:8px;margin-bottom:8px;">'
+    + '<input id="kb-p-tags" placeholder="Tags" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 10px;border-radius:4px;font-size:12px;">'
+    + '<select id="kb-p-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 8px;border-radius:4px;font-size:12px;">'
+    + '<option>documentation</option><option>general</option><option>sdwan</option>'
+    + '<option>pipeline-failure</option><option>infrastructure</option></select>'
+    + '</div>'
+    + '<div style="font-size:11px;color:#667788;margin-bottom:10px;">Long documents are automatically split into searchable chunks.</div>'
+    + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
+    + '<button id="kb-p-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;">Cancel</button>'
+    + '<button id="kb-p-save" style="background:#8e44ad;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:600;">Ingest</button>'
+    + '</div></div></div>';
+
+  grid.innerHTML = html;
+
+  // Load articles list
+  await refreshKbList();
+
+  // Wire up buttons via setTimeout to ensure DOM is ready
+  setTimeout(() => {
+    const askInput = document.getElementById('kb-ask-input');
+    const askBtn   = document.getElementById('kb-ask-btn');
+    if (askBtn) askBtn.onclick = kbAsk;
+    if (askInput) askInput.onkeydown = e => { if (e.key === 'Enter') kbAsk(); };
+
+    const searchInput = document.getElementById('kb-search-input');
+    const filterSel   = document.getElementById('kb-filter-status');
+    if (searchInput) searchInput.oninput = () => refreshKbList();
+    if (filterSel)   filterSel.onchange  = () => refreshKbList();
+
+    const addBtn   = document.getElementById('kb-add-btn');
+    const pasteBtn = document.getElementById('kb-paste-btn');
+    const seedBtn  = document.getElementById('kb-seed-btn');
+    if (addBtn)   addBtn.onclick   = () => kbOpenModal(null);
+    if (pasteBtn) pasteBtn.onclick = () => kbOpenPasteModal();
+    if (seedBtn)  seedBtn.onclick  = kbSeed;
+
+    const mCancel = document.getElementById('kb-m-cancel');
+    const mSave   = document.getElementById('kb-m-save');
+    const pCancel = document.getElementById('kb-p-cancel');
+    const pSave   = document.getElementById('kb-p-save');
+    if (mCancel) mCancel.onclick = () => { document.getElementById('kb-modal').style.display = 'none'; };
+    if (mSave)   mSave.onclick   = kbSaveModal;
+    if (pCancel) pCancel.onclick = () => { document.getElementById('kb-paste-modal').style.display = 'none'; };
+    if (pSave)   pSave.onclick   = kbPasteIngest;
+  }, 0);
+}
+
+async function refreshKbList() {
+  const el     = document.getElementById('kb-articles-list');
+  if (!el) return;
+  const q      = (document.getElementById('kb-search-input') || {value:''}).value.trim();
+  const status = (document.getElementById('kb-filter-status') || {value:'published'}).value;
+
+  let articles = [];
+  if (q) {
+    const r = await fetch('/api/kb/search?q=' + encodeURIComponent(q) + '&status=' + status + '&top_k=20');
+    const d = await r.json();
+    articles = d.results || [];
+  } else {
+    const r = await fetch('/api/kb/articles?status=' + status + '&limit=100');
+    articles = await r.json();
+  }
+
+  if (!articles.length) {
+    el.innerHTML = '<div style="color:#667788;font-size:13px;padding:20px 0;">No articles found.</div>';
+    return;
+  }
+
+  const catColors = {
+    'sdwan':'#00bceb','pipeline-failure':'#e74c3c','infrastructure':'#f39c12',
+    'dashboard':'#9b59b6','upgrade':'#2ecc71','documentation':'#3498db','general':'#667788'
+  };
+
+  el.innerHTML = articles.map(a => {
+    const cat   = a.category || 'general';
+    const cc    = catColors[cat] || '#667788';
+    const score = a.score != null ? ' <span style="color:#667788;font-size:10px;">(' + (a.score*100).toFixed(0) + '% match)</span>' : '';
+    const isDraft = a.status === 'draft';
+    return '<div style="background:#161b22;border:1px solid ' + (isDraft?'#f39c12':'#2a3040') + ';border-radius:6px;padding:10px 14px;margin-bottom:8px;cursor:pointer;" onclick="kbViewArticle(' + a.id + ')">'
+      + '<div style="display:flex;align-items:center;gap:8px;">'
+      + '<span style="background:' + cc + '22;color:' + cc + ';border:1px solid ' + cc + '44;border-radius:3px;padding:1px 6px;font-size:10px;font-weight:600;">' + cat + '</span>'
+      + (isDraft ? '<span style="background:#f39c1222;color:#f39c12;border:1px solid #f39c1244;border-radius:3px;padding:1px 6px;font-size:10px;">DRAFT</span>' : '')
+      + '<span style="font-size:13px;font-weight:600;color:#c9d1d9;">' + a.title + score + '</span>'
+      + '<span style="margin-left:auto;font-size:10px;color:#667788;">' + (a.tags||'') + '</span>'
+      + '</div></div>';
+  }).join('');
+}
+
+async function kbViewArticle(id) {
+  _kbCurrentId = id;
+  const r   = await fetch('/api/kb/article/' + id);
+  const art = await r.json();
+  kbOpenModal(art);
+}
+
+function kbOpenModal(art) {
+  const modal = document.getElementById('kb-modal');
+  document.getElementById('kb-modal-title').textContent = art ? 'Edit Article' : 'Add Article';
+  document.getElementById('kb-m-title').value    = art ? (art.title||'') : '';
+  document.getElementById('kb-m-body').value     = art ? (art.body||'')  : '';
+  document.getElementById('kb-m-tags').value     = art ? (art.tags||'')  : '';
+  document.getElementById('kb-m-category').value = art ? (art.category||'general') : 'general';
+  document.getElementById('kb-m-status').value   = art ? (art.status||'draft')     : 'draft';
+  if (!art) _kbCurrentId = null;
+  modal.style.display = 'flex';
+}
+
+async function kbSaveModal() {
+  const payload = {
+    title:    document.getElementById('kb-m-title').value,
+    body:     document.getElementById('kb-m-body').value,
+    tags:     document.getElementById('kb-m-tags').value,
+    category: document.getElementById('kb-m-category').value,
+    status:   document.getElementById('kb-m-status').value,
+  };
+  if (_kbCurrentId) {
+    await fetch('/api/kb/article/' + _kbCurrentId, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  } else {
+    await fetch('/api/kb/article', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  }
+  document.getElementById('kb-modal').style.display = 'none';
+  await refreshKbList();
+  loadKbTab();
+}
+
+function kbOpenPasteModal() {
+  document.getElementById('kb-p-title').value = '';
+  document.getElementById('kb-p-body').value  = '';
+  document.getElementById('kb-p-tags').value  = '';
+  document.getElementById('kb-paste-modal').style.display = 'flex';
+}
+
+async function kbPasteIngest() {
+  const title    = document.getElementById('kb-p-title').value || 'Pasted Document';
+  const text     = document.getElementById('kb-p-body').value;
+  const tags     = document.getElementById('kb-p-tags').value;
+  const category = document.getElementById('kb-p-category').value;
+  if (!text.trim()) { alert('Please paste some content first.'); return; }
+  const saveBtn = document.getElementById('kb-p-save');
+  saveBtn.textContent = 'Ingesting...'; saveBtn.disabled = true;
+  const r = await fetch('/api/kb/ingest', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({title, text, tags, category, status:'published'})});
+  const d = await r.json();
+  saveBtn.textContent = 'Ingest'; saveBtn.disabled = false;
+  document.getElementById('kb-paste-modal').style.display = 'none';
+  alert('Ingested ' + d.count + ' article chunk(s). IDs: ' + (d.ids||[]).join(', '));
+  await refreshKbList();
+  loadKbTab();
+}
+
+async function kbAsk() {
+  const input  = document.getElementById('kb-ask-input');
+  const ansEl  = document.getElementById('kb-answer');
+  const askBtn = document.getElementById('kb-ask-btn');
+  const q = input ? input.value.trim() : '';
+  if (!q) return;
+  askBtn.textContent = 'Thinking...'; askBtn.disabled = true;
+  ansEl.style.display = 'block';
+  ansEl.textContent = 'Searching knowledge base and querying Ollama...';
+  try {
+    const r = await fetch('/api/kb/ask', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question: q})});
+    const d = await r.json();
+    let text = d.answer || d.error || 'No answer.';
+    if (d.sources && d.sources.length) {
+      text += '\n\n\u2014 Sources: ' + d.sources.map(s => s.title + ' (' + Math.round(s.score*100) + '%)').join(', ');
+    }
+    ansEl.textContent = text;
+  } catch(e) {
+    ansEl.textContent = 'Error: ' + e;
+  }
+  askBtn.textContent = 'Ask'; askBtn.disabled = false;
+}
+
+async function kbSeed() {
+  const btn = document.getElementById('kb-seed-btn');
+  btn.textContent = 'Seeding...'; btn.disabled = true;
+  await fetch('/api/kb/seed', {method:'POST'});
+  btn.textContent = 'Seed from AGENTS.md'; btn.disabled = false;
+  await loadKbTab();
+}
+
+// Hook into switchTab to load KB when selected
+const _origSwitchTab = typeof switchTab === 'function' ? switchTab : null;
 </script>
 </body>
 </html>
 """
+
+# ── Knowledge Base API ────────────────────────────────────────────────────────
+
+@app.route("/api/kb/status")
+def api_kb_status():
+    if not _KB_AVAILABLE:
+        return jsonify({"available": False, "error": _kb_err_msg})
+    ollama = _kb.ollama_status()
+    arts = _kb.list_articles(status=None, limit=1000)
+    published = sum(1 for a in arts if a["status"] == "published")
+    drafts    = sum(1 for a in arts if a["status"] == "draft")
+    return jsonify({"available": True, "ollama": ollama,
+                    "total": len(arts), "published": published, "drafts": drafts})
+
+@app.route("/api/kb/articles")
+def api_kb_articles():
+    if not _KB_AVAILABLE:
+        return jsonify([])
+    status   = request.args.get("status")       # published | draft | None=all
+    category = request.args.get("category")
+    limit    = int(request.args.get("limit", 200))
+    return jsonify(_kb.list_articles(status=status, category=category, limit=limit))
+
+@app.route("/api/kb/article/<int:article_id>")
+def api_kb_article(article_id):
+    if not _KB_AVAILABLE:
+        return jsonify({"error": "KB unavailable"}), 503
+    art = _kb.get_article(article_id=article_id)
+    if not art:
+        return jsonify({"error": "not found"}), 404
+    art.pop("embedding", None)
+    return jsonify(art)
+
+@app.route("/api/kb/article", methods=["POST"])
+def api_kb_add():
+    if not _KB_AVAILABLE:
+        return jsonify({"error": "KB unavailable"}), 503
+    data = request.json or {}
+    aid = _kb.add_article(
+        title=data.get("title", "Untitled"),
+        body=data.get("body", ""),
+        tags=data.get("tags", ""),
+        category=data.get("category", "general"),
+        status=data.get("status", "draft"),
+    )
+    return jsonify({"id": aid})
+
+@app.route("/api/kb/article/<int:article_id>", methods=["PUT"])
+def api_kb_update(article_id):
+    if not _KB_AVAILABLE:
+        return jsonify({"error": "KB unavailable"}), 503
+    data = request.json or {}
+    _kb.update_article(article_id=article_id, **data)
+    return jsonify({"ok": True})
+
+@app.route("/api/kb/article/<int:article_id>/publish", methods=["POST"])
+def api_kb_publish(article_id):
+    if not _KB_AVAILABLE:
+        return jsonify({"error": "KB unavailable"}), 503
+    _kb.publish_article(article_id=article_id)
+    return jsonify({"ok": True})
+
+@app.route("/api/kb/article/<int:article_id>", methods=["DELETE"])
+def api_kb_delete(article_id):
+    if not _KB_AVAILABLE:
+        return jsonify({"error": "KB unavailable"}), 503
+    _kb.delete_article(article_id=article_id)
+    return jsonify({"ok": True})
+
+@app.route("/api/kb/search")
+def api_kb_search():
+    if not _KB_AVAILABLE:
+        return jsonify({"results": [], "error": "KB unavailable"})
+    q      = request.args.get("q", "")
+    top_k  = int(request.args.get("top_k", 5))
+    status = request.args.get("status", "published")
+    if not q:
+        return jsonify({"results": []})
+    results = _kb.search(query=q, top_k=top_k, status=status)
+    for r in results:
+        r.pop("embedding", None)
+    return jsonify({"results": results})
+
+@app.route("/api/kb/ask", methods=["POST"])
+def api_kb_ask():
+    if not _KB_AVAILABLE:
+        return jsonify({"error": "KB unavailable"}), 503
+    data     = request.json or {}
+    question = data.get("question", "")
+    model    = data.get("model")
+    if not question:
+        return jsonify({"error": "question required"}), 400
+    result = _kb.ask(question=question, model=model)
+    return jsonify(result)
+
+@app.route("/api/kb/ingest", methods=["POST"])
+def api_kb_ingest():
+    """Paste-to-KB: ingest raw text submitted from dashboard or chat."""
+    if not _KB_AVAILABLE:
+        return jsonify({"error": "KB unavailable"}), 503
+    data     = request.json or {}
+    title    = data.get("title", "Pasted Document")
+    text     = data.get("text", "")
+    tags     = data.get("tags", "")
+    category = data.get("category", "documentation")
+    status   = data.get("status", "published")
+    if not text.strip():
+        return jsonify({"error": "text required"}), 400
+    ids = _kb_seed.ingest_text(title=title, text=text, tags=tags,
+                               category=category, status=status)
+    return jsonify({"ids": ids, "count": len(ids)})
+
+@app.route("/api/kb/seed", methods=["POST"])
+def api_kb_seed():
+    """Seed KB from AGENTS.md — idempotent."""
+    if not _KB_AVAILABLE:
+        return jsonify({"error": "KB unavailable"}), 503
+    _kb_seed.seed_from_agents_md()
+    arts = _kb.list_articles(status=None, limit=1000)
+    return jsonify({"ok": True, "total": len(arts)})
+
+@app.route("/api/kb/reembed", methods=["POST"])
+def api_kb_reembed():
+    """Rebuild all embeddings (background thread)."""
+    if not _KB_AVAILABLE:
+        return jsonify({"error": "KB unavailable"}), 503
+    threading.Thread(target=_kb.reembed_all, daemon=True).start()
+    return jsonify({"ok": True, "message": "Re-embedding started in background"})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False)
