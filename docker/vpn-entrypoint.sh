@@ -21,6 +21,10 @@ if ip link show tun0 >/dev/null 2>&1; then
     # 172.16.0.0/12 covers Loopback0 ranges (172.30.255.x etc.)
     # used as ip ssh source-interface on switches — not always pushed by dCloud VPN
     ip route add 172.16.0.0/12 dev tun0 2>/dev/null && echo "  Added 172.16.0.0/12 -> tun0" || echo "  172.16.0.0/12 already present"
+
+    # Restore DNS after VPN tunnel may overwrite resolv.conf — use host corporate DNS
+    echo "  Restoring DNS (64.102.6.247)..."
+    printf 'nameserver 64.102.6.247\nnameserver 173.37.137.85\n' > /etc/resolv.conf
 else
     echo "WARNING: tun0 did not come up in 30s"
 fi
