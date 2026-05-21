@@ -1687,14 +1687,20 @@ def phase_scc_reset_check():
 
     results = {}
 
-    # 1. Access policy rules — expect 0 custom rules
+    # 1. Access policy rules — expect 0 non-default rules
     try:
         r = requests.get("https://api.sse.cisco.com/policies/v2/rules",
                          headers=hdrs, timeout=15)
-        rules = r.json().get("data", r.json()) if r.ok else []
-        count = len(rules) if isinstance(rules, list) else 0
-        ok1 = (count == 0)
-        detail = f"{count} rule(s)" + ("" if ok1 else " — need to delete all custom rules")
+        if r.ok:
+            rules = r.json().get("results", r.json().get("data", []))
+            custom = [x for x in rules if isinstance(x, dict) and not x.get("ruleIsDefault", False)]
+            count = len(custom)
+            ok1 = (count == 0)
+            names = ", ".join(x.get("ruleName","?") for x in custom)
+            detail = f"{count} custom rule(s)" + (f": {names} — delete them" if custom else "")
+        else:
+            ok1 = False
+            detail = f"API error {r.status_code}: {r.text[:100]}"
         _persist("access_policy_rules", "completed" if ok1 else "failed", detail)
         results["access_policy_rules"] = (ok1, detail)
     except Exception as e:
