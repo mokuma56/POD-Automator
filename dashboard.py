@@ -904,7 +904,89 @@ def api_scc_unconfirm(pod_id, item_key):
     return jsonify({"status": "ok", "item_key": item_key})
 
 
-def _run_phase_in_vpn(pod_id, phase_fn):
+# ── EVPN Fabric endpoints ─────────────────────────────────────────────────────
+
+@app.route("/api/fabric/status/<pod_id>")
+def api_fabric_status(pod_id):
+    """Return per-step fabric status for a POD."""
+    import evpn_fabric
+    evpn_fabric.ensure_fabric_table()
+    c = _db()
+    rows = c.execute(
+        "SELECT step_name, status, result, started_at, completed_at "
+        "FROM fabric_steps WHERE pod_id=?", (pod_id,)
+    ).fetchall()
+    c.close()
+    steps = {}
+    for row in rows:
+        steps[row[0]] = {
+            "status":       row[1],
+            "result":       row[2] or "",
+            "started_at":   row[3] or "",
+            "completed_at": row[4] or "",
+        }
+    return jsonify({"pod_id": pod_id, "steps": steps})
+
+
+@app.route("/api/fabric/run/<pod_id>", methods=["POST"])
+def api_fabric_run(pod_id):
+    """Kick off the full EVPN fabric automation for a POD in a background thread."""
+    import threading, evpn_fabric
+    evpn_fabric.ensure_fabric_table()
+
+    data     = request.get_json(silent=True) or {}
+    from_step = int(data.get("from_step", 1))
+
+    def _run():
+        import os, sqlite3 as _sq
+        os.environ["POD_ID"]  = pod_id
+        os.environ["DB_PATH"] = DB_PATH
+        def _log(msg):
+            try:
+                c2 = _sq.connect(DB_PATH)
+                c2.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, str(msg)))
+                c2.commit(); c2.close()
+            except Exception: pass
+        evpn_fabric.run_fabric(from_step=from_step, log_fn=_log)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "message": f"Fabric automation started for {pod_id} from step {from_step}"})
+
+
+@app.route("/api/fabric/verify/<pod_id>", methods=["POST"])
+def api_fabric_verify(pod_id):
+    """Run verify-only steps (BGP EVPN summary + NVE peers) for a POD."""
+    import threading, evpn_fabric
+    evpn_fabric.ensure_fabric_table()
+
+    def _run():
+        import os, sqlite3 as _sq
+        os.environ["POD_ID"]  = pod_id
+        os.environ["DB_PATH"] = DB_PATH
+        def _log(msg):
+            try:
+                c2 = _sq.connect(DB_PATH)
+                c2.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, str(msg)))
+                c2.commit(); c2.close()
+            except Exception: pass
+        evpn_fabric.run_fabric(verify_only=True, log_fn=_log)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "message": f"Fabric verify started for {pod_id}"})
+
+
+@app.route("/api/fabric/reset/<pod_id>", methods=["POST"])
+def api_fabric_reset(pod_id):
+    """Clear all fabric steps for a POD so it can be re-run from scratch."""
+    import evpn_fabric
+    evpn_fabric.ensure_fabric_table()
+    c = _db()
+    c.execute("DELETE FROM fabric_steps WHERE pod_id=?", (pod_id,))
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "message": f"Fabric steps reset for {pod_id}"})
+
+
+
     """Run a named phase function from onboard_router.py inside the VPN network namespace."""
     script = (
         "import sys, os\n"
@@ -1695,6 +1777,7 @@ DASHBOARD_HTML = """
       <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
       <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
       <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
+      <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
     </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
@@ -1726,6 +1809,11 @@ DASHBOARD_HTML = """
     <div class="tab-content" id="tab-scc">
       <div id="scc-grid" style="min-height:260px;">
         <div style="color:#667788;font-size:13px;">Select a POD to load SCC reset checklist</div>
+      </div>
+    </div>
+    <div class="tab-content" id="tab-fabric">
+      <div id="fabric-grid" style="padding:16px;min-height:260px;">
+        <div style="color:#667788;font-size:13px;">Select a POD to load EVPN Fabric status</div>
       </div>
     </div>
   </div>
@@ -2715,6 +2803,115 @@ function switchTab(btn, name) {
     const podId = document.getElementById('detail-pod-id').dataset.podId;
     if (podId) loadSccChecklist(podId);
   }
+  if (name === 'fabric') {
+    const podId = document.getElementById('detail-pod-id').dataset.podId;
+    if (podId) loadFabricStatus(podId);
+  }
+}
+
+const FABRIC_STEPS = [
+  "vrf_definitions","multicast_replication","l2vni_vlan_mappings","l3vni_vlans",
+  "dag_svis","l3vni_svis","nve_interface","bgp_evpn",
+  "spine_external_interface","spine_bgp_sdwan","access_ports",
+  "verify_bgp_evpn","verify_nve_peers"
+];
+const FABRIC_STEP_LABELS = {
+  vrf_definitions: "VRF Definitions",
+  multicast_replication: "Multicast Replication",
+  l2vni_vlan_mappings: "L2VNI VLAN Mappings",
+  l3vni_vlans: "L3VNI VLANs",
+  dag_svis: "Anycast Gateway SVIs",
+  l3vni_svis: "L3VNI SVIs",
+  nve_interface: "NVE Interface",
+  bgp_evpn: "BGP EVPN",
+  spine_external_interface: "Spine External Interface",
+  spine_bgp_sdwan: "Spine BGP SD-WAN",
+  access_ports: "Access / AP Ports",
+  verify_bgp_evpn: "Verify BGP EVPN",
+  verify_nve_peers: "Verify NVE Peers",
+};
+const FABRIC_STEP_TARGETS = {
+  vrf_definitions: "All 3 switches",
+  multicast_replication: "Leaf1 + Leaf2",
+  l2vni_vlan_mappings: "Leaf1 + Leaf2",
+  l3vni_vlans: "All 3 switches",
+  dag_svis: "Leaf1 + Leaf2",
+  l3vni_svis: "All 3 switches",
+  nve_interface: "All 3 switches",
+  bgp_evpn: "All 3 switches",
+  spine_external_interface: "Border Spine",
+  spine_bgp_sdwan: "Border Spine",
+  access_ports: "Leaf1 + Leaf2",
+  verify_bgp_evpn: "Border Spine",
+  verify_nve_peers: "Border Spine",
+};
+
+async function loadFabricStatus(podId) {
+  const grid = document.getElementById('fabric-grid');
+  grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
+  const r = await fetch('/api/fabric/status/' + podId);
+  const data = await r.json();
+  renderFabricGrid(podId, data.steps || {});
+}
+
+function renderFabricGrid(podId, steps) {
+  const grid = document.getElementById('fabric-grid');
+  const statusColor = { completed:'#2ecc71', failed:'#e74c3c', running:'#f39c12', skipped:'#e67e22', pending:'#667788' };
+  const statusIcon  = { completed:'✓', failed:'✗', running:'⟳', skipped:'⚠', pending:'—' };
+
+  let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">';
+  html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">EVPN VXLAN Fabric</span>';
+  html += '<div style="display:flex;gap:8px;">';
+  html += '<button id="fabric-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">Run Fabric</button>';
+  html += '<button id="fabric-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;">Reset</button>';
+  html += '<button id="fabric-verify-btn" style="background:#27ae60;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;">Verify Only</button>';
+  html += '</div></div>';
+
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;">';
+  for (const s of FABRIC_STEPS) {
+    const info = steps[s] || {};
+    const st   = info.status || 'pending';
+    const col  = statusColor[st] || '#667788';
+    const icon = statusIcon[st] || '—';
+    const result = info.result || '';
+    html += '<div style="background:#1a2030;border:1px solid #2a3040;border-radius:6px;padding:10px 12px;">';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;">';
+    html += '<span style="font-size:12px;font-weight:600;color:#cdd6e0;">' + (FABRIC_STEP_LABELS[s]||s) + '</span>';
+    html += '<span style="font-size:13px;font-weight:700;color:' + col + ';">' + icon + '</span>';
+    html += '</div>';
+    html += '<div style="font-size:11px;color:#667788;margin-top:3px;">' + (FABRIC_STEP_TARGETS[s]||'') + '</div>';
+    if (result) html += '<div style="font-size:11px;color:#889aaa;margin-top:4px;word-break:break-word;">' + result.substring(0,120) + '</div>';
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div id="fabric-log" style="margin-top:14px;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:10px;font-size:11px;font-family:monospace;color:#8899aa;max-height:200px;overflow-y:auto;display:none;"></div>';
+
+  grid.innerHTML = html;
+
+  setTimeout(() => {
+    const runBtn    = document.getElementById('fabric-run-btn');
+    const resetBtn  = document.getElementById('fabric-reset-btn');
+    const verifyBtn = document.getElementById('fabric-verify-btn');
+    if (runBtn)    runBtn.onclick    = () => triggerFabric(podId, 'run');
+    if (resetBtn)  resetBtn.onclick  = () => { if(confirm('Reset all fabric steps for ' + podId + '?')) triggerFabric(podId, 'reset'); };
+    if (verifyBtn) verifyBtn.onclick = () => triggerFabric(podId, 'verify');
+  }, 0);
+}
+
+async function triggerFabric(podId, action) {
+  const logEl = document.getElementById('fabric-log');
+  if (logEl) { logEl.style.display = 'block'; logEl.textContent = 'Starting ' + action + '...\\n'; }
+  const r = await fetch('/api/fabric/' + action + '/' + podId, { method: 'POST' });
+  const data = await r.json();
+  if (logEl) logEl.textContent += (data.message || JSON.stringify(data)) + '\\n';
+  // Poll for updates
+  let polls = 0;
+  const poll = setInterval(async () => {
+    polls++;
+    await loadFabricStatus(podId);
+    if (polls > 60) clearInterval(poll);
+  }, 5000);
 }
 
 function closeDetail() {
