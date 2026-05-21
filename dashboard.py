@@ -2589,11 +2589,20 @@ async function loadSccChecklist(podId) {
     const icon  = done ? '&#x2713;' : d.status === 'failed' ? '&#x2717;' : '&#x25cb;';
     const detail = esc(d.detail || '');
     const confirmedBy = d.confirmed_by ? ' — ' + esc(d.confirmed_by) : '';
+    const btnId = 'scc-btn-' + item.key;
     const btnHtml = isManual
       ? (done
-          ? '<button onclick="sccUnconfirm(\'' + podId + '\',\'' + item.key + '\')" style="margin-left:8px;padding:2px 8px;font-size:11px;background:#1a2d3d;color:#ff4757;border:1px solid #ff4757;border-radius:4px;cursor:pointer;">Undo</button>'
-          : '<button onclick="sccConfirm(\'' + podId + '\',\'' + item.key + '\')" style="margin-left:8px;padding:2px 8px;font-size:11px;background:#1a2d3d;color:#02c8ff;border:1px solid #02c8ff;border-radius:4px;cursor:pointer;">Confirm</button>')
+          ? '<button id="' + btnId + '" style="margin-left:8px;padding:2px 8px;font-size:11px;background:#1a2d3d;color:#ff4757;border:1px solid #ff4757;border-radius:4px;cursor:pointer;">Undo</button>'
+          : '<button id="' + btnId + '" style="margin-left:8px;padding:2px 8px;font-size:11px;background:#1a2d3d;color:#02c8ff;border:1px solid #02c8ff;border-radius:4px;cursor:pointer;">Confirm</button>')
       : '';
+    if (isManual) {
+      setTimeout(() => {
+        const btn = document.getElementById(btnId);
+        if (btn) btn.onclick = done
+          ? () => sccUnconfirm(podId, item.key)
+          : () => sccConfirm(podId, item.key);
+      }, 0);
+    }
     return '<div style="display:flex;align-items:center;padding:8px 10px;background:#0d1f2d;border-radius:6px;margin-bottom:6px;">'
       + '<span style="color:' + color + ';font-size:16px;width:20px;flex-shrink:0">' + icon + '</span>'
       + '<div style="flex:1;margin-left:8px;">'
@@ -2611,13 +2620,17 @@ async function loadSccChecklist(podId) {
   grid.innerHTML =
     '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">'
     + '<div style="font-size:13px;font-weight:600;color:#e0e8f0;">SCC Reset Checklist — ' + completedCount + ' / ' + allItems.length + ' items</div>'
-    + '<button onclick="sccRecheck(\'' + podId + '\')" style="padding:4px 12px;font-size:12px;background:#0d1f2d;color:#02c8ff;border:1px solid #02c8ff;border-radius:4px;cursor:pointer;">&#x21bb; Re-check Auto Items</button>'
+    + '<button id="scc-recheck-btn" style="padding:4px 12px;font-size:12px;background:#0d1f2d;color:#02c8ff;border:1px solid #02c8ff;border-radius:4px;cursor:pointer;">&#x21bb; Re-check Auto Items</button>'
     + '</div>'
     + (allDone ? '<div style="padding:8px 12px;background:#00ff8822;border:1px solid #00ff88;border-radius:6px;color:#00ff88;font-size:13px;margin-bottom:12px;">&#x2713; All 12 items confirmed — POD cleared</div>' : '')
     + '<div style="font-size:12px;color:#667788;margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:1px;">Automated checks (via API)</div>'
     + SCC_AUTO_ITEMS.map(i => sccRow(i, false)).join('')
     + '<div style="font-size:12px;color:#667788;margin-top:14px;margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:1px;">Manual proctor confirmation</div>'
     + SCC_MANUAL_ITEMS.map(i => sccRow(i, true)).join('');
+  setTimeout(() => {
+    const rb = document.getElementById('scc-recheck-btn');
+    if (rb) rb.onclick = () => sccRecheck(podId);
+  }, 0);
 }
 
 async function sccConfirm(podId, itemKey) {
