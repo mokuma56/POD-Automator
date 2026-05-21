@@ -118,6 +118,18 @@ def _migrate():
         INSERT OR IGNORE INTO upgrade_config (device_type, golden_version, image_filename, image_path)
         VALUES ('router', '17.18.2', '', '')
     """)
+    # SCC reset checklist table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scc_checklist (
+            pod_id TEXT,
+            item_key TEXT,
+            status TEXT DEFAULT 'pending',
+            detail TEXT DEFAULT '',
+            confirmed_by TEXT DEFAULT '',
+            confirmed_at TIMESTAMP,
+            PRIMARY KEY (pod_id, item_key)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -174,6 +186,21 @@ def api_pods():
         vpn = check_pod_vpn(p["pod_id"])
         p["vpn_status"] = vpn["status"]
         p["vpn_detail"] = vpn["detail"]
+        # Add SCC checklist all-confirmed flag
+        ALL_SCC_KEYS = [
+            "access_policy_rules", "network_tunnel_groups", "zta_profiles",
+            "epp_posture_profiles", "dlp_rules", "private_resources",
+            "dns_servers", "ravpn_ip_pool", "ise_pxgrid", "epp_manual",
+            "duo_saml", "te_integration",
+        ]
+        try:
+            scc_rows = conn.execute(
+                "SELECT item_key, status FROM scc_checklist WHERE pod_id=?", (p["pod_id"],)
+            ).fetchall()
+            scc_map = {r["item_key"]: r["status"] for r in scc_rows}
+            p["scc_all_confirmed"] = all(scc_map.get(k) == "completed" for k in ALL_SCC_KEYS)
+        except Exception:
+            p["scc_all_confirmed"] = False
         result.append(p)
     conn.close()
     return jsonify(result)
@@ -786,6 +813,100 @@ def api_ad_rerun(pod_id):
 
     threading.Thread(target=_rerun, daemon=True).start()
     return jsonify({"status": "ok", "message": f"AD re-run started for {pod_id}"})
+
+
+@app.route("/api/scc/status/<pod_id>")
+def api_scc_status(pod_id):
+    """Return all SCC checklist items for a POD."""
+    c = _db()
+    rows = c.execute(
+        "SELECT item_key, status, detail, confirmed_by, confirmed_at "
+        "FROM scc_checklist WHERE pod_id=?", (pod_id,)
+    ).fetchall()
+    c.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/scc/recheck/<pod_id>", methods=["POST"])
+def api_scc_recheck(pod_id):
+    """Re-run the 4 automated SCC checks inside POD VPN namespace."""
+    import threading
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container not running for {pod_id}"}), 400
+
+    def _check():
+        _run_phase_in_vpn(pod_id, "phase_scc_reset_check")
+
+    threading.Thread(target=_check, daemon=True).start()
+    return jsonify({"status": "ok", "message": f"SCC re-check started for {pod_id}"})
+
+
+@app.route("/api/scc/confirm/<pod_id>/<item_key>", methods=["POST"])
+def api_scc_confirm(pod_id, item_key):
+    """Mark a manual SCC checklist item as confirmed by proctor."""
+    data = request.get_json(silent=True) or {}
+    confirmed_by = data.get("confirmed_by", "proctor")
+    MANUAL_ITEMS = {
+        "dlp_rules", "private_resources", "dns_servers",
+        "ravpn_ip_pool", "ise_pxgrid", "epp_manual",
+        "duo_saml", "te_integration",
+    }
+    if item_key not in MANUAL_ITEMS:
+        return jsonify({"status": "error", "message": f"Unknown manual item: {item_key}"}), 400
+    c = _db()
+    c.execute(
+        "INSERT OR REPLACE INTO scc_checklist "
+        "(pod_id, item_key, status, detail, confirmed_by, confirmed_at) "
+        "VALUES (?, ?, 'completed', 'Manually confirmed', ?, datetime('now'))",
+        (pod_id, item_key, confirmed_by)
+    )
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "item_key": item_key})
+
+
+@app.route("/api/scc/unconfirm/<pod_id>/<item_key>", methods=["POST"])
+def api_scc_unconfirm(pod_id, item_key):
+    """Reset a manual SCC checklist item back to pending."""
+    c = _db()
+    c.execute(
+        "INSERT OR REPLACE INTO scc_checklist "
+        "(pod_id, item_key, status, detail, confirmed_by, confirmed_at) "
+        "VALUES (?, ?, 'pending', '', '', NULL)",
+        (pod_id, item_key)
+    )
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "item_key": item_key})
+
+
+def _run_phase_in_vpn(pod_id, phase_fn):
+    """Run a named phase function from onboard_router.py inside the VPN network namespace."""
+    script = (
+        "import sys, os\n"
+        "sys.path.insert(0, '/pipeline')\n"
+        f"os.environ['POD_ID'] = '{pod_id}'\n"
+        "os.environ['DB_PATH'] = '/pipeline/host-data/pod_state.db'\n"
+        "os.environ['SCC_KEYS_DIR'] = '/pipeline/host-data/scc_keys'\n"
+        "import onboard_router\n"
+        f"fn = getattr(onboard_router, '{phase_fn}')\n"
+        "ok, result = fn()\n"
+        "print('ok' if ok else 'fail', str(result)[:300])\n"
+    )
+    subprocess.run(
+        ["docker", "run", "--rm",
+         "--network", f"container:vpn-{pod_id}",
+         "-v", f"{os.path.expanduser('~/sw_projects/pod_automator')}:/pipeline",
+         "-v", f"{os.path.expanduser('~/sw_projects/pod_automator/data')}:/pipeline/host-data",
+         "-e", f"POD_ID={pod_id}",
+         "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+         "-e", "SCC_KEYS_DIR=/pipeline/host-data/scc_keys",
+         "pod-automator-pipeline",
+         "python3", "-c", script],
+        timeout=120
+    )
 
 
 @app.route("/api/ssh/terminal/<pod_id>/<ip>", methods=["POST"])
@@ -1551,6 +1672,7 @@ DASHBOARD_HTML = """
       <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
       <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
       <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
+      <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
     </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
@@ -1579,6 +1701,11 @@ DASHBOARD_HTML = """
         <div style="color:#667788;font-size:13px;">Select a POD to load upgrade status</div>
       </div>
     </div>
+    <div class="tab-content" id="tab-scc">
+      <div id="scc-grid" style="padding:16px;">
+        <div style="color:#667788;font-size:13px;">Select a POD to load SCC reset checklist</div>
+      </div>
+    </div>
   </div>
 
 <script>
@@ -1601,6 +1728,7 @@ const PIPELINE_ORDER = [
   "connectivity_test",
   "cdfmc_check",
   "ad_verify",
+  "scc_reset_check",
 ];
 
 async function handleFile(file) {
@@ -1754,7 +1882,8 @@ function renderTable(pods) {
     const vpnColor = vpn === 'connected' ? '#00e68a' : vpn === 'connecting' ? '#ffa502' : '#ff4757';
     const readyAll = isFullyReady(p);
     const hasWarn  = hasSkippedSteps(p);
-    const readyBadge = readyAll    ? '<span class="badge pass">READY</span>'
+    const readyBadge = readyAll && p.scc_all_confirmed ? '<span class="badge pass">READY</span>'
+      : readyAll && !p.scc_all_confirmed ? '<span class="badge warn" title="SCC checklist incomplete">READY*</span>'
       : hasWarn && p.sdwan_online === 'yes' ? '<span class="badge warn">WARN</span>'
       : p.sdwan_online === 'yes'            ? '<span class="badge running">Partial</span>'
       : '<span class="badge pending">Pending</span>';
@@ -1896,6 +2025,7 @@ async function showPipeline(podId) {
    loadCdfmc(podId);
    loadAd(podId);
    loadUpgrade(podId);
+   loadSccChecklist(podId);
 
   // Elapsed timer is managed by loadSteps based on running state
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
@@ -1909,7 +2039,7 @@ async function loadSteps(podId) {
   const done    = steps.filter(s => s.status === 'completed' || s.status === 'skipped').length;
   const skipped = steps.filter(s => s.status === 'skipped').length;
   const running = steps.some(s => s.status === 'running');
-  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify']);
+  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify','scc_reset_check']);
   const hardFailed = steps.some(s => s.status === 'failed' && !SOFT_FAIL.has(s.step_name));
   const softFailed = steps.some(s => s.status === 'failed' && SOFT_FAIL.has(s.step_name));
   const allAccountedFor = steps.length > 0 && steps.every(s => s.status === 'completed' || s.status === 'skipped' || s.status === 'failed');
@@ -2424,11 +2554,96 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
+// ── SCC Reset Checklist ──────────────────────────────────────────
+const SCC_AUTO_ITEMS = [
+  { key: 'access_policy_rules',   label: 'Access Policy Rules cleared' },
+  { key: 'network_tunnel_groups', label: 'Network Tunnel Groups cleared' },
+  { key: 'zta_profiles',          label: 'ZTA Profiles reset to default' },
+  { key: 'epp_posture_profiles',  label: 'EPP Posture Profiles cleared' },
+];
+const SCC_MANUAL_ITEMS = [
+  { key: 'dlp_rules',        label: 'DLP Rules cleared' },
+  { key: 'private_resources',label: 'Private Resources & Resource Groups cleared' },
+  { key: 'dns_servers',      label: 'DNS Servers reset' },
+  { key: 'ravpn_ip_pool',    label: 'RAVPN Profiles & IP Pools cleared' },
+  { key: 'ise_pxgrid',       label: 'ISE / pxGrid integration removed' },
+  { key: 'epp_manual',       label: 'EPP Policies manually verified' },
+  { key: 'duo_saml',         label: 'Duo / DuoSSO SAML metadata removed' },
+  { key: 'te_integration',   label: 'Thousand Eyes integration reset' },
+];
+
+async function loadSccChecklist(podId) {
+  const grid = document.getElementById('scc-grid');
+  grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading SCC checklist...</div>';
+  const r = await fetch('/api/scc/status/' + podId);
+  const items = await r.json();
+  const map = {};
+  items.forEach(i => { map[i.item_key] = i; });
+
+  function sccRow(item, isManual) {
+    const d = map[item.key] || { status: 'pending', detail: '', confirmed_by: '', confirmed_at: '' };
+    const done = d.status === 'completed';
+    const color = done ? '#00ff88' : d.status === 'failed' ? '#ff4757' : '#8899aa';
+    const icon  = done ? '&#x2713;' : d.status === 'failed' ? '&#x2717;' : '&#x25cb;';
+    const detail = esc(d.detail || '');
+    const confirmedBy = d.confirmed_by ? ' — ' + esc(d.confirmed_by) : '';
+    const btnHtml = isManual
+      ? (done
+          ? '<button onclick="sccUnconfirm(\'' + podId + '\',\'' + item.key + '\')" style="margin-left:8px;padding:2px 8px;font-size:11px;background:#1a2d3d;color:#ff4757;border:1px solid #ff4757;border-radius:4px;cursor:pointer;">Undo</button>'
+          : '<button onclick="sccConfirm(\'' + podId + '\',\'' + item.key + '\')" style="margin-left:8px;padding:2px 8px;font-size:11px;background:#1a2d3d;color:#02c8ff;border:1px solid #02c8ff;border-radius:4px;cursor:pointer;">Confirm</button>')
+      : '';
+    return '<div style="display:flex;align-items:center;padding:8px 10px;background:#0d1f2d;border-radius:6px;margin-bottom:6px;">'
+      + '<span style="color:' + color + ';font-size:16px;width:20px;flex-shrink:0">' + icon + '</span>'
+      + '<div style="flex:1;margin-left:8px;">'
+      + '<div style="font-size:13px;color:#e0e8f0;">' + esc(item.label) + (isManual ? ' <span style="font-size:10px;color:#445566;padding:1px 5px;background:#112240;border-radius:3px;">manual</span>' : ' <span style="font-size:10px;color:#445566;padding:1px 5px;background:#112240;border-radius:3px;">auto</span>') + '</div>'
+      + (detail ? '<div style="font-size:11px;color:#667788;margin-top:2px;">' + detail + confirmedBy + '</div>' : '')
+      + '</div>'
+      + btnHtml
+      + '</div>';
+  }
+
+  const allItems = [...SCC_AUTO_ITEMS, ...SCC_MANUAL_ITEMS];
+  const completedCount = allItems.filter(i => (map[i.key] || {}).status === 'completed').length;
+  const allDone = completedCount === allItems.length;
+
+  grid.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">'
+    + '<div style="font-size:13px;font-weight:600;color:#e0e8f0;">SCC Reset Checklist — ' + completedCount + ' / ' + allItems.length + ' items</div>'
+    + '<button onclick="sccRecheck(\'' + podId + '\')" style="padding:4px 12px;font-size:12px;background:#0d1f2d;color:#02c8ff;border:1px solid #02c8ff;border-radius:4px;cursor:pointer;">&#x21bb; Re-check Auto Items</button>'
+    + '</div>'
+    + (allDone ? '<div style="padding:8px 12px;background:#00ff8822;border:1px solid #00ff88;border-radius:6px;color:#00ff88;font-size:13px;margin-bottom:12px;">&#x2713; All 12 items confirmed — POD cleared</div>' : '')
+    + '<div style="font-size:12px;color:#667788;margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:1px;">Automated checks (via API)</div>'
+    + SCC_AUTO_ITEMS.map(i => sccRow(i, false)).join('')
+    + '<div style="font-size:12px;color:#667788;margin-top:14px;margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:1px;">Manual proctor confirmation</div>'
+    + SCC_MANUAL_ITEMS.map(i => sccRow(i, true)).join('');
+}
+
+async function sccConfirm(podId, itemKey) {
+  await fetch('/api/scc/confirm/' + podId + '/' + itemKey, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({confirmed_by: 'proctor'}) });
+  loadSccChecklist(podId);
+}
+
+async function sccUnconfirm(podId, itemKey) {
+  await fetch('/api/scc/unconfirm/' + podId + '/' + itemKey, { method: 'POST' });
+  loadSccChecklist(podId);
+}
+
+async function sccRecheck(podId) {
+  const grid = document.getElementById('scc-grid');
+  grid.innerHTML = '<div style="padding:20px;color:#02c8ff;font-size:13px;">&#8635; Re-checking auto items via API — check Live Logs for progress...</div>';
+  await fetch('/api/scc/recheck/' + podId, { method: 'POST' });
+  setTimeout(() => loadSccChecklist(podId), 5000);
+}
+
 function switchTab(btn, name) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
+  if (name === 'scc') {
+    const podId = document.getElementById('detail-pod-id').dataset.podId;
+    if (podId) loadSccChecklist(podId);
+  }
 }
 
 function closeDetail() {

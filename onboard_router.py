@@ -1546,6 +1546,178 @@ for i in items:
     result = f"scc_org={scc_org} | deployed={'yes' if deployed else 'no'} | ftd={ftd_status}"
     print(f"     {'✓' if ok else '✗'} {result}")
     return ok, result
+# ── SCC keys directory (on host, mounted into container) ─────────────────────
+SCC_KEYS_DIR = os.environ.get(
+    "SCC_KEYS_DIR",
+    "/pipeline/host-data/scc_keys"
+)
+
+def _scc_load_keys(org_number: str) -> dict:
+    """Load SCC API key JSON for the given org number string (e.g. '514')."""
+    path = os.path.join(SCC_KEYS_DIR, f"scc_keys_{org_number}.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"SCC keys not found: {path}")
+    with open(path) as f:
+        return json.load(f)
+
+
+def _scc_token(key_id: str, key_secret: str) -> str:
+    """Obtain a short-lived bearer token from SSE auth API."""
+    r = requests.post(
+        "https://api.sse.cisco.com/auth/v2/token",
+        auth=(key_id, key_secret),
+        data={"grant_type": "client_credentials"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def _scc_org_number_from_pod() -> str:
+    """Derive org number from pod_number stored in DB (e.g. POD 14 → org 514)."""
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    pod_id  = os.environ.get("POD_ID", "")
+    try:
+        import sqlite3 as _sq
+        c = _sq.connect(db_path)
+        c.row_factory = _sq.Row
+        row = c.execute("SELECT pod_number FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        c.close()
+        if row and row["pod_number"]:
+            return str(500 + int(row["pod_number"]))
+    except Exception:
+        pass
+    return ""
+
+
+def phase_scc_reset_check():
+    """
+    Automated SCC reset verification (4 of 12 checklist items).
+    Reads scc_keys_<org>.json, authenticates, and checks:
+      1. access_policy_rules   — no non-default rules
+      2. network_tunnel_groups — no NTGs
+      3. zta_profiles          — only default-profile remains
+      4. epp_posture_profiles  — no non-system-defined profiles
+
+    Persists each item to scc_checklist table.
+    Returns (ok, result_string).
+    """
+    import sqlite3 as _sq
+
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    pod_id  = os.environ.get("POD_ID", "")
+
+    def _persist(item_key, status, detail=""):
+        if not pod_id:
+            return
+        try:
+            c = _sq.connect(db_path)
+            c.execute(
+                "INSERT OR REPLACE INTO scc_checklist "
+                "(pod_id, item_key, status, detail) VALUES (?, ?, ?, ?)",
+                (pod_id, item_key, status, str(detail)[:500])
+            )
+            c.commit(); c.close()
+        except Exception as e:
+            print(f"     scc_checklist DB write failed: {e}")
+
+    org_num = _scc_org_number_from_pod()
+    if not org_num:
+        msg = "Could not determine SCC org number from pod_number — run detect_pod_number first"
+        for k in ("access_policy_rules", "network_tunnel_groups", "zta_profiles", "epp_posture_profiles"):
+            _persist(k, "skipped", msg)
+        return False, msg
+
+    try:
+        keys = _scc_load_keys(org_num)
+    except FileNotFoundError as e:
+        msg = str(e)
+        for k in ("access_policy_rules", "network_tunnel_groups", "zta_profiles", "epp_posture_profiles"):
+            _persist(k, "skipped", msg)
+        return False, f"SCC keys missing for org {org_num} — generate keys first | {msg}"
+
+    key_id     = keys.get("scc_api_key") or keys.get("key_id", "")
+    key_secret = keys.get("scc_api_secret") or keys.get("key_secret", "")
+    org_id     = str(keys.get("scc_org_id", ""))
+
+    try:
+        token = _scc_token(key_id, key_secret)
+        hdrs  = {"Authorization": f"Bearer {token}"}
+    except Exception as e:
+        msg = f"SCC auth failed: {e}"
+        for k in ("access_policy_rules", "network_tunnel_groups", "zta_profiles", "epp_posture_profiles"):
+            _persist(k, "failed", msg)
+        return False, msg
+
+    results = {}
+
+    # 1. Access policy rules — expect 0 custom rules
+    try:
+        r = requests.get("https://api.sse.cisco.com/policies/v2/rules",
+                         headers=hdrs, timeout=15)
+        rules = r.json().get("data", r.json()) if r.ok else []
+        count = len(rules) if isinstance(rules, list) else 0
+        ok1 = (count == 0)
+        detail = f"{count} rule(s)" + ("" if ok1 else " — need to delete all custom rules")
+        _persist("access_policy_rules", "completed" if ok1 else "failed", detail)
+        results["access_policy_rules"] = (ok1, detail)
+    except Exception as e:
+        _persist("access_policy_rules", "failed", str(e))
+        results["access_policy_rules"] = (False, str(e))
+
+    # 2. Network tunnel groups — expect 0
+    try:
+        r = requests.get("https://api.sse.cisco.com/deployments/v2/networktunnelgroups",
+                         headers=hdrs, timeout=15)
+        ntgs = r.json().get("data", r.json()) if r.ok else []
+        count = len(ntgs) if isinstance(ntgs, list) else 0
+        ok2 = (count == 0)
+        detail = f"{count} NTG(s)" + ("" if ok2 else " — need to delete all NTGs")
+        _persist("network_tunnel_groups", "completed" if ok2 else "failed", detail)
+        results["network_tunnel_groups"] = (ok2, detail)
+    except Exception as e:
+        _persist("network_tunnel_groups", "failed", str(e))
+        results["network_tunnel_groups"] = (False, str(e))
+
+    # 3. ZTA profiles — only "default-profile" should remain
+    try:
+        r = requests.get("https://api.sse.cisco.com/deployments/v2/ztna/profiles",
+                         headers=hdrs, timeout=15)
+        profiles = r.json().get("data", r.json()) if r.ok else []
+        custom = [p for p in (profiles if isinstance(profiles, list) else [])
+                  if str(p.get("profileId", "")) != "default-profile"]
+        ok3 = (len(custom) == 0)
+        detail = (f"{len(custom)} custom ZTA profile(s)" if custom else "only default-profile") \
+                 + ("" if ok3 else " — delete custom profiles")
+        _persist("zta_profiles", "completed" if ok3 else "failed", detail)
+        results["zta_profiles"] = (ok3, detail)
+    except Exception as e:
+        _persist("zta_profiles", "failed", str(e))
+        results["zta_profiles"] = (False, str(e))
+
+    # 4. EPP posture profiles — delete any without "System defined" tag
+    try:
+        r = requests.get(
+            f"https://api.umbrella.com/v1/organizations/{org_id}/postureprofiles",
+            headers=hdrs, timeout=15)
+        profs = r.json() if r.ok else []
+        custom = [p for p in (profs if isinstance(profs, list) else [])
+                  if "System defined" not in (p.get("tags") or [])]
+        ok4 = (len(custom) == 0)
+        detail = (f"{len(custom)} custom EPP profile(s)" if custom else "only system-defined") \
+                 + ("" if ok4 else " — delete custom profiles")
+        _persist("epp_posture_profiles", "completed" if ok4 else "failed", detail)
+        results["epp_posture_profiles"] = (ok4, detail)
+    except Exception as e:
+        _persist("epp_posture_profiles", "failed", str(e))
+        results["epp_posture_profiles"] = (False, str(e))
+
+    all_ok = all(v[0] for v in results.values())
+    summary = " | ".join(f"{k}: {'✓' if v[0] else '✗'} {v[1]}" for k, v in results.items())
+    print(f"     SCC reset check ({'PASS' if all_ok else 'FAIL'}): {summary}")
+    return all_ok, summary
+
+
 if __name__ == "__main__":
     pod_id = os.environ.get("POD_ID", f"POD-{SERIAL}")
     print(f"\nOnboarding {UUID} for {pod_id}\n{'='*40}")
