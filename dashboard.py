@@ -1673,8 +1673,8 @@ DASHBOARD_HTML = """
       <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches</button>
       <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
       <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
-      <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
       <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
+      <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
     </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
@@ -2582,18 +2582,28 @@ async function loadSccChecklist(podId) {
   const map = {};
   items.forEach(i => { map[i.item_key] = i; });
 
-  function sccRow(item, isManual) {
-    const d = map[item.key] || { status: 'pending', detail: '', confirmed_by: '', confirmed_at: '' };
+  const allItems = [...SCC_AUTO_ITEMS, ...SCC_MANUAL_ITEMS];
+  const completedCount = allItems.filter(i => (map[i.key] || {}).status === 'completed').length;
+  const allDone = completedCount === allItems.length;
+  const hasFail = allItems.some(i => (map[i.key] || {}).status === 'failed');
+  const pct = Math.round(completedCount / allItems.length * 100);
+  const barColor = allDone ? '#00e68a' : hasFail ? '#ff4757' : '#445566';
+  const statusLabel = allDone ? '✓ All cleared' : hasFail ? ('✗ ' + (allItems.length - completedCount) + ' remaining') : '— pending';
+  const statusColor = allDone ? '#00e68a' : hasFail ? '#ff4757' : '#8899aa';
+
+  function sccCheck(item, isManual) {
+    const d = map[item.key] || { status: 'pending', detail: '', confirmed_by: '' };
     const done = d.status === 'completed';
-    const color = done ? '#00ff88' : d.status === 'failed' ? '#ff4757' : '#8899aa';
-    const icon  = done ? '&#x2713;' : d.status === 'failed' ? '&#x2717;' : '&#x25cb;';
-    const detail = esc(d.detail || '');
-    const confirmedBy = d.confirmed_by ? ' — ' + esc(d.confirmed_by) : '';
+    const failed = d.status === 'failed';
+    const icon = done ? '✓' : failed ? '✗' : '○';
+    const iconColor = done ? '#00e68a' : failed ? '#ff4757' : '#445566';
+    const result = d.detail || (done ? 'OK' : failed ? 'FAIL' : '—');
+    const confirmedBy = (isManual && d.confirmed_by) ? ' — ' + escHtml(d.confirmed_by) : '';
     const btnId = 'scc-btn-' + item.key;
     const btnHtml = isManual
       ? (done
-          ? '<button id="' + btnId + '" style="margin-left:8px;padding:2px 8px;font-size:11px;background:#1a2d3d;color:#ff4757;border:1px solid #ff4757;border-radius:4px;cursor:pointer;">Undo</button>'
-          : '<button id="' + btnId + '" style="margin-left:8px;padding:2px 8px;font-size:11px;background:#1a2d3d;color:#02c8ff;border:1px solid #02c8ff;border-radius:4px;cursor:pointer;">Confirm</button>')
+        ? '<button id="' + btnId + '" class="btn-reconnect" style="background:#3d0a0a;border-color:#ff4757;color:#ff4757;padding:2px 8px;font-size:11px;">Undo</button>'
+        : '<button id="' + btnId + '" class="btn-reconnect" style="padding:2px 8px;font-size:11px;">Confirm</button>')
       : '';
     if (isManual) {
       setTimeout(() => {
@@ -2603,30 +2613,39 @@ async function loadSccChecklist(podId) {
           : () => sccConfirm(podId, item.key);
       }, 0);
     }
-    return '<div style="display:flex;align-items:center;padding:8px 10px;background:#0d1f2d;border-radius:6px;margin-bottom:6px;">'
-      + '<span style="color:' + color + ';font-size:16px;width:20px;flex-shrink:0">' + icon + '</span>'
-      + '<div style="flex:1;margin-left:8px;">'
-      + '<div style="font-size:13px;color:#e0e8f0;">' + esc(item.label) + (isManual ? ' <span style="font-size:10px;color:#445566;padding:1px 5px;background:#112240;border-radius:3px;">manual</span>' : ' <span style="font-size:10px;color:#445566;padding:1px 5px;background:#112240;border-radius:3px;">auto</span>') + '</div>'
-      + (detail ? '<div style="font-size:11px;color:#667788;margin-top:2px;">' + detail + confirmedBy + '</div>' : '')
-      + '</div>'
-      + btnHtml
+    return '<div class="switch-check">'
+      + '<span class="check-label"><span class="check-icon" style="color:' + iconColor + '">' + icon + '</span>'
+      + escHtml(item.label)
+      + (isManual ? ' <span style="font-size:10px;color:#445566;background:#112240;padding:1px 4px;border-radius:3px;">manual</span>' : '')
+      + '</span>'
+      + '<span class="check-result ' + (done ? 'check-pass' : failed ? 'check-fail' : 'check-na') + '" style="display:flex;align-items:center;gap:6px;">'
+      + escHtml(result) + confirmedBy + btnHtml
+      + '</span>'
       + '</div>';
   }
 
-  const allItems = [...SCC_AUTO_ITEMS, ...SCC_MANUAL_ITEMS];
-  const completedCount = allItems.filter(i => (map[i.key] || {}).status === 'completed').length;
-  const allDone = completedCount === allItems.length;
-
   grid.innerHTML =
-    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">'
-    + '<div style="font-size:13px;font-weight:600;color:#e0e8f0;">SCC Reset Checklist — ' + completedCount + ' / ' + allItems.length + ' items</div>'
-    + '<button id="scc-recheck-btn" style="padding:4px 12px;font-size:12px;background:#0d1f2d;color:#02c8ff;border:1px solid #02c8ff;border-radius:4px;cursor:pointer;">&#x21bb; Re-check Auto Items</button>'
+    // Summary bar
+    '<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">'
+    + '<div style="font-size:13px;font-weight:600;color:' + statusColor + '">' + statusLabel + '</div>'
+    + '<div style="flex:1;min-width:80px;"><div style="background:#1a2d4a;border-radius:3px;height:6px;overflow:hidden;"><div style="height:100%;width:' + pct + '%;background:' + barColor + ';border-radius:3px;transition:width 0.5s;"></div></div></div>'
+    + '<div style="font-size:11px;color:#667788;white-space:nowrap;">' + completedCount + '/' + allItems.length + '</div>'
+    + '<button id="scc-recheck-btn" class="btn-reconnect">&#x21bb; Re-check Auto</button>'
     + '</div>'
-    + (allDone ? '<div style="padding:8px 12px;background:#00ff8822;border:1px solid #00ff88;border-radius:6px;color:#00ff88;font-size:13px;margin-bottom:12px;">&#x2713; All 12 items confirmed — POD cleared</div>' : '')
-    + '<div style="font-size:12px;color:#667788;margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:1px;">Automated checks (via API)</div>'
-    + SCC_AUTO_ITEMS.map(i => sccRow(i, false)).join('')
-    + '<div style="font-size:12px;color:#667788;margin-top:14px;margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:1px;">Manual proctor confirmation</div>'
-    + SCC_MANUAL_ITEMS.map(i => sccRow(i, true)).join('');
+    + (allDone ? '<div style="padding:8px 12px;background:#00e68a22;border:1px solid #00e68a;border-radius:6px;color:#00e68a;font-size:13px;margin-bottom:12px;">&#x2713; All 12 items confirmed — POD cleared</div>' : '')
+    // Auto card
+    + '<div class="switch-card' + (SCC_AUTO_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : SCC_AUTO_ITEMS.some(i => (map[i.key]||{}).status==='failed') ? ' fail' : '') + '" style="margin-bottom:10px;">'
+    + '<div class="switch-card-title"><span class="role-tag cc">AUTO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automated API Checks</span></div>'
+    + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_AUTO_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_AUTO_ITEMS.length*100) + '%;background:' + (SCC_AUTO_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : SCC_AUTO_ITEMS.some(i=>(map[i.key]||{}).status==='failed') ? '#ff4757' : '#445566') + '"></div></div>'
+    + SCC_AUTO_ITEMS.map(i => sccCheck(i, false)).join('')
+    + '</div>'
+    // Manual card
+    + '<div class="switch-card' + (SCC_MANUAL_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : '') + '">'
+    + '<div class="switch-card-title"><span class="role-tag border">MANUAL</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Proctor Confirmation</span></div>'
+    + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_MANUAL_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_MANUAL_ITEMS.length*100) + '%;background:' + (SCC_MANUAL_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : '#445566') + '"></div></div>'
+    + SCC_MANUAL_ITEMS.map(i => sccCheck(i, true)).join('')
+    + '</div>';
+
   setTimeout(() => {
     const rb = document.getElementById('scc-recheck-btn');
     if (rb) rb.onclick = () => sccRecheck(podId);
