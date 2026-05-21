@@ -1679,6 +1679,11 @@ def phase_scc_reset_check():
     try:
         token = _scc_token(key_id, key_secret)
         hdrs  = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        # Extract Umbrella org ID from JWT (sub: org/XXXXXXX/client/...)
+        import base64 as _b64, json as _json, re as _re
+        _payload = _json.loads(_b64.b64decode(token.split('.')[1] + '=='))
+        _m = _re.search(r'org/(\d+)/', _payload.get('sub', ''))
+        umbrella_org_id = _m.group(1) if _m else org_num
     except Exception as e:
         msg = f"SCC auth failed: {e}"
         for k in ALL_KEYS:
@@ -1687,17 +1692,23 @@ def phase_scc_reset_check():
 
     results = {}
 
-    # 1. Access policy rules — expect 0 non-default rules
+    # 1. Access policy rules — delete all non-default rules
     try:
         r = requests.get("https://api.sse.cisco.com/policies/v2/rules",
                          headers=hdrs, timeout=15)
         if r.ok:
             rules = r.json().get("results", r.json().get("data", []))
             custom = [x for x in rules if isinstance(x, dict) and not x.get("ruleIsDefault", False)]
-            count = len(custom)
-            ok1 = (count == 0)
-            names = ", ".join(x.get("ruleName","?") for x in custom)
-            detail = f"{count} custom rule(s)" + (f": {names} — delete them" if custom else "")
+            deleted = []
+            for rule in custom:
+                d = requests.delete(f"https://api.sse.cisco.com/policies/v2/rules/{rule['ruleId']}",
+                                    headers=hdrs, timeout=15)
+                deleted.append(f"{rule.get('ruleName','?')}({'ok' if d.ok else d.status_code})")
+            ok1 = True
+            if deleted:
+                detail = f"deleted {len(deleted)} rule(s): {', '.join(deleted)}"
+            else:
+                detail = "0 custom rule(s)"
         else:
             ok1 = False
             detail = f"API error {r.status_code}: {r.text[:100]}"
@@ -1707,85 +1718,142 @@ def phase_scc_reset_check():
         _persist("access_policy_rules", "failed", str(e))
         results["access_policy_rules"] = (False, str(e))
 
-    # 2. Network tunnel groups — expect 0
+    # 2. Network tunnel groups — delete all
     try:
         r = requests.get("https://api.sse.cisco.com/deployments/v2/networktunnelgroups",
                          headers=hdrs, timeout=15)
-        ntgs = r.json().get("data", r.json()) if r.ok else []
-        count = len(ntgs) if isinstance(ntgs, list) else 0
-        ok3 = (count == 0)
-        detail = f"{count} NTG(s)" + ("" if ok3 else " — need to delete all NTGs")
+        if r.ok:
+            ntgs = r.json().get("data", r.json()) if isinstance(r.json(), dict) else r.json()
+            ntgs = ntgs if isinstance(ntgs, list) else []
+            deleted = []
+            for ntg in ntgs:
+                tid = ntg.get("tunnelId") or ntg.get("id") or ntg.get("tunnelGroupId")
+                if tid:
+                    d = requests.delete(f"https://api.sse.cisco.com/deployments/v2/networktunnelgroups/{tid}",
+                                        headers=hdrs, timeout=15)
+                    deleted.append(f"{ntg.get('name','?')}({'ok' if d.ok else d.status_code})")
+            ok3 = True
+            detail = f"deleted {len(deleted)} NTG(s): {', '.join(deleted)}" if deleted else "0 NTG(s)"
+        else:
+            ok3 = False
+            detail = f"API error {r.status_code}: {r.text[:100]}"
         _persist("network_tunnel_groups", "completed" if ok3 else "failed", detail)
         results["network_tunnel_groups"] = (ok3, detail)
     except Exception as e:
         _persist("network_tunnel_groups", "failed", str(e))
         results["network_tunnel_groups"] = (False, str(e))
 
-    # 4. ZTA profiles — only "default-profile" should remain
+    # 3. ZTA profiles — delete all except default-profile
     try:
         r = requests.get("https://api.sse.cisco.com/deployments/v2/ztna/profiles",
                          headers=hdrs, timeout=15)
-        profiles = r.json().get("data", r.json()) if r.ok else []
-        custom = [p for p in (profiles if isinstance(profiles, list) else [])
-                  if str(p.get("profileId", "")) != "default-profile"]
-        ok4 = (len(custom) == 0)
-        detail = (f"{len(custom)} custom ZTA profile(s)" if custom else "only default-profile") \
-                 + ("" if ok4 else " — delete custom profiles")
+        if r.ok:
+            profiles = r.json().get("data", r.json()) if isinstance(r.json(), dict) else r.json()
+            profiles = profiles if isinstance(profiles, list) else []
+            custom = [p for p in profiles if str(p.get("profileId","")) != "default-profile"
+                      and str(p.get("name","")) != "default-profile"]
+            deleted = []
+            for p in custom:
+                pid = p.get("profileId") or p.get("id")
+                if pid:
+                    d = requests.delete(f"https://api.sse.cisco.com/deployments/v2/ztna/profiles/{pid}",
+                                        headers=hdrs, timeout=15)
+                    deleted.append(f"{p.get('name','?')}({'ok' if d.ok else d.status_code})")
+            ok4 = True
+            detail = f"deleted {len(deleted)} ZTA profile(s): {', '.join(deleted)}" if deleted else "only default-profile"
+        else:
+            ok4 = False
+            detail = f"API error {r.status_code}: {r.text[:100]}"
         _persist("zta_profiles", "completed" if ok4 else "failed", detail)
         results["zta_profiles"] = (ok4, detail)
     except Exception as e:
         _persist("zta_profiles", "failed", str(e))
         results["zta_profiles"] = (False, str(e))
 
-    # 5. Private resources + resource groups — expect 0 of each
+    # 4. Private resources + resource groups — delete all
     try:
-        # Private resources
-        r_res = requests.get("https://api.sse.cisco.com/deployments/v2/privateresources",
-                             headers=hdrs, timeout=15)
-        resources = r_res.json().get("data", r_res.json()) if r_res.ok else []
-        res_count = len(resources) if isinstance(resources, list) else 0
-
-        # Resource groups
+        deleted_res, deleted_grp = [], []
+        # Delete resource groups first (resources may depend on them)
         r_grp = requests.get("https://api.sse.cisco.com/deployments/v2/resourcegroups",
                              headers=hdrs, timeout=15)
-        groups = r_grp.json().get("data", r_grp.json()) if r_grp.ok else []
-        grp_count = len(groups) if isinstance(groups, list) else 0
-
-        ok5 = (res_count == 0 and grp_count == 0)
-        detail = f"{res_count} resource(s), {grp_count} group(s)" \
-                 + ("" if ok5 else " — delete all private resources and groups")
-        _persist("private_resources", "completed" if ok5 else "failed", detail)
+        if r_grp.ok:
+            groups = r_grp.json().get("data", r_grp.json()) if isinstance(r_grp.json(), dict) else r_grp.json()
+            for g in (groups if isinstance(groups, list) else []):
+                gid = g.get("id") or g.get("groupId")
+                if gid:
+                    d = requests.delete(f"https://api.sse.cisco.com/deployments/v2/resourcegroups/{gid}",
+                                        headers=hdrs, timeout=15)
+                    deleted_grp.append(f"{g.get('name','?')}({'ok' if d.ok else d.status_code})")
+        # Delete private resources
+        r_res = requests.get("https://api.sse.cisco.com/deployments/v2/privateresources",
+                             headers=hdrs, timeout=15)
+        if r_res.ok:
+            resources = r_res.json().get("data", r_res.json()) if isinstance(r_res.json(), dict) else r_res.json()
+            for res in (resources if isinstance(resources, list) else []):
+                rid = res.get("id") or res.get("resourceId")
+                if rid:
+                    d = requests.delete(f"https://api.sse.cisco.com/deployments/v2/privateresources/{rid}",
+                                        headers=hdrs, timeout=15)
+                    deleted_res.append(f"{res.get('name','?')}({'ok' if d.ok else d.status_code})")
+        ok5 = True
+        parts = []
+        if deleted_res: parts.append(f"deleted {len(deleted_res)} resource(s): {', '.join(deleted_res)}")
+        if deleted_grp: parts.append(f"deleted {len(deleted_grp)} group(s): {', '.join(deleted_grp)}")
+        detail = " | ".join(parts) if parts else "0 resource(s), 0 group(s)"
+        _persist("private_resources", "completed", detail)
         results["private_resources"] = (ok5, detail)
     except Exception as e:
         _persist("private_resources", "failed", str(e))
         results["private_resources"] = (False, str(e))
 
-    # 6. DNS servers — expect none configured (api.umbrella.com)
+    # 5. DNS servers — delete all custom
     try:
         r = requests.get(
-            f"https://api.umbrella.com/v1/organizations/{org_id}/dnsservers",
+            f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/dnsservers",
             headers=hdrs, timeout=15)
-        servers = r.json() if r.ok else []
-        count = len(servers) if isinstance(servers, list) else 0
-        ok6 = (count == 0)
-        detail = f"{count} custom DNS server(s)" + ("" if ok6 else " — remove all custom DNS servers")
+        if r.ok:
+            servers = r.json() if isinstance(r.json(), list) else r.json().get("data", [])
+            deleted = []
+            for s in (servers if isinstance(servers, list) else []):
+                sid = s.get("id") or s.get("serverId")
+                if sid:
+                    d = requests.delete(
+                        f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/dnsservers/{sid}",
+                        headers=hdrs, timeout=15)
+                    deleted.append(f"{s.get('name','?')}({'ok' if d.ok else d.status_code})")
+            ok6 = True
+            detail = f"deleted {len(deleted)} DNS server(s): {', '.join(deleted)}" if deleted else "0 custom DNS server(s)"
+        else:
+            ok6 = (r.status_code == 404)  # 404 = none configured = clean
+            detail = "0 custom DNS server(s)" if ok6 else f"API error {r.status_code}: {r.text[:100]}"
         _persist("dns_servers", "completed" if ok6 else "failed", detail)
         results["dns_servers"] = (ok6, detail)
     except Exception as e:
         _persist("dns_servers", "failed", str(e))
         results["dns_servers"] = (False, str(e))
 
-    # 6. EPP posture profiles — no non-system-defined profiles
+    # 6. EPP posture profiles — delete all non-system-defined
     try:
         r = requests.get(
-            f"https://api.umbrella.com/v1/organizations/{org_id}/postureprofiles",
+            f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/postureprofiles",
             headers=hdrs, timeout=15)
-        profs = r.json() if r.ok else []
-        custom = [p for p in (profs if isinstance(profs, list) else [])
-                  if "System defined" not in (p.get("tags") or [])]
-        ok8 = (len(custom) == 0)
-        detail = (f"{len(custom)} custom EPP profile(s)" if custom else "only system-defined") \
-                 + ("" if ok8 else " — delete custom profiles")
+        if r.ok:
+            profs = r.json() if isinstance(r.json(), list) else r.json().get("data", [])
+            custom = [p for p in (profs if isinstance(profs, list) else [])
+                      if "System defined" not in (p.get("tags") or [])]
+            deleted = []
+            for p in custom:
+                pid = p.get("id") or p.get("profileId")
+                if pid:
+                    d = requests.delete(
+                        f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/postureprofiles/{pid}",
+                        headers=hdrs, timeout=15)
+                    deleted.append(f"{p.get('name','?')}({'ok' if d.ok else d.status_code})")
+            ok8 = True
+            detail = f"deleted {len(deleted)} EPP profile(s): {', '.join(deleted)}" if deleted else "only system-defined"
+        else:
+            ok8 = (r.status_code == 404)
+            detail = "only system-defined" if ok8 else f"API error {r.status_code}: {r.text[:100]}"
         _persist("epp_posture_profiles", "completed" if ok8 else "failed", detail)
         results["epp_posture_profiles"] = (ok8, detail)
     except Exception as e:
