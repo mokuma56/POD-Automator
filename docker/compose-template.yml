@@ -35,6 +35,7 @@ services:
       ROUTER_PASS: {{router_pass}}
       DB_PATH: /pipeline/host-data/pod_state.db
       SCC_KEYS_DIR: /pipeline/host-data/scc_keys
+      BOOTSTRAP_PATH: /pipeline/data/bootstrap/ciscosdwan.cfg
     volumes:
       - {{pod_id}}-bootstrap:/pipeline/data/bootstrap
       - {{host_data}}:/pipeline/host-data
