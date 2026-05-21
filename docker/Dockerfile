@@ -19,7 +19,8 @@ ENV VMANAGE=198.18.133.10 \
     ROUTER_PASS=C1sco12345 \
     PYTHONUNBUFFERED=1
 
-COPY onboard.py onboard_router.py PseudocoBranches_Config-Group-Template.csv ./
+COPY onboard.py onboard_router.py evpn_fabric.py PseudocoBranches_Config-Group-Template.csv ./
+COPY base_configs/ ./base_configs/
 COPY docker/vpn-entrypoint.sh /vpn-entrypoint.sh
 COPY data/ ./data/
 

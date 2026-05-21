@@ -23,10 +23,28 @@ Public API:
 """
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
+
+# ── SSL / httpx patch for Cisco corporate network ─────────────────────────────
+# huggingface_hub v1.x uses httpx which fails SSL on corporate proxies.
+# Disable XET backend and patch httpx to skip verification before any HF import.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+try:
+    import httpx as _httpx
+    _orig_client = _httpx.Client.__init__
+    _orig_async  = _httpx.AsyncClient.__init__
+    def _client_noverify(self, *a, **kw): kw.setdefault("verify", False); _orig_client(self, *a, **kw)
+    def _async_noverify(self, *a, **kw):  kw.setdefault("verify", False); _orig_async(self, *a, **kw)
+    _httpx.Client.__init__      = _client_noverify
+    _httpx.AsyncClient.__init__ = _async_noverify
+except Exception:
+    pass
+# ─────────────────────────────────────────────────────────────────────────────
 
 DB_PATH = Path(__file__).parent / "data" / "pod_state.db"
 OLLAMA_MODEL = "llama3.2"

@@ -938,24 +938,35 @@ def api_fabric_status(pod_id):
 
 @app.route("/api/fabric/run/<pod_id>", methods=["POST"])
 def api_fabric_run(pod_id):
-    """Kick off the full EVPN fabric automation for a POD in a background thread."""
+    """Kick off EVPN fabric via docker run inside the VPN network namespace."""
     import threading, evpn_fabric
     evpn_fabric.ensure_fabric_table()
 
-    data     = request.get_json(silent=True) or {}
+    # Verify VPN container is running
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    data = request.get_json(silent=True) or {}
     from_step = int(data.get("from_step", 1))
 
     def _run():
-        import os, sqlite3 as _sq
-        os.environ["POD_ID"]  = pod_id
-        os.environ["DB_PATH"] = DB_PATH
-        def _log(msg):
-            try:
-                c2 = _sq.connect(DB_PATH)
-                c2.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, str(msg)))
-                c2.commit(); c2.close()
-            except Exception: pass
-        evpn_fabric.run_fabric(from_step=from_step, log_fn=_log)
+        result = subprocess.run([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest",
+            "evpn_fabric.py", "--from", str(from_step)
+        ], capture_output=True, text=True, timeout=600)
+        log(pod_id, f"[fabric] stdout: {result.stdout[-500:].strip()}")
+        if result.stderr:
+            log(pod_id, f"[fabric] stderr: {result.stderr[-300:].strip()}")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "message": f"Fabric automation started for {pod_id} from step {from_step}"})
@@ -963,21 +974,31 @@ def api_fabric_run(pod_id):
 
 @app.route("/api/fabric/verify/<pod_id>", methods=["POST"])
 def api_fabric_verify(pod_id):
-    """Run verify-only steps (BGP EVPN summary + NVE peers) for a POD."""
+    """Run verify-only fabric steps via docker run inside the VPN network namespace."""
     import threading, evpn_fabric
     evpn_fabric.ensure_fabric_table()
 
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
     def _run():
-        import os, sqlite3 as _sq
-        os.environ["POD_ID"]  = pod_id
-        os.environ["DB_PATH"] = DB_PATH
-        def _log(msg):
-            try:
-                c2 = _sq.connect(DB_PATH)
-                c2.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, str(msg)))
-                c2.commit(); c2.close()
-            except Exception: pass
-        evpn_fabric.run_fabric(verify_only=True, log_fn=_log)
+        result = subprocess.run([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest",
+            "evpn_fabric.py", "--verify"
+        ], capture_output=True, text=True, timeout=120)
+        log(pod_id, f"[fabric-verify] stdout: {result.stdout[-500:].strip()}")
+        if result.stderr:
+            log(pod_id, f"[fabric-verify] stderr: {result.stderr[-300:].strip()}")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "message": f"Fabric verify started for {pod_id}"})
@@ -992,6 +1013,115 @@ def api_fabric_reset(pod_id):
     c.execute("DELETE FROM fabric_steps WHERE pod_id=?", (pod_id,))
     c.commit(); c.close()
     return jsonify({"status": "ok", "message": f"Fabric steps reset for {pod_id}"})
+
+
+# ── Base Config Reset ─────────────────────────────────────────────────────────
+
+BASECONFIG_SWITCHES = {
+    "border_spine": {"name": "Border Spine", "ip": "198.18.128.24"},
+    "leaf1":        {"name": "Leaf 1",        "ip": "198.18.128.22"},
+    "leaf2":        {"name": "Leaf 2",        "ip": "198.18.128.23"},
+}
+
+@app.route("/api/baseconfig/status/<pod_id>")
+def api_baseconfig_status(pod_id):
+    """Return last reset/verify result for each switch from pipeline_logs."""
+    result = {}
+    c = _db()
+    for key in BASECONFIG_SWITCHES:
+        # Look for reset result
+        rows = c.execute(
+            "SELECT log_line FROM pipeline_logs WHERE pod_id=? AND log_line LIKE ? ORDER BY rowid DESC LIMIT 1",
+            (pod_id, f"[baseconfig/{key}]%")
+        ).fetchall()
+        reset_line = rows[0]["log_line"] if rows else None
+        # Look for verify result
+        vrows = c.execute(
+            "SELECT log_line FROM pipeline_logs WHERE pod_id=? AND log_line LIKE ? ORDER BY rowid DESC LIMIT 1",
+            (pod_id, f"[verify/{key}]%")
+        ).fetchall()
+        verify_line = vrows[0]["log_line"] if vrows else None
+        result[key] = {"reset": reset_line, "verify": verify_line}
+    c.close()
+    return jsonify(result)
+
+
+@app.route("/api/baseconfig/verify/<pod_id>", methods=["POST"])
+def api_baseconfig_verify(pod_id):
+    """Verify base config on all 3 switches via docker run in VPN namespace."""
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    def _run():
+        for key in BASECONFIG_SWITCHES:
+            script = (
+                "import sys, os; sys.path.insert(0, '.'); import onboard_router; "
+                f"ok, detail = onboard_router.phase_baseconfig_verify('{key}'); "
+                "print(repr((ok, detail)))"
+            )
+            result = subprocess.run([
+                "docker", "run", "--rm",
+                "--network", f"container:vpn-{pod_id}",
+                "-v", f"{os.path.abspath(DATA_DIR / 'base_configs')}:/pipeline/base_configs:ro",
+                "--entrypoint", "python3",
+                "pod-automator:latest", "-c", script
+            ], capture_output=True, text=True, timeout=60)
+            stdout = result.stdout.strip()
+            last_line = stdout.splitlines()[-1] if stdout else ""
+            try:
+                ok_val, detail_val = eval(last_line)
+            except Exception:
+                ok_val, detail_val = False, f"parse error: {stdout[:200]}"
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[verify/{key}] {status_str}: {detail_val}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "message": f"Verify started for all switches on {pod_id}"})
+
+@app.route("/api/baseconfig/reset/<pod_id>/<switch_key>", methods=["POST"])
+def api_baseconfig_reset(pod_id, switch_key):
+    """Push base config to one switch (or 'all') via docker run in VPN namespace."""
+    if switch_key not in BASECONFIG_SWITCHES and switch_key != "all":
+        return jsonify({"status": "error", "message": f"Unknown switch: {switch_key}"}), 400
+
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    keys = list(BASECONFIG_SWITCHES.keys()) if switch_key == "all" else [switch_key]
+
+    def _run():
+        for key in keys:
+            script = (
+                "import sys, os; sys.path.insert(0, '.'); import onboard_router; "
+                f"ok, detail = onboard_router.phase_baseconfig_reset('{key}'); "
+                "print(repr((ok, detail)))"
+            )
+            result = subprocess.run([
+                "docker", "run", "--rm",
+                "--network", f"container:vpn-{pod_id}",
+                "-v", f"{os.path.abspath(DATA_DIR / 'base_configs')}:/pipeline/base_configs:ro",
+                "--entrypoint", "python3",
+                "pod-automator:latest", "-c", script
+            ], capture_output=True, text=True, timeout=120)
+            stdout = result.stdout.strip()
+            last_line = stdout.splitlines()[-1] if stdout else ""
+            try:
+                ok_val, detail_val = eval(last_line)
+            except Exception:
+                ok_val, detail_val = False, f"parse error: {stdout[:200]}"
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[baseconfig/{key}] {status_str}: {detail_val}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "message": f"Base config reset started for {switch_key} on {pod_id}"})
 
 
 
@@ -1678,62 +1808,60 @@ DASHBOARD_HTML = """
   <span class="refresh-btn" onclick="location.reload()">&#x21bb; Refresh</span>
   <span class="auto-refresh">(auto 5s)</span>
 
-   <div class="upload-section">
-    <h3>Upload Event Details CSV</h3>
-    <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()"
-         ondragover="this.classList.add('dragover'); event.preventDefault()"
-         ondragleave="this.classList.remove('dragover')"
-         ondrop="event.preventDefault(); handleFile(event.dataTransfer.files[0])">
-      <div>Click or drop CSV file here</div>
-      <div class="hint">EventsDetails.csv from dCloud — auto-discovers PODs</div>
-      <input type="file" id="file-input" accept=".csv" onchange="handleFile(this.files[0])">
-    </div>
-    <div class="upload-result" id="upload-result"></div>
-  </div>
+   <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:20px;">
 
-  <div class="upload-section" id="upgrade-config-section">
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
-      <h3 style="margin:0">Software Upgrade Images</h3>
-      <span style="font-size:11px;color:#667788">Set golden versions &amp; upload .bin images to Ubuntu automation PC</span>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;" id="upgrade-config-grid">
-      <div style="background:#0d1f2d;border-radius:8px;padding:14px;">
-        <div style="font-size:11px;color:#667788;margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">Switch (C9300) Golden Version</div>
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
-          <input id="switch-golden-input" type="text" placeholder="e.g. 17.12.1"
-            style="flex:1;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:5px 8px;font-size:13px;">
-          <button onclick="setGoldenVersion('switch')"
-            style="padding:5px 12px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:12px;">Set</button>
-        </div>
-        <div style="font-size:11px;color:#667788;margin-bottom:6px">Upload Switch Image (.bin)</div>
-        <div class="upload-zone" style="padding:10px;" onclick="document.getElementById('switch-bin-input').click()"
-             ondragover="this.classList.add('dragover');event.preventDefault()"
-             ondragleave="this.classList.remove('dragover')"
-             ondrop="event.preventDefault();uploadImage(event.dataTransfer.files[0],'switch')">
-          <div style="font-size:12px">Click or drop switch .bin here</div>
-          <input type="file" id="switch-bin-input" accept=".bin" onchange="uploadImage(this.files[0],'switch')" style="display:none">
-        </div>
-        <div id="switch-image-status" style="font-size:11px;color:#667788;margin-top:6px;"></div>
+    <!-- CSV Upload -->
+    <div class="upload-section" style="margin-bottom:0;">
+      <h3>Upload Event Details CSV</h3>
+      <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()"
+           ondragover="this.classList.add('dragover'); event.preventDefault()"
+           ondragleave="this.classList.remove('dragover')"
+           ondrop="event.preventDefault(); handleFile(event.dataTransfer.files[0])">
+        <div>Click or drop CSV file here</div>
+        <div class="hint">EventsDetails.csv from dCloud</div>
+        <input type="file" id="file-input" accept=".csv" onchange="handleFile(this.files[0])">
       </div>
-      <div style="background:#0d1f2d;border-radius:8px;padding:14px;">
-        <div style="font-size:11px;color:#667788;margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">Router (C8231-G2) Golden Version</div>
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
-          <input id="router-golden-input" type="text" placeholder="e.g. 17.18.2"
-            style="flex:1;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:5px 8px;font-size:13px;">
-          <button onclick="setGoldenVersion('router')"
-            style="padding:5px 12px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:12px;">Set</button>
-        </div>
-        <div style="font-size:11px;color:#667788;margin-bottom:6px">Upload Router Image (.bin)</div>
-        <div class="upload-zone" style="padding:10px;" onclick="document.getElementById('router-bin-input').click()"
-             ondragover="this.classList.add('dragover');event.preventDefault()"
-             ondragleave="this.classList.remove('dragover')"
-             ondrop="event.preventDefault();uploadImage(event.dataTransfer.files[0],'router')">
-          <div style="font-size:12px">Click or drop router .bin here</div>
-          <input type="file" id="router-bin-input" accept=".bin" onchange="uploadImage(this.files[0],'router')" style="display:none">
-        </div>
-        <div id="router-image-status" style="font-size:11px;color:#667788;margin-top:6px;"></div>
-      </div>
+      <div class="upload-result" id="upload-result"></div>
     </div>
+
+    <!-- Switch Image -->
+    <div class="upload-section" style="margin-bottom:0;" id="upgrade-config-section">
+      <h3>Switch Image (C9300)</h3>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+        <input id="switch-golden-input" type="text" placeholder="Golden e.g. 17.12.1"
+          style="flex:1;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:5px 8px;font-size:12px;">
+        <button onclick="setGoldenVersion('switch')"
+          style="padding:5px 10px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">Set</button>
+      </div>
+      <div class="upload-zone" style="padding:10px;" onclick="document.getElementById('switch-bin-input').click()"
+           ondragover="this.classList.add('dragover');event.preventDefault()"
+           ondragleave="this.classList.remove('dragover')"
+           ondrop="event.preventDefault();uploadImage(event.dataTransfer.files[0],'switch')">
+        <div style="font-size:12px">Click or drop switch .bin here</div>
+        <input type="file" id="switch-bin-input" accept=".bin" onchange="uploadImage(this.files[0],'switch')" style="display:none">
+      </div>
+      <div id="switch-image-status" style="font-size:11px;color:#667788;margin-top:6px;"></div>
+    </div>
+
+    <!-- Router Image -->
+    <div class="upload-section" style="margin-bottom:0;">
+      <h3>Router Image (C8231-G2)</h3>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+        <input id="router-golden-input" type="text" placeholder="Golden e.g. 17.18.2"
+          style="flex:1;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:5px 8px;font-size:12px;">
+        <button onclick="setGoldenVersion('router')"
+          style="padding:5px 10px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">Set</button>
+      </div>
+      <div class="upload-zone" style="padding:10px;" onclick="document.getElementById('router-bin-input').click()"
+           ondragover="this.classList.add('dragover');event.preventDefault()"
+           ondragleave="this.classList.remove('dragover')"
+           ondrop="event.preventDefault();uploadImage(event.dataTransfer.files[0],'router')">
+        <div style="font-size:12px">Click or drop router .bin here</div>
+        <input type="file" id="router-bin-input" accept=".bin" onchange="uploadImage(this.files[0],'router')" style="display:none">
+      </div>
+      <div id="router-image-status" style="font-size:11px;color:#667788;margin-top:6px;"></div>
+    </div>
+
   </div>
 
   <div class="summary" id="summary"></div>
@@ -1784,8 +1912,9 @@ DASHBOARD_HTML = """
       <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
       <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
       <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
-      <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
       <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
+      <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
+      <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
       <button class="tab-btn" onclick="switchTab(this, 'kb')">&#128218; Knowledge Base</button>
     </div>
     <div class="tab-content active" id="tab-steps">
@@ -1810,11 +1939,6 @@ DASHBOARD_HTML = """
         <div style="color:#667788;font-size:13px;">Select a POD to load AD verification status</div>
       </div>
     </div>
-    <div class="tab-content" id="tab-upgrade">
-      <div id="upgrade-grid" style="padding:16px;">
-        <div style="color:#667788;font-size:13px;">Select a POD to load upgrade status</div>
-      </div>
-    </div>
     <div class="tab-content" id="tab-scc">
       <div id="scc-grid" style="min-height:260px;">
         <div style="color:#667788;font-size:13px;">Select a POD to load SCC reset checklist</div>
@@ -1823,6 +1947,18 @@ DASHBOARD_HTML = """
     <div class="tab-content" id="tab-fabric">
       <div id="fabric-grid" style="padding:16px;min-height:260px;">
         <div style="color:#667788;font-size:13px;">Select a POD to load EVPN Fabric status</div>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-baseconfig">
+      <div id="baseconfig-grid" style="padding:16px;min-height:260px;">
+        <div style="color:#667788;font-size:13px;">Select a POD to manage base configs</div>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-upgrade">
+      <div id="upgrade-grid" style="padding:16px;">
+        <div style="color:#667788;font-size:13px;">Select a POD to load upgrade status</div>
       </div>
     </div>
 
@@ -1891,7 +2027,20 @@ async function load() {
   }
   const detailEl = document.getElementById('detail-pod-id');
   const detailId = detailEl ? detailEl.dataset.podId : '';
-  if (detailId) showPipeline(detailId);
+  if (detailId) {
+    // Only refresh the active tab to avoid re-rendering all tabs and causing page jumps
+    const activeTab = document.querySelector('.tab-btn.active');
+    const tabName = activeTab ? activeTab.getAttribute('onclick').match(/switchTab\(this,\s*'(\w+)'\)/)?.[1] : null;
+    if (tabName === 'pipeline' || !tabName) loadSteps(detailId);
+    else if (tabName === 'switches')  loadSwitches(detailId);
+    else if (tabName === 'cdfmc')     loadCdfmc(detailId);
+    else if (tabName === 'ad')        loadAd(detailId);
+    else if (tabName === 'upgrade')   loadUpgrade(detailId);
+    else if (tabName === 'scc')       loadSccChecklist(detailId);
+    else if (tabName === 'fabric')    loadFabricStatus(detailId);
+    else if (tabName === 'baseconfig') loadBaseConfig(detailId);
+    // logs tab has its own 2s poller; kb tab is static
+  }
 }
 
 function isFullyReady(p) {
@@ -2151,6 +2300,8 @@ async function showPipeline(podId) {
    loadAd(podId);
    loadUpgrade(podId);
    loadSccChecklist(podId);
+   loadFabricStatus(podId);
+   loadBaseConfig(podId);
 
   // Elapsed timer is managed by loadSteps based on running state
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
@@ -2822,6 +2973,10 @@ function switchTab(btn, name) {
     const podId = document.getElementById('detail-pod-id').dataset.podId;
     if (podId) loadFabricStatus(podId);
   }
+  if (name === 'baseconfig') {
+    const podId = document.getElementById('detail-pod-id').dataset.podId;
+    if (podId) loadBaseConfig(podId);
+  }
   if (name === 'kb') {
     loadKbTab();
   }
@@ -2863,10 +3018,15 @@ const FABRIC_STEP_TARGETS = {
   verify_bgp_evpn: "Border Spine",
   verify_nve_peers: "Border Spine",
 };
+const FABRIC_STEP_COMMANDS = {
+  verify_bgp_evpn:  "show bgp l2vpn evpn summary",
+  verify_nve_peers: "show nve peers",
+};
 
 async function loadFabricStatus(podId) {
   const grid = document.getElementById('fabric-grid');
-  grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
+  if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+  if (!grid._lastHtml) grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
   const r = await fetch('/api/fabric/status/' + podId);
   const data = await r.json();
   renderFabricGrid(podId, data.steps || {});
@@ -2874,38 +3034,103 @@ async function loadFabricStatus(podId) {
 
 function renderFabricGrid(podId, steps) {
   const grid = document.getElementById('fabric-grid');
-  const statusColor = { completed:'#2ecc71', failed:'#e74c3c', running:'#f39c12', skipped:'#e67e22', pending:'#667788' };
-  const statusIcon  = { completed:'✓', failed:'✗', running:'⟳', skipped:'⚠', pending:'—' };
+  const total = FABRIC_STEPS.length;
+  const done    = FABRIC_STEPS.filter(s => (steps[s]||{}).status === 'completed').length;
+  const failed  = FABRIC_STEPS.filter(s => (steps[s]||{}).status === 'failed').length;
+  const running = FABRIC_STEPS.some(s => (steps[s]||{}).status === 'running');
+  const pct     = Math.min(100, Math.round(done / total * 100));
+  const barColor = failed ? '#ff4757' : running ? '#02c8ff' : done === total ? '#00e68a' : '#667788';
+  const labelText = failed  ? 'Failed at step ' + (done + 1) + '/' + total
+                  : running ? 'Running \u2014 ' + done + '/' + total
+                  : done === total ? 'Complete! All ' + total + ' steps done'
+                  : done === 0    ? 'Not started'
+                  : 'Paused \u2014 ' + done + '/' + total;
 
-  let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">';
+  let html = '';
+
+  // ── Header row ──────────────────────────────────────────────────────────────
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
   html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">EVPN VXLAN Fabric</span>';
   html += '<div style="display:flex;gap:8px;">';
-  html += '<button id="fabric-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">Run Fabric</button>';
-  html += '<button id="fabric-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;">Reset</button>';
-  html += '<button id="fabric-verify-btn" style="background:#27ae60;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;">Verify Only</button>';
+  html += '<button id="fabric-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#9654; Run Fabric</button>';
+  html += '<button id="fabric-verify-btn" style="background:#27ae60;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;">&#10003; Verify Only</button>';
+  html += '<button id="fabric-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;">&#8635; Reset</button>';
   html += '</div></div>';
 
-  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;">';
-  for (const s of FABRIC_STEPS) {
-    const info = steps[s] || {};
-    const st   = info.status || 'pending';
-    const col  = statusColor[st] || '#667788';
-    const icon = statusIcon[st] || '—';
-    const result = info.result || '';
-    html += '<div style="background:#1a2030;border:1px solid #2a3040;border-radius:6px;padding:10px 12px;">';
-    html += '<div style="display:flex;justify-content:space-between;align-items:center;">';
-    html += '<span style="font-size:12px;font-weight:600;color:#cdd6e0;">' + (FABRIC_STEP_LABELS[s]||s) + '</span>';
-    html += '<span style="font-size:13px;font-weight:700;color:' + col + ';">' + icon + '</span>';
+  // ── Status bar ───────────────────────────────────────────────────────────────
+  html += '<div style="margin-bottom:14px;">';
+  html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
+  html += '<span>' + labelText + '</span>';
+  html += '<span>' + pct + '% (' + done + '/' + total + ')</span>';
+  html += '</div>';
+  html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
+  html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
+  html += '</div></div>';
+
+  // ── Config step cards (11) ───────────────────────────────────────────────────
+  const configSteps  = FABRIC_STEPS.filter(s => !s.startsWith('verify_'));
+  const verifySteps  = FABRIC_STEPS.filter(s =>  s.startsWith('verify_'));
+
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-bottom:12px;">';
+  configSteps.forEach((s, i) => {
+    const info   = steps[s] || {};
+    const st     = info.status || 'pending';
+    const result = (info.result || '').substring(0, 200);
+    const dur    = formatDur(info.started_at, info.completed_at);
+    const cardBorder = st === 'failed'    ? 'border-left:3px solid #ff4757;'
+                     : st === 'running'   ? 'border-left:3px solid #02c8ff;'
+                     : st === 'completed' ? 'border-left:3px solid #00e68a;' : '';
+    html += '<div class="step-card" style="' + cardBorder + '">';
+    html += '<div class="step-num">Step ' + (FABRIC_STEPS.indexOf(s)+1) + '/' + total + '</div>';
+    html += '<div class="step-name">' + (FABRIC_STEP_LABELS[s]||s) + '</div>';
+    html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (FABRIC_STEP_TARGETS[s]||'') + '</div>';
+    html += pipelineBadge(st);
+    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (dur)    html += '<div class="step-dur">' + dur + '</div>';
     html += '</div>';
-    html += '<div style="font-size:11px;color:#667788;margin-top:3px;">' + (FABRIC_STEP_TARGETS[s]||'') + '</div>';
-    if (result) html += '<div style="font-size:11px;color:#889aaa;margin-top:4px;word-break:break-word;">' + result.substring(0,120) + '</div>';
-    html += '</div>';
-  }
+  });
   html += '</div>';
 
-  html += '<div id="fabric-log" style="margin-top:14px;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:10px;font-size:11px;font-family:monospace;color:#8899aa;max-height:200px;overflow-y:auto;display:none;"></div>';
+  // ── Verify cards (2) — full width, side by side ───────────────────────────
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">';
+  verifySteps.forEach((s) => {
+    const info   = steps[s] || {};
+    const st     = info.status || 'pending';
+    const result = (info.result || '').substring(0, 2000);
+    const dur    = formatDur(info.started_at, info.completed_at);
+    const cardBorder = st === 'failed'    ? 'border-left:3px solid #ff4757;'
+                     : st === 'running'   ? 'border-left:3px solid #02c8ff;'
+                     : st === 'completed' ? 'border-left:3px solid #00e68a;' : '';
+    html += '<div class="step-card" style="' + cardBorder + 'padding:14px;">';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
+    html += '<div>';
+    html += '<div class="step-num">Step ' + (FABRIC_STEPS.indexOf(s)+1) + '/' + total + '</div>';
+    html += '<div class="step-name" style="font-size:13px;">' + (FABRIC_STEP_LABELS[s]||s) + '</div>';
+    html += '<div style="font-size:10px;color:#556677;">' + (FABRIC_STEP_TARGETS[s]||'') + '</div>';
+    html += '</div>';
+    html += '<div style="text-align:right;">';
+    html += pipelineBadge(st);
+    if (dur) html += '<div class="step-dur">' + dur + '</div>';
+    html += '</div></div>';
+    if (FABRIC_STEP_COMMANDS[s]) {
+      html += '<div style="font-size:10px;color:#02c8ff;font-family:monospace;background:#0a1628;border-radius:3px;padding:3px 7px;margin-bottom:8px;display:inline-block;">' + FABRIC_STEP_COMMANDS[s] + '</div>';
+    }
+    const parts = result.split('\\n');
+    const summary = parts[0];
+    const rawOutput = parts.slice(1).join('\\n').trim();
+    if (summary) html += '<div class="step-result" style="margin-bottom:6px;">' + summary + '</div>';
+    if (rawOutput) {
+      html += '<pre style="font-size:10px;color:#aabbcc;background:#060d18;border:1px solid #1e3050;border-radius:4px;padding:8px;height:200px;overflow-y:auto;white-space:pre;margin:0;text-align:left;">' + rawOutput.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>';
+    }
+    html += '</div>';
+  });
+  html += '</div>';
 
-  grid.innerHTML = html;
+  // Only update DOM if content changed — prevents scroll jump on re-render
+  const newHtml = html;
+  if (grid._lastHtml === newHtml) return;
+  grid._lastHtml = newHtml;
+  grid.innerHTML = newHtml;
 
   setTimeout(() => {
     const runBtn    = document.getElementById('fabric-run-btn');
@@ -2915,6 +3140,130 @@ function renderFabricGrid(podId, steps) {
     if (resetBtn)  resetBtn.onclick  = () => { if(confirm('Reset all fabric steps for ' + podId + '?')) triggerFabric(podId, 'reset'); };
     if (verifyBtn) verifyBtn.onclick = () => triggerFabric(podId, 'verify');
   }, 0);
+
+  // Auto-refresh while any step is running
+  if (running) {
+    setTimeout(() => loadFabricStatus(podId), 4000);
+  }
+}
+
+// ── Base Config Reset ─────────────────────────────────────────────────────────
+
+const BASECONFIG_SWITCHES = {
+  border_spine: { name: 'Border Spine', ip: '198.18.128.24' },
+  leaf1:        { name: 'Leaf 1',        ip: '198.18.128.22' },
+  leaf2:        { name: 'Leaf 2',        ip: '198.18.128.23' },
+};
+
+async function loadBaseConfig(podId) {
+  const grid = document.getElementById('baseconfig-grid');
+  if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+  const r = await fetch('/api/baseconfig/status/' + podId);
+  const data = await r.json();
+  renderBaseConfigGrid(podId, data);
+}
+
+function _bcStatusBadge(line) {
+  if (!line) return { color: '#667788', text: 'Not run', short: '' };
+  if (line.includes('RUNNING')) return { color: '#f39c12', text: 'Running...', short: '' };
+  if (line.includes('FAILED')) return { color: '#e74c3c', text: 'FAILED', short: line.substring(line.indexOf(']')+1, line.indexOf(']')+80) };
+  return { color: '#00e68a', text: 'OK', short: line.substring(line.indexOf(']')+1, line.indexOf(']')+80) };
+}
+
+function renderBaseConfigGrid(podId, statusData) {
+  const grid = document.getElementById('baseconfig-grid');
+  if (!grid) return;
+
+  let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">';
+  html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">Switch Base Config Reset</span>';
+  html += '<div style="display:flex;gap:8px;">';
+  html += '<button id="baseconfig-verify-btn" style="background:#1a6e3c;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#10003; Verify All</button>';
+  html += '<button id="baseconfig-all-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 18px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#8635; Reset All 3 Switches</button>';
+  html += '</div></div>';
+
+  html += '<div style="background:#12202f;border:1px solid #e74c3c44;border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:11px;color:#e74c3c;">';
+  html += '&#9888;  This will overwrite the running config on the selected switch(es) with the known-good base config and save to NVRAM. EVPN fabric config will be removed.';
+  html += '</div>';
+
+  html += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;">';
+  for (const [key, info] of Object.entries(BASECONFIG_SWITCHES)) {
+    const s = (statusData && statusData[key]) ? statusData[key] : {};
+    const resetBadge  = _bcStatusBadge(s.reset  || null);
+    const verifyBadge = _bcStatusBadge(s.verify || null);
+    html += '<div style="background:#0a1628;border:1px solid #1e3050;border-radius:8px;padding:14px;text-align:center;">';
+    html += '<div style="font-size:13px;font-weight:700;color:#cdd6e0;margin-bottom:4px;">' + info.name + '</div>';
+    html += '<div style="font-size:11px;color:#556677;margin-bottom:10px;">' + info.ip + '</div>';
+    // Reset row
+    html += '<div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:4px;">';
+    html += '<span style="color:#8899aa;">Reset</span>';
+    html += '<span style="color:' + resetBadge.color + ';font-weight:600;">' + resetBadge.text + '</span>';
+    html += '</div>';
+    if (resetBadge.short) html += '<div style="font-size:9px;color:#556677;margin-bottom:6px;text-align:left;word-break:break-word;">' + resetBadge.short.trim() + '</div>';
+    // Verify row
+    html += '<div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:10px;">';
+    html += '<span style="color:#8899aa;">Verify</span>';
+    html += '<span style="color:' + verifyBadge.color + ';font-weight:600;">' + verifyBadge.text + '</span>';
+    html += '</div>';
+    if (verifyBadge.short) html += '<div style="font-size:9px;color:#556677;margin-bottom:6px;text-align:left;word-break:break-word;">' + verifyBadge.short.trim() + '</div>';
+    html += '<button id="baseconfig-btn-' + key + '" style="background:#c0392b;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;width:100%;">&#8635; Reset ' + info.name + '</button>';
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div id="baseconfig-log" style="margin-top:14px;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:10px;font-size:11px;font-family:monospace;color:#8899aa;max-height:160px;overflow-y:auto;display:none;"></div>';
+
+  grid.innerHTML = html;
+
+  setTimeout(() => {
+    document.getElementById('baseconfig-all-btn').onclick = () => triggerBaseConfig(podId, 'all');
+    document.getElementById('baseconfig-verify-btn').onclick = () => triggerBaseConfigVerify(podId);
+    for (const key of Object.keys(BASECONFIG_SWITCHES)) {
+      const btn = document.getElementById('baseconfig-btn-' + key);
+      if (btn) btn.onclick = () => triggerBaseConfig(podId, key);
+    }
+  }, 0);
+}
+
+async function triggerBaseConfig(podId, switchKey) {
+  if (!confirm('Reset base config on ' + (switchKey === 'all' ? 'ALL 3 switches' : BASECONFIG_SWITCHES[switchKey].name) + '?\\nThis will overwrite running config and remove EVPN fabric settings.')) return;
+  const logEl = document.getElementById('baseconfig-log');
+  if (logEl) { logEl.style.display = 'block'; logEl.textContent = 'Starting base config reset for ' + switchKey + '...\\n'; }
+  const r = await fetch('/api/baseconfig/reset/' + podId + '/' + switchKey, { method: 'POST' });
+  const data = await r.json();
+  if (logEl) logEl.textContent += (data.message || JSON.stringify(data)) + '\\n';
+  // Poll status cards + log
+  let polls = 0;
+  const poll = setInterval(async () => {
+    polls++;
+    const [lr, sr] = await Promise.all([
+      fetch('/api/logs/' + podId).then(r => r.json()),
+      fetch('/api/baseconfig/status/' + podId).then(r => r.json()),
+    ]);
+    const relevant = lr.filter(l => l.includes('[baseconfig/')).slice(-12);
+    if (logEl) logEl.textContent = relevant.join('\\n');
+    renderBaseConfigGrid(podId, sr);
+    if (polls > 40) clearInterval(poll);
+  }, 3000);
+}
+
+async function triggerBaseConfigVerify(podId) {
+  const logEl = document.getElementById('baseconfig-log');
+  if (logEl) { logEl.style.display = 'block'; logEl.textContent = 'Starting verify...\\n'; }
+  const r = await fetch('/api/baseconfig/verify/' + podId, { method: 'POST' });
+  const data = await r.json();
+  if (logEl) logEl.textContent += (data.message || JSON.stringify(data)) + '\\n';
+  let polls = 0;
+  const poll = setInterval(async () => {
+    polls++;
+    const [lr, sr] = await Promise.all([
+      fetch('/api/logs/' + podId).then(r => r.json()),
+      fetch('/api/baseconfig/status/' + podId).then(r => r.json()),
+    ]);
+    const relevant = lr.filter(l => l.includes('[verify/')).slice(-12);
+    if (logEl) logEl.textContent = relevant.join('\\n');
+    renderBaseConfigGrid(podId, sr);
+    if (polls > 20) clearInterval(poll);
+  }, 3000);
 }
 
 async function triggerFabric(podId, action) {
@@ -2923,13 +3272,17 @@ async function triggerFabric(podId, action) {
   const r = await fetch('/api/fabric/' + action + '/' + podId, { method: 'POST' });
   const data = await r.json();
   if (logEl) logEl.textContent += (data.message || JSON.stringify(data)) + '\\n';
-  // Poll for updates
+  // Poll for updates — stop as soon as nothing is running anymore
+  const maxPolls = action === 'verify' ? 12 : 60;
   let polls = 0;
   const poll = setInterval(async () => {
     polls++;
-    await loadFabricStatus(podId);
-    if (polls > 60) clearInterval(poll);
-  }, 5000);
+    const sr = await fetch('/api/fabric/status/' + podId).then(r => r.json());
+    const steps = sr.steps || {};
+    const stillRunning = Object.values(steps).some(s => s.status === 'running');
+    renderFabricGrid(podId, steps);
+    if (!stillRunning || polls >= maxPolls) clearInterval(poll);
+  }, 3000);
 }
 
 function closeDetail() {
@@ -2983,157 +3336,109 @@ async function loadKbTab() {
   const grid = document.getElementById('kb-grid');
   if (!grid) return;
 
-  // Status bar
   let st = {};
   try { const r = await fetch('/api/kb/status'); st = await r.json(); } catch(e) {}
 
-  const ollamaOk  = st.ollama && st.ollama.running;
-  const ollamaMsg = ollamaOk
-    ? '<span style="color:#2ecc71;">&#9679; Ollama running (' + (st.ollama.model||'') + ')</span>'
-    : '<span style="color:#e74c3c;">&#9679; Ollama offline &mdash; '
-      + '<a href="https://ollama.com/download" target="_blank" style="color:#00bceb;">Install Ollama</a>'
-      + ', then run: <code>ollama pull llama3.2</code></span>';
-
-  let html = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">'
-    + '<span style="font-size:20px;font-weight:700;color:#00bceb;">&#128218; Knowledge Base</span>'
-    + '<span style="font-size:12px;color:#8899aa;">'
-    + (st.published||0) + ' published &bull; ' + (st.drafts||0) + ' drafts'
-    + '</span>'
-    + '<span style="font-size:12px;">' + ollamaMsg + '</span>'
-    + '<button id="kb-seed-btn" style="margin-left:auto;background:#0d4f6e;color:#00bceb;border:1px solid #00bceb;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;">Seed from AGENTS.md</button>'
+  let html = '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">'
+    + '<span style="font-size:18px;font-weight:700;color:#00bceb;">&#128218; Proctor Knowledge Base</span>'
+    + '<span style="font-size:12px;color:#667788;">' + (st.published||0) + ' articles</span>'
+    + '<button id="kb-add-btn" style="margin-left:auto;background:#27ae60;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">+ New Article</button>'
     + '</div>';
 
-  // Ask bar
-  html += '<div style="display:flex;gap:8px;margin-bottom:16px;">'
-    + '<input id="kb-ask-input" type="text" placeholder="Ask a question about the lab..." '
-    + 'style="flex:1;background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:8px 12px;border-radius:4px;font-size:13px;">'
-    + '<button id="kb-ask-btn" style="background:#02c8ff;color:#000;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-weight:600;font-size:13px;">Ask</button>'
-    + '</div>'
-    + '<div id="kb-answer" style="display:none;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:12px;margin-bottom:16px;font-size:13px;color:#c9d1d9;white-space:pre-wrap;"></div>';
-
-  // Search + Add
+  // Search bar
   html += '<div style="display:flex;gap:8px;margin-bottom:14px;">'
     + '<input id="kb-search-input" type="text" placeholder="Search articles..." '
-    + 'style="flex:1;background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:7px 12px;border-radius:4px;font-size:12px;">'
-    + '<select id="kb-filter-status" style="background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
-    + '<option value="published">Published</option><option value="draft">Drafts</option><option value="">All</option>'
-    + '</select>'
-    + '<button id="kb-add-btn" style="background:#27ae60;color:#fff;border:none;padding:7px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">+ Add Article</button>'
-    + '<button id="kb-paste-btn" style="background:#8e44ad;color:#fff;border:none;padding:7px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#128203; Paste Doc</button>'
-    + '</div>';
+    + 'style="flex:1;background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:8px 12px;border-radius:4px;font-size:13px;">'
+    + '<button id="kb-search-btn" style="background:#02c8ff;color:#000;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-weight:600;font-size:13px;">Search</button>'
+    + '</div>'
+    + '<div id="kb-answer" style="display:none;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:12px;margin-bottom:14px;font-size:13px;color:#c9d1d9;white-space:pre-wrap;"></div>';
 
   html += '<div id="kb-articles-list"></div>';
 
-  // Edit / Paste modal
-  html += '<div id="kb-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center;">'
-    + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;width:660px;max-height:80vh;overflow-y:auto;">'
-    + '<div style="font-size:16px;font-weight:700;color:#00bceb;margin-bottom:12px;" id="kb-modal-title">Add Article</div>'
-    + '<input id="kb-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:13px;margin-bottom:8px;box-sizing:border-box;">'
-    + '<textarea id="kb-m-body" rows="12" placeholder="Body (markdown supported)" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;font-family:monospace;margin-bottom:8px;box-sizing:border-box;resize:vertical;"></textarea>'
-    + '<div style="display:flex;gap:8px;margin-bottom:8px;">'
-    + '<input id="kb-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 10px;border-radius:4px;font-size:12px;">'
-    + '<select id="kb-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 8px;border-radius:4px;font-size:12px;">'
-    + '<option>general</option><option>sdwan</option><option>pipeline-failure</option><option>infrastructure</option>'
-    + '<option>dashboard</option><option>upgrade</option><option>documentation</option></select>'
-    + '<select id="kb-m-status" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 8px;border-radius:4px;font-size:12px;">'
-    + '<option value="published">Published</option><option value="draft">Draft</option></select>'
+  // Article modal
+  html += '<div id="kb-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:center;justify-content:center;">'
+    + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;width:680px;max-height:85vh;overflow-y:auto;">'
+    + '<div style="font-size:16px;font-weight:700;color:#00bceb;margin-bottom:14px;" id="kb-modal-title">New Article</div>'
+    + '<input id="kb-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:14px;margin-bottom:10px;box-sizing:border-box;">'
+    + '<textarea id="kb-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:10px;box-sizing:border-box;resize:vertical;"></textarea>'
+    + '<div style="display:flex;gap:8px;margin-bottom:14px;">'
+    + '<input id="kb-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
+    + '<select id="kb-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
+    + '<option>general</option><option>sdwan</option><option>switches</option><option>infrastructure</option>'
+    + '<option>troubleshooting</option><option>procedure</option></select>'
     + '</div>'
     + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
-    + '<button id="kb-m-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;">Cancel</button>'
-    + '<button id="kb-m-save" style="background:#00bceb;color:#000;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:600;">Save</button>'
-    + '</div></div></div>';
-
-  // Paste-doc modal
-  html += '<div id="kb-paste-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center;">'
-    + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;width:680px;max-height:80vh;overflow-y:auto;">'
-    + '<div style="font-size:16px;font-weight:700;color:#8e44ad;margin-bottom:12px;">&#128203; Paste Documentation</div>'
-    + '<input id="kb-p-title" placeholder="Document title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:13px;margin-bottom:8px;box-sizing:border-box;">'
-    + '<textarea id="kb-p-body" rows="14" placeholder="Paste your documentation here (plain text or markdown)..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;font-family:monospace;margin-bottom:8px;box-sizing:border-box;resize:vertical;"></textarea>'
-    + '<div style="display:flex;gap:8px;margin-bottom:8px;">'
-    + '<input id="kb-p-tags" placeholder="Tags" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 10px;border-radius:4px;font-size:12px;">'
-    + '<select id="kb-p-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 8px;border-radius:4px;font-size:12px;">'
-    + '<option>documentation</option><option>general</option><option>sdwan</option>'
-    + '<option>pipeline-failure</option><option>infrastructure</option></select>'
-    + '</div>'
-    + '<div style="font-size:11px;color:#667788;margin-bottom:10px;">Long documents are automatically split into searchable chunks.</div>'
-    + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
-    + '<button id="kb-p-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;">Cancel</button>'
-    + '<button id="kb-p-save" style="background:#8e44ad;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:600;">Ingest</button>'
+    + '<button id="kb-m-delete" style="background:#c0392b;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;display:none;">Delete</button>'
+    + '<button id="kb-m-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;margin-left:auto;">Cancel</button>'
+    + '<button id="kb-m-save" style="background:#00bceb;color:#000;border:none;padding:7px 20px;border-radius:4px;cursor:pointer;font-weight:700;">Save</button>'
     + '</div></div></div>';
 
   grid.innerHTML = html;
-
-  // Load articles list
   await refreshKbList();
 
-  // Wire up buttons via setTimeout to ensure DOM is ready
   setTimeout(() => {
-    const askInput = document.getElementById('kb-ask-input');
-    const askBtn   = document.getElementById('kb-ask-btn');
-    if (askBtn) askBtn.onclick = kbAsk;
-    if (askInput) askInput.onkeydown = e => { if (e.key === 'Enter') kbAsk(); };
-
     const searchInput = document.getElementById('kb-search-input');
-    const filterSel   = document.getElementById('kb-filter-status');
-    if (searchInput) searchInput.oninput = () => refreshKbList();
-    if (filterSel)   filterSel.onchange  = () => refreshKbList();
-
-    const addBtn   = document.getElementById('kb-add-btn');
-    const pasteBtn = document.getElementById('kb-paste-btn');
-    const seedBtn  = document.getElementById('kb-seed-btn');
-    if (addBtn)   addBtn.onclick   = () => kbOpenModal(null);
-    if (pasteBtn) pasteBtn.onclick = () => kbOpenPasteModal();
-    if (seedBtn)  seedBtn.onclick  = kbSeed;
+    const searchBtn   = document.getElementById('kb-search-btn');
+    const addBtn      = document.getElementById('kb-add-btn');
+    if (addBtn)      addBtn.onclick      = () => kbOpenModal(null);
+    if (searchBtn)   searchBtn.onclick   = () => refreshKbList();
+    if (searchInput) searchInput.onkeydown = e => { if (e.key === 'Enter') refreshKbList(); };
 
     const mCancel = document.getElementById('kb-m-cancel');
     const mSave   = document.getElementById('kb-m-save');
-    const pCancel = document.getElementById('kb-p-cancel');
-    const pSave   = document.getElementById('kb-p-save');
+    const mDelete = document.getElementById('kb-m-delete');
     if (mCancel) mCancel.onclick = () => { document.getElementById('kb-modal').style.display = 'none'; };
     if (mSave)   mSave.onclick   = kbSaveModal;
-    if (pCancel) pCancel.onclick = () => { document.getElementById('kb-paste-modal').style.display = 'none'; };
-    if (pSave)   pSave.onclick   = kbPasteIngest;
+    if (mDelete) mDelete.onclick = kbDeleteArticle;
   }, 0);
 }
 
 async function refreshKbList() {
-  const el     = document.getElementById('kb-articles-list');
+  const el = document.getElementById('kb-articles-list');
   if (!el) return;
-  const q      = (document.getElementById('kb-search-input') || {value:''}).value.trim();
-  const status = (document.getElementById('kb-filter-status') || {value:'published'}).value;
+  const q = (document.getElementById('kb-search-input') || {value:''}).value.trim();
 
   let articles = [];
-  if (q) {
-    const r = await fetch('/api/kb/search?q=' + encodeURIComponent(q) + '&status=' + status + '&top_k=20');
-    const d = await r.json();
-    articles = d.results || [];
-  } else {
-    const r = await fetch('/api/kb/articles?status=' + status + '&limit=100');
-    articles = await r.json();
+  try {
+    if (q) {
+      const r = await fetch('/api/kb/search?q=' + encodeURIComponent(q) + '&status=published&top_k=20');
+      const d = await r.json();
+      articles = d.results || [];
+    } else {
+      const r = await fetch('/api/kb/articles?status=published&limit=200');
+      articles = await r.json();
+    }
+  } catch(e) {
+    el.innerHTML = '<div style="color:#e74c3c;padding:20px;">Error loading articles: ' + e + '</div>';
+    return;
   }
 
   if (!articles.length) {
-    el.innerHTML = '<div style="color:#667788;font-size:13px;padding:20px 0;">No articles found.</div>';
+    el.innerHTML = q
+      ? '<div style="color:#667788;padding:20px;">No articles matched your search.</div>'
+      : '<div style="color:#667788;padding:20px;">No articles yet. Click <b style="color:#00bceb">+ New Article</b> to add your first one.</div>';
     return;
   }
 
   const catColors = {
-    'sdwan':'#00bceb','pipeline-failure':'#e74c3c','infrastructure':'#f39c12',
-    'dashboard':'#9b59b6','upgrade':'#2ecc71','documentation':'#3498db','general':'#667788'
+    'sdwan':'#00bceb','switches':'#2ecc71','infrastructure':'#f39c12',
+    'troubleshooting':'#e74c3c','procedure':'#9b59b6','general':'#667788'
   };
 
   el.innerHTML = articles.map(a => {
-    const cat   = a.category || 'general';
-    const cc    = catColors[cat] || '#667788';
-    const score = a.score != null ? ' <span style="color:#667788;font-size:10px;">(' + (a.score*100).toFixed(0) + '% match)</span>' : '';
-    const isDraft = a.status === 'draft';
-    return '<div style="background:#161b22;border:1px solid ' + (isDraft?'#f39c12':'#2a3040') + ';border-radius:6px;padding:10px 14px;margin-bottom:8px;cursor:pointer;" onclick="kbViewArticle(' + a.id + ')">'
-      + '<div style="display:flex;align-items:center;gap:8px;">'
-      + '<span style="background:' + cc + '22;color:' + cc + ';border:1px solid ' + cc + '44;border-radius:3px;padding:1px 6px;font-size:10px;font-weight:600;">' + cat + '</span>'
-      + (isDraft ? '<span style="background:#f39c1222;color:#f39c12;border:1px solid #f39c1244;border-radius:3px;padding:1px 6px;font-size:10px;">DRAFT</span>' : '')
+    const cat = a.category || 'general';
+    const cc  = catColors[cat] || '#667788';
+    const score = a.score != null ? ' <span style="color:#556677;font-size:10px;">&#8212; ' + (a.score*100).toFixed(0) + '% match</span>' : '';
+    const preview = (a.body||'').replace(/[#*`]/g,'').substring(0,120).trim();
+    return '<div style="background:#0d1117;border:1px solid #1e2d40;border-radius:6px;padding:12px 16px;margin-bottom:8px;cursor:pointer;" '
+      + 'onclick="kbViewArticle(' + a.id + ')">'
+      + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
+      + '<span style="background:' + cc + '22;color:' + cc + ';border:1px solid ' + cc + '44;border-radius:3px;padding:1px 7px;font-size:10px;font-weight:700;text-transform:uppercase;">' + cat + '</span>'
       + '<span style="font-size:13px;font-weight:600;color:#c9d1d9;">' + a.title + score + '</span>'
-      + '<span style="margin-left:auto;font-size:10px;color:#667788;">' + (a.tags||'') + '</span>'
-      + '</div></div>';
+      + (a.tags ? '<span style="margin-left:auto;font-size:10px;color:#445566;">' + a.tags + '</span>' : '')
+      + '</div>'
+      + (preview ? '<div style="font-size:11px;color:#556677;margin-top:2px;">' + preview + (a.body.length > 120 ? '...' : '') + '</div>' : '')
+      + '</div>';
   }).join('');
 }
 
@@ -3145,89 +3450,51 @@ async function kbViewArticle(id) {
 }
 
 function kbOpenModal(art) {
-  const modal = document.getElementById('kb-modal');
-  document.getElementById('kb-modal-title').textContent = art ? 'Edit Article' : 'Add Article';
-  document.getElementById('kb-m-title').value    = art ? (art.title||'') : '';
-  document.getElementById('kb-m-body').value     = art ? (art.body||'')  : '';
-  document.getElementById('kb-m-tags').value     = art ? (art.tags||'')  : '';
+  const modal   = document.getElementById('kb-modal');
+  const delBtn  = document.getElementById('kb-m-delete');
+  document.getElementById('kb-modal-title').textContent = art ? 'Edit Article' : 'New Article';
+  document.getElementById('kb-m-title').value    = art ? (art.title||'')    : '';
+  document.getElementById('kb-m-body').value     = art ? (art.body||'')     : '';
+  document.getElementById('kb-m-tags').value     = art ? (art.tags||'')     : '';
   document.getElementById('kb-m-category').value = art ? (art.category||'general') : 'general';
-  document.getElementById('kb-m-status').value   = art ? (art.status||'draft')     : 'draft';
   if (!art) _kbCurrentId = null;
+  if (delBtn) delBtn.style.display = art ? 'inline-block' : 'none';
   modal.style.display = 'flex';
 }
 
 async function kbSaveModal() {
   const payload = {
-    title:    document.getElementById('kb-m-title').value,
-    body:     document.getElementById('kb-m-body').value,
-    tags:     document.getElementById('kb-m-tags').value,
+    title:    document.getElementById('kb-m-title').value.trim(),
+    body:     document.getElementById('kb-m-body').value.trim(),
+    tags:     document.getElementById('kb-m-tags').value.trim(),
     category: document.getElementById('kb-m-category').value,
-    status:   document.getElementById('kb-m-status').value,
+    status:   'published',
   };
+  if (!payload.title || !payload.body) { alert('Title and body are required.'); return; }
+  const saveBtn = document.getElementById('kb-m-save');
+  saveBtn.textContent = 'Saving...'; saveBtn.disabled = true;
   if (_kbCurrentId) {
     await fetch('/api/kb/article/' + _kbCurrentId, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
   } else {
     await fetch('/api/kb/article', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
   }
+  saveBtn.textContent = 'Save'; saveBtn.disabled = false;
   document.getElementById('kb-modal').style.display = 'none';
+  _kbCurrentId = null;
+  await refreshKbList();
+  const r = await fetch('/api/kb/status'); const st = await r.json();
+  const countEl = document.querySelector('#kb-grid span[style*="667788"]');
+  if (countEl) countEl.textContent = (st.published||0) + ' articles';
+}
+
+async function kbDeleteArticle() {
+  if (!_kbCurrentId) return;
+  if (!confirm('Delete this article? This cannot be undone.')) return;
+  await fetch('/api/kb/article/' + _kbCurrentId, {method:'DELETE'});
+  document.getElementById('kb-modal').style.display = 'none';
+  _kbCurrentId = null;
   await refreshKbList();
   loadKbTab();
-}
-
-function kbOpenPasteModal() {
-  document.getElementById('kb-p-title').value = '';
-  document.getElementById('kb-p-body').value  = '';
-  document.getElementById('kb-p-tags').value  = '';
-  document.getElementById('kb-paste-modal').style.display = 'flex';
-}
-
-async function kbPasteIngest() {
-  const title    = document.getElementById('kb-p-title').value || 'Pasted Document';
-  const text     = document.getElementById('kb-p-body').value;
-  const tags     = document.getElementById('kb-p-tags').value;
-  const category = document.getElementById('kb-p-category').value;
-  if (!text.trim()) { alert('Please paste some content first.'); return; }
-  const saveBtn = document.getElementById('kb-p-save');
-  saveBtn.textContent = 'Ingesting...'; saveBtn.disabled = true;
-  const r = await fetch('/api/kb/ingest', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({title, text, tags, category, status:'published'})});
-  const d = await r.json();
-  saveBtn.textContent = 'Ingest'; saveBtn.disabled = false;
-  document.getElementById('kb-paste-modal').style.display = 'none';
-  alert('Ingested ' + d.count + ' article chunk(s). IDs: ' + (d.ids||[]).join(', '));
-  await refreshKbList();
-  loadKbTab();
-}
-
-async function kbAsk() {
-  const input  = document.getElementById('kb-ask-input');
-  const ansEl  = document.getElementById('kb-answer');
-  const askBtn = document.getElementById('kb-ask-btn');
-  const q = input ? input.value.trim() : '';
-  if (!q) return;
-  askBtn.textContent = 'Thinking...'; askBtn.disabled = true;
-  ansEl.style.display = 'block';
-  ansEl.textContent = 'Searching knowledge base and querying Ollama...';
-  try {
-    const r = await fetch('/api/kb/ask', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question: q})});
-    const d = await r.json();
-    let text = d.answer || d.error || 'No answer.';
-    if (d.sources && d.sources.length) {
-      text += '\n\n\u2014 Sources: ' + d.sources.map(s => s.title + ' (' + Math.round(s.score*100) + '%)').join(', ');
-    }
-    ansEl.textContent = text;
-  } catch(e) {
-    ansEl.textContent = 'Error: ' + e;
-  }
-  askBtn.textContent = 'Ask'; askBtn.disabled = false;
-}
-
-async function kbSeed() {
-  const btn = document.getElementById('kb-seed-btn');
-  btn.textContent = 'Seeding...'; btn.disabled = true;
-  await fetch('/api/kb/seed', {method:'POST'});
-  btn.textContent = 'Seed from AGENTS.md'; btn.disabled = false;
-  await loadKbTab();
 }
 
 // Hook into switchTab to load KB when selected

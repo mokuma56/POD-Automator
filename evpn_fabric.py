@@ -634,10 +634,14 @@ def step_verify_bgp_evpn(log_fn=print):
     spine_ip = SWITCHES["border_spine"]["ip"]
     ok, output = _send_raw(spine_ip, ["show bgp l2vpn evpn summary"])
     log_fn(output[-600:])
-    # Pass if we see at least 2 established neighbors (Leaf1 + Leaf2)
-    established = output.count("Established") + output.count("Up")
+    # IOS XE shows prefix count (a digit) in State/PfxRcd when neighbor is established
+    import re
+    established = sum(1 for line in output.splitlines()
+                      if re.search(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s+4\s+\d+.*\s+\d+\s*$', line.strip()))
+    # Also accept explicit "Established" or "Up" keywords (older IOS)
+    established += output.count("Established") + output.count("Up/Down") * 0
     passed = ok and established >= 2
-    detail = f"{established} BGP EVPN neighbor(s) established"
+    detail = f"{established} BGP EVPN neighbor(s) established\n{output[-800:]}"
     _persist_fabric_step("verify_bgp_evpn", "completed" if passed else "failed", detail)
     return passed, detail
 
@@ -650,7 +654,7 @@ def step_verify_nve_peers(log_fn=print):
     # Expect at least 1 peer per leaf
     peer_count = output.count("UP") + output.count("up")
     passed = ok and peer_count >= 1
-    detail = f"{peer_count} NVE peer(s) UP"
+    detail = f"{peer_count} NVE peer(s) UP\n{output[-800:]}"
     _persist_fabric_step("verify_nve_peers", "completed" if passed else "failed", detail)
     return passed, detail
 
@@ -700,11 +704,16 @@ def ensure_fabric_table():
 
 # ── Public entry point (called from dashboard or CLI) ─────────────────────────
 
-def run_fabric(from_step=1, only_step=None, verify_only=False, log_fn=print):
+def run_fabric(from_step=1, only_step=None, verify_only=False, log_fn=print, pod_id=None, db_path=None):
     """
     Run the EVPN fabric automation.
     Returns list of (step_name, ok, detail) tuples.
     """
+    global POD_ID, DB_PATH
+    if pod_id:
+        POD_ID = pod_id
+    if db_path:
+        DB_PATH = db_path
     ensure_fabric_table()
     completed = _load_completed_fabric_steps()
     results = []
