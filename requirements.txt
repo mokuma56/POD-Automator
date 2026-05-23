@@ -4,3 +4,4 @@ requests>=2.31
 urllib3>=2.0
 ldap3>=2.9
 pywinrm>=0.4
+netmiko>=4.3
