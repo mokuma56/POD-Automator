@@ -347,37 +347,6 @@ def api_switches(pod_id):
             "step_status": step.get("status", "pending"),
         })
 
-    # Add connectivity test — show per-switch labels
-    ct = results.get("connectivity_test", {})
-    conn_checks = []
-    if ct.get("status") == "completed" and ct.get("parts"):
-        for p in ct["parts"]:
-            sw_name = p.split("(")[0].replace("PASS: ", "").replace("FAIL: ", "").strip() if "(" in p else ""
-            label = f"{sw_name} -> Ping Catalyst Center" if sw_name else "Ping Catalyst Center"
-            if p.startswith("PASS"):
-                conn_checks.append({"label": label, "status": "pass", "result": "Success"})
-            elif p.startswith("FAIL"):
-                conn_checks.append({"label": label, "status": "fail", "result": "Failed"})
-    elif ct.get("status") == "running":
-        conn_checks.append({"label": "Ping Catalyst Center", "status": "na", "result": "testing..."})
-    elif ct.get("status") == "failed":
-        conn_checks.append({"label": "Ping Catalyst Center", "status": "fail", "result": "Failed"})
-    else:
-        conn_checks.append({"label": "Ping Catalyst Center", "status": "na", "result": "pending"})
-
-    ct_passed = sum(1 for c in conn_checks if c["status"] == "pass")
-    ct_failed = sum(1 for c in conn_checks if c["status"] == "fail")
-    switch_data.append({
-        "name": "Catalyst Center",
-        "model": "198.18.5.100",
-        "host": "connectivity",
-        "checks": conn_checks,
-        "passed": ct_passed,
-        "failed": ct_failed,
-        "total": len(conn_checks),
-        "step_status": ct.get("status", "pending"),
-    })
-
     return jsonify(switch_data)
 
 
@@ -1015,7 +984,107 @@ def api_fabric_reset(pod_id):
     return jsonify({"status": "ok", "message": f"Fabric steps reset for {pod_id}"})
 
 
-# ── Base Config Reset ─────────────────────────────────────────────────────────
+@app.route("/api/catc/discover/<pod_id>", methods=["POST"])
+def api_catc_discover(pod_id):
+    """Run Catalyst Center discovery for a POD's switches (manual trigger)."""
+    import threading
+
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    def _run():
+        # Clear previous catc step logs for this pod so re-runs start fresh
+        c = _db()
+        c.execute("DELETE FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[catc:step]%'", (pod_id,))
+        c.commit(); c.close()
+
+        proc = subprocess.Popen([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-u", "-c",
+            "import sys; sys.path.insert(0,'/pipeline'); import onboard_router; "
+            "ok, r = onboard_router.phase_catc_discover(); "
+            "print(('OK: ' if ok else 'FAIL: ') + str(r))"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, line)  # writes every [catc:step] line to pipeline_logs
+
+        proc.wait()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "message": f"Catalyst Center discovery started for {pod_id}"})
+
+
+@app.route("/api/catc/status/<pod_id>")
+def api_catc_status(pod_id):
+    """Return per-step CatC discovery status for a POD."""
+    c = _db()
+    rows = c.execute(
+        "SELECT log_line FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[catc:step]%' ORDER BY rowid",
+        (pod_id,)
+    ).fetchall()
+    c.close()
+
+    # Steps in order
+    step_order = ["auth", "check_inventory", "create_discovery", "verify_results", "assign_site", "provision"]
+    step_labels = {
+        "auth":             "Authenticate to Catalyst Center",
+        "check_inventory":  "Check Existing Inventory",
+        "create_discovery": "Run Discovery Job",
+        "verify_results":   "Verify Reachability",
+        "assign_site":      "Assign to Site (MAIN)",
+        "provision":        "Provision / Sync with Site",
+    }
+
+    # Parse log lines: [catc:step] <step> | <status> | <message>
+    steps = {}
+    for row in rows:
+        line = row["log_line"]
+        # format: [catc:step] step_name | status | message
+        body = line[len("[catc:step] "):]
+        parts = [p.strip() for p in body.split("|", 2)]
+        if len(parts) < 2:
+            continue
+        name, status = parts[0], parts[1]
+        msg = parts[2] if len(parts) > 2 else ""
+        # Last line wins for each step
+        steps[name] = {"status": status, "message": msg}
+
+    step_list = []
+    overall_running = False
+    for key in step_order:
+        s = steps.get(key, {"status": "pending", "message": ""})
+        if s["status"] == "running":
+            overall_running = True
+        step_list.append({
+            "key":     key,
+            "label":   step_labels[key],
+            "status":  s["status"],
+            "message": s["message"],
+        })
+
+    completed = sum(1 for s in step_list if s["status"] == "completed")
+    failed    = sum(1 for s in step_list if s["status"] == "failed")
+    overall   = "running" if overall_running else ("failed" if failed else ("completed" if completed == len(step_order) else "pending"))
+
+    return jsonify({
+        "steps":   step_list,
+        "overall": overall,
+        "running": overall_running,
+        "total":   len(step_order),
+        "done":    completed,
+    })
 
 BASECONFIG_SWITCHES = {
     "border_spine": {"name": "Border Spine", "ip": "198.18.128.24"},
@@ -1042,6 +1111,18 @@ def api_baseconfig_status(pod_id):
         ).fetchall()
         verify_line = vrows[0]["log_line"] if vrows else None
         result[key] = {"reset": reset_line, "verify": verify_line}
+    # ISE cleanup status
+    ise_rows = c.execute(
+        "SELECT log_line FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[baseconfig/ise]%' ORDER BY rowid DESC LIMIT 1",
+        (pod_id,)
+    ).fetchall()
+    result["ise"] = {"reset": ise_rows[0]["log_line"] if ise_rows else None, "verify": None}
+    # CC cleanup status
+    catc_rows = c.execute(
+        "SELECT log_line FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[baseconfig/catc]%' ORDER BY rowid DESC LIMIT 1",
+        (pod_id,)
+    ).fetchall()
+    result["catc"] = {"reset": catc_rows[0]["log_line"] if catc_rows else None, "verify": None}
     c.close()
     return jsonify(result)
 
@@ -1067,9 +1148,10 @@ def api_baseconfig_verify(pod_id):
                 "docker", "run", "--rm",
                 "--network", f"container:vpn-{pod_id}",
                 "-v", f"{os.path.abspath(DATA_DIR / 'base_configs')}:/pipeline/base_configs:ro",
+                "-e", "BASE_CONFIGS_DIR=/pipeline/base_configs",
                 "--entrypoint", "python3",
                 "pod-automator:latest", "-c", script
-            ], capture_output=True, text=True, timeout=60)
+            ], capture_output=True, text=True, timeout=120)
             stdout = result.stdout.strip()
             last_line = stdout.splitlines()[-1] if stdout else ""
             try:
@@ -1095,33 +1177,168 @@ def api_baseconfig_reset(pod_id, switch_key):
     if r.returncode != 0 or r.stdout.strip() != "running":
         return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
 
-    keys = list(BASECONFIG_SWITCHES.keys()) if switch_key == "all" else [switch_key]
+    # Leaves first, then Border Spine — leafs are only reachable through the spine's
+    # management VLAN, so resetting the spine first would lose reachability to the leafs.
+    RESET_ORDER = ["leaf1", "leaf2", "border_spine"]
+    keys = [k for k in RESET_ORDER if k in BASECONFIG_SWITCHES] if switch_key == "all" else [switch_key]
 
+    def _sanitize(s):
+        """Collapse multiline error strings to a single line for clean card display."""
+        return " | ".join(line.strip() for line in str(s).splitlines() if line.strip())[:300]
     def _run():
         for key in keys:
+            import datetime as _dt
+            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            log(pod_id, f"[baseconfig/{key}] RUNNING started_at={ts}: connecting to {BASECONFIG_SWITCHES[key]['ip']}...")
             script = (
                 "import sys, os; sys.path.insert(0, '.'); import onboard_router; "
                 f"ok, detail = onboard_router.phase_baseconfig_reset('{key}'); "
                 "print(repr((ok, detail)))"
             )
+            try:
+                result = subprocess.run([
+                    "docker", "run", "--rm",
+                    "--network", f"container:vpn-{pod_id}",
+                    "-v", f"{os.path.abspath(DATA_DIR / 'base_configs')}:/pipeline/base_configs:ro",
+                    "-e", "BASE_CONFIGS_DIR=/pipeline/base_configs",
+                    "--entrypoint", "python3",
+                    "pod-automator:latest", "-c", script
+                ], capture_output=True, text=True, timeout=420)
+                stdout = result.stdout.strip()
+                last_line = stdout.splitlines()[-1] if stdout else ""
+                try:
+                    ok_val, detail_val = eval(last_line)
+                except Exception:
+                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
+            except subprocess.TimeoutExpired:
+                ok_val, detail_val = False, "timed out after 300s"
+            except Exception as e:
+                ok_val, detail_val = False, str(e)
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[baseconfig/{key}] {status_str}: {_sanitize(detail_val)}")
+
+        # After all switches, clean up ISE NADs (only when resetting all)
+        if switch_key == "all":
+            import datetime as _dt
+            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            log(pod_id, f"[baseconfig/ise] RUNNING started_at={ts}: removing switch NADs from ISE...")
+            script = (
+                "import sys; sys.path.insert(0, '.'); import onboard_router; "
+                "ok, detail = onboard_router.phase_ise_cleanup(); "
+                "print(repr((ok, detail)))"
+            )
+            try:
+                result = subprocess.run([
+                    "docker", "run", "--rm",
+                    "--network", f"container:vpn-{pod_id}",
+                    "--entrypoint", "python3",
+                    "pod-automator:latest", "-c", script
+                ], capture_output=True, text=True, timeout=60)
+                stdout = result.stdout.strip()
+                last_line = stdout.splitlines()[-1] if stdout else ""
+                try:
+                    ok_val, detail_val = eval(last_line)
+                except Exception:
+                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
+            except subprocess.TimeoutExpired:
+                ok_val, detail_val = False, "timed out after 60s"
+            except Exception as e:
+                ok_val, detail_val = False, str(e)
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[baseconfig/ise] {status_str}: {_sanitize(detail_val)}")
+
+            # Catalyst Center — delete the 3 switches from inventory
+            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            log(pod_id, f"[baseconfig/catc] RUNNING started_at={ts}: removing switches from Catalyst Center...")
+            script = (
+                "import sys; sys.path.insert(0, '.'); import onboard_router; "
+                "ok, detail = onboard_router.phase_catc_cleanup(); "
+                "print(repr((ok, detail)))"
+            )
+            try:
+                result = subprocess.run([
+                    "docker", "run", "--rm",
+                    "--network", f"container:vpn-{pod_id}",
+                    "--entrypoint", "python3",
+                    "pod-automator:latest", "-c", script
+                ], capture_output=True, text=True, timeout=60)
+                stdout = result.stdout.strip()
+                last_line = stdout.splitlines()[-1] if stdout else ""
+                try:
+                    ok_val, detail_val = eval(last_line)
+                except Exception:
+                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
+            except subprocess.TimeoutExpired:
+                ok_val, detail_val = False, "timed out after 60s"
+            except Exception as e:
+                ok_val, detail_val = False, str(e)
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[baseconfig/catc] {status_str}: {_sanitize(detail_val)}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "message": f"Base config reset started for {switch_key} on {pod_id}"})
+
+
+@app.route("/api/baseconfig/service/<pod_id>/<service>", methods=["POST"])
+def api_baseconfig_service(pod_id, service):
+    """Run ISE or CC cleanup individually for a POD."""
+    if service not in ("ise", "catc"):
+        return jsonify({"status": "error", "message": f"Unknown service: {service}"}), 400
+
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    fn = "phase_ise_cleanup" if service == "ise" else "phase_catc_cleanup"
+    label = "ISE NAD cleanup" if service == "ise" else "Catalyst Center cleanup"
+
+    def _run():
+        import datetime as _dt
+        ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        log(pod_id, f"[baseconfig/{service}] RUNNING started_at={ts}: starting {label}...")
+        script = (
+            f"import sys; sys.path.insert(0, '.'); import onboard_router; "
+            f"ok, detail = onboard_router.{fn}(); "
+            f"print(repr((ok, detail)))"
+        )
+        try:
             result = subprocess.run([
                 "docker", "run", "--rm",
                 "--network", f"container:vpn-{pod_id}",
-                "-v", f"{os.path.abspath(DATA_DIR / 'base_configs')}:/pipeline/base_configs:ro",
                 "--entrypoint", "python3",
                 "pod-automator:latest", "-c", script
-            ], capture_output=True, text=True, timeout=120)
+            ], capture_output=True, text=True, timeout=60)
             stdout = result.stdout.strip()
             last_line = stdout.splitlines()[-1] if stdout else ""
             try:
                 ok_val, detail_val = eval(last_line)
             except Exception:
-                ok_val, detail_val = False, f"parse error: {stdout[:200]}"
-            status_str = "OK" if ok_val else "FAILED"
-            log(pod_id, f"[baseconfig/{key}] {status_str}: {detail_val}")
+                ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
+        except subprocess.TimeoutExpired:
+            ok_val, detail_val = False, "timed out after 60s"
+        except Exception as e:
+            ok_val, detail_val = False, str(e)
+        status_str = "OK" if ok_val else "FAILED"
+        detail_clean = " | ".join(line.strip() for line in str(detail_val).splitlines() if line.strip())[:300]
+        log(pod_id, f"[baseconfig/{service}] {status_str}: {detail_clean}")
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"status": "started", "message": f"Base config reset started for {switch_key} on {pod_id}"})
+    return jsonify({"status": "started", "message": f"{label} started for {pod_id}"})
+
+
+@app.route("/api/baseconfig/clear/<pod_id>", methods=["POST"])
+def api_baseconfig_clear(pod_id):
+    """Delete all baseconfig and verify log lines for this POD so cards reset to 'Not run'."""
+    c = _db()
+    c.execute(
+        "DELETE FROM pipeline_logs WHERE pod_id=? AND (log_line LIKE '[baseconfig/%' OR log_line LIKE '[verify/%')",
+        (pod_id,)
+    )
+    c.close()
+    return jsonify({"status": "ok", "message": f"Baseconfig status cleared for {pod_id}"})
 
 
 
@@ -1331,13 +1548,74 @@ def api_upgrade_upload_image():
     return jsonify({"status": "ok", "filename": filename, "local_path": str(local_path)})
 
 
+def _run_upgrade_container(pod_id, step_name, script):
+    """
+    Run an upgrade script in a docker container, streaming stdout to pipeline_logs
+    and updating the step result live. Shared by switch and router upgrade endpoints.
+    """
+    import subprocess as sp
+
+    # Mark step as running
+    c2 = _db()
+    c2.execute("INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, result) "
+               "VALUES (?, ?, 'running', datetime('now'), 'Starting...')", (pod_id, step_name))
+    c2.commit(); c2.close()
+
+    cmd = [
+        "docker", "run", "--rm",
+        "--network", f"container:vpn-{pod_id}",
+        "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+        "--entrypoint", "python3",
+        "pod-automator:latest", "-u", "-c", script
+    ]
+
+    ok_val, result_val = False, "No output"
+    last_progress = ""
+    try:
+        proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            # Write to live logs
+            cx = _db()
+            cx.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)",
+                       (pod_id, f"[{step_name}] {line}"))
+            cx.commit()
+            # Update live result field with latest meaningful line
+            if not line.startswith("("):
+                last_progress = line.strip()
+                cx.execute("UPDATE pipeline_steps SET result=? WHERE pod_id=? AND step_name=?",
+                           (last_progress[:500], pod_id, step_name))
+                cx.commit()
+            cx.close()
+            # Parse final result tuple
+            if line.startswith("("):
+                try: ok_val, result_val = eval(line)
+                except Exception: pass
+        proc.wait(timeout=60)
+    except Exception as e:
+        result_val = f"Container error: {e}"
+
+    status = "completed" if ok_val else "failed"
+    c3 = _db()
+    c3.execute("INSERT OR REPLACE INTO pipeline_steps "
+               "(pod_id, step_name, status, started_at, completed_at, result) "
+               "VALUES (?, ?, ?, datetime('now'), datetime('now'), ?)",
+               (pod_id, step_name, status, str(result_val)[:500]))
+    c3.commit(); c3.close()
+
+
 @app.route("/api/upgrade/switch/<pod_id>/<switch_key>", methods=["POST"])
 def api_upgrade_switch(pod_id, switch_key):
     """Run switch upgrade for a specific switch in a POD."""
     import threading
-    ok, msg = _ensure_pipeline_container(pod_id)
-    if not ok:
-        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
 
     c = _db()
     cfg = c.execute("SELECT * FROM upgrade_config WHERE device_type='switch'").fetchone()
@@ -1357,33 +1635,7 @@ def api_upgrade_switch(pod_id, switch_key):
             "print(repr((ok, result)))"
         )
         step_name = f"upgrade_{switch_key}"
-        # Mark as running
-        c2 = _db()
-        c2.execute("INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, result) "
-                   "VALUES (?, ?, 'running', datetime('now'), '')", (pod_id, step_name))
-        c2.commit(); c2.close()
-
-        res = subprocess.run([
-            "docker", "run", "--rm",
-            "--network", f"container:vpn-{pod_id}",
-            "--entrypoint", "python3",
-            "pod-automator:latest", "-c", script
-        ], capture_output=True, text=True, timeout=3600)
-
-        stdout = res.stdout.strip()
-        last_line = next((l for l in reversed(stdout.splitlines()) if l.startswith("(")), "")
-        ok_val, result_val = False, res.stderr.strip()[:300] or "no output"
-        if last_line:
-            try: ok_val, result_val = eval(last_line)
-            except Exception: pass
-
-        status = "completed" if ok_val else "failed"
-        c3 = _db()
-        c3.execute("INSERT OR REPLACE INTO pipeline_steps "
-                   "(pod_id, step_name, status, started_at, completed_at, result) "
-                   "VALUES (?, ?, ?, datetime('now'), datetime('now'), ?)",
-                   (pod_id, step_name, status, str(result_val)[:500]))
-        c3.commit(); c3.close()
+        _run_upgrade_container(pod_id, step_name, script)
 
     threading.Thread(target=_upgrade, daemon=True).start()
     return jsonify({"status": "ok", "message": f"Switch upgrade started for {switch_key} on {pod_id}"})
@@ -1393,9 +1645,12 @@ def api_upgrade_switch(pod_id, switch_key):
 def api_upgrade_router(pod_id):
     """Run router upgrade for a POD."""
     import threading
-    ok, msg = _ensure_pipeline_container(pod_id)
-    if not ok:
-        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
 
     c = _db()
     cfg = c.execute("SELECT * FROM upgrade_config WHERE device_type='router'").fetchone()
@@ -1418,32 +1673,7 @@ def api_upgrade_router(pod_id):
             "print(repr((ok, result)))"
         )
         step_name = "upgrade_router"
-        c2 = _db()
-        c2.execute("INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, result) "
-                   "VALUES (?, ?, 'running', datetime('now'), '')", (pod_id, step_name))
-        c2.commit(); c2.close()
-
-        res = subprocess.run([
-            "docker", "run", "--rm",
-            "--network", f"container:vpn-{pod_id}",
-            "--entrypoint", "python3",
-            "pod-automator:latest", "-c", script
-        ], capture_output=True, text=True, timeout=3600)
-
-        stdout = res.stdout.strip()
-        last_line = next((l for l in reversed(stdout.splitlines()) if l.startswith("(")), "")
-        ok_val, result_val = False, res.stderr.strip()[:300] or "no output"
-        if last_line:
-            try: ok_val, result_val = eval(last_line)
-            except Exception: pass
-
-        status = "completed" if ok_val else "failed"
-        c3 = _db()
-        c3.execute("INSERT OR REPLACE INTO pipeline_steps "
-                   "(pod_id, step_name, status, started_at, completed_at, result) "
-                   "VALUES (?, ?, ?, datetime('now'), datetime('now'), ?)",
-                   (pod_id, step_name, status, str(result_val)[:500]))
-        c3.commit(); c3.close()
+        _run_upgrade_container(pod_id, step_name, script)
 
     threading.Thread(target=_upgrade, daemon=True).start()
     return jsonify({"status": "ok", "message": f"Router upgrade started for {pod_id}"})
@@ -1764,7 +1994,7 @@ DASHBOARD_HTML = """
   .progress-label { font-size: 12px; color: #8899aa; margin-bottom: 6px; }
 
   .switch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
-  .switch-card { background: #0a1628; border-radius: 8px; padding: 12px; border: 1px solid #1a2d4a; }
+  .switch-card { background: #0a1628; border-radius: 8px; padding: 12px; border: 1px solid #1a2d4a; display: flex; flex-direction: column; }
   .switch-card.fail { border-color: #3d0000; }
   .switch-card.pass { border-color: #003d2a; }
   .switch-card.warn { border-color: #3d2200; }
@@ -1948,6 +2178,7 @@ DASHBOARD_HTML = """
       <div id="fabric-grid" style="padding:16px;min-height:260px;">
         <div style="color:#667788;font-size:13px;">Select a POD to load EVPN Fabric status</div>
       </div>
+      <div id="catc-tile-container" style="padding:0 16px 16px;"></div>
     </div>
 
     <div class="tab-content" id="tab-baseconfig">
@@ -2743,12 +2974,33 @@ async function loadUpgrade(podId) {
     const icon  = status === 'completed' ? '✓' : status === 'failed' ? '✗' :
                   status === 'running' ? '⟳' : '–';
 
-    // Parse current version from switch verify result if available
-    let currentVer = '';
-    const verifyKey = stepKey.replace('upgrade_', 'verify_');
-    // Try to extract version from result
-    const vm = result.match(/([\d]+\.[\d]+\.[\d]+)/);
-    if (vm) currentVer = vm[1];
+    // Phase detection from live result text
+    const phases = ['Connecting','Checking version','Copying image','Installing','Activating','Reloading','Verifying','done'];
+    let phaseIdx = -1;
+    if (status === 'running') {
+      const rl = result.toLowerCase();
+      if (rl.includes('verif') || rl.includes('ssh')) phaseIdx = 6;
+      else if (rl.includes('reload') || rl.includes('waiting') || rl.includes('back up')) phaseIdx = 5;
+      else if (rl.includes('activat') || rl.includes('commit')) phaseIdx = 4;
+      else if (rl.includes('install') || rl.includes('expand') || rl.includes('software install')) phaseIdx = 3;
+      else if (rl.includes('cop') || rl.includes('bytes') || rl.includes('elapsed') || rl.includes('http')) phaseIdx = 2;
+      else if (rl.includes('version') || rl.includes('golden') || rl.includes('upgrade needed') || rl.includes('no upgrade')) phaseIdx = 1;
+      else if (rl.includes('connect') || rl.includes('starting') || rl.includes('ssh')) phaseIdx = 0;
+      else phaseIdx = 0;
+    } else if (status === 'completed') { phaseIdx = 7; }
+
+    // Build phase progress bar
+    let phaseBar = '';
+    if (status === 'running' || status === 'completed') {
+      const phaseDots = phases.slice(0,7).map((p, i) => {
+        const done = phaseIdx > i || status === 'completed';
+        const active = phaseIdx === i && status === 'running';
+        const pc = done ? '#2ed573' : active ? '#ffa502' : '#334455';
+        const fw = active ? '700' : '400';
+        return '<span style="color:' + pc + ';font-weight:' + fw + ';font-size:10px">' + (done ? '● ' : active ? '◉ ' : '○ ') + p + '</span>';
+      }).join('<span style="color:#334;"> › </span>');
+      phaseBar = '<div style="margin-bottom:8px;line-height:1.8;">' + phaseDots + '</div>';
+    }
 
     const noImage = !imageFile;
     const canRun = !noImage && status !== 'running';
@@ -2762,14 +3014,15 @@ async function loadUpgrade(podId) {
       '<span style="color:#e0e8f0;font-size:13px;font-weight:600">' + label + '</span>',
       '<span style="margin-left:auto;font-size:11px;color:#667788">Golden: ' + (golden || '\u2014') + '</span>',
       '</div>',
-      result ? '<div style="font-size:11px;color:' + color + ';margin-bottom:8px;word-break:break-all">' + escHtml(result.substring(0,150)) + '</div>' : '',
+      phaseBar,
+      result ? '<div style="font-size:11px;color:' + color + ';margin-bottom:8px;word-break:break-all;font-style:italic">' + escHtml(result.substring(0,120)) + '</div>' : '',
       noImage ? '<div style="font-size:11px;color:#ff4757;margin-bottom:8px;">\u26a0 No image uploaded \u2014 use the upload card above</div>' : '',
       '<button id="' + btnId + '" style="' + btnStyle + '">',
       status === 'running' ? '\u27f3 Upgrading...' : '\u2b06 Run Upgrade',
       '</button></div>'
     ].join('');
 
-    // Attach click handler after render (avoids inline onclick quoting issues)
+    // Attach click handler after render
     if (canRun) {
       setTimeout(function() {
         const btn = document.getElementById(btnId);
@@ -2813,14 +3066,14 @@ async function runUpgrade(podId, apiPath, label) {
     alert('Error: ' + (d.message || 'unknown'));
     return;
   }
-  // Reload the tab every 30s while running
+  // Reload the tab every 5s while running, 30s otherwise
   const poll = setInterval(async () => {
     const stR = await fetch('/api/upgrade/status/' + podId);
     const steps = await stR.json();
     const running = steps.some(s => s.status === 'running');
     loadUpgrade(podId);
     if (!running) clearInterval(poll);
-  }, 30000);
+  }, 5000);
   loadUpgrade(podId);
 }
 
@@ -3141,6 +3394,9 @@ function renderFabricGrid(podId, steps) {
     if (verifyBtn) verifyBtn.onclick = () => triggerFabric(podId, 'verify');
   }, 0);
 
+  // Render the CatC tile (lives outside _lastHtml gate — always re-rendered)
+  renderCatcTile(podId);
+
   // Auto-refresh while any step is running
   if (running) {
     setTimeout(() => loadFabricStatus(podId), 4000);
@@ -3161,13 +3417,46 @@ async function loadBaseConfig(podId) {
   const r = await fetch('/api/baseconfig/status/' + podId);
   const data = await r.json();
   renderBaseConfigGrid(podId, data);
+  // If something is already running (e.g. page refresh mid-reset), start a poller
+  const anyRunning = Object.values(data || {}).some(s => (s.reset||'').includes('RUNNING') || (s.verify||'').includes('RUNNING'));
+  if (anyRunning) {
+    const logEl = document.getElementById('baseconfig-log');
+    if (logEl) logEl.style.display = 'block';
+    let polls = 0;
+    const poll = setInterval(async () => {
+      polls++;
+      const [lr, sr] = await Promise.all([
+        fetch('/api/logs/' + podId).then(r => r.json()),
+        fetch('/api/baseconfig/status/' + podId).then(r => r.json()),
+      ]);
+      const relevant = lr.filter(l => l.includes('[baseconfig/')).slice(-12);
+      if (logEl) logEl.textContent = relevant.join('\\n');
+      renderBaseConfigGrid(podId, sr);
+      const stillRunning = Object.values(sr || {}).some(s => (s.reset||'').includes('RUNNING') || (s.verify||'').includes('RUNNING'));
+      if ((!stillRunning && polls > 5) || polls > 200) clearInterval(poll);
+    }, 3000);
+  }
 }
 
 function _bcStatusBadge(line) {
-  if (!line) return { color: '#667788', text: 'Not run', short: '' };
-  if (line.includes('RUNNING')) return { color: '#f39c12', text: 'Running...', short: '' };
-  if (line.includes('FAILED')) return { color: '#e74c3c', text: 'FAILED', short: line.substring(line.indexOf(']')+1, line.indexOf(']')+80) };
-  return { color: '#00e68a', text: 'OK', short: line.substring(line.indexOf(']')+1, line.indexOf(']')+80) };
+  if (!line) return { color: '#667788', text: 'Not run', short: '', running: false, startedAt: null };
+  if (line.includes('RUNNING')) {
+    const m = line.match(/started_at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)/);
+    const startedAt = m ? m[1] : null;
+    const ts = startedAt ? new Date(startedAt).getTime() : NaN;
+    if (!isNaN(ts)) {
+      const elapsed = Math.floor((Date.now() - ts) / 1000);
+      if (elapsed > 600) {
+        return { color: '#e74c3c', text: '&#10007; Stale', short: 'Did not complete — try again', running: false, startedAt: null };
+      }
+    }
+    const shortMsg = line.replace(/^\[.*?\]\s*RUNNING\s+started_at=[\w\-:TZ]+:\s*/, '').trim();
+    return { color: '#f39c12', text: '&#9696; Running...', short: shortMsg, running: true, startedAt: startedAt };
+  }
+  // Extract text after the closing bracket tag
+  const afterTag = line.replace(/^\[.*?\]\s*/, '');
+  if (line.includes('FAILED')) return { color: '#e74c3c', text: '&#10007; FAILED', short: afterTag.replace(/^FAILED:\s*/i, '').substring(0, 120).trim(), running: false, startedAt: null };
+  return { color: '#00e68a', text: '&#10003; OK', short: afterTag.replace(/^OK:\s*/i, '').substring(0, 120).trim(), running: false, startedAt: null };
 }
 
 function renderBaseConfigGrid(podId, statusData) {
@@ -3178,60 +3467,139 @@ function renderBaseConfigGrid(podId, statusData) {
   html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">Switch Base Config Reset</span>';
   html += '<div style="display:flex;gap:8px;">';
   html += '<button id="baseconfig-verify-btn" style="background:#1a6e3c;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#10003; Verify All</button>';
-  html += '<button id="baseconfig-all-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 18px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#8635; Reset All 3 Switches</button>';
+  html += '<button id="baseconfig-clear-btn" style="background:#445566;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#215; Clear Status</button>';
+  html += '<button id="baseconfig-all-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 18px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#8635; Reset Infrastructure</button>';
   html += '</div></div>';
 
   html += '<div style="background:#12202f;border:1px solid #e74c3c44;border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:11px;color:#e74c3c;">';
   html += '&#9888;  This will overwrite the running config on the selected switch(es) with the known-good base config and save to NVRAM. EVPN fabric config will be removed.';
   html += '</div>';
 
-  html += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;">';
+  html += '<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;">';
+
+  // Determine if Border Spine is currently running — blocks leaf resets
+  const spineStatus = (statusData && statusData.border_spine) ? statusData.border_spine : {};
+  const spineRunning = _bcStatusBadge(spineStatus.reset || null).running;
+
+  // Helper: render one card
+  function _bcCard(key, title, ip, roleClass, roleLabel, resetBadge, verifyBadge, btnId, btnLabel, blocked, blockedMsg) {
+    const isOk   = resetBadge.text.includes('OK');
+    const isFail = resetBadge.text.includes('FAILED') || resetBadge.text.includes('Stale');
+    const cardClass = 'switch-card' + (isOk ? ' pass' : isFail ? ' fail' : '');
+    const detailStyle = 'font-size:10px;color:#667788;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;display:block;margin-bottom:4px;';
+    let h = '<div class="' + cardClass + '">';
+    // Title row
+    h += '<div class="switch-card-title">';
+    h += '<span class="role-tag ' + roleClass + '">' + roleLabel + '</span>';
+    h += '<span style="color:#e0e6ed;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + title + '</span>';
+    h += '<span class="device-model">' + ip + '</span>';
+    h += '</div>';
+    // Reset row
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:2px;">';
+    h += '<span style="color:#8899aa;">Reset</span>';
+    h += '<span style="color:' + resetBadge.color + ';font-weight:600;">' + resetBadge.text + '</span>';
+    h += '</div>';
+    // Detail / progress under reset
+    if (resetBadge.running && resetBadge.startedAt) {
+      const ts = new Date(resetBadge.startedAt).getTime();
+      const elapsed = isNaN(ts) ? 0 : Math.floor((Date.now() - ts) / 1000);
+      const elStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
+      const phase = elapsed < 20  ? '① Connecting via Telnet...'
+                  : elapsed < 50  ? '② Pushing config lines...'
+                  : elapsed < 70  ? '③ Saving + reloading...'
+                  : elapsed < 310 ? '④ Waiting for reboot... (' + Math.max(0, 310-elapsed) + 's left)'
+                  : elapsed < 370 ? '⑤ Reconnecting via SSH...'
+                  : '⑥ RSA keys + final save...';
+      h += '<div style="' + detailStyle + 'color:#f39c12;">' + phase + ' — ' + elStr + ' elapsed</div>';
+      h += '<div class="switch-bar" style="margin-bottom:4px;"><div class="switch-bar-fill" style="width:' + Math.min(99,Math.round(elapsed/390*100)) + '%;background:#f39c12;"></div></div>';
+    } else {
+      const txt = (resetBadge.short || '').substring(0, 60);
+      h += '<div style="' + detailStyle + '" title="' + (resetBadge.short||'').replace(/"/g,'&quot;') + '">' + (txt || '&nbsp;') + '</div>';
+      h += '<div style="height:4px;margin-bottom:4px;"></div>';
+    }
+    // Verify row — always rendered for uniform height
+    if (verifyBadge !== null) {
+      h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:2px;">';
+      h += '<span style="color:#8899aa;">Verify</span>';
+      h += '<span style="color:' + verifyBadge.color + ';font-weight:600;">' + verifyBadge.text + '</span>';
+      h += '</div>';
+      const vtxt = (verifyBadge.short || '').substring(0, 60);
+      h += '<div style="' + detailStyle + '" title="' + (verifyBadge.short||'').replace(/"/g,'&quot;') + '">' + (vtxt || '&nbsp;') + '</div>';
+    } else {
+      h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:2px;">';
+      h += '<span style="color:#8899aa;">Verify</span>';
+      h += '<span style="color:#334455;font-weight:600;">N/A</span>';
+      h += '</div>';
+      h += '<div style="' + detailStyle + '">&nbsp;</div>';
+    }
+    // Button pinned to bottom
+    if (blocked) {
+      h += '<button disabled style="margin-top:auto;background:#1a2d4a;color:#445566;border:1px solid #1e3050;padding:5px 10px;border-radius:4px;font-size:11px;width:100%;cursor:not-allowed;">&#9203; Spine Resetting...</button>';
+    } else {
+      h += '<button id="' + btnId + '" style="margin-top:auto;background:#c0392b;color:#fff;border:none;padding:5px 10px;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">&#8635; ' + btnLabel + '</button>';
+    }
+    h += '</div>';
+    return h;
+  }
+
   for (const [key, info] of Object.entries(BASECONFIG_SWITCHES)) {
     const s = (statusData && statusData[key]) ? statusData[key] : {};
     const resetBadge  = _bcStatusBadge(s.reset  || null);
     const verifyBadge = _bcStatusBadge(s.verify || null);
-    html += '<div style="background:#0a1628;border:1px solid #1e3050;border-radius:8px;padding:14px;text-align:center;">';
-    html += '<div style="font-size:13px;font-weight:700;color:#cdd6e0;margin-bottom:4px;">' + info.name + '</div>';
-    html += '<div style="font-size:11px;color:#556677;margin-bottom:10px;">' + info.ip + '</div>';
-    // Reset row
-    html += '<div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:4px;">';
-    html += '<span style="color:#8899aa;">Reset</span>';
-    html += '<span style="color:' + resetBadge.color + ';font-weight:600;">' + resetBadge.text + '</span>';
-    html += '</div>';
-    if (resetBadge.short) html += '<div style="font-size:9px;color:#556677;margin-bottom:6px;text-align:left;word-break:break-word;">' + resetBadge.short.trim() + '</div>';
-    // Verify row
-    html += '<div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:10px;">';
-    html += '<span style="color:#8899aa;">Verify</span>';
-    html += '<span style="color:' + verifyBadge.color + ';font-weight:600;">' + verifyBadge.text + '</span>';
-    html += '</div>';
-    if (verifyBadge.short) html += '<div style="font-size:9px;color:#556677;margin-bottom:6px;text-align:left;word-break:break-word;">' + verifyBadge.short.trim() + '</div>';
-    html += '<button id="baseconfig-btn-' + key + '" style="background:#c0392b;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;width:100%;">&#8635; Reset ' + info.name + '</button>';
-    html += '</div>';
+    const isLeaf = key === 'leaf1' || key === 'leaf2';
+    const blocked = isLeaf && spineRunning;
+    const role = key === 'border_spine' ? 'border' : 'leaf';
+    const roleLabel = key === 'border_spine' ? 'SPINE' : 'LEAF';
+    html += _bcCard(key, info.name, info.ip, role, roleLabel, resetBadge, verifyBadge,
+                    'baseconfig-btn-' + key, 'Reset', blocked, '');
   }
+
+  // ISE card
+  const iseS = (statusData && statusData.ise) ? statusData.ise : {};
+  const iseBadge = _bcStatusBadge(iseS.reset || null);
+  html += _bcCard('ise', 'ISE', '198.18.5.101', 'cc', 'ISE', iseBadge, null,
+                  'baseconfig-btn-ise', 'Cleanup NADs', false, '');
+
+  // Catalyst Center card
+  const catcS = (statusData && statusData.catc) ? statusData.catc : {};
+  const catcBadge = _bcStatusBadge(catcS.reset || null);
+  html += _bcCard('catc', 'Catalyst Center', '198.18.5.100', 'cc', 'CATC', catcBadge, null,
+                  'baseconfig-btn-catc', 'Cleanup Devices', false, '');
+
   html += '</div>';
 
   html += '<div id="baseconfig-log" style="margin-top:14px;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:10px;font-size:11px;font-family:monospace;color:#8899aa;max-height:160px;overflow-y:auto;display:none;"></div>';
 
+  // Only rebuild DOM if content changed — but always re-render when something is running
+  const anyRunning = Object.values(statusData || {}).some(s => (s.reset||'').includes('RUNNING') || (s.verify||'').includes('RUNNING'));
+  if (!anyRunning && grid._lastHtml === html) return;
+  grid._lastHtml = html;
   grid.innerHTML = html;
 
   setTimeout(() => {
     document.getElementById('baseconfig-all-btn').onclick = () => triggerBaseConfig(podId, 'all');
     document.getElementById('baseconfig-verify-btn').onclick = () => triggerBaseConfigVerify(podId);
+    document.getElementById('baseconfig-clear-btn').onclick = () => clearBaseConfigStatus(podId);
     for (const key of Object.keys(BASECONFIG_SWITCHES)) {
       const btn = document.getElementById('baseconfig-btn-' + key);
       if (btn) btn.onclick = () => triggerBaseConfig(podId, key);
     }
+    const iseBtn = document.getElementById('baseconfig-btn-ise');
+    if (iseBtn) iseBtn.onclick = () => triggerBaseConfigService(podId, 'ise');
+    const catcBtn = document.getElementById('baseconfig-btn-catc');
+    if (catcBtn) catcBtn.onclick = () => triggerBaseConfigService(podId, 'catc');
   }, 0);
 }
 
 async function triggerBaseConfig(podId, switchKey) {
-  if (!confirm('Reset base config on ' + (switchKey === 'all' ? 'ALL 3 switches' : BASECONFIG_SWITCHES[switchKey].name) + '?\\nThis will overwrite running config and remove EVPN fabric settings.')) return;
+  const grid = document.getElementById('baseconfig-grid');
+  if (grid) grid._lastHtml = null;  // force re-render so log area shows
   const logEl = document.getElementById('baseconfig-log');
   if (logEl) { logEl.style.display = 'block'; logEl.textContent = 'Starting base config reset for ' + switchKey + '...\\n'; }
   const r = await fetch('/api/baseconfig/reset/' + podId + '/' + switchKey, { method: 'POST' });
   const data = await r.json();
   if (logEl) logEl.textContent += (data.message || JSON.stringify(data)) + '\\n';
-  // Poll status cards + log
+  // Poll status cards + log — runs until no RUNNING state or 10 min max (200 x 3s)
   let polls = 0;
   const poll = setInterval(async () => {
     polls++;
@@ -3242,11 +3610,37 @@ async function triggerBaseConfig(podId, switchKey) {
     const relevant = lr.filter(l => l.includes('[baseconfig/')).slice(-12);
     if (logEl) logEl.textContent = relevant.join('\\n');
     renderBaseConfigGrid(podId, sr);
-    if (polls > 40) clearInterval(poll);
+    const stillRunning = Object.values(sr || {}).some(s => (s.reset||'').includes('RUNNING') || (s.verify||'').includes('RUNNING'));
+    if ((!stillRunning && polls > 5) || polls > 200) clearInterval(poll);
+  }, 3000);
+}
+
+async function triggerBaseConfigService(podId, service) {
+  const grid = document.getElementById('baseconfig-grid');
+  if (grid) grid._lastHtml = null;
+  const logEl = document.getElementById('baseconfig-log');
+  if (logEl) { logEl.style.display = 'block'; logEl.textContent = 'Starting ' + service.toUpperCase() + ' cleanup...\\n'; }
+  const r = await fetch('/api/baseconfig/service/' + podId + '/' + service, { method: 'POST' });
+  const data = await r.json();
+  if (logEl) logEl.textContent += (data.message || JSON.stringify(data)) + '\\n';
+  let polls = 0;
+  const poll = setInterval(async () => {
+    polls++;
+    const [lr, sr] = await Promise.all([
+      fetch('/api/logs/' + podId).then(r => r.json()),
+      fetch('/api/baseconfig/status/' + podId).then(r => r.json()),
+    ]);
+    const relevant = lr.filter(l => l.includes('[baseconfig/' + service + ']')).slice(-8);
+    if (logEl) logEl.textContent = relevant.join('\\n');
+    renderBaseConfigGrid(podId, sr);
+    const badge = _bcStatusBadge(sr[service] ? sr[service].reset : null);
+    if (!badge.running || polls > 20) clearInterval(poll);
   }, 3000);
 }
 
 async function triggerBaseConfigVerify(podId) {
+  const grid = document.getElementById('baseconfig-grid');
+  if (grid) grid._lastHtml = null;
   const logEl = document.getElementById('baseconfig-log');
   if (logEl) { logEl.style.display = 'block'; logEl.textContent = 'Starting verify...\\n'; }
   const r = await fetch('/api/baseconfig/verify/' + podId, { method: 'POST' });
@@ -3266,6 +3660,13 @@ async function triggerBaseConfigVerify(podId) {
   }, 3000);
 }
 
+async function clearBaseConfigStatus(podId) {
+  await fetch('/api/baseconfig/clear/' + podId, { method: 'POST' });
+  const grid = document.getElementById('baseconfig-grid');
+  if (grid) grid._lastHtml = null;
+  loadBaseConfig(podId);
+}
+
 async function triggerFabric(podId, action) {
   const logEl = document.getElementById('fabric-log');
   if (logEl) { logEl.style.display = 'block'; logEl.textContent = 'Starting ' + action + '...\\n'; }
@@ -3282,6 +3683,107 @@ async function triggerFabric(podId, action) {
     const stillRunning = Object.values(steps).some(s => s.status === 'running');
     renderFabricGrid(podId, steps);
     if (!stillRunning || polls >= maxPolls) clearInterval(poll);
+  }, 3000);
+}
+
+async function loadCatcStatus(podId) {
+  // Returns parsed step data; also updates #catc-progress-area if it exists
+  let data;
+  try {
+    data = await fetch('/api/catc/status/' + podId).then(r => r.json());
+  } catch(e) { return null; }
+
+  const steps   = data.steps   || [];
+  const done    = data.done    || 0;
+  const total = data.total || 6;
+  const overall = data.overall || 'pending';
+
+  const pct      = total > 0 ? Math.round(done / total * 100) : 0;
+  const barColor = overall === 'completed' ? '#00e68a'
+                 : overall === 'failed'    ? '#ff4757'
+                 : overall === 'running'   ? '#02c8ff' : '#445566';
+  const labelText = overall === 'completed' ? 'Complete \u2014 all ' + total + ' steps done'
+                  : overall === 'failed'    ? 'Failed'
+                  : overall === 'running'   ? 'Running...'
+                  : overall === 'pending'   ? 'Not started' : overall;
+
+  let h = '';
+  h += '<div style="margin-bottom:10px;">';
+  h += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
+  h += '<span>' + labelText + '</span>';
+  h += '<span>' + pct + '% (' + done + '/' + total + ')</span>';
+  h += '</div>';
+  h += '<div style="background:#0d1117;border-radius:4px;height:6px;overflow:hidden;">';
+  h += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
+  h += '</div></div>';
+  h += '<div style="display:flex;flex-direction:column;gap:5px;">';
+  steps.forEach(s => {
+    const icon  = s.status === 'completed' ? '&#10003;' : s.status === 'failed' ? '&#10007;' : s.status === 'running' ? '&#9696;' : '&#9675;';
+    const color = s.status === 'completed' ? '#00e68a'  : s.status === 'failed' ? '#ff4757'  : s.status === 'running' ? '#02c8ff' : '#445566';
+    h += '<div style="display:flex;align-items:flex-start;gap:8px;font-size:11px;">';
+    h += '<span style="color:' + color + ';min-width:12px;margin-top:1px;">' + icon + '</span>';
+    h += '<span style="color:#cdd6e0;min-width:170px;">' + s.label + '</span>';
+    if (s.message) h += '<span style="color:#8899aa;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + s.message.replace(/"/g, '&quot;') + '">' + s.message + '</span>';
+    h += '</div>';
+  });
+  h += '</div>';
+
+  const area = document.getElementById('catc-progress-area');
+  if (area) area.innerHTML = h;
+  return data;
+}
+
+function renderCatcTile(podId) {
+  const container = document.getElementById('catc-tile-container');
+  if (!container || !podId) return;
+
+  container.innerHTML =
+    '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+        '<div>' +
+          '<span style="font-size:13px;font-weight:600;color:#cdd6e0;">Catalyst Center Discovery</span>' +
+          '<span style="font-size:10px;color:#667788;margin-left:8px;">198.18.5.100</span>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px;">' +
+          '<button id="catc-discover-btn" style="background:#7b4fff;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#128269; Discover</button>' +
+          '<button id="catc-rerun-btn" style="background:#1a2d4a;color:#8899aa;border:1px solid #2a3d5a;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#8635; Re-run</button>' +
+        '</div>' +
+      '</div>' +
+      '<div id="catc-progress-area"></div>' +
+    '</div>';
+
+  document.getElementById('catc-discover-btn').addEventListener('click', () => triggerCatcDiscover(podId));
+  document.getElementById('catc-rerun-btn').addEventListener('click',    () => triggerCatcDiscover(podId));
+  loadCatcStatus(podId);
+}
+
+async function triggerCatcDiscover(podId) {
+  const btn   = document.getElementById('catc-discover-btn');
+  const rerun = document.getElementById('catc-rerun-btn');
+  const area  = document.getElementById('catc-progress-area');
+  if (btn)   { btn.disabled   = true;  btn.textContent = 'Running...'; }
+  if (rerun) { rerun.disabled = true; }
+  if (area)  { area.innerHTML = '<div style="color:#8899aa;font-size:11px;">Starting...</div>'; }
+
+  const r = await fetch('/api/catc/discover/' + podId, { method: 'POST' });
+  const data = await r.json();
+  if (data.status === 'error') {
+    if (area) area.innerHTML = '<div style="color:#ff4757;font-size:11px;">&#10007; ' + (data.message || 'Error') + '</div>';
+    if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
+    if (rerun) { rerun.disabled = false; }
+    return;
+  }
+
+  // Poll until done
+  let polls = 0;
+  const poll = setInterval(async () => {
+    polls++;
+    const sr = await loadCatcStatus(podId);
+    if (!sr || !sr.running || polls >= 60) {
+      clearInterval(poll);
+      if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
+      if (rerun) { rerun.disabled = false; }
+    }
   }, 3000);
 }
 

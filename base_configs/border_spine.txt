@@ -2,6 +2,9 @@ service password-encryption
 !
 hostname Site_105-Border-Spine
 !
+no boot manual
+boot system switch all flash:packages.conf
+!
 ip domain name dcloud.cisco.com
 !
 no ip domain lookup
@@ -145,9 +148,4 @@ ntp server vrf Mgmt-vrf 198.18.128.1
 !
 no vlan 10,101,102
 !
-Exit
-!
-crypto key generate rsa modulus 2048
-!
 end
-!

@@ -690,6 +690,281 @@ SWITCHES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Catalyst Center Discovery
+# ---------------------------------------------------------------------------
+
+CATC_HOST     = "198.18.5.100"
+CATC_USER     = "admin"
+CATC_PASS     = "Demo@C!sco"
+CATC_BASE     = f"https://{CATC_HOST}"
+CATC_MAIN_SITE_ID = "919ce2a1-39b7-4c1f-a7ec-c76e50170ab7"  # Global/NORTH CAROLINA/Durham/Site-105/MAIN
+
+CATC_SWITCHES = {
+    "verify_border_spine": {"ip": "198.18.128.24", "name": "Border Spine"},
+    "verify_leaf1":        {"ip": "198.18.128.22", "name": "Leaf 1"},
+    "verify_leaf2":        {"ip": "198.18.128.23", "name": "Leaf 2"},
+}
+
+# Loopback IPs used for Catalyst Center discovery (mgmt interfaces excluded from telemetry)
+CATC_DISCOVERY_IPS = {
+    "border_spine": {"loopback": "172.30.255.3", "mgmt": "198.18.128.24", "name": "Border Spine"},
+    "leaf1":        {"loopback": "172.30.255.1", "mgmt": "198.18.128.22", "name": "Leaf 1"},
+    "leaf2":        {"loopback": "172.30.255.2", "mgmt": "198.18.128.23", "name": "Leaf 2"},
+}
+
+
+def _catc_token():
+    import requests, urllib3
+    urllib3.disable_warnings()
+    r = requests.post(f"{CATC_BASE}/dna/system/api/v1/auth/token",
+                      auth=(CATC_USER, CATC_PASS), verify=False, timeout=15)
+    r.raise_for_status()
+    return r.json()["Token"]
+
+
+def _catc_headers():
+    return {"X-Auth-Token": _catc_token(), "Content-Type": "application/json"}
+
+
+def _catc_wait_execution(headers, exec_id, timeout=60):
+    """Poll /dnacaap/management/execution-status until SUCCESS or FAILURE."""
+    import requests, urllib3, time
+    urllib3.disable_warnings()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = requests.get(
+            f"{CATC_BASE}/dna/intent/api/v1/dnacaap/management/execution-status/{exec_id}",
+            headers=headers, verify=False, timeout=15)
+        d = r.json()
+        status = d.get("status", "")
+        if status == "SUCCESS":
+            return True, "SUCCESS"
+        if status == "FAILURE":
+            return False, d.get("bapiError", "FAILURE")
+        time.sleep(3)
+    return False, f"Execution {exec_id} timed out after {timeout}s"
+
+
+def _catc_wait_task(headers, task_id, timeout=120):
+    """Poll a Catalyst Center task until it completes. Returns (ok, data)."""
+    import requests, urllib3, time
+    urllib3.disable_warnings()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = requests.get(f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
+                         headers=headers, verify=False, timeout=15)
+        t = r.json().get("response", {})
+        if t.get("isError"):
+            return False, t.get("failureReason", t.get("progress", "unknown error"))
+        # Discovery tasks return the discovery ID in 'data' immediately
+        if t.get("data"):
+            return True, t.get("data")
+        if t.get("endTime"):
+            return True, t.get("progress", "completed")
+        time.sleep(3)
+    return False, f"Task {task_id} timed out after {timeout}s"
+
+
+def _catc_wait_discovery(headers, discovery_id, timeout=300):
+    """Poll discovery until status=Inactive (complete). Returns (ok, device_list)."""
+    import requests, urllib3, time
+    urllib3.disable_warnings()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = requests.get(
+            f"{CATC_BASE}/dna/intent/api/v1/discovery/{discovery_id}",
+            headers=headers, verify=False, timeout=15)
+        status = r.json().get("response", {}).get("discoveryStatus", "")
+
+        r2 = requests.get(
+            f"{CATC_BASE}/dna/intent/api/v1/discovery/{discovery_id}/network-device",
+            headers=headers, verify=False, timeout=15)
+        devices = r2.json().get("response", [])
+
+        elapsed = int(time.time() - (deadline - timeout))
+        print(f"     Discovery {status}... {elapsed}s ({len(devices)} devices)")
+
+        if status == "Inactive":
+            return True, devices
+        time.sleep(10)
+    return False, []
+
+
+def phase_catc_discover(log_fn=print):
+    """
+    Discover all 3 lab switches in Catalyst Center using pre-existing credentials.
+    Creates a new discovery job targeting the 3 switch IPs, polls until complete,
+    then verifies all switches are Reachable.
+    Returns (ok, result_string).
+    """
+    import requests, urllib3, json
+    urllib3.disable_warnings()
+
+    # Loopback IPs used for discovery; mgmt IPs used for inventory check and site assignment
+    loopback_ips = [info["loopback"] for info in CATC_DISCOVERY_IPS.values()]
+    mgmt_ips     = [info["mgmt"]     for info in CATC_DISCOVERY_IPS.values()]
+    discovery_ip_list = ",".join(loopback_ips)
+    summary = ", ".join(loopback_ips)  # default; overwritten after discovery
+
+    # ── Step 1: Authenticate ─────────────────────────────────────────────────
+    log_fn("[catc:step] auth | running | Authenticating to Catalyst Center")
+    try:
+        headers = _catc_headers()
+    except Exception as e:
+        log_fn(f"[catc:step] auth | failed | Auth failed: {e}")
+        return False, f"Catalyst Center auth failed: {e}"
+    log_fn(f"[catc:step] auth | completed | Connected to {CATC_HOST}")
+
+    # ── Step 2: Check existing inventory (by loopback IP) ────────────────────
+    log_fn("[catc:step] check_inventory | running | Checking existing inventory")
+    r = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
+                     headers=headers, verify=False, timeout=15)
+    existing = {d["managementIpAddress"]: d for d in r.json().get("response", [])}
+    # Devices discovered via loopback will appear with the loopback as managementIpAddress
+    already_ok = [ip for ip in loopback_ips
+                  if existing.get(ip, {}).get("reachabilityStatus") in ("Reachable", "Success")]
+    if len(already_ok) == len(loopback_ips):
+        log_fn(f"[catc:step] check_inventory | completed | All 3 switches already reachable via loopback")
+        log_fn(f"[catc:step] create_discovery | completed | Skipped — already in inventory")
+        log_fn(f"[catc:step] verify_results | completed | All switches reachable in inventory")
+        # Still fall through to site assignment and provisioning
+    else:
+        log_fn(f"[catc:step] check_inventory | completed | {len(already_ok)}/3 already reachable — need discovery")
+
+    # ── Step 3: Create and run discovery job (only if not already in inventory) ─
+    if len(already_ok) < len(loopback_ips):
+      import time as _t
+      job_name = f"NaC-Lab-Switches-{_t.strftime('%Y%m%d-%H%M%S')}"
+      log_fn(f"[catc:step] create_discovery | running | Creating discovery for loopbacks: {discovery_ip_list}")
+      payload = {
+        "name":          job_name,
+        "discoveryType": "Multi Range",
+        "ipAddressList": discovery_ip_list,
+        "protocolOrder":  "ssh",
+        "timeout":        5,
+        "retry":          2,
+        "netconfPort":    "830",
+        "globalCredentialIdList": [
+            "82d24eba-dcc0-4fb8-8810-137d190bf90f",  # CLI netadmin
+            "e6b5e009-5aa3-41b2-a576-d92e6a4c8f02",  # SNMPv2 Read
+            "07d96097-7dac-4929-a9d6-622eb43f3d3e",  # SNMPv2 Write
+            "d6e2d122-0a7b-42a9-87cf-6a21f1d12e2a",  # NETCONF
+            "a21757fb-057d-43c1-baa4-6187b0d13cd9",  # HTTP Read  (netadmin)
+            "64b9020e-923f-4577-ae3b-6397d3feb94a",  # HTTP Write (netadmin)
+        ],
+      }
+      r2 = requests.post(f"{CATC_BASE}/dna/intent/api/v1/discovery",
+                         headers=headers, json=payload, verify=False, timeout=15)
+      if r2.status_code not in (200, 201, 202):
+          log_fn(f"[catc:step] create_discovery | failed | HTTP {r2.status_code}: {r2.text[:200]}")
+          return False, f"Discovery create failed ({r2.status_code}): {r2.text[:300]}"
+
+      # Resolve discovery ID by matching the job name — avoids stale task data field
+      import time as _time2
+      discovery_id = None
+      for _ in range(15):
+          r3 = requests.get(f"{CATC_BASE}/dna/intent/api/v1/discovery/1/500",
+                            headers=headers, verify=False, timeout=15)
+          for disc in r3.json().get("response", []):
+              if disc.get("name") == job_name:
+                  discovery_id = disc["id"]
+                  break
+          if discovery_id:
+              break
+          _time2.sleep(2)
+
+      if not discovery_id:
+          log_fn(f"[catc:step] create_discovery | failed | Could not find discovery job '{job_name}'")
+          return False, f"Could not locate discovery job after creation"
+
+      log_fn(f"[catc:step] create_discovery | running | Discovery ID {discovery_id} — polling for completion")
+
+      ok, devices = _catc_wait_discovery(headers, discovery_id, timeout=300)
+      if not ok:
+          log_fn(f"[catc:step] create_discovery | failed | Discovery timed out")
+          return False, "Discovery timed out waiting for all devices"
+      log_fn(f"[catc:step] create_discovery | completed | Discovery {discovery_id} finished ({len(devices)} devices)")
+
+      # ── Step 4: Verify results ─────────────────────────────────────────────
+      log_fn(f"[catc:step] verify_results | running | Checking reachability for {len(devices)} devices")
+      results = []
+      all_reachable = True
+      for d in devices:
+          ip     = d.get("managementIpAddress", "?")
+          host   = d.get("hostname", "?")
+          status = d.get("reachabilityStatus", "?")
+          results.append(f"{ip} ({host}): {status}")
+          log_fn(f"[catc:step] verify_results | running | {ip} | {host} | {status}")
+          if status not in ("Reachable", "Success"):
+              all_reachable = False
+
+      summary = "; ".join(results)
+      if not all_reachable:
+          log_fn(f"[catc:step] verify_results | failed | Some switches not reachable: {summary}")
+          return False, f"Some switches not reachable: {summary}"
+      log_fn(f"[catc:step] verify_results | completed | All switches reachable: {summary}")
+
+    # ── Step 5: Assign to site ───────────────────────────────────────────────
+    log_fn(f"[catc:step] assign_site | running | Assigning to Global/NORTH CAROLINA/Durham/Site-105/MAIN")
+
+    # Devices discovered via loopback — their managementIpAddress in CatC is the loopback IP
+    r_inv = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
+                         headers=headers, verify=False, timeout=15)
+    inv = {d["managementIpAddress"]: d for d in r_inv.json().get("response", [])}
+
+    already_assigned = [
+        ip for ip in loopback_ips
+        if CATC_MAIN_SITE_ID in inv.get(ip, {}).get("siteHierarchyId", "")
+    ]
+    if len(already_assigned) == len(loopback_ips):
+        log_fn(f"[catc:step] assign_site | completed | All 3 already assigned to MAIN site")
+    else:
+        to_assign = [ip for ip in loopback_ips if ip not in already_assigned]
+        log_fn(f"[catc:step] assign_site | running | Assigning {len(to_assign)} device(s) to site")
+        payload_assign = {"device": [{"ip": ip} for ip in loopback_ips]}
+        r_assign = requests.post(
+            f"{CATC_BASE}/dna/intent/api/v1/assign-device-to-site/{CATC_MAIN_SITE_ID}/device",
+            headers=headers, json=payload_assign, verify=False, timeout=15)
+        if r_assign.status_code not in (200, 202):
+            log_fn(f"[catc:step] assign_site | failed | HTTP {r_assign.status_code}: {r_assign.text[:200]}")
+            return False, f"Site assignment failed ({r_assign.status_code}): {r_assign.text[:200]}"
+
+        exec_id = r_assign.json().get("executionId")
+        log_fn(f"[catc:step] assign_site | running | Execution {exec_id} — waiting for completion")
+        ok, msg = _catc_wait_execution(headers, exec_id, timeout=90)
+        if not ok:
+            log_fn(f"[catc:step] assign_site | failed | {msg}")
+            return False, f"Site assignment execution failed: {msg}"
+        log_fn(f"[catc:step] assign_site | completed | All 3 switches assigned to MAIN site")
+
+    # ── Step 6: Provision (sync with site) ───────────────────────────────────
+    log_fn(f"[catc:step] provision | running | Verifying devices are managed and syncing")
+    import time as _time
+    deadline = _time.time() + 120
+    all_managed = False
+    while _time.time() < deadline:
+        r_check = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
+                               headers=headers, verify=False, timeout=15)
+        inv2 = {d["managementIpAddress"]: d for d in r_check.json().get("response", [])}
+        states = [(ip, inv2.get(ip, {}).get("managementState", "?"),
+                       inv2.get(ip, {}).get("collectionStatus", "?")) for ip in loopback_ips]
+        managed = [ip for ip, ms, cs in states if ms == "Managed" and cs not in ("In Progress", "Not Synced")]
+        log_fn(f"[catc:step] provision | running | Managed: {len(managed)}/3 — "
+               + " | ".join(f"{ip}:{cs}" for ip, ms, cs in states))
+        if len(managed) == len(loopback_ips):
+            all_managed = True
+            break
+        _time.sleep(10)
+
+    if not all_managed:
+        log_fn(f"[catc:step] provision | failed | Not all devices reached Managed state in time")
+        return False, "Provision verification timed out — devices not all Managed"
+
+    log_fn(f"[catc:step] provision | completed | All 3 switches Managed and synced at MAIN site")
+    return True, f"All switches discovered, assigned to MAIN site, and provisioned: {summary}"
+
+
 def run_switch_checks(step_name):
     info = SWITCHES.get(step_name)
     if not info:
@@ -873,46 +1148,187 @@ def phase_baseconfig_verify(switch_key, log_fn=print):
 
 def phase_baseconfig_reset(switch_key, log_fn=print):
     """
-    Push the known-good base config for a switch via SSH.
-    Sends conf t, all config lines, end, write memory.
+    Reset a switch to its known-good base config using Telnet + TFTP + reload.
+    Delegates to reset_switches.reset_switch() which mirrors the proven manual script.
     Returns (ok, detail).
     """
+    import reset_switches
+
+    base_dir = os.environ.get("BASE_CONFIGS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "base_configs")
     info = BASECONFIG_SWITCHES.get(switch_key)
     if not info:
         return False, f"Unknown switch key: {switch_key}"
 
-    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "base_configs")
     cfg_path = os.path.join(base_dir, info["file"])
     if not os.path.exists(cfg_path):
         return False, f"Base config not found: {cfg_path}"
 
-    with open(cfg_path) as f:
-        lines = [l.rstrip() for l in f.readlines()]
+    log_fn(f"  Starting TFTP-based reset for {info['name']} ({info['ip']})...")
+    return reset_switches.reset_switch(switch_key, cfg_path, log_fn=log_fn)
 
-    log_fn(f"  Connecting to {info['name']} ({info['ip']})...")
+
+# ---------------------------------------------------------------------------
+# ISE cleanup
+# ---------------------------------------------------------------------------
+
+ISE_HOST = "198.18.5.101"
+ISE_USER = "admin"
+ISE_PASS = "C1sco12345"
+
+# NAD names added by Catalyst Center discovery — should be removed on reset
+ISE_SWITCH_NAD_NAMES = [
+    "Site_105-Border-Spine.dcloud.cisco.com",
+    "Site_105-Leaf1.dcloud.cisco.com",
+    "Site_105-Leaf2.dcloud.cisco.com",
+]
+
+# Safety net: only delete NADs whose IP matches one of these switch Loopback IPs
+# (ISE NADs are registered with Loopback IPs, same as Catalyst Center discovery)
+ISE_SWITCH_NAD_IPS = {"172.30.255.3", "172.30.255.1", "172.30.255.2"}
+
+
+def phase_ise_cleanup(log_fn=print):
+    """
+    Delete the 3 switch NADs from ISE that Catalyst Center adds during discovery.
+    Catalyst Center will re-add them on next discovery/provisioning run.
+    Returns (ok, detail).
+    """
+    import ssl, urllib.request, urllib.error, base64, json
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    creds = base64.b64encode(f"{ISE_USER}:{ISE_PASS}".encode()).decode()
+    headers = {"Accept": "application/json", "Authorization": f"Basic {creds}"}
+
+    def _get(path):
+        req = urllib.request.Request(f"https://{ISE_HOST}{path}", headers=headers)
+        resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+        return json.loads(resp.read().decode())
+
+    def _delete(path):
+        req = urllib.request.Request(f"https://{ISE_HOST}{path}", headers=headers, method="DELETE")
+        try:
+            urllib.request.urlopen(req, context=ctx, timeout=15)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None  # already gone
+            raise
+
+    log_fn("  Fetching ISE network device list...")
     try:
-        client, shell = ssh_switch(info["ip"])
+        data = _get("/ers/config/networkdevice?size=100")
     except Exception as e:
-        return False, f"SSH failed: {e}"
+        return False, f"ISE unreachable: {e}"
 
+    resources = data.get("SearchResult", {}).get("resources", [])
+    # Build name→id map
+    nad_map = {r["name"]: r["id"] for r in resources}
+
+    deleted, skipped, errors = [], [], []
+    for name in ISE_SWITCH_NAD_NAMES:
+        if name not in nad_map:
+            log_fn(f"  {name}: not found (already removed)")
+            skipped.append(name)
+            continue
+        nad_id = nad_map[name]
+        # Safety check: verify the NAD's IP is one of the known switch IPs
+        # before deleting — prevents accidentally wiping the CC NAD or others
+        try:
+            nad_detail = _get(f"/ers/config/networkdevice/{nad_id}")
+            nad_ip = nad_detail.get("NetworkDevice", {}).get("NetworkDeviceIPList", [{}])[0].get("ipaddress", "")
+            if nad_ip not in ISE_SWITCH_NAD_IPS:
+                log_fn(f"  {name}: SKIPPED — IP {nad_ip} not in switch IP list (safety check)")
+                skipped.append(name)
+                continue
+        except Exception as e:
+            log_fn(f"  {name}: could not verify IP — {e}, skipping for safety")
+            skipped.append(name)
+            continue
+        log_fn(f"  Deleting {name} ({nad_id}, IP {nad_ip})...")
+        try:
+            result = _delete(f"/ers/config/networkdevice/{nad_id}")
+            if result is None:
+                log_fn(f"  {name}: already gone (404)")
+                skipped.append(name)
+            else:
+                log_fn(f"  {name}: deleted")
+                deleted.append(name)
+        except Exception as e:
+            log_fn(f"  {name}: ERROR — {e}")
+            errors.append(f"{name}: {e}")
+
+    if errors:
+        return False, f"Errors: {'; '.join(errors)}"
+
+    parts = []
+    if deleted:
+        parts.append(f"deleted {len(deleted)}: {', '.join(n.split('.')[0] for n in deleted)}")
+    if skipped:
+        parts.append(f"already gone: {len(skipped)}")
+    return True, "; ".join(parts) if parts else "nothing to do"
+
+
+def phase_catc_cleanup(log_fn=print):
+    """
+    Delete the 3 switches from Catalyst Center inventory.
+    Catalyst Center will re-discover and provision them on the next run.
+    Returns (ok, detail).
+    """
+    import requests, urllib3
+    urllib3.disable_warnings()
+
+    log_fn("  Getting Catalyst Center auth token...")
     try:
-        log_fn(f"  Pushing {len(lines)} config lines...")
-        switch_cmd(shell, "conf t", timeout=3)
-        for line in lines:
-            switch_cmd(shell, line if line else " ", timeout=3)
-        switch_cmd(shell, "end", timeout=3)
-        out = switch_cmd(shell, "write memory", timeout=15)
-        ok = "[OK]" in out or "OK" in out or "Building" in out
-        detail = f"{'OK' if ok else 'WARN'}: {len(lines)} lines pushed, write memory {'OK' if ok else 'may have failed'}"
-        log_fn(f"  {detail}")
-        client.close()
-        return ok, detail
+        headers = _catc_headers()
     except Exception as e:
-        client.close()
-        return False, f"Config push failed: {e}"
+        return False, f"CC auth failed: {e}"
+
+    # Get all network devices and find the 3 switch IPs
+    switch_ips = {info["mgmt"] for info in CATC_DISCOVERY_IPS.values()}
+    log_fn("  Fetching device inventory from Catalyst Center...")
+    try:
+        r = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
+                         headers=headers, verify=False, timeout=15)
+        r.raise_for_status()
+        devices = r.json().get("response", [])
+    except Exception as e:
+        return False, f"CC inventory fetch failed: {e}"
+
+    # Match by management IP
+    to_delete = [d for d in devices if d.get("managementIpAddress") in switch_ips]
+    if not to_delete:
+        log_fn("  No switch devices found in CC inventory (already removed)")
+        return True, "nothing to do — devices not in inventory"
+
+    deleted, errors = [], []
+    for dev in to_delete:
+        dev_id = dev["id"]
+        name   = dev.get("hostname", dev.get("managementIpAddress", dev_id))
+        log_fn(f"  Deleting {name} ({dev.get('managementIpAddress')}) from CC...")
+        try:
+            r = requests.delete(
+                f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}",
+                headers=headers, verify=False, timeout=30
+            )
+            if r.status_code in (200, 202, 204):
+                log_fn(f"  {name}: deleted")
+                deleted.append(name)
+            else:
+                msg = f"{name}: unexpected status {r.status_code} — {r.text[:100]}"
+                log_fn(f"  {msg}")
+                errors.append(msg)
+        except Exception as e:
+            msg = f"{name}: {e}"
+            log_fn(f"  ERROR: {msg}")
+            errors.append(msg)
+
+    if errors:
+        return False, f"Errors: {'; '.join(errors)}"
+    return True, f"deleted {len(deleted)}: {', '.join(deleted)}"
 
 
-# Ubuntu automation PC — fixed address in all dCloud sessions
 CDFMC_AUTOMATION_HOST = "198.18.134.12"
 CDFMC_AUTOMATION_USER = "cisco"
 CDFMC_AUTOMATION_PASS = "C1sco12345"
@@ -1120,13 +1536,19 @@ def phase_switch_upgrade(switch_key):
         client.close()
         return False, f"Image copy failed on {name}: {copy_result[-300:]}"
 
-    print(f"     [{name}] Image copied. Running software install...")
+    print(f"     [{name}] Image copied. Saving config before install...")
 
-    # 3. Install, activate, commit
-    shell.send(f"software install add file flash:{image} activate commit\n")
+    # 3. Save config first — IOS rejects install if config is unsaved
+    shell.send("write memory\n")
+    time.sleep(5)
+    if shell.recv_ready():
+        shell.recv(8192)
+
+    # 4. Install, activate, commit (correct IOS XE command)
+    print(f"     [{name}] Running install add activate commit...")
+    shell.send(f"install add file flash:{image} activate commit\n")
     time.sleep(3)
-    # Confirm any prompts
-    shell.send("\n")
+
     install_out = b""
     deadline2 = time.time() + 1800  # 30 min max for install + reload
     last_print = time.time()
@@ -1136,11 +1558,16 @@ def phase_switch_upgrade(switch_key):
             chunk = shell.recv(8192)
             install_out += chunk
             decoded = chunk.decode(errors="replace")
-            if "reload" in decoded.lower() or "restarting" in decoded.lower():
+            print(f"     [{name}] {decoded.strip()[:120]}")
+            # Confirm any y/n prompts
+            if any(x in decoded.lower() for x in ["proceed", "y/n", "yes/no", "reload", "[y]"]):
+                shell.send("y\n")
+                time.sleep(2)
+            if "reloading" in decoded.lower() or "restarting" in decoded.lower() or "install_add_activate_commit" in decoded.lower():
                 reloading = True
                 print(f"     [{name}] Switch reloading...")
                 break
-            if "FAILED" in decoded or "failed" in decoded.lower():
+            if "FAILED" in decoded:
                 client.close()
                 return False, f"Install failed on {name}: {decoded[-300:]}"
         if time.time() - last_print > 30:

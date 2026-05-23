@@ -202,11 +202,8 @@ steps = [
      ("scc_reset_check",    onboard_router.phase_scc_reset_check),
 ]
 
-# Steps that should NOT halt the pipeline on failure — record as skipped/warn and continue
-# controller_mode_enable and verify_online are soft-fail so switch checks always run
-# even if the router fails to come up (e.g. vBond/vSmart down)
 SOFT_FAIL_STEPS = {
-    "detect_pod_number",   # soft-fail — AD may not be provisioned yet; pipeline must continue
+    "detect_pod_number",
     "controller_mode_enable",
     "verify_online",
     "verify_border_spine",
