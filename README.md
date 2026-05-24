@@ -105,6 +105,68 @@ search (sentence-transformers) and an optional Ollama LLM for AI-assisted answer
 - **Update from chat** — paste documentation here in the OpenCode chat and it is
   ingested directly into the KB via `kb_seed.ingest_text()`
 
+### Lab Adventure — Student-Facing Choose Your Own Adventure Dashboard
+A separate student-facing web app served from the Ubuntu automation PC at
+`http://198.18.134.12:8099`. Students browse to it during the lab session and
+choose which campus fabric architecture to deploy.
+
+**Home page** presents the full "Architect's Dilemma at Pseudoco" scenario —
+business context, Zero Trust alignment, pros/cons comparison of both
+architectures, and two tiles to choose from.
+
+**BGP EVPN path (`/evpn`)** — overview of VXLAN architecture, what will be
+deployed, step preview, then **Deploy + Verify** pushes full EVPN config
+(VRFs, L2/L3 VNIs, anycast gateways, NVE, BGP EVPN) to all three switches
+and verifies BGP neighbors and NVE peers via live SSE streaming.
+
+**SD-Access path (`/sda`)** — CIO quote, four strategic pillars (Identity,
+Segmentation, Automation, Zero Trust), step preview, then **Deploy + Verify**
+runs Catalyst Center discovery followed by the full 10-step SDA fabric deploy
+(fabric site, virtual networks, anycast gateways, transit, fabric devices,
+L3 handoff, port assignments, verification) via live SSE streaming.
+
+Both paths show a real-time step progress list with a gradient progress bar
+and a result screen. A back link returns to the home page at any point.
+
+#### Auto-Updating from GitHub
+`lab_adventure.py` in `elevateLab/` is a thin shim. On every launch it does a
+`git pull` on `~/pod_automator` (the POD-Automator repo) then execs the real
+implementation from there. This means:
+
+- Push `lab_adventure.py` changes to GitHub → next launch picks them up
+- No manual file transfer to Ubuntu needed
+- The `elevateLab/` repo (cdFMC/Terraform automation) is never touched
+
+#### One-Time Setup on a New Ubuntu Host
+```bash
+curl -fsSL https://raw.githubusercontent.com/mokuma56/POD-Automator/main/setup_lab_adventure.sh | bash
+```
+
+Or copy and run manually:
+```bash
+bash ~/setup_lab_adventure.sh
+```
+
+This clones `POD-Automator` to `~/pod_automator` and installs the shim at
+`~/Documents/elevateLab/lab_adventure.py` (backing up any existing file).
+
+#### Running the Lab Adventure
+```bash
+cd ~/Documents/elevateLab && python3 lab_adventure.py
+# Serves at http://198.18.134.12:8099
+```
+
+#### Development Workflow
+```
+Mac (develop) ──git push──► GitHub (mokuma56/POD-Automator)
+                                        │
+                                (on next launch)
+                                        ▼
+                             Ubuntu lab_adventure shim
+                             → git pull → exec real file
+                             http://198.18.134.12:8099
+```
+
 ---
 
 ## Pipeline Steps
@@ -196,8 +258,14 @@ pod-automator/
 ├── dashboard.py                          # Flask dashboard — all UI, API endpoints, tabs
 ├── onboard_router.py                     # All pipeline phase functions
 ├── onboard.py                            # Docker entrypoint — pipeline loop, soft-fail logic
+├── evpn_fabric.py                        # EVPN fabric deploy — 14 steps incl. dot1x_security
+├── sda_fabric.py                         # SDA fabric deploy (10 steps) + rollback (13 steps)
+├── lab_adventure.py                      # Student-facing Choose Your Own Adventure app (port 8099)
+├── setup_lab_adventure.sh               # One-time Ubuntu setup — clones repo, installs shim
+├── run_dashboard.sh                      # Auto-restart wrapper for Flask dashboard
 ├── kb.py                                 # Knowledge base — SQLite + embeddings + Ollama RAG
 ├── kb_seed.py                            # KB seeder — AGENTS.md import + ingest_text() API
+├── generate_lab_cards.py                 # reportlab PDF generator for lab detail cards
 ├── base_configs/
 │   ├── border_spine.txt                  # Baseline config for C9300-48UB Border Spine
 │   ├── leaf1.txt                         # Baseline config for C9300-48P Leaf 1
