@@ -7,7 +7,8 @@ VPN_USER="$2"
 VPN_PASS="$3"
 
 # Ensure DNS works before openconnect tries to resolve the VPN host
-printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' > /etc/resolv.conf
+# Use corporate DNS — resolves both dcloud-rtp and dcloud-sjc hosts
+printf 'nameserver 64.102.6.247\nnameserver 173.37.137.85\n' > /etc/resolv.conf
 
 echo "Connecting to $VPN_HOST as $VPN_USER..."
 echo "$VPN_PASS" | openconnect --interface tun0 --user "$VPN_USER" --passwd-on-stdin "$VPN_HOST" &
