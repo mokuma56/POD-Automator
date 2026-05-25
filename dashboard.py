@@ -2782,6 +2782,7 @@ async function disconnectVpn(podId) {
 }
 
 let timerInterval = null;
+let stepPollId = null;
 
 function elapsedStr(ms) {
   if (ms < 0) return '';
@@ -2915,6 +2916,15 @@ async function loadSteps(podId) {
       '<span class="started-at" data-time="' + (step?.started_at || '') + '" style="display:none"></span>' +
       '</div>';
   }).join('');
+
+  // Auto-poll steps while pipeline is running (keeps countdown live on any tab)
+  if (running) {
+    if (!stepPollId) {
+      stepPollId = setInterval(() => loadSteps(podId), 5000);
+    }
+  } else {
+    if (stepPollId) { clearInterval(stepPollId); stepPollId = null; }
+  }
 }
 
 let logPollId = null;
@@ -4596,6 +4606,7 @@ function closeDetail() {
   el.textContent = '';
   el.dataset.podId = '';
   if (logPollId) clearInterval(logPollId);
+  if (stepPollId) { clearInterval(stepPollId); stepPollId = null; }
 }
 
 async function connectAllVpn() {
