@@ -3,8 +3,49 @@ Onboard C8231-G2 Secure Router with correct values from CSV template.
 Usage: uv run --directory ~/sw_projects/pod_automator python3 onboard_router.py [SERIAL]
 """
 
-import csv, json, os, sys, time, paramiko, requests, subprocess, urllib3
+import csv, json, os, re, sys, time, paramiko, requests, subprocess, urllib3
 urllib3.disable_warnings()
+
+
+def _parse_vrfs(output: str):
+    """Parse 'show vrf' output and return (has_mgmt, extra_vrfs).
+    Filters purely in Python — no SSH pipes used.
+    VRF name lines start at column 0; interface continuation lines are indented.
+    """
+    SKIP = {"Mgmt-vrf", "Default", "Name", "show", "vrf"}
+    has_mgmt = "Mgmt-vrf" in output
+    extra_vrfs = []
+    for line in output.splitlines():
+        # Indented lines = interface members, skip them
+        if not line or line[0] == " ":
+            continue
+        first = line.split()[0] if line.split() else ""
+        # Skip command echo lines (e.g. "show vrf")
+        if first.lower() in ("show", "vrf"):
+            continue
+        # VRF names are word-chars + hyphens only (no / # . > : spaces)
+        if not re.match(r'^[\w][\w\-]*$', first):
+            continue
+        if first in SKIP:
+            continue
+        extra_vrfs.append(first)
+    return has_mgmt, extra_vrfs
+
+
+def _parse_version_str(output: str):
+    """Parse 'show version' and return (ver_ok, ver_str).
+    ver_ok is True if version string contains '17.12'.
+    """
+    ver_str = "??"
+    for line in output.splitlines():
+        # Match lines like: "Cisco IOS XE Software, Version 17.12.01"
+        if re.search(r'[Vv]ersion\s+\d+\.\d+', line):
+            m = re.search(r'[Vv]ersion\s+(\S+)', line)
+            if m:
+                ver_str = m.group(1).rstrip(",")
+                break
+    ver_ok = "17.12" in ver_str
+    return ver_ok, ver_str
 
 # Upgrade config — overridden by dashboard before calling phase functions
 GOLDEN_VERSION_SWITCH = "17.12.1"
@@ -971,11 +1012,21 @@ def run_switch_checks(step_name):
         return False, "UNKNOWN STEP"
     ip = info["ip"]
     print(f"  SSH to {info['name']} ({ip})...")
-    try:
-        client, shell = ssh_switch(ip)
-    except Exception as e:
-        print(f"  SSH failed: {e}")
-        return False, f"SSH FAILED: {e}"
+    client, shell = None, None
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            client, shell = ssh_switch(ip)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            print(f"  SSH attempt {attempt}/3 failed: {e}")
+            if attempt < 3:
+                time.sleep(10)
+    if last_err is not None:
+        print(f"  SSH failed after 3 attempts: {last_err}")
+        return False, f"SSH FAILED: {last_err}"
 
     parts = []
 
@@ -994,76 +1045,39 @@ def run_switch_checks(step_name):
         out = switch_cmd(shell, "show ip ospf neighbor")
         neighbors = [l for l in out.splitlines() if "FULL" in l]
         n_count = len(neighbors)
-        if n_count >= 2:
-            parts.append(f"PASS: {n_count} OSPF neighbors")
-        else:
-            parts.append(f"FAIL: {n_count} OSPF neighbors (expected 2)")
+        parts.append(f"PASS: {n_count} OSPF neighbors" if n_count >= 2 else f"FAIL: {n_count} OSPF neighbors (expected 2)")
 
-        # VRF — skip header, prompt, and interface continuation lines (indented with >2 spaces)
-        # VRF name lines are indented by exactly 2 spaces; interface continuations by more
-        out = switch_cmd(shell, "show vrf")
-        vrf_lines = [
-            l.strip() for l in out.splitlines()
-            if l.strip()
-            and "show vrf" not in l.lower()
-            and not l.strip().endswith("#")
-            and not l.strip().endswith(">")
-            and not l.strip().startswith("Name")
-            and not (len(l) - len(l.lstrip()) > 2)  # skip deep-indented interface continuation lines
-        ]
-        has_mgmt = any("Mgmt-vrf" in l for l in vrf_lines)
-        extra_vrfs = [l for l in vrf_lines if "Mgmt-vrf" not in l and "Default" not in l]
-        if has_mgmt and not extra_vrfs:
-            parts.append(f"PASS: VRF OK (Mgmt-vrf only)")
-        else:
-            parts.append(f"FAIL: unexpected VRFs: {extra_vrfs or 'Mgmt-vrf missing'}")
+        # VRF — no pipes, filter in Python
+        out_vrf = switch_cmd(shell, "show vrf")
+        has_mgmt, extra_vrfs = _parse_vrfs(out_vrf)
+        parts.append(f"PASS: VRF OK (Mgmt-vrf only)" if (has_mgmt and not extra_vrfs) else f"FAIL: unexpected VRFs: {extra_vrfs or 'Mgmt-vrf missing'}")
 
-        # Version
-        out = switch_cmd(shell, "show ver | i Version")
-        ver_ok = "17.12" in out
-        ver_str = "??"
-        if "Version" in out:
-            for line in out.splitlines():
-                if "Version" in line and "Cisco" in line:
-                    parts2 = line.split("Version")[-1].strip().split()
-                    if parts2:
-                        ver_str = parts2[0]
-                    break
+        # Version — no pipes, filter in Python
+        out_ver = switch_cmd(shell, "show version")
+        ver_ok, ver_str = _parse_version_str(out_ver)
         parts.append(f"{'PASS' if ver_ok else 'FAIL'}: Version {ver_str}")
 
         # VLAN
-        out = switch_cmd(shell, "show vlan")
-        has_vlan5 = "5    DNAC-Discovery" in out
+        out = switch_cmd(shell, "show vlan brief")
+        has_vlan5 = any("5" in l and "DNAC" in l for l in out.splitlines())
         parts.append(f"{'PASS' if has_vlan5 else 'FAIL'}: VLAN 5 {'present' if has_vlan5 else 'missing'}")
 
     else:
-        # Leaf switches
-        # Skip OSPF — just check VRF, version, VLAN
-        # VRF name lines are indented 2 spaces; interface continuations are indented more — skip those
-        out = switch_cmd(shell, "show vrf")
-        vrf_lines = [
-            l.strip() for l in out.splitlines()
-            if l.strip()
-            and not l.strip().startswith("Name")
-            and "show vrf" not in l.lower()
-            and not l.strip().endswith("#")
-            and not l.strip().endswith(">")
-            and not (len(l) - len(l.lstrip()) > 2)  # skip deep-indented interface continuation lines
-        ]
-        extra_vrfs = [l for l in vrf_lines if "Mgmt-vrf" not in l and "Default" not in l]
-        parts.append(f"PASS: VRF OK (Mgmt-vrf only)" if not extra_vrfs else f"FAIL: extra VRFs {extra_vrfs}")
+        # Leaf switches — VRF, version, VLAN
+        out_vrf = switch_cmd(shell, "show vrf")
+        has_mgmt, extra_vrfs = _parse_vrfs(out_vrf)
+        parts.append(f"PASS: VRF OK (Mgmt-vrf only)" if (has_mgmt and not extra_vrfs) else f"FAIL: extra VRFs {extra_vrfs or 'Mgmt-vrf missing'}")
 
-        out = switch_cmd(shell, "show ver | i Version")
-        ver_ok = "17.12" in out
-        parts.append(f"{'PASS' if ver_ok else 'FAIL'}: Version 17.12.x")
+        out_ver = switch_cmd(shell, "show version")
+        ver_ok, ver_str = _parse_version_str(out_ver)
+        parts.append(f"{'PASS' if ver_ok else 'FAIL'}: Version {ver_str}")
 
-        out = switch_cmd(shell, "show vlan")
-        # Only VLAN 1 should exist (plus internal ones)
+        out = switch_cmd(shell, "show vlan brief")
         vlan_lines = [l for l in out.splitlines() if l.strip() and l[0].isdigit()]
-        non_default = [l for l in vlan_lines if not l.startswith("1") and
-                       not l.startswith("100") and not l.startswith("999")]
+        non_default = [l for l in vlan_lines if not l.startswith("1 ") and not l.startswith("1\t")
+                       and not l.startswith("100") and not l.startswith("999")]
         vlan_ok = len(non_default) == 0
-        parts.append(f"{'PASS' if vlan_ok else 'FAIL'}: VLAN check ({'only default' if vlan_ok else f'extra: {non_default}'})")
+        parts.append(f"{'PASS' if vlan_ok else 'FAIL'}: VLAN check ({'only default' if vlan_ok else f'extra: {[l.split()[0] for l in non_default]}'})")
 
     client.close()
     result = " | ".join(parts)
@@ -1127,13 +1141,23 @@ def phase_baseconfig_verify(switch_key, log_fn=print):
         out = switch_cmd(shell, "show vrf | include Mgmt", timeout=8)
         checks["Mgmt-vrf"] = "OK" if "Mgmt-vrf" in out else "MISSING"
 
-        # Check VLAN 10 present (common base VLAN)
-        out = switch_cmd(shell, "show vlan brief | include ^10 ", timeout=8)
-        checks["vlan10"] = "OK" if out.strip() else "MISSING"
+        # Check Loopback0 present (present in all base configs, good indicator config loaded)
+        out = switch_cmd(shell, "show run | include ^interface Loopback0", timeout=8)
+        checks["loopback0"] = "OK" if "Loopback0" in out else "MISSING"
 
         # No EVPN NVE interface (should be gone after reset)
         out = switch_cmd(shell, "show run | include ^interface nve", timeout=8)
-        checks["no_nve"] = "OK" if "nve" not in out.lower() else "STILL_PRESENT"
+        # Check for the actual interface line — avoid false positives from banner/echo noise
+        nve_present = any(
+            line.strip().lower().startswith("interface nve")
+            for line in out.splitlines()
+        )
+        checks["no_nve"] = "STILL_PRESENT" if nve_present else "OK"
+
+        # No fabric VRFs (Main/IOT/PROD should be gone after reset)
+        out = switch_cmd(shell, "show vrf", timeout=8)
+        fabric_vrfs = [v for v in ["Main", "IOT", "PROD"] if v in out]
+        checks["no_fabric_vrfs"] = f"STILL_PRESENT:{','.join(fabric_vrfs)}" if fabric_vrfs else "OK"
 
         client.close()
     except Exception as e:
@@ -2082,11 +2106,34 @@ SCC_KEYS_DIR = os.environ.get(
     "/pipeline/host-data/scc_keys"
 )
 
-def _scc_load_keys(org_number: str) -> dict:
-    """Load SCC API key JSON for the given org number string (e.g. '514')."""
+def _scc_load_keys(org_number: str, pod_id: str = None) -> dict:
+    """
+    Load SCC API keys for the given org.
+    Priority:
+      1. DB row for pod_id (scc_api_key / scc_api_secret columns)
+      2. JSON file at SCC_KEYS_DIR/scc_keys_<org>.json (legacy fallback)
+    """
+    # 1. Try DB first if pod_id provided
+    if pod_id:
+        try:
+            db_path = os.environ.get("DB_PATH", os.environ.get("POD_STATE_DB", "/pipeline/host-data/pod_state.db"))
+            import sqlite3 as _sqlite3
+            with _sqlite3.connect(db_path) as _conn:
+                row = _conn.execute(
+                    "SELECT scc_api_key, scc_api_secret FROM pods WHERE pod_id=?",
+                    (pod_id,)
+                ).fetchone()
+            if row and row[0] and row[1]:
+                return {"scc_api_key": row[0], "scc_api_secret": row[1]}
+        except Exception:
+            pass  # fall through to file
+
+    # 2. Fallback to JSON file
     path = os.path.join(SCC_KEYS_DIR, f"scc_keys_{org_number}.json")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"SCC keys not found: {path}")
+        raise FileNotFoundError(
+            f"SCC keys not found in DB (pod_id={pod_id!r}) or file ({path})"
+        )
     with open(path) as f:
         return json.load(f)
 
@@ -2195,7 +2242,7 @@ def phase_scc_reset_check():
         return False, msg
 
     try:
-        keys = _scc_load_keys(org_num)
+        keys = _scc_load_keys(org_num, pod_id=pod_id)
     except FileNotFoundError as e:
         msg = str(e)
         for k in ALL_KEYS:

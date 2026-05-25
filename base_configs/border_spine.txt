@@ -146,6 +146,12 @@ line vty 5 31
 ntp source GigabitEthernet0/0
 ntp server vrf Mgmt-vrf 198.18.128.1
 !
-no vlan 10,101,102
+no vlan 10,101,102,1010,1101,1102
+!
+no vrf definition Main
+no vrf definition IOT
+no vrf definition PROD
+!
+no interface nve1
 !
 end

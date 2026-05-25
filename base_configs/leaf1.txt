@@ -141,4 +141,10 @@ interface GigabitEthernet1/0/11
 !
 no vlan 10,101,102
 !
+no vrf definition Main
+no vrf definition IOT
+no vrf definition PROD
+!
+no interface nve1
+!
 end

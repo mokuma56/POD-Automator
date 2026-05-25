@@ -1,6 +1,7 @@
 """POD Dashboard — upload events CSV, start pipelines, monitor live progress."""
 
 import sqlite3, json, threading, csv, io, os, time, sys, subprocess
+from datetime import datetime
 from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request
 
@@ -91,6 +92,15 @@ def _migrate():
     # Migration: add pod_number — AD-confirmed authoritative POD number
     try:
         conn.execute("ALTER TABLE pods ADD COLUMN pod_number TEXT DEFAULT ''")
+    except Exception:
+        pass
+    # Migration: add SCC API credentials columns
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN scc_api_key TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN scc_api_secret TEXT DEFAULT ''")
     except Exception:
         pass
     conn.execute("""
@@ -549,9 +559,22 @@ def api_cdfmc_recheck(pod_id):
     if not row:
         return jsonify({"status": "error", "message": "POD not found"}), 404
 
-    ok, msg = _ensure_pipeline_container(pod_id)
-    if not ok:
-        return jsonify({"status": "error", "message": f"Could not start pipeline container: {msg}"}), 400
+    # Check VPN container is at least running (don't require healthy — tunnel may still work)
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=8
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container not running for {pod_id} — connect VPN first"}), 400
+
+    # Mark as running immediately so UI shows feedback right away
+    conn2 = _db()
+    conn2.execute(
+        "INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, result) "
+        "VALUES (?, 'cdfmc_check', 'running', datetime('now'), 'Checking — please wait...')",
+        (pod_id,)
+    )
+    conn2.commit(); conn2.close()
 
     def _recheck():
         script = (
@@ -574,21 +597,22 @@ def api_cdfmc_recheck(pod_id):
                 ok_val, result_val = eval(last_line)
             except Exception as e:
                 result_val = f"parse error: {e}"
+        elif res.stderr:
+            result_val = res.stderr.strip()[:300]
         status = "completed" if ok_val else "failed"
-        conn2 = _db()
-        conn2.execute(
+        conn3 = _db()
+        conn3.execute(
             "INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, completed_at, result) "
             "VALUES (?, 'cdfmc_check', ?, datetime('now'), datetime('now'), ?)",
             (pod_id, status, str(result_val)[:500])
         )
-        # Parse and persist scc_org
         import re as _re
         m = _re.search(r"scc_org=([^\s|]+)", str(result_val))
         if m:
-            conn2.execute("UPDATE pods SET scc_org=?, updated_at=datetime('now') WHERE pod_id=?",
+            conn3.execute("UPDATE pods SET scc_org=?, updated_at=datetime('now') WHERE pod_id=?",
                           (m.group(1), pod_id))
-        conn2.commit()
-        conn2.close()
+        conn3.commit(); conn3.close()
+        log(pod_id, f"[cdfmc_check] {'OK' if ok_val else 'FAILED'}: {result_val}")
 
     threading.Thread(target=_recheck, daemon=True).start()
     return jsonify({"status": "ok", "message": "cdFMC re-check started for " + pod_id})
@@ -809,17 +833,31 @@ def api_scc_status(pod_id):
 
 @app.route("/api/scc/recheck/<pod_id>", methods=["POST"])
 def api_scc_recheck(pod_id):
-    """Re-run the 4 automated SCC checks inside POD VPN namespace."""
-    import threading
-    r = subprocess.run(
-        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
-        capture_output=True, text=True, timeout=8
-    )
-    if r.returncode != 0 or r.stdout.strip() != "running":
-        return jsonify({"status": "error", "message": f"VPN container not running for {pod_id}"}), 400
+    """Re-run automated SCC checks directly on host (needs public internet)."""
+    import threading, importlib, os as _os
+
+    # Clear the step so it shows as running
+    c = _db()
+    c.execute("DELETE FROM pipeline_steps WHERE pod_id=? AND step_name='scc_reset_check'", (pod_id,))
+    c.commit(); c.close()
 
     def _check():
-        _run_phase_in_vpn(pod_id, "phase_scc_reset_check")
+        _os.environ["POD_ID"] = pod_id
+        _os.environ["DB_PATH"] = str(Path(__file__).parent / "data" / "pod_state.db")
+        _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
+        try:
+            import onboard_router as _or
+            importlib.reload(_or)
+            ok, result = _or.phase_scc_reset_check()
+            log(pod_id, f"[scc_reset_check] {'OK' if ok else 'FAILED'}: {result}")
+            c2 = _db()
+            c2.execute(
+                "INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, result) VALUES (?,?,?,?)",
+                (pod_id, "scc_reset_check", "completed" if ok else "failed", result)
+            )
+            c2.commit(); c2.close()
+        except Exception as e:
+            log(pod_id, f"[scc_reset_check] ERROR: {e}")
 
     threading.Thread(target=_check, daemon=True).start()
     return jsonify({"status": "ok", "message": f"SCC re-check started for {pod_id}"})
@@ -984,6 +1022,144 @@ def api_fabric_reset(pod_id):
     return jsonify({"status": "ok", "message": f"Fabric steps reset for {pod_id}"})
 
 
+# ---------------------------------------------------------------------------
+# SDA Fabric API routes
+# ---------------------------------------------------------------------------
+
+SDA_DEPLOY_STEPS   = ["discovery", "provision", "fabric_site", "virtual_networks",
+                       "anycast_gateways", "transit", "fabric_devices", "l3_handoff",
+                       "port_assignments", "verify"]
+SDA_ROLLBACK_STEPS = ["remove_fabric_devices", "remove_anycast_gateways", "disable_gbac_policy",
+                       "remove_transit", "remove_vn_assignments", "remove_virtual_networks",
+                       "remove_fabric_site", "delete_devices", "delete_discovery",
+                       "delete_ise_nads", "remove_network_profile"]
+
+
+SDA_DEPLOY_STEP_KEYS   = ["discovery","provision","fabric_site","virtual_networks","anycast_gateways","transit","fabric_devices","l3_handoff","port_assignments","verify"]
+SDA_ROLLBACK_STEP_KEYS = ["remove_fabric_devices","remove_anycast_gateways","disable_gbac_policy","remove_transit","remove_vn_assignments","remove_virtual_networks","remove_fabric_site","delete_devices","delete_discovery","delete_ise_nads","remove_network_profile"]
+
+
+def _ensure_sda_table():
+    import sda_fabric
+    sda_fabric.DB_PATH = str(DATA_DIR / "data" / "pod_state.db")
+    sda_fabric.ensure_sda_table()
+
+
+@app.route("/api/sda/status/<pod_id>")
+def api_sda_status(pod_id):
+    """Return SDA step status from sda_steps table."""
+    _ensure_sda_table()
+    c = _db()
+    rows = c.execute(
+        "SELECT mode, step_name, status, result, started_at, completed_at "
+        "FROM sda_steps WHERE pod_id=?", (pod_id,)
+    ).fetchall()
+    c.close()
+    steps = {"deploy": {}, "rollback": {}}
+    for mode, step_name, status, result, started_at, completed_at in rows:
+        steps.setdefault(mode, {})[step_name] = {
+            "status":       status or "pending",
+            "result":       result or "",
+            "started_at":   started_at or "",
+            "completed_at": completed_at or "",
+        }
+    return jsonify({"pod_id": pod_id, "deploy": steps["deploy"], "rollback": steps["rollback"]})
+
+
+@app.route("/api/sda/deploy/<pod_id>", methods=["POST"])
+def api_sda_deploy(pod_id):
+    """Run full SDA fabric deploy pipeline."""
+    _ensure_sda_table()
+    from_step = request.json.get("from_step") if request.is_json else None
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    from_arg = f"from_step='{from_step}'" if from_step else "from_step=None"
+    script = (
+        "import sys, os; sys.path.insert(0, '.'); import sda_fabric; "
+        f"sda_fabric.POD_ID = '{pod_id}'; "
+        "sda_fabric.DB_PATH = '/pipeline/host-data/pod_state.db'; "
+        f"ok, msg = sda_fabric.run_deploy({from_arg}, log_fn=print); "
+        "print(('OK: ' if ok else 'FAIL: ') + str(msg))"
+    )
+
+    import threading
+    def _run():
+        proc = subprocess.Popen([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-u", "-c", script
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, f"[sda/log] {line}")
+        proc.wait()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "ok", "message": f"SDA deploy started for {pod_id}"})
+
+
+@app.route("/api/sda/rollback/<pod_id>", methods=["POST"])
+def api_sda_rollback(pod_id):
+    """Run full SDA fabric rollback pipeline."""
+    _ensure_sda_table()
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    script = (
+        "import sys; sys.path.insert(0, '.'); import sda_fabric; "
+        f"sda_fabric.POD_ID = '{pod_id}'; "
+        "sda_fabric.DB_PATH = '/pipeline/host-data/pod_state.db'; "
+        "ok, msg = sda_fabric.run_rollback(log_fn=print); "
+        "print(('OK: ' if ok else 'FAIL: ') + str(msg))"
+    )
+
+    import threading
+    def _run():
+        proc = subprocess.Popen([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-u", "-c", script
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, f"[sda/log] {line}")
+        proc.wait()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "ok", "message": f"SDA rollback started for {pod_id}"})
+
+
+@app.route("/api/sda/clear/<pod_id>", methods=["POST"])
+def api_sda_clear(pod_id):
+    """Clear all SDA step rows and log lines for a POD."""
+    _ensure_sda_table()
+    c = _db()
+    c.execute("DELETE FROM sda_steps WHERE pod_id=?", (pod_id,))
+    c.execute("DELETE FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[sda/%'", (pod_id,))
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "message": f"SDA state cleared for {pod_id}"})
+
+
+
 @app.route("/api/catc/discover/<pod_id>", methods=["POST"])
 def api_catc_discover(pod_id):
     """Run Catalyst Center discovery for a POD's switches (manual trigger)."""
@@ -1139,6 +1315,8 @@ def api_baseconfig_verify(pod_id):
 
     def _run():
         for key in BASECONFIG_SWITCHES:
+            ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            log(pod_id, f"[verify/{key}] RUNNING started_at={ts}: connecting to {BASECONFIG_SWITCHES[key]['ip']}...")
             script = (
                 "import sys, os; sys.path.insert(0, '.'); import onboard_router; "
                 f"ok, detail = onboard_router.phase_baseconfig_verify('{key}'); "
@@ -1214,8 +1392,38 @@ def api_baseconfig_reset(pod_id, switch_key):
                 ok_val, detail_val = False, "timed out after 300s"
             except Exception as e:
                 ok_val, detail_val = False, str(e)
-            status_str = "OK" if ok_val else "FAILED"
-            log(pod_id, f"[baseconfig/{key}] {status_str}: {_sanitize(detail_val)}")
+                status_str = "OK" if ok_val else "FAILED"
+                log(pod_id, f"[baseconfig/{key}] {status_str}: {_sanitize(detail_val)}")
+
+                # Auto-verify after successful reset
+                if ok_val:
+                    import datetime as _dt2
+                    ts2 = _dt2.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                    log(pod_id, f"[verify/{key}] RUNNING started_at={ts2}: connecting to {BASECONFIG_SWITCHES[key]['ip']}...")
+                    vscript = (
+                        "import sys, os; sys.path.insert(0, '.'); import onboard_router; "
+                        f"ok, detail = onboard_router.phase_baseconfig_verify('{key}'); "
+                        "print(repr((ok, detail)))"
+                    )
+                    try:
+                        vresult = subprocess.run([
+                            "docker", "run", "--rm",
+                            "--network", f"container:vpn-{pod_id}",
+                            "-v", f"{os.path.abspath(DATA_DIR / 'base_configs')}:/pipeline/base_configs:ro",
+                            "-e", "BASE_CONFIGS_DIR=/pipeline/base_configs",
+                            "--entrypoint", "python3",
+                            "pod-automator:latest", "-c", vscript
+                        ], capture_output=True, text=True, timeout=60)
+                        vout = vresult.stdout.strip()
+                        vlast = vout.splitlines()[-1] if vout else ""
+                        try:
+                            vok, vdetail = eval(vlast)
+                        except Exception:
+                            vok, vdetail = False, f"parse error: {vout[:200]}"
+                    except Exception as ve:
+                        vok, vdetail = False, str(ve)
+                    vstatus = "OK" if vok else "FAILED"
+                    log(pod_id, f"[verify/{key}] {vstatus}: {_sanitize(vdetail)}")
 
         # After all switches, clean up ISE NADs (only when resetting all)
         if switch_key == "all":
@@ -1337,6 +1545,7 @@ def api_baseconfig_clear(pod_id):
         "DELETE FROM pipeline_logs WHERE pod_id=? AND (log_line LIKE '[baseconfig/%' OR log_line LIKE '[verify/%')",
         (pod_id,)
     )
+    c.commit()
     c.close()
     return jsonify({"status": "ok", "message": f"Baseconfig status cleared for {pod_id}"})
 
@@ -1760,7 +1969,36 @@ def pod_assigned(pod_id):
     return jsonify({"status": "ok"})
 
 
-@app.route("/api/run-pod/<pod_id>", methods=["POST"])
+@app.route("/api/pod-scc-keys/<pod_id>", methods=["GET"])
+def get_scc_keys(pod_id):
+    """Return SCC API key/secret for a POD (masked secret)."""
+    conn = _db()
+    row = conn.execute(
+        "SELECT scc_api_key, scc_api_secret FROM pods WHERE pod_id=?", (pod_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"scc_api_key": "", "scc_api_secret": ""})
+    return jsonify({"scc_api_key": row["scc_api_key"] or "", "scc_api_secret": row["scc_api_secret"] or ""})
+
+
+@app.route("/api/pod-scc-keys/<pod_id>", methods=["POST"])
+def save_scc_keys(pod_id):
+    """Save SCC API key/secret for a POD."""
+    data = request.get_json(force=True)
+    key = data.get("scc_api_key", "").strip()
+    secret = data.get("scc_api_secret", "").strip()
+    conn = _db()
+    conn.execute(
+        "UPDATE pods SET scc_api_key=?, scc_api_secret=?, updated_at=datetime('now') WHERE pod_id=?",
+        (key, secret, pod_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+
+
 def run_pod(pod_id):
     """Run the pipeline for a single POD (VPN must already be connected)."""
     import subprocess, os, tempfile
@@ -2142,8 +2380,9 @@ DASHBOARD_HTML = """
       <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
       <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
       <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
-      <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
-      <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
+       <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
+       <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
+       <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
       <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
       <button class="tab-btn" onclick="switchTab(this, 'kb')">&#128218; Knowledge Base</button>
     </div>
@@ -2159,27 +2398,44 @@ DASHBOARD_HTML = """
         <div style="color:#667788;font-size:13px;">Select a POD to load switch verification results</div>
       </div>
     </div>
-    <div class="tab-content" id="tab-cdfmc">
-      <div id="cdfmc-grid" style="padding:16px;">
-        <div style="color:#667788;font-size:13px;">Select a POD to load cdFMC status</div>
-      </div>
-    </div>
-    <div class="tab-content" id="tab-ad">
-      <div id="ad-grid" style="padding:16px;">
-        <div style="color:#667788;font-size:13px;">Select a POD to load AD verification status</div>
-      </div>
-    </div>
-    <div class="tab-content" id="tab-scc">
-      <div id="scc-grid" style="min-height:260px;">
-        <div style="color:#667788;font-size:13px;">Select a POD to load SCC reset checklist</div>
-      </div>
-    </div>
-    <div class="tab-content" id="tab-fabric">
-      <div id="fabric-grid" style="padding:16px;min-height:260px;">
-        <div style="color:#667788;font-size:13px;">Select a POD to load EVPN Fabric status</div>
-      </div>
-      <div id="catc-tile-container" style="padding:0 16px 16px;"></div>
-    </div>
+     <div class="tab-content" id="tab-cdfmc">
+       <div id="cdfmc-actions" style="display:none;margin-bottom:10px;padding:0 16px;gap:8px;">
+         <button id="cdfmc-recheck-btn" class="btn-reconnect">⟳ Re-check</button>
+         <button id="cdfmc-redeploy-btn" class="btn-reconnect" style="color:#ff4757;border-color:#ff4757;">⚠ Reset &amp; Redeploy</button>
+       </div>
+       <div id="cdfmc-grid" style="padding:16px;">
+         <div style="color:#667788;font-size:13px;">Select a POD to load cdFMC status</div>
+       </div>
+     </div>
+     <div class="tab-content" id="tab-ad">
+       <div id="ad-actions" style="display:none;margin-bottom:10px;padding:0 16px;gap:8px;">
+         <button id="ad-recheck-btn" class="btn-reconnect">⟳ Re-check</button>
+         <button id="ad-rerun-btn" class="btn-reconnect" style="color:#ff4757;border-color:#ff4757;">⚠ Re-run AD Automation</button>
+       </div>
+       <div id="ad-grid" style="padding:16px;">
+         <div style="color:#667788;font-size:13px;">Select a POD to load AD verification status</div>
+       </div>
+     </div>
+     <div class="tab-content" id="tab-scc">
+       <div id="scc-actions" style="display:none;margin-bottom:10px;">
+         <button id="scc-recheck-btn" class="btn-reconnect" onclick="sccRecheckCurrent()">&#x21bb; Re-check Auto</button>
+       </div>
+       <div id="scc-grid" style="min-height:260px;">
+         <div style="color:#667788;font-size:13px;">Select a POD to load SCC reset checklist</div>
+       </div>
+     </div>
+     <div class="tab-content" id="tab-fabric">
+       <div id="fabric-grid" style="padding:16px;min-height:260px;">
+         <div style="color:#667788;font-size:13px;">Select a POD to load EVPN Fabric status</div>
+       </div>
+       <div id="catc-tile-container" style="padding:0 16px 16px;"></div>
+     </div>
+
+     <div class="tab-content" id="tab-sda">
+       <div id="sda-grid" style="padding:16px;min-height:260px;">
+         <div style="color:#667788;font-size:13px;">Select a POD to manage SDA Fabric</div>
+       </div>
+     </div>
 
     <div class="tab-content" id="tab-baseconfig">
       <div id="baseconfig-grid" style="padding:16px;min-height:260px;">
@@ -2269,6 +2525,7 @@ async function load() {
     else if (tabName === 'upgrade')   loadUpgrade(detailId);
     else if (tabName === 'scc')       loadSccChecklist(detailId);
     else if (tabName === 'fabric')    loadFabricStatus(detailId);
+    else if (tabName === 'sda')       loadSdaStatus(detailId);
     else if (tabName === 'baseconfig') loadBaseConfig(detailId);
     // logs tab has its own 2s poller; kb tab is static
   }
@@ -2757,8 +3014,20 @@ async function recheckSwitches(podId) {
 }
 
 async function loadCdfmc(podId) {
+  if (window._cdfmcRechecking) return;  // don't interrupt an in-progress recheck
   const grid = document.getElementById('cdfmc-grid');
   if (!grid) return;
+
+  // Wire static action buttons outside the grid
+  const actionsDiv = document.getElementById('cdfmc-actions');
+  if (actionsDiv) {
+    actionsDiv.style.display = 'flex';
+    const rb = document.getElementById('cdfmc-recheck-btn');
+    if (rb) { rb.onclick = null; rb.onclick = () => recheckCdfmc(podId); }
+    const db = document.getElementById('cdfmc-redeploy-btn');
+    if (db) { db.onclick = null; db.onclick = () => redeployCdfmc(podId); }
+  }
+
   const r = await fetch('/api/cdfmc/' + podId);
   const d = await r.json();
   const deployed = d.deployed;
@@ -2779,8 +3048,6 @@ async function loadCdfmc(podId) {
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
       <span style="font-size:22px;color:${statusColor}">${statusIcon}</span>
       <span style="font-size:15px;font-weight:600;color:#e0e8f0">cdFMC / Terraform Automation</span>
-      <button onclick="recheckCdfmc('${podId}')" style="margin-left:auto;padding:5px 14px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:6px;cursor:pointer;font-size:12px;">⟳ Re-check</button>
-      <button onclick="redeployCdfmc('${podId}')" style="padding:5px 14px;background:#1a2a3a;border:1px solid #ff4757;color:#ff4757;border-radius:6px;cursor:pointer;font-size:12px;">⚠ Reset &amp; Redeploy</button>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
       <div style="background:#0d1f2d;border-radius:8px;padding:14px;">
@@ -2802,9 +3069,22 @@ async function loadCdfmc(podId) {
 
 async function recheckCdfmc(podId) {
   const grid = document.getElementById('cdfmc-grid');
-  grid.innerHTML = '<div style="padding:20px;color:#ffa502;font-size:13px;">⟳ Running cdFMC re-check...</div>';
+  grid.innerHTML = '<div style="padding:20px;color:#ffa502;font-size:13px;">⟳ cdFMC re-check started — please wait...</div>';
+  window._cdfmcRechecking = true;
   await fetch('/api/cdfmc/recheck/' + podId, { method: 'POST' });
-  setTimeout(() => loadCdfmc(podId), 5000);
+  let polls = 0;
+  const poller = setInterval(async () => {
+    polls++;
+    const r = await fetch('/api/cdfmc/' + podId);
+    const d = await r.json();
+    if (d.step_status !== 'running' || polls > 60) {
+      clearInterval(poller);
+      window._cdfmcRechecking = false;
+      loadCdfmc(podId);
+    } else {
+      grid.innerHTML = '<div style="padding:20px;color:#ffa502;font-size:13px;">⟳ cdFMC re-check running — please wait... (' + (polls * 3) + 's)</div>';
+    }
+  }, 3000);
 }
 
 async function redeployCdfmc(podId) {
@@ -2821,6 +3101,14 @@ async function redeployCdfmc(podId) {
 async function loadAd(podId) {
   const grid = document.getElementById('ad-grid');
   if (!grid) return;
+  const adActions = document.getElementById('ad-actions');
+  if (adActions) {
+    adActions.style.display = 'flex';
+    const rb = document.getElementById('ad-recheck-btn');
+    if (rb) { rb.onclick = null; rb.onclick = () => recheckAd(podId); }
+    const rr = document.getElementById('ad-rerun-btn');
+    if (rr) { rr.onclick = null; rr.onclick = () => rerunAd(podId); }
+  }
   const r = await fetch('/api/ad/status/' + podId);
   const d = await r.json();
 
@@ -2850,8 +3138,6 @@ async function loadAd(podId) {
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
       <span style="font-size:22px;color:${statusColor}">${statusIcon}</span>
       <span style="font-size:15px;font-weight:600;color:#e0e8f0">AD User Verification</span>
-      <button onclick="recheckAd('${podId}')" style="margin-left:auto;padding:5px 14px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:6px;cursor:pointer;font-size:12px;">⟳ Re-check</button>
-      <button onclick="rerunAd('${podId}')" style="padding:5px 14px;background:#1a2a3a;border:1px solid #ff4757;color:#ff4757;border-radius:6px;cursor:pointer;font-size:12px;">⚠ Re-run AD Automation</button>
     </div>
     <div style="background:#0d1f2d;border-radius:8px;padding:14px;margin-bottom:14px;">
       <div style="font-size:11px;color:#667788;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Status</div>
@@ -3117,11 +3403,17 @@ const SCC_MANUAL_ITEMS = [
 
 async function loadSccChecklist(podId) {
   const grid = document.getElementById('scc-grid');
-  // Don't clear grid — update in place to avoid layout bounce
+  window._sccCurrentPodId = podId;
+  const actionsDiv = document.getElementById('scc-actions');
+  if (actionsDiv) actionsDiv.style.display = 'block';
   const r = await fetch('/api/scc/status/' + podId);
   const items = await r.json();
   const map = {};
   items.forEach(i => { map[i.item_key] = i; });
+
+  // Load existing SCC keys
+  const keysR = await fetch('/api/pod-scc-keys/' + podId);
+  const keysD = await keysR.json();
 
   const allItems = [...SCC_AUTO_ITEMS, ...SCC_MANUAL_ITEMS];
   const completedCount = allItems.filter(i => (map[i.key] || {}).status === 'completed').length;
@@ -3169,12 +3461,23 @@ async function loadSccChecklist(podId) {
   }
 
   grid.innerHTML =
+    // SCC API Credentials card
+    '<div class="switch-card" style="margin-bottom:12px;">'
+    + '<div class="switch-card-title"><span class="role-tag cc">KEYS</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">SCC API Credentials</span></div>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:center;margin-top:6px;">'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">API Key</div>'
+    + '<input id="scc-key-input" type="text" value="' + escHtml(keysD.scc_api_key || '') + '" placeholder="API Key" style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">Key Secret</div>'
+    + '<input id="scc-secret-input" type="password" value="' + escHtml(keysD.scc_api_secret || '') + '" placeholder="Key Secret" style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<button id="scc-keys-save-btn" class="btn-reconnect" style="margin-top:16px;white-space:nowrap;">Save Keys</button>'
+    + '</div>'
+    + '<div id="scc-keys-status" style="font-size:11px;color:#667788;margin-top:4px;min-height:16px;"></div>'
+    + '</div>'
     // Summary bar
-    '<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">'
+    + '<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">'
     + '<div style="font-size:13px;font-weight:600;color:' + statusColor + '">' + statusLabel + '</div>'
     + '<div style="flex:1;min-width:80px;"><div style="background:#1a2d4a;border-radius:3px;height:6px;overflow:hidden;"><div style="height:100%;width:' + pct + '%;background:' + barColor + ';border-radius:3px;transition:width 0.5s;"></div></div></div>'
     + '<div style="font-size:11px;color:#667788;white-space:nowrap;">' + completedCount + '/' + allItems.length + '</div>'
-    + '<button id="scc-recheck-btn" class="btn-reconnect">&#x21bb; Re-check Auto</button>'
     + '</div>'
     + (allDone ? '<div style="padding:8px 12px;background:#00e68a22;border:1px solid #00e68a;border-radius:6px;color:#00e68a;font-size:13px;margin-bottom:12px;">&#x2713; All 13 items confirmed — POD cleared</div>' : '')
     // Auto card
@@ -3191,8 +3494,28 @@ async function loadSccChecklist(podId) {
     + '</div>';
 
   setTimeout(() => {
-    const rb = document.getElementById('scc-recheck-btn');
-    if (rb) rb.onclick = () => sccRecheck(podId);
+    const saveBtn = document.getElementById('scc-keys-save-btn');
+    if (saveBtn) saveBtn.onclick = async () => {
+      const key = document.getElementById('scc-key-input').value.trim();
+      const secret = document.getElementById('scc-secret-input').value.trim();
+      const statusEl = document.getElementById('scc-keys-status');
+      statusEl.style.color = '#ffa502';
+      statusEl.textContent = 'Saving...';
+      const res = await fetch('/api/pod-scc-keys/' + podId, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({scc_api_key: key, scc_api_secret: secret})
+      });
+      const d = await res.json();
+      if (d.status === 'ok') {
+        statusEl.style.color = '#00e68a';
+        statusEl.textContent = '✓ Saved';
+        setTimeout(() => { statusEl.textContent = ''; }, 3000);
+      } else {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ Save failed';
+      }
+    };
   }, 0);
 }
 
@@ -3204,6 +3527,10 @@ async function sccConfirm(podId, itemKey) {
 async function sccUnconfirm(podId, itemKey) {
   await fetch('/api/scc/unconfirm/' + podId + '/' + itemKey, { method: 'POST' });
   loadSccChecklist(podId);
+}
+
+async function sccRecheckCurrent() {
+  if (window._sccCurrentPodId) sccRecheck(window._sccCurrentPodId);
 }
 
 async function sccRecheck(podId) {
@@ -3239,6 +3566,7 @@ const FABRIC_STEPS = [
   "vrf_definitions","multicast_replication","l2vni_vlan_mappings","l3vni_vlans",
   "dag_svis","l3vni_svis","nve_interface","bgp_evpn",
   "spine_external_interface","spine_bgp_sdwan","access_ports",
+  "dot1x_security",
   "verify_bgp_evpn","verify_nve_peers"
 ];
 const FABRIC_STEP_LABELS = {
@@ -3253,6 +3581,7 @@ const FABRIC_STEP_LABELS = {
   spine_external_interface: "Spine External Interface",
   spine_bgp_sdwan: "Spine BGP SD-WAN",
   access_ports: "Access / AP Ports",
+  dot1x_security: "802.1x / IBNS 2.0",
   verify_bgp_evpn: "Verify BGP EVPN",
   verify_nve_peers: "Verify NVE Peers",
 };
@@ -3268,6 +3597,7 @@ const FABRIC_STEP_TARGETS = {
   spine_external_interface: "Border Spine",
   spine_bgp_sdwan: "Border Spine",
   access_ports: "Leaf1 + Leaf2",
+  dot1x_security: "Leaf1 + Leaf2",
   verify_bgp_evpn: "Border Spine",
   verify_nve_peers: "Border Spine",
 };
@@ -3411,6 +3741,358 @@ const BASECONFIG_SWITCHES = {
   leaf2:        { name: 'Leaf 2',        ip: '198.18.128.23' },
 };
 
+// ---------------------------------------------------------------------------
+// SDA Fabric Tab
+// ---------------------------------------------------------------------------
+
+const SDA_DEPLOY_STEP_KEYS = [
+  "discovery","provision","fabric_site","virtual_networks",
+  "anycast_gateways","transit","fabric_devices","l3_handoff",
+  "port_assignments","verify"
+];
+const SDA_DEPLOY_STEP_LABELS = {
+  discovery:        "Discovery (Loopbacks)",
+  provision:        "Provision to MAIN Site",
+  fabric_site:      "Create Fabric Site",
+  virtual_networks: "Create L3 VNs",
+  anycast_gateways: "Anycast Gateways",
+  transit:          "XAR-Transit",
+  fabric_devices:   "Fabric Devices",
+  l3_handoff:       "L3 Handoff",
+  port_assignments: "Trunk Port Assignments",
+  verify:           "Verify Fabric",
+};
+const SDA_DEPLOY_STEP_TARGETS = {
+  discovery:        "172.30.255.1–3",
+  provision:        "All 3 switches",
+  fabric_site:      "Site-105/MAIN",
+  virtual_networks: "Main / PROD / IOT",
+  anycast_gateways: "VLAN 10 / 101 / 102",
+  transit:          "BGP ASN 65534",
+  fabric_devices:   "Border+CP + Leaf1+Leaf2",
+  l3_handoff:       "Gi1/0/48 per VN",
+  port_assignments: "Gi1/0/2 Leaf1+Leaf2",
+  verify:           "Catalyst Center",
+};
+
+const SDA_ROLLBACK_STEP_KEYS = [
+  "remove_port_assignments","remove_l3_handoffs",
+  "remove_fabric_devices","remove_anycast_gateways","disable_gbac_policy",
+  "remove_transit","remove_vn_assignments","remove_virtual_networks",
+  "remove_fabric_site","delete_devices","delete_discovery",
+  "delete_ise_nads","remove_network_profile"
+];
+const SDA_ROLLBACK_STEP_LABELS = {
+  remove_port_assignments: "Remove Port Assignments",
+  remove_l3_handoffs:      "Remove L3 Handoffs",
+  remove_fabric_devices:   "Remove Fabric Devices",
+  remove_anycast_gateways: "Remove Anycast Gateways",
+  disable_gbac_policy:     "Disable GBAC Policy",
+  remove_transit:          "Remove XAR-Transit",
+  remove_vn_assignments:   "Remove VN Site Assignments",
+  remove_virtual_networks: "Delete L3 VNs",
+  remove_fabric_site:      "Delete Fabric Site",
+  delete_devices:          "Delete from Inventory",
+  delete_discovery:        "Delete Discovery Job",
+  delete_ise_nads:         "Delete ISE NADs",
+  remove_network_profile:  "Remove Network Profile",
+};
+const SDA_ROLLBACK_STEP_TARGETS = {
+  remove_port_assignments: "Gi1/0/2 Leaf1+Leaf2",
+  remove_l3_handoffs:      "Gi1/0/48 Border Spine",
+  remove_fabric_devices:   "Edge nodes first",
+  remove_anycast_gateways: "VLAN 10 / 101 / 102",
+  disable_gbac_policy:     "CATC GBAC",
+  remove_transit:          "XAR-Transit",
+  remove_vn_assignments:   "Main / PROD / IOT",
+  remove_virtual_networks: "Main / PROD / IOT",
+  remove_fabric_site:      "Site-105/MAIN",
+  delete_devices:          "All 3 switches",
+  delete_discovery:        "Site-105-Discovery",
+  delete_ise_nads:         "ISE loopback NADs",
+  remove_network_profile:  "Site network profile",
+};
+
+function renderSdaGrid(podId, data) {
+  const grid = document.getElementById('sda-grid');
+  if (!grid) return;
+
+  const deploy   = data.deploy   || {};
+  const rollback = data.rollback || {};
+
+  // ── Compute overall state ────────────────────────────────────────────────
+  const dSteps   = SDA_DEPLOY_STEP_KEYS;
+  const dDone    = dSteps.filter(s => (deploy[s]||{}).status === 'completed').length;
+  const dFailed  = dSteps.filter(s => (deploy[s]||{}).status === 'failed').length;
+  const dRunning = dSteps.some(s => (deploy[s]||{}).status === 'running');
+  const dTotal   = dSteps.length;
+  const dPct     = Math.min(100, Math.round(dDone / dTotal * 100));
+  const barColor = dFailed  ? '#ff4757'
+                 : dRunning ? '#02c8ff'
+                 : dDone === dTotal && dDone > 0 ? '#00e68a' : '#445566';
+  const labelText = dFailed  ? 'Failed at step ' + (dDone + 1) + '/' + dTotal
+                  : dRunning ? 'Running \u2014 ' + dDone + '/' + dTotal
+                  : dDone === dTotal && dDone > 0 ? 'Complete! All ' + dTotal + ' steps done'
+                  : dDone === 0 ? 'Not started'
+                  : 'Paused \u2014 ' + dDone + '/' + dTotal;
+
+  let html = '';
+
+  // ── CatC Discovery tile container ─────────────────────────────────────────
+  html += '<div id="sda-catc-tile-container" style="margin-bottom:14px;"></div>';
+
+  // ── Header row ────────────────────────────────────────────────────────────
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
+  html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">SDA Fabric — Deploy</span>';
+  html += '<div style="display:flex;gap:8px;">';
+  html += '<button id="sda-deploy-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#9654; Run Deploy</button>';
+  html += '<button id="sda-rollback-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;">&#8635; Rollback</button>';
+  html += '<button id="sda-clear-btn" style="background:#1a2d4a;color:#8899aa;border:1px solid #2a3d5a;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#10005; Clear</button>';
+  html += '</div></div>';
+
+  // ── Progress bar ──────────────────────────────────────────────────────────
+  html += '<div style="margin-bottom:14px;">';
+  html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
+  html += '<span>' + labelText + '</span>';
+  html += '<span>' + dPct + '% (' + dDone + '/' + dTotal + ')</span>';
+  html += '</div>';
+  html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
+  html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + dPct + '%;transition:width 0.4s;"></div>';
+  html += '</div></div>';
+
+  // ── Deploy step cards ─────────────────────────────────────────────────────
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-bottom:18px;">';
+  dSteps.forEach((s, i) => {
+    const info   = deploy[s] || {};
+    const st     = info.status || 'pending';
+    const result = (info.result || '').substring(0, 200);
+    const dur    = formatDur(info.started_at, info.completed_at);
+    const cardBorder = st === 'failed'    ? 'border-left:3px solid #ff4757;'
+                     : st === 'running'   ? 'border-left:3px solid #02c8ff;'
+                     : st === 'completed' ? 'border-left:3px solid #00e68a;' : '';
+    html += '<div class="step-card" style="' + cardBorder + '">';
+    html += '<div class="step-num">Step ' + (i + 1) + '/' + dTotal + '</div>';
+    html += '<div class="step-name">' + (SDA_DEPLOY_STEP_LABELS[s] || s) + '</div>';
+    html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (SDA_DEPLOY_STEP_TARGETS[s] || '') + '</div>';
+    html += pipelineBadge(st);
+    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (dur)    html += '<div class="step-dur">' + dur + '</div>';
+    html += '</div>';
+  });
+  html += '</div>';
+
+  // ── Rollback section ──────────────────────────────────────────────────────
+  const rSteps   = SDA_ROLLBACK_STEP_KEYS;
+  const rDone    = rSteps.filter(s => (rollback[s]||{}).status === 'completed').length;
+  const rFailed  = rSteps.filter(s => (rollback[s]||{}).status === 'failed').length;
+  const rRunning = rSteps.some(s => (rollback[s]||{}).status === 'running');
+  const rTotal   = rSteps.length;
+  const rPct     = Math.min(100, Math.round(rDone / rTotal * 100));
+  const rBarColor = rFailed  ? '#ff4757' : rRunning ? '#e67e22' : rDone === rTotal && rDone > 0 ? '#00e68a' : '#445566';
+  const rLabel    = rFailed  ? 'Rollback failed at step ' + (rDone + 1) + '/' + rTotal
+                  : rRunning ? 'Rolling back \u2014 ' + rDone + '/' + rTotal
+                  : rDone === rTotal && rDone > 0 ? 'Rollback complete! All ' + rTotal + ' steps done'
+                  : rDone === 0 ? 'Not started'
+                  : 'Paused \u2014 ' + rDone + '/' + rTotal;
+
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">';
+  html += '<span style="font-size:13px;font-weight:600;color:#cdd6e0;">Rollback</span>';
+  html += '<span style="font-size:11px;color:#8899aa;">' + rPct + '% (' + rDone + '/' + rTotal + ')</span>';
+  html += '</div>';
+  html += '<div style="background:#0d1117;border-radius:4px;height:5px;overflow:hidden;margin-bottom:10px;">';
+  html += '<div style="height:100%;border-radius:4px;background:' + rBarColor + ';width:' + rPct + '%;transition:width 0.4s;"></div>';
+  html += '</div>';
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;">';
+  rSteps.forEach((s, i) => {
+    const info   = rollback[s] || {};
+    const st     = info.status || 'pending';
+    const result = (info.result || '').substring(0, 200);
+    const dur    = formatDur(info.started_at, info.completed_at);
+    const cardBorder = st === 'failed'    ? 'border-left:3px solid #ff4757;'
+                     : st === 'running'   ? 'border-left:3px solid #e67e22;'
+                     : st === 'completed' ? 'border-left:3px solid #00e68a;' : '';
+    html += '<div class="step-card" style="' + cardBorder + '">';
+    html += '<div class="step-num">Step ' + (i + 1) + '/' + rTotal + '</div>';
+    html += '<div class="step-name">' + (SDA_ROLLBACK_STEP_LABELS[s] || s) + '</div>';
+    html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (SDA_ROLLBACK_STEP_TARGETS[s] || '') + '</div>';
+    html += pipelineBadge(st);
+    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (dur)    html += '<div class="step-dur">' + dur + '</div>';
+    html += '</div>';
+  });
+  html += '</div>';
+
+  if (grid._lastHtml === html && !dRunning && !rRunning) return;
+  grid._lastHtml = html;
+  grid.innerHTML = html;
+
+  // Wire buttons
+  setTimeout(() => {
+    const deployBtn   = document.getElementById('sda-deploy-btn');
+    const rollbackBtn = document.getElementById('sda-rollback-btn');
+    const clearBtn    = document.getElementById('sda-clear-btn');
+    if (deployBtn)   deployBtn.onclick   = () => triggerSda(podId, 'deploy');
+    if (rollbackBtn) rollbackBtn.onclick = () => { if (confirm('Roll back SDA fabric for ' + podId + '? This will remove all SDA config.')) triggerSda(podId, 'rollback'); };
+    if (clearBtn)    clearBtn.onclick    = () => clearSda(podId);
+  }, 0);
+
+  // Render CatC tile inside the container we just created
+  renderSdaCatcTile(podId);
+}
+
+function renderSdaCatcTile(podId) {
+  const container = document.getElementById('sda-catc-tile-container');
+  if (!container || !podId) return;
+
+  container.innerHTML =
+    '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+        '<div>' +
+          '<span style="font-size:13px;font-weight:600;color:#cdd6e0;">Catalyst Center Discovery</span>' +
+          '<span style="font-size:10px;color:#667788;margin-left:8px;">198.18.5.100</span>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px;">' +
+          '<button id="sda-catc-discover-btn" style="background:#7b4fff;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#128269; Discover</button>' +
+          '<button id="sda-catc-rerun-btn" style="background:#1a2d4a;color:#8899aa;border:1px solid #2a3d5a;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#8635; Re-run</button>' +
+        '</div>' +
+      '</div>' +
+      '<div id="sda-catc-progress-area"></div>' +
+    '</div>';
+
+  document.getElementById('sda-catc-discover-btn').addEventListener('click', () => triggerSdaCatcDiscover(podId));
+  document.getElementById('sda-catc-rerun-btn').addEventListener('click',    () => triggerSdaCatcDiscover(podId));
+  loadSdaCatcStatus(podId);
+}
+
+async function loadSdaCatcStatus(podId) {
+  let data;
+  try { data = await fetch('/api/catc/status/' + podId).then(r => r.json()); }
+  catch(e) { return null; }
+
+  const steps   = data.steps   || [];
+  const done    = data.done    || 0;
+  const total   = data.total   || 6;
+  const overall = data.overall || 'pending';
+  const pct      = total > 0 ? Math.round(done / total * 100) : 0;
+  const barColor = overall === 'completed' ? '#00e68a' : overall === 'failed' ? '#ff4757' : overall === 'running' ? '#02c8ff' : '#445566';
+  const labelText = overall === 'completed' ? 'Complete \u2014 all ' + total + ' steps done'
+                  : overall === 'failed'    ? 'Failed'
+                  : overall === 'running'   ? 'Running...'
+                  : 'Not started';
+
+  let h = '';
+  h += '<div style="margin-bottom:10px;">';
+  h += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
+  h += '<span>' + labelText + '</span><span>' + pct + '% (' + done + '/' + total + ')</span>';
+  h += '</div>';
+  h += '<div style="background:#0d1117;border-radius:4px;height:6px;overflow:hidden;">';
+  h += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
+  h += '</div></div>';
+  h += '<div style="display:flex;flex-direction:column;gap:5px;">';
+  steps.forEach(s => {
+    const icon  = s.status === 'completed' ? '&#10003;' : s.status === 'failed' ? '&#10007;' : s.status === 'running' ? '&#9696;' : '&#9675;';
+    const color = s.status === 'completed' ? '#00e68a'  : s.status === 'failed' ? '#ff4757'  : s.status === 'running' ? '#02c8ff' : '#445566';
+    h += '<div style="display:flex;align-items:flex-start;gap:8px;font-size:11px;">';
+    h += '<span style="color:' + color + ';min-width:12px;margin-top:1px;">' + icon + '</span>';
+    h += '<span style="color:#cdd6e0;min-width:170px;">' + s.label + '</span>';
+    if (s.message) h += '<span style="color:#8899aa;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + s.message.replace(/"/g, '&quot;') + '">' + s.message + '</span>';
+    h += '</div>';
+  });
+  h += '</div>';
+
+  const area = document.getElementById('sda-catc-progress-area');
+  if (area) area.innerHTML = h;
+  return data;
+}
+
+async function triggerSdaCatcDiscover(podId) {
+  const btn   = document.getElementById('sda-catc-discover-btn');
+  const rerun = document.getElementById('sda-catc-rerun-btn');
+  const area  = document.getElementById('sda-catc-progress-area');
+  if (btn)   { btn.disabled   = true;  btn.textContent = 'Running...'; }
+  if (rerun) { rerun.disabled = true; }
+  if (area)  { area.innerHTML = '<div style="color:#8899aa;font-size:11px;">Starting...</div>'; }
+
+  const r = await fetch('/api/catc/discover/' + podId, { method: 'POST' });
+  const resp = await r.json();
+  if (resp.status === 'error') {
+    if (area) area.innerHTML = '<div style="color:#ff4757;font-size:11px;">&#10007; ' + (resp.message || 'Error') + '</div>';
+    if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
+    if (rerun) { rerun.disabled = false; }
+    return;
+  }
+
+  let polls = 0;
+  const poll = setInterval(async () => {
+    polls++;
+    const sr = await loadSdaCatcStatus(podId);
+    if (!sr || !sr.running || polls >= 60) {
+      clearInterval(poll);
+      if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
+      if (rerun) { rerun.disabled = false; }
+    }
+  }, 3000);
+}
+
+async function loadSdaStatus(podId) {
+  const grid = document.getElementById('sda-grid');
+  if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+  const data = await fetch('/api/sda/status/' + podId).then(r => r.json());
+  renderSdaGrid(podId, data);
+  // Auto-poll if anything is running
+  const isRunning = s => (s || {}).status === 'running';
+  const anyRunning = [...Object.values(data.deploy || {}), ...Object.values(data.rollback || {})].some(isRunning);
+  if (anyRunning) _sdaStartPoller(podId);
+}
+
+function _sdaStartPoller(podId) {
+  let polls = 0;
+  const isRunning = s => (s || {}).status === 'running';
+  const poll = setInterval(async () => {
+    polls++;
+    const data = await fetch('/api/sda/status/' + podId).then(r => r.json());
+    renderSdaGrid(podId, data);
+    const anyRunning = [...Object.values(data.deploy || {}), ...Object.values(data.rollback || {})].some(isRunning);
+    if ((!anyRunning && polls > 3) || polls > 300) clearInterval(poll);
+  }, 3000);
+}
+
+async function triggerSda(podId, action) {
+  const grid = document.getElementById('sda-grid');
+  if (grid) grid._lastHtml = null;
+  await fetch('/api/sda/clear/' + podId, { method: 'POST' });
+  await fetch('/api/sda/' + action + '/' + podId, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+  _sdaStartPoller(podId);
+}
+
+async function clearSda(podId) {
+  await fetch('/api/sda/clear/' + podId, { method: 'POST' });
+  loadSdaStatus(podId);
+}
+
+// Tick running switch-reset timers every second without a full re-render.
+// _bcRunningTimers is a map of key -> startedAt (ms) set by renderBaseConfigGrid.
+window._bcRunningTimers = {};
+function _bcTickTimers() {
+  const now = Date.now();
+  Object.entries(window._bcRunningTimers).forEach(([key, tsMs]) => {
+    const timerEl = document.getElementById('bc-timer-' + key);
+    const barEl   = document.getElementById('bc-bar-'   + key);
+    if (!timerEl) return;
+    const elapsed = Math.floor((now - tsMs) / 1000);
+    const elStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
+    const phase = elapsed < 20  ? '① Connecting via Telnet...'
+                : elapsed < 50  ? '② Pushing config lines...'
+                : elapsed < 70  ? '③ Saving + reloading...'
+                : elapsed < 310 ? '④ Waiting for reboot... (' + Math.max(0, 310-elapsed) + 's left)'
+                : elapsed < 370 ? '⑤ Reconnecting via SSH...'
+                : '⑥ RSA keys + final save...';
+    timerEl.textContent = phase + ' — ' + elStr + ' elapsed';
+    if (barEl) barEl.style.width = Math.min(99, Math.round(elapsed / 390 * 100)) + '%';
+  });
+}
+setInterval(_bcTickTimers, 1000);
+
 async function loadBaseConfig(podId) {
   const grid = document.getElementById('baseconfig-grid');
   if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
@@ -3433,7 +4115,7 @@ async function loadBaseConfig(podId) {
       if (logEl) logEl.textContent = relevant.join('\\n');
       renderBaseConfigGrid(podId, sr);
       const stillRunning = Object.values(sr || {}).some(s => (s.reset||'').includes('RUNNING') || (s.verify||'').includes('RUNNING'));
-      if ((!stillRunning && polls > 5) || polls > 200) clearInterval(poll);
+      if ((!stillRunning && polls > 5) || polls > 200) { clearInterval(poll); window._bcRunningTimers = {}; }
     }, 3000);
   }
 }
@@ -3472,7 +4154,7 @@ function renderBaseConfigGrid(podId, statusData) {
   html += '</div></div>';
 
   html += '<div style="background:#12202f;border:1px solid #e74c3c44;border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:11px;color:#e74c3c;">';
-  html += '&#9888;  This will overwrite the running config on the selected switch(es) with the known-good base config and save to NVRAM. EVPN fabric config will be removed.';
+  html += '&#9888;  This will overwrite the running config on the selected switch(es) with the known-good base config and save to NVRAM. Fabric config will be removed.';
   html += '</div>';
 
   html += '<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;">';
@@ -3510,8 +4192,8 @@ function renderBaseConfigGrid(podId, statusData) {
                   : elapsed < 310 ? '④ Waiting for reboot... (' + Math.max(0, 310-elapsed) + 's left)'
                   : elapsed < 370 ? '⑤ Reconnecting via SSH...'
                   : '⑥ RSA keys + final save...';
-      h += '<div style="' + detailStyle + 'color:#f39c12;">' + phase + ' — ' + elStr + ' elapsed</div>';
-      h += '<div class="switch-bar" style="margin-bottom:4px;"><div class="switch-bar-fill" style="width:' + Math.min(99,Math.round(elapsed/390*100)) + '%;background:#f39c12;"></div></div>';
+      h += '<div id="bc-timer-' + key + '" style="' + detailStyle + 'color:#f39c12;"></div>';
+      h += '<div class="switch-bar" style="margin-bottom:4px;"><div id="bc-bar-' + key + '" class="switch-bar-fill" style="width:0%;background:#f39c12;"></div></div>';
     } else {
       const txt = (resetBadge.short || '').substring(0, 60);
       h += '<div style="' + detailStyle + '" title="' + (resetBadge.short||'').replace(/"/g,'&quot;') + '">' + (txt || '&nbsp;') + '</div>';
@@ -3576,19 +4258,36 @@ function renderBaseConfigGrid(podId, statusData) {
   grid._lastHtml = html;
   grid.innerHTML = html;
 
-  setTimeout(() => {
-    document.getElementById('baseconfig-all-btn').onclick = () => triggerBaseConfig(podId, 'all');
-    document.getElementById('baseconfig-verify-btn').onclick = () => triggerBaseConfigVerify(podId);
-    document.getElementById('baseconfig-clear-btn').onclick = () => clearBaseConfigStatus(podId);
-    for (const key of Object.keys(BASECONFIG_SWITCHES)) {
-      const btn = document.getElementById('baseconfig-btn-' + key);
-      if (btn) btn.onclick = () => triggerBaseConfig(podId, key);
+  // Rebuild the 1-second timer registry from the current status data
+  window._bcRunningTimers = {};
+  for (const [key, s] of Object.entries(statusData || {})) {
+    const badge = _bcStatusBadge(s.reset || null);
+    if (badge.running && badge.startedAt) {
+      window._bcRunningTimers[key] = new Date(badge.startedAt).getTime();
     }
-    const iseBtn = document.getElementById('baseconfig-btn-ise');
-    if (iseBtn) iseBtn.onclick = () => triggerBaseConfigService(podId, 'ise');
-    const catcBtn = document.getElementById('baseconfig-btn-catc');
-    if (catcBtn) catcBtn.onclick = () => triggerBaseConfigService(podId, 'catc');
-  }, 0);
+  }
+  // Tick immediately so the timer shows correct value before the next 1-second interval
+  _bcTickTimers();
+
+  // Wire buttons — must run after every innerHTML replacement
+  _bcWireButtons(podId);
+}
+
+function _bcWireButtons(podId) {
+  const allBtn = document.getElementById('baseconfig-all-btn');
+  if (allBtn) allBtn.onclick = () => triggerBaseConfig(podId, 'all');
+  const verifyBtn = document.getElementById('baseconfig-verify-btn');
+  if (verifyBtn) verifyBtn.onclick = () => triggerBaseConfigVerify(podId);
+  const clearBtn = document.getElementById('baseconfig-clear-btn');
+  if (clearBtn) clearBtn.onclick = () => clearBaseConfigStatus(podId);
+  for (const key of Object.keys(BASECONFIG_SWITCHES)) {
+    const btn = document.getElementById('baseconfig-btn-' + key);
+    if (btn) btn.onclick = () => triggerBaseConfig(podId, key);
+  }
+  const iseBtn = document.getElementById('baseconfig-btn-ise');
+  if (iseBtn) iseBtn.onclick = () => triggerBaseConfigService(podId, 'ise');
+  const catcBtn = document.getElementById('baseconfig-btn-catc');
+  if (catcBtn) catcBtn.onclick = () => triggerBaseConfigService(podId, 'catc');
 }
 
 async function triggerBaseConfig(podId, switchKey) {
@@ -3656,7 +4355,13 @@ async function triggerBaseConfigVerify(podId) {
     const relevant = lr.filter(l => l.includes('[verify/')).slice(-12);
     if (logEl) logEl.textContent = relevant.join('\\n');
     renderBaseConfigGrid(podId, sr);
-    if (polls > 20) clearInterval(poll);
+    // Stop only when all switch verify results are present and none are still RUNNING
+    const switchKeys = Object.keys(BASECONFIG_SWITCHES);
+    const allDone = switchKeys.every(k => {
+      const v = (sr[k] && sr[k].verify) || '';
+      return v && !v.includes('RUNNING');
+    });
+    if ((allDone && polls > 2) || polls > 60) clearInterval(poll);
   }, 3000);
 }
 

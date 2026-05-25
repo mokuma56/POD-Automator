@@ -18,8 +18,9 @@ Steps (run in order):
   9.  spine_external_interface  — Gi1/0/48 trunk + VRF-Lite SVIs      (Spine only)
   10. spine_bgp_sdwan           — BGP peering toward SD-WAN router     (Spine only)
   11. access_ports              — Client/AP port configs               (Leaf1+2 only)
-  12. verify_bgp_evpn           — show bgp l2vpn evpn summary          (Spine verify)
-  13. verify_nve_peers          — show nve peers                       (Spine verify)
+  12. dot1x_security            — IBNS 2.0 / 802.1x + device sensor   (Leaf1+2 only)
+  13. verify_bgp_evpn           — show bgp l2vpn evpn summary          (Spine verify)
+  14. verify_nve_peers          — show nve peers                       (Spine verify)
 
 Usage:
   uv run python3 evpn_fabric.py              # run all steps
@@ -375,6 +376,256 @@ interface GigabitEthernet1/0/3
  ip nbar protocol-discovery
 """
 
+# ── 802.1x / IBNS 2.0 security config (Leaf1 + Leaf2 only) ───────────────────
+#
+# Optimised for IOS XE 17.x + ISE 3.x IBNS 2.0 validated design:
+#  - Device Sensor (DHCP/CDP/LLDP) for ISE profiling
+#  - IPDT policy required by device-tracking attach-policy on access ports
+#  - access-session filter-list for ISE accounting/auth attributes
+#  - 4 interface templates: DOT1X/MAB × CLOSED/OPEN
+#  - DOT1X_MAB_POLICY (dot1x-first) + MAB_DOT1X_POLICY (mab-first)
+#  - CTS role-based enforcement on data VLANs
+#  - Critical-auth service templates for ISE AAA-down survivability
+#
+DOT1X_SECURITY = """\
+cdp run
+lldp run
+!
+device-tracking policy IPDT_POLICY
+ no protocol udp
+ tracking enable
+!
+device sensor filter-list dhcp list DHCP-SENSOR-LIST
+ option name host-name
+ option name requested-address
+ option name parameter-request-list
+ option name class-identifier
+ option name client-identifier
+device sensor filter-list cdp list CDP-SENSOR-LIST
+ tlv name device-name
+ tlv name address-type
+ tlv name capabilities-type
+ tlv name platform-type
+device sensor filter-list lldp list LLDP-SENSOR-LIST
+ tlv name system-name
+ tlv name system-description
+ tlv name system-capabilities
+device sensor filter-spec dhcp include list DHCP-SENSOR-LIST
+device sensor filter-spec cdp include list CDP-SENSOR-LIST
+device sensor filter-spec lldp include list LLDP-SENSOR-LIST
+device sensor notify all-changes
+!
+access-session attributes filter-list list ISE-DS-LIST
+ vlan-id
+ cdp
+ lldp
+ dhcp
+ http
+access-session authentication attributes filter-spec include list ISE-DS-LIST
+access-session accounting attributes filter-spec include list ISE-DS-LIST
+!
+dot1x system-auth-control
+no ip dhcp snooping information option
+!
+service-template CRITICAL_DATA_ACCESS
+ access-group PERMIT-ISE
+service-template CRITICAL_VOICE_ACCESS
+ access-group PERMIT-ISE
+ voice vlan
+!
+ip access-list extended PERMIT-ISE
+ 10 permit ip any any
+!
+cts role-based enforcement
+cts role-based enforcement vlan-list 10,101-102
+!
+class-map type control subscriber match-all AAA_SVR_DOWN_AUTHD_HOST
+ match result-type aaa-timeout
+ match authorization-status authorized
+!
+class-map type control subscriber match-all AAA_SVR_DOWN_UNAUTHD_HOST
+ match result-type aaa-timeout
+ match authorization-status unauthorized
+!
+class-map type control subscriber match-all AUTHC_SUCCESS_AUTHZ_FAIL
+ match authorization-status unauthorized
+ match result-type success
+!
+class-map type control subscriber match-all DOT1X
+ match method dot1x
+!
+class-map type control subscriber match-all DOT1X_FAILED
+ match method dot1x
+ match result-type method dot1x authoritative
+!
+class-map type control subscriber match-all DOT1X_NO_RESP
+ match method dot1x
+ match result-type method dot1x agent-not-found
+!
+class-map type control subscriber match-all DOT1X_TIMEOUT
+ match method dot1x
+ match result-type method dot1x method-timeout
+!
+class-map type control subscriber match-any IN_CRITICAL_AUTH
+ match activated-service-template CRITICAL_DATA_ACCESS
+ match activated-service-template CRITICAL_VOICE_ACCESS
+!
+class-map type control subscriber match-all MAB
+ match method mab
+!
+class-map type control subscriber match-all MAB_FAILED
+ match method mab
+ match result-type method mab authoritative
+!
+class-map type control subscriber match-none NOT_IN_CRITICAL_AUTH
+ match activated-service-template CRITICAL_DATA_ACCESS
+ match activated-service-template CRITICAL_VOICE_ACCESS
+!
+policy-map type control subscriber DOT1X_MAB_POLICY
+ event session-started match-all
+  10 class always do-until-failure
+   10 authenticate using dot1x retries 2 retry-time 0 priority 10
+ event authentication-failure match-first
+  5 class DOT1X_FAILED do-until-failure
+   10 terminate dot1x
+   20 authenticate using mab priority 20
+  10 class AAA_SVR_DOWN_UNAUTHD_HOST do-until-failure
+   10 clear-authenticated-data-hosts-on-port
+   20 activate service-template CRITICAL_DATA_ACCESS
+   30 activate service-template CRITICAL_VOICE_ACCESS
+   40 authorize
+   50 pause reauthentication
+  20 class AAA_SVR_DOWN_AUTHD_HOST do-until-failure
+   10 pause reauthentication
+   20 authorize
+  30 class DOT1X_NO_RESP do-until-failure
+   10 terminate dot1x
+   20 authenticate using mab priority 20
+  40 class MAB_FAILED do-until-failure
+   10 terminate mab
+   20 authentication-restart 60
+  50 class always do-until-failure
+   10 terminate dot1x
+   20 terminate mab
+   30 authentication-restart 60
+ event agent-found match-all
+  10 class always do-until-failure
+   10 terminate mab
+   20 authenticate using dot1x retries 2 retry-time 0 priority 10
+ event aaa-available match-all
+  10 class IN_CRITICAL_AUTH do-until-failure
+   10 clear-session
+  20 class NOT_IN_CRITICAL_AUTH do-until-failure
+   10 resume reauthentication
+ event inactivity-timeout match-all
+  10 class always do-until-failure
+   10 clear-session
+ event authentication-success match-all
+  10 class always do-until-failure
+   10 activate service-template DEFAULT_LINKSEC_POLICY_SHOULD_SECURE
+ event violation match-all
+  10 class always do-until-failure
+   10 restrict
+ event authorization-failure match-all
+  10 class AUTHC_SUCCESS_AUTHZ_FAIL do-until-failure
+   10 authentication-restart 60
+!
+policy-map type control subscriber MAB_DOT1X_POLICY
+ event session-started match-all
+  10 class always do-until-failure
+   10 authenticate using mab priority 20
+ event authentication-failure match-first
+  5 class DOT1X_FAILED do-until-failure
+   10 terminate dot1x
+   20 authenticate using mab priority 20
+  10 class AAA_SVR_DOWN_UNAUTHD_HOST do-until-failure
+   10 clear-authenticated-data-hosts-on-port
+   20 activate service-template CRITICAL_DATA_ACCESS
+   30 activate service-template CRITICAL_VOICE_ACCESS
+   40 authorize
+   50 pause reauthentication
+  20 class AAA_SVR_DOWN_AUTHD_HOST do-until-failure
+   10 pause reauthentication
+   20 authorize
+  30 class MAB_FAILED do-until-failure
+   10 terminate mab
+   20 authenticate using dot1x retries 2 retry-time 0 priority 10
+  40 class DOT1X_NO_RESP do-until-failure
+   10 terminate dot1x
+   20 authentication-restart 60
+  60 class always do-until-failure
+   10 terminate mab
+   20 terminate dot1x
+   30 authentication-restart 60
+ event agent-found match-all
+  10 class always do-until-failure
+   10 terminate mab
+   20 authenticate using dot1x retries 2 retry-time 0 priority 10
+ event aaa-available match-all
+  10 class IN_CRITICAL_AUTH do-until-failure
+   10 clear-session
+  20 class NOT_IN_CRITICAL_AUTH do-until-failure
+   10 resume reauthentication
+ event inactivity-timeout match-all
+  10 class always do-until-failure
+   10 clear-session
+ event authentication-success match-all
+  10 class always do-until-failure
+   10 activate service-template DEFAULT_LINKSEC_POLICY_SHOULD_SECURE
+ event violation match-all
+  10 class always do-until-failure
+   10 restrict
+ event authorization-failure match-all
+  10 class AUTHC_SUCCESS_AUTHZ_FAIL do-until-failure
+   10 authentication-restart 60
+!
+template WIRED_DOT1X_CLOSED
+ dot1x pae authenticator
+ dot1x timeout quiet-period 300
+ dot1x timeout tx-period 7
+ mab
+ access-session control-direction in
+ access-session closed
+ access-session port-control auto
+ authentication periodic
+ authentication timer reauthenticate server
+ service-policy type control subscriber DOT1X_MAB_POLICY
+!
+template WIRED_DOT1X_OPEN
+ dot1x pae authenticator
+ dot1x timeout quiet-period 300
+ dot1x timeout tx-period 7
+ mab
+ access-session control-direction in
+ access-session port-control auto
+ authentication periodic
+ authentication timer reauthenticate server
+ service-policy type control subscriber DOT1X_MAB_POLICY
+!
+template WIRED_MAB_CLOSED
+ dot1x pae authenticator
+ dot1x timeout quiet-period 300
+ dot1x timeout tx-period 7
+ mab
+ access-session control-direction in
+ access-session closed
+ access-session port-control auto
+ authentication periodic
+ authentication timer reauthenticate server
+ service-policy type control subscriber MAB_DOT1X_POLICY
+!
+template WIRED_MAB_OPEN
+ dot1x pae authenticator
+ dot1x timeout quiet-period 300
+ dot1x timeout tx-period 7
+ mab
+ access-session control-direction in
+ access-session port-control auto
+ authentication periodic
+ authentication timer reauthenticate server
+ service-policy type control subscriber MAB_DOT1X_POLICY
+"""
+
 # ── SSH helpers ───────────────────────────────────────────────────────────────
 
 def _ssh_connect(ip):
@@ -629,6 +880,14 @@ def step_access_ports(log_fn=print):
     ], log_fn)
 
 
+def step_dot1x_security(log_fn=print):
+    log_fn("Step 12: 802.1x / IBNS 2.0 security config → Leaf1 + Leaf2")
+    return _run("dot1x_security", [
+        ("leaf1", DOT1X_SECURITY),
+        ("leaf2", DOT1X_SECURITY),
+    ], log_fn)
+
+
 def step_verify_bgp_evpn(log_fn=print):
     log_fn("Step 12: Verify BGP EVPN summary → Border Spine")
     spine_ip = SWITCHES["border_spine"]["ip"]
@@ -673,6 +932,7 @@ FABRIC_STEPS = [
     ("spine_external_interface",  step_spine_external_interface),
     ("spine_bgp_sdwan",           step_spine_bgp_sdwan),
     ("access_ports",              step_access_ports),
+    ("dot1x_security",            step_dot1x_security),
     ("verify_bgp_evpn",           step_verify_bgp_evpn),
     ("verify_nve_peers",          step_verify_nve_peers),
 ]

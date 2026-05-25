@@ -4,11 +4,15 @@ reset_switches.py — Reset a switch to base config via raw Telnet config push.
 Workflow:
   1. Raw Telnet connect (telnetlib) — works on blank and configured switches
   2. Authenticate if needed, get to enable prompt
-  3. Enter 'conf t', push config lines, end with 'end' in the stream
-  4. Wait for enable prompt (hostname#, not hostname(config*)#)
-  5. write memory
-  6. reload
-  7. Wait 240s, reconnect SSH, generate RSA keys, write memory
+  3. Enter 'conf t', push base config lines, exit config mode
+  4. write memory — saves base config to NVRAM (also regenerates nvram_config on flash)
+  5. Delete flash files that would re-apply lab config on reload:
+     - nvram_config / nvram_config_bkup (C9300 restores from these if present,
+       overriding NVRAM — must be deleted AFTER write memory so they don't
+       get deleted then regenerated with the old lab config)
+     - .dbpersist, .prst_sync, vlan.dat, dc_profile_dir (CC/DNAC provisioning)
+  6. reload — switch boots from NVRAM (base config) since flash backups are gone
+  7. Wait 300s, reconnect SSH, generate RSA keys, final write memory
 """
 
 import time
@@ -29,10 +33,29 @@ SWITCH_IPS = {
 
 TELNET_TIMEOUT = 30
 
+# Flash files deleted AFTER write memory to prevent lab config being restored on reload.
+# nvram_config / nvram_config_bkup are the key ones — C9300 loads these in preference
+# to NVRAM if they exist. Delete them after saving base config so reload uses NVRAM.
+FLASH_CLEANUP = [
+    "flash:nvram_config",
+    "flash:nvram_config_bkup",
+    "flash:vlan.dat",
+    "flash:.dbpersist",
+    "flash:.prst_sync",
+    "flash:iosxe_config.txt",
+    "flash:dc_profile_dir",
+    "flash:pnp-info",
+    "flash:pnp-tech",
+    "flash:nve_cfg.json",
+    "flash:evpn_cfg.json",
+    "flash:.evpn",
+    "flash:dnac_evpn.cfg",
+]
+
 
 def _wait_for_enable(tn, log_fn, timeout=15):
     """
-    Read until we see an enable prompt: ends with '# ' or '#\r' but NOT '(config'.
+    Read until we see an enable prompt: ends with '#' but NOT '(config'.
     Sends blank lines periodically to get a fresh prompt.
     """
     deadline = time.time() + timeout
@@ -42,7 +65,6 @@ def _wait_for_enable(tn, log_fn, timeout=15):
         time.sleep(0.5)
         chunk = tn.read_very_eager().decode("utf-8", errors="replace")
         buf += chunk
-        # Look for enable prompt — last line ends with # but not (config...#
         lines = [l.strip() for l in buf.splitlines() if l.strip()]
         if lines:
             last = lines[-1]
@@ -50,14 +72,25 @@ def _wait_for_enable(tn, log_fn, timeout=15):
                 log_fn(f"  Enable prompt confirmed: {last!r}")
                 return True
             log_fn(f"  Waiting for enable prompt, current: {last!r}")
-        buf = buf[-200:]  # keep last 200 chars
+        buf = buf[-200:]
     return False
+
+
+def _send_cmd(tn, cmd, wait=1.5):
+    """Send a command and drain output after a short wait."""
+    tn.write(cmd.encode("utf-8") + b"\n")
+    time.sleep(wait)
+    return tn.read_very_eager().decode("utf-8", errors="replace")
 
 
 def _telnet_reset(host, local_config_path, log_fn):
     """
-    Raw Telnet to switch: push base config lines directly, write memory, reload.
-    Works on blank switches (no AAA) and configured switches alike.
+    Raw Telnet to switch:
+      1. Authenticate + enable
+      2. Push base config via conf t
+      3. write memory  (base config now in NVRAM AND flash:nvram_config)
+      4. Delete flash files that would override NVRAM on reload
+      5. reload
     """
     log_fn(f"  Raw Telnet connecting to {host}:23...")
     tn = telnetlib.Telnet(host, 23, timeout=TELNET_TIMEOUT)
@@ -81,49 +114,46 @@ def _telnet_reset(host, local_config_path, log_fn):
         tn.write(SWITCH_SECRET.encode() + b"\n")
         tn.read_until(b"#", timeout=10)
 
-    # Confirm at enable prompt
     tn.write(b"\n")
     time.sleep(0.5)
     tn.read_very_eager()
     log_fn(f"  At enable prompt")
 
-    # Read config lines
+    # Suppress DNS lookups immediately
+    _send_cmd(tn, "terminal length 0", wait=0.5)
+    _send_cmd(tn, "no ip domain lookup", wait=0.5)
+
+    # ── Step 1: Push base config ──────────────────────────────────────────────
     log_fn(f"  Reading base config from {local_config_path}...")
     with open(local_config_path) as f:
         config_lines = [l.rstrip() for l in f if l.strip() and not l.strip().startswith("!")]
 
-    # Prepend 'no ip domain lookup' to prevent DNS errors mid-output
     if "no ip domain lookup" not in config_lines:
         config_lines.insert(0, "no ip domain lookup")
-
     if "config-register 0x2102" not in config_lines:
         config_lines.append("config-register 0x2102")
-
-    # Always end with 'end' to ensure we exit config mode cleanly
     config_lines.append("end")
 
     log_fn(f"  Entering config mode, pushing {len(config_lines)} lines...")
     tn.write(b"conf t\n")
     tn.read_until(b"(config)#", timeout=10)
 
-    # Push in small batches with pauses
     BATCH = 10
     for i in range(0, len(config_lines), BATCH):
-        batch = config_lines[i:i+BATCH]
+        batch = config_lines[i:i + BATCH]
         for line in batch:
             tn.write(line.encode("utf-8") + b"\r\n")
             time.sleep(0.08)
         time.sleep(0.5)
         log_fn(f"  Pushed lines {i+1}–{min(i+BATCH, len(config_lines))}/{len(config_lines)}")
 
-    # Wait for enable prompt — 'end' in the stream should have exited config mode
-    log_fn(f"  Waiting for enable prompt after 'end'...")
+    log_fn(f"  Waiting for enable prompt after config push...")
     time.sleep(2)
     ok = _wait_for_enable(tn, log_fn, timeout=20)
     if not ok:
         raise RuntimeError(f"Did not return to enable prompt after config push on {host}")
 
-    # Send 'end' again + flush to be absolutely sure we are NOT in config mode
+    # Double-end safety
     tn.write(b"end\n")
     time.sleep(1)
     tn.read_very_eager()
@@ -131,11 +161,12 @@ def _telnet_reset(host, local_config_path, log_fn):
     if not ok:
         raise RuntimeError(f"Still in config mode before write memory on {host}")
 
-    # Write memory — read until [OK] explicitly, not just #
-    # DNS errors can appear mid-output and cause read_until(#) to return early
-    log_fn(f"  Saving config (write memory)...")
+    # ── Step 2: write memory FIRST ───────────────────────────────────────────
+    # This saves base config to NVRAM. It also regenerates flash:nvram_config
+    # and flash:nvram_config_bkup — but with the BASE config, not the lab config.
+    # We delete those files next so reload falls back to NVRAM (base config).
+    log_fn(f"  Saving base config to NVRAM (write memory)...")
     tn.write(b"write memory\n")
-    # Collect output for up to 30s looking for [OK]
     deadline = time.time() + 30
     wm_buf = ""
     while time.time() < deadline:
@@ -145,17 +176,30 @@ def _telnet_reset(host, local_config_path, log_fn):
             log_fn(f"  write memory OK")
             break
         if "(config" in wm_buf:
-            raise RuntimeError(f"write memory ran inside config mode on {host} — config not saved")
+            raise RuntimeError(f"write memory ran inside config mode on {host}")
         time.sleep(0.5)
     else:
         raise RuntimeError(f"write memory did not confirm [OK] on {host} — output: {wm_buf.strip()[-120:]!r}")
 
-    # Reload
+    # ── Step 3: Delete flash files AFTER write memory ────────────────────────
+    # nvram_config / nvram_config_bkup now have base config — delete them so
+    # the C9300 cannot restore the old lab config. Also wipe NVRAM now that
+    # the flash backups are gone (so there is NO config backup path left except
+    # NVRAM which has the base config).
+    log_fn(f"  Deleting flash config backup files (post write memory)...")
+    for fname in FLASH_CLEANUP:
+        log_fn(f"    Deleting {fname}...")
+        tn.write(f"delete /force /recursive {fname}\n".encode())
+        time.sleep(2)
+        tn.read_very_eager()
+    log_fn(f"  Flash cleanup done")
+
+    # ── Step 4: reload ───────────────────────────────────────────────────────
     log_fn(f"  Reloading switch...")
     tn.write(b"reload\n")
     out = tn.read_until(b"?", timeout=15).decode("utf-8", errors="replace")
     if "Save?" in out or "save" in out.lower():
-        tn.write(b"yes\n")
+        tn.write(b"no\n")
         tn.read_until(b"?", timeout=10)
     tn.write(b"\n")
     time.sleep(2)
@@ -163,11 +207,11 @@ def _telnet_reset(host, local_config_path, log_fn):
         tn.close()
     except Exception:
         pass
-    log_fn(f"  Reload initiated — waiting 240s for reboot...")
+    log_fn(f"  Reload initiated — waiting 300s for reboot...")
 
 
 def _post_reload(host, log_fn):
-    """Reconnect via SSH, generate RSA keys, write memory."""
+    """Reconnect via SSH after reload, generate RSA keys, write memory."""
     from netmiko import ConnectHandler
 
     log_fn(f"  Reconnecting via SSH to {host}...")
@@ -202,14 +246,14 @@ def _post_reload(host, log_fn):
     out = conn.send_command(
         "crypto key generate rsa modulus 2048",
         expect_string=r"#|already exist",
-        read_timeout=30,
+        read_timeout=60,
     )
-    log_fn(f"  RSA: {out[:60].strip()}")
+    log_fn(f"  RSA: {out[:80].strip()}")
 
     log_fn(f"  Final write memory...")
-    out = conn.send_command("write memory", expect_string=r"#", read_timeout=20)
+    out = conn.send_command("write memory", expect_string=r"\[OK\]|#", read_timeout=20)
     if "[OK]" not in out:
-        log_fn(f"  Warning: {out[:80]}")
+        log_fn(f"  Warning: write memory output: {out[:80]}")
     conn.disconnect()
     log_fn(f"  Done — SSH verified OK on {host}")
     return True
@@ -223,7 +267,7 @@ def reset_switch(switch_key, local_config_path, log_fn=print):
 
     try:
         _telnet_reset(host, local_config_path, log_fn)
-        time.sleep(240)
+        time.sleep(300)
         _post_reload(host, log_fn)
         return True, f"OK: {switch_key} ({host}) reset to base config"
     except Exception as e:
