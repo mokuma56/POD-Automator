@@ -3449,9 +3449,16 @@ async function loadSccChecklist(podId) {
   const map = {};
   items.forEach(i => { map[i.item_key] = i; });
 
-  // Load existing SCC keys
+  // Load existing SCC keys — but don't overwrite if user is actively typing
   const keysR = await fetch('/api/pod-scc-keys/' + podId);
   const keysD = await keysR.json();
+  if (window._sccKeysDirty) {
+    // User is typing — preserve their input, just update key/secret from DOM
+    const existingKey = document.getElementById('scc-key-input');
+    const existingSecret = document.getElementById('scc-secret-input');
+    if (existingKey) keysD.scc_api_key = existingKey.value;
+    if (existingSecret) keysD.scc_api_secret = existingSecret.value;
+  }
 
   const allItems = [...SCC_AUTO_ITEMS, ...SCC_MANUAL_ITEMS];
   const completedCount = allItems.filter(i => (map[i.key] || {}).status === 'completed').length;
@@ -3537,23 +3544,39 @@ async function loadSccChecklist(podId) {
       const key = document.getElementById('scc-key-input').value.trim();
       const secret = document.getElementById('scc-secret-input').value.trim();
       const statusEl = document.getElementById('scc-keys-status');
+      if (!key || !secret) {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ Both API Key and Secret are required';
+        return;
+      }
       statusEl.style.color = '#ffa502';
       statusEl.textContent = 'Saving...';
-      const res = await fetch('/api/pod-scc-keys/' + podId, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({scc_api_key: key, scc_api_secret: secret})
-      });
-      const d = await res.json();
-      if (d.status === 'ok') {
-        statusEl.style.color = '#00e68a';
-        statusEl.textContent = '✓ Saved';
-        setTimeout(() => { statusEl.textContent = ''; }, 3000);
-      } else {
+      try {
+        const res = await fetch('/api/pod-scc-keys/' + podId, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({scc_api_key: key, scc_api_secret: secret})
+        });
+        const d = await res.json();
+        if (d.status === 'ok') {
+          window._sccKeysDirty = false;
+          statusEl.style.color = '#00e68a';
+          statusEl.textContent = '✓ Saved — ready to Re-check';
+        } else {
+          statusEl.style.color = '#ff4757';
+          statusEl.textContent = '✗ Save failed: ' + (d.message || 'unknown error');
+        }
+      } catch(e) {
         statusEl.style.color = '#ff4757';
-        statusEl.textContent = '✗ Save failed';
+        statusEl.textContent = '✗ Save failed: ' + e;
       }
     };
+
+    // Prevent auto-reload from wiping input fields while user is typing
+    const keyInput = document.getElementById('scc-key-input');
+    const secretInput = document.getElementById('scc-secret-input');
+    if (keyInput) keyInput.addEventListener('input', () => { window._sccKeysDirty = true; });
+    if (secretInput) secretInput.addEventListener('input', () => { window._sccKeysDirty = true; });
   }, 0);
 }
 
@@ -3580,8 +3603,8 @@ async function sccRecheck(podId) {
   const MAX_POLLS = 24; // 120s timeout (24 x 5s)
   grid.innerHTML = '<div style="padding:20px;color:#02c8ff;font-size:13px;" id="scc-recheck-status">'
     + '&#8635; Re-checking auto items via API...</div>'
-    + '<div style="padding:0 20px;"><button onclick="sccRecheckCancel(\'' + podId + '\')" '
-    + 'class="btn-reconnect" style="background:#3d0a0a;border-color:#ff4757;color:#ff4757;font-size:11px;margin-top:8px;">✕ Cancel</button></div>';
+    + '<div style="padding:0 20px;"><button onclick="sccRecheckCancel(&quot;' + podId + '&quot;)" '
+    + 'class="btn-reconnect" style="background:#3d0a0a;border-color:#ff4757;color:#ff4757;font-size:11px;margin-top:8px;">&#x2715; Cancel</button></div>';
 
   const poller = setInterval(async () => {
     polls++;
