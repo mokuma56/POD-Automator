@@ -55,6 +55,8 @@ def check_pod_vpn(pod_id):
 def _db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA synchronous=FULL")
     return conn
 
 def _migrate():
@@ -836,10 +838,14 @@ def api_scc_recheck(pod_id):
     """Re-run automated SCC checks directly on host (needs public internet)."""
     import threading, importlib, os as _os
 
-    # Clear the step so it shows as running
+    # Mark as running immediately so UI can poll
     c = _db()
-    c.execute("DELETE FROM pipeline_steps WHERE pod_id=? AND step_name='scc_reset_check'", (pod_id,))
+    c.execute(
+        "INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, result) VALUES (?,?,?,datetime('now'),?)",
+        (pod_id, "scc_reset_check", "running", "")
+    )
     c.commit(); c.close()
+    log(pod_id, "[scc_reset_check] Starting SCC API checks...")
 
     def _check():
         _os.environ["POD_ID"] = pod_id
@@ -857,10 +863,42 @@ def api_scc_recheck(pod_id):
             )
             c2.commit(); c2.close()
         except Exception as e:
-            log(pod_id, f"[scc_reset_check] ERROR: {e}")
+            msg = f"ERROR: {e}"
+            log(pod_id, f"[scc_reset_check] {msg}")
+            c3 = _db()
+            c3.execute(
+                "INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, result) VALUES (?,?,?,?)",
+                (pod_id, "scc_reset_check", "failed", msg)
+            )
+            c3.commit(); c3.close()
 
     threading.Thread(target=_check, daemon=True).start()
     return jsonify({"status": "ok", "message": f"SCC re-check started for {pod_id}"})
+
+
+@app.route("/api/pipeline-steps/<pod_id>", methods=["GET"])
+def api_pipeline_steps(pod_id):
+    """Return all pipeline steps for a POD."""
+    c = _db()
+    rows = c.execute(
+        "SELECT step_name, status, result, started_at, completed_at FROM pipeline_steps WHERE pod_id=? ORDER BY rowid",
+        (pod_id,)
+    ).fetchall()
+    c.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/scc/recheck-timeout/<pod_id>", methods=["POST"])
+def api_scc_recheck_timeout(pod_id):
+    """Mark a stuck SCC recheck as failed (called on cancel or UI timeout)."""
+    c = _db()
+    c.execute(
+        "INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, result) VALUES (?,?,?,?)",
+        (pod_id, "scc_reset_check", "failed", "Timed out or cancelled — re-check manually")
+    )
+    c.commit(); c.close()
+    log(pod_id, "[scc_reset_check] Timed out or cancelled by user")
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/scc/run-check-sync/<pod_id>", methods=["POST"])
@@ -3535,9 +3573,45 @@ async function sccRecheckCurrent() {
 
 async function sccRecheck(podId) {
   const grid = document.getElementById('scc-grid');
-  grid.innerHTML = '<div style="padding:20px;color:#02c8ff;font-size:13px;">&#8635; Re-checking auto items via API — check Live Logs for progress...</div>';
   await fetch('/api/scc/recheck/' + podId, { method: 'POST' });
-  setTimeout(() => loadSccChecklist(podId), 5000);
+
+  // Poll for completion with timeout
+  let polls = 0;
+  const MAX_POLLS = 24; // 120s timeout (24 x 5s)
+  grid.innerHTML = '<div style="padding:20px;color:#02c8ff;font-size:13px;" id="scc-recheck-status">'
+    + '&#8635; Re-checking auto items via API...</div>'
+    + '<div style="padding:0 20px;"><button onclick="sccRecheckCancel(\'' + podId + '\')" '
+    + 'class="btn-reconnect" style="background:#3d0a0a;border-color:#ff4757;color:#ff4757;font-size:11px;margin-top:8px;">✕ Cancel</button></div>';
+
+  const poller = setInterval(async () => {
+    polls++;
+    try {
+      const r = await fetch('/api/pipeline-steps/' + podId);
+      const steps = await r.json();
+      const scc = steps.find(s => s.step_name === 'scc_reset_check');
+      const statusEl = document.getElementById('scc-recheck-status');
+      if (scc && scc.status !== 'running') {
+        clearInterval(poller);
+        loadSccChecklist(podId);
+        return;
+      }
+      if (polls >= MAX_POLLS) {
+        clearInterval(poller);
+        // Write timeout to DB then reload
+        await fetch('/api/scc/recheck-timeout/' + podId, { method: 'POST' });
+        loadSccChecklist(podId);
+        return;
+      }
+      if (statusEl) statusEl.textContent = '\u21bb Re-checking auto items via API... (' + (polls * 5) + 's)';
+    } catch(e) { /* keep polling */ }
+  }, 5000);
+  window._sccRecheckPoller = poller;
+}
+
+async function sccRecheckCancel(podId) {
+  if (window._sccRecheckPoller) clearInterval(window._sccRecheckPoller);
+  await fetch('/api/scc/recheck-timeout/' + podId, { method: 'POST' });
+  loadSccChecklist(podId);
 }
 
 function switchTab(btn, name) {
