@@ -2037,6 +2037,7 @@ def save_scc_keys(pod_id):
 
 
 
+@app.route("/api/run-pod/<pod_id>", methods=["POST"])
 def run_pod(pod_id):
     """Run the pipeline for a single POD (VPN must already be connected)."""
     import subprocess, os, tempfile
