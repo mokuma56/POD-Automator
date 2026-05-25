@@ -6,6 +6,9 @@ VPN_HOST="$1"
 VPN_USER="$2"
 VPN_PASS="$3"
 
+# Ensure DNS works before openconnect tries to resolve the VPN host
+printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' > /etc/resolv.conf
+
 echo "Connecting to $VPN_HOST as $VPN_USER..."
 echo "$VPN_PASS" | openconnect --interface tun0 --user "$VPN_USER" --passwd-on-stdin "$VPN_HOST" &
 VPN_PID=$!
