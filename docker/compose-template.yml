@@ -41,5 +41,12 @@ services:
       - {{host_data}}:/pipeline/host-data
     restart: "no"
 
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "172.{{pod_subnet}}.0.0/16"
+
 volumes:
   {{pod_id}}-bootstrap:

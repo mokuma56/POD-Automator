@@ -53,6 +53,12 @@ def read_csv(path):
             merged["router_ip"] = DEFAULTS["router_ip"]
             merged["serial"] = merged["router_serial"]
             merged["host_data"] = str(PROJECT_ROOT / "data")
+            # Assign a unique 172.x subnet per POD
+            try:
+                pod_num = int(row["pod_id"].split("-")[-1])
+            except (ValueError, IndexError):
+                pod_num = len(pods) + 20
+            merged["pod_subnet"] = str(40 + pod_num)
             pods.append(merged)
     return pods
 
@@ -91,6 +97,12 @@ def read_db(status_filter=("pending", "available", "ready", "")):
         merged["serial"] = merged["router_serial"]
         merged["session_id"] = d.get("session_id", "")
         merged["host_data"] = str(PROJECT_ROOT / "data")
+        # Assign a unique 172.x subnet per POD (172.20, 172.21, 172.22, ...)
+        try:
+            pod_num = int(d["pod_id"].split("-")[-1])
+        except (ValueError, IndexError):
+            pod_num = len(pods) + 20
+        merged["pod_subnet"] = str(40 + pod_num)
         pods.append(merged)
     return pods
 
