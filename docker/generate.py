@@ -209,7 +209,7 @@ def action_down(pods):
             for pod_id in pod_ids:
                 conn.execute("DELETE FROM pipeline_steps WHERE pod_id=?", (pod_id,))
                 conn.execute("DELETE FROM pipeline_logs WHERE pod_id=?", (pod_id,))
-                conn.execute("UPDATE pods SET status='pending', updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
+                conn.execute("UPDATE pods SET status='pending', sdwan_online='', updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
             conn.commit()
             conn.close()
             print(f"  DB state reset for {len(pod_ids)} POD(s) ✅")
