@@ -359,6 +359,42 @@ def api_switches(pod_id):
             "step_status": step.get("status", "pending"),
         })
 
+    # Add connectivity_test as a separate card
+    ct_step = results.get("connectivity_test", {})
+    ct_status = ct_step.get("status", "pending")
+    ct_parts = ct_step.get("parts", [])
+    ct_checks = []
+    switch_order = [("border_spine", "Border Spine"), ("leaf1", "Leaf 1"), ("leaf2", "Leaf 2")]
+    for i, (_, label) in enumerate(switch_order):
+        if ct_status == "completed" and i < len(ct_parts):
+            part = ct_parts[i]
+            if part.startswith("PASS"):
+                ct_checks.append({"label": label + " → 198.18.5.100", "status": "pass", "result": part.replace("PASS: ", "")})
+            elif part.startswith("FAIL"):
+                ct_checks.append({"label": label + " → 198.18.5.100", "status": "fail", "result": part.replace("FAIL: ", "")})
+            else:
+                ct_checks.append({"label": label + " → 198.18.5.100", "status": "pass", "result": part})
+        elif ct_status == "running":
+            ct_checks.append({"label": label + " → 198.18.5.100", "status": "na", "result": "checking..."})
+        elif ct_status == "failed":
+            ct_checks.append({"label": label + " → 198.18.5.100", "status": "fail", "result": "ping failed"})
+        else:
+            ct_checks.append({"label": label + " → 198.18.5.100", "status": "na", "result": "pending"})
+
+    ct_passed = sum(1 for c in ct_checks if c["status"] == "pass")
+    ct_failed = sum(1 for c in ct_checks if c["status"] == "fail")
+    switch_data.append({
+        "name": "Switch Connectivity",
+        "model": "",
+        "ip": "",
+        "host": "connectivity_test",
+        "checks": ct_checks,
+        "passed": ct_passed,
+        "failed": ct_failed,
+        "total": len(ct_checks),
+        "step_status": ct_status,
+    })
+
     return jsonify(switch_data)
 
 
@@ -2951,6 +2987,7 @@ function roleClass(name) {
   if (name.includes('Border')) return 'border';
   if (name.includes('Leaf')) return 'leaf';
   if (name.includes('Catalyst')) return 'cc';
+  if (name === 'Switch Connectivity') return 'cc';
   return '';
 }
 
@@ -3003,7 +3040,7 @@ async function loadSwitches(podId) {
       </div>`;
     }).join('');
 
-    const roleLabel = sw.name === 'Catalyst Center' ? 'CC' : sw.name.includes('Border') ? 'Spine' : 'Leaf';
+    const roleLabel = sw.name === 'Catalyst Center' ? 'CC' : sw.name === 'Switch Connectivity' ? 'TEST' : sw.name.includes('Border') ? 'Spine' : 'Leaf';
 
 
     return '<div class="switch-card ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
