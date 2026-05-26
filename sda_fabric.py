@@ -8,6 +8,7 @@ Deploy steps (in order):
   4.  virtual_networks — Create L3 VNs: Main / PROD / IOT and assign to fabric
   5.  anycast_gateways — Create anycast gateways (VLAN 10/101/102)
   6.  transit         — Create XAR-Transit (IP-Based, ASN 65534)
+  6b. clean_fabric_vlans — Remove conflicting VLANs/SVIs from switches + resync
   7.  fabric_devices  — Add Border+CP node + 2 edge nodes
   8.  l3_handoff      — Configure L3 handoff per VN on Gi1/0/48
   9.  port_assignments — Trunk ports Gi1/0/2 on Leaf1+Leaf2 (native 10, allowed 10,101,102)
@@ -32,8 +33,10 @@ import logging
 import sqlite3
 import datetime
 import os
+import re
 import requests
 import urllib3
+import paramiko
 
 urllib3.disable_warnings()
 logger = logging.getLogger(__name__)
@@ -113,6 +116,56 @@ SWITCH_IPS = {
     "leaf1":        {"loopback": "172.30.255.1", "mgmt": "198.18.128.22", "name": "Site_105-Leaf1"},
     "leaf2":        {"loopback": "172.30.255.2", "mgmt": "198.18.128.23", "name": "Site_105-Leaf2"},
 }
+
+SWITCH_USER = "netadmin"
+SWITCH_PASS = "C1sco12345"
+
+# VLANs/SVIs that must NOT exist before adding devices to SDA fabric
+FABRIC_CONFLICT_VLANS = [10, 101, 102, 1010, 1101, 1102]
+
+
+def _ssh_clean_switch_vlans(mgmt_ip, vlans, log_fn=print):
+    """SSH to a switch and remove conflicting VLANs and SVIs before SDA fabric add."""
+    import socket
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=20, allow_agent=False, look_for_keys=False)
+        chan = client.invoke_shell()
+        import time as _time
+
+        def send(cmd, wait=1.5):
+            chan.send(cmd + "\n")
+            _time.sleep(wait)
+            out = b""
+            while chan.recv_ready():
+                out += chan.recv(4096)
+            return out.decode(errors="ignore")
+
+        send("terminal length 0", 0.5)
+        send("configure terminal", 0.5)
+        for v in vlans:
+            send(f"no interface Vlan{v}", 0.5)
+        send("end", 0.5)
+        vlan_list = ",".join(str(v) for v in vlans)
+        send(f"no vlan {vlan_list}", 0.5)
+        out = send("write memory", 3)
+        log_fn(f"    {mgmt_ip}: cleaned VLANs {vlan_list} — {'OK' if '[OK]' in out or 'Copy complete' in out else 'write issued'}")
+        client.close()
+    except Exception as e:
+        log_fn(f"    WARNING: SSH to {mgmt_ip} failed: {e}")
+
+
+def _catc_resync_device(s, dev_id, log_fn=print):
+    """Trigger inventory resync for a device and wait for it."""
+    r = s.put(f"{CATC_BASE}/dna/intent/api/v1/network-device/sync", json=[dev_id])
+    if r.status_code not in (200, 201, 202):
+        log_fn(f"    WARNING: resync {dev_id} → {r.status_code}")
+        return
+    task_id = r.json().get("response", {}).get("taskId")
+    if task_id:
+        _wait_task(s, task_id, log_fn=log_fn, timeout=120)
 
 DISCOVERY_NAME  = "Site-105-Discovery"
 DISCOVERY_RANGE = "172.30.255.1-172.30.255.3"
@@ -262,10 +315,7 @@ def step_discovery(log_fn=print):
     s = _catc_session(log_fn)
     disc_id = _get_discovery_id(s)
     if disc_id:
-        log_fn(f"  Discovery '{DISCOVERY_NAME}' already exists (id={disc_id}), re-running...")
-        r = s.post(f"{CATC_BASE}/dna/intent/api/v1/discovery/{disc_id}/network-device")
-        if r.status_code not in (200, 201, 202):
-            raise RuntimeError(f"Re-run discovery failed: {r.status_code} {r.text[:200]}")
+        log_fn(f"  Discovery '{DISCOVERY_NAME}' already exists (id={disc_id}), reusing...")
     else:
         log_fn(f"  Creating discovery job '{DISCOVERY_NAME}'...")
         payload = {
@@ -302,36 +352,37 @@ def step_discovery(log_fn=print):
 
 
 def step_provision(log_fn=print):
-    """Provision the 3 switches to MAIN site."""
+    """Provision the 3 switches to MAIN site via SDA wired provisioning."""
     s = _catc_session(log_fn)
-    # Get device IDs
-    device_ids = []
+
+    # Check which devices are already SDA-provisioned
+    r = s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/provisionDevices")
+    already = {d["networkDeviceId"] for d in r.json().get("response", [])}
+
+    to_provision = []
     for key, info in SWITCH_IPS.items():
         dev_id = _get_device_id(s, info["name"])
         if not dev_id:
             raise RuntimeError(f"Device not found in inventory: {info['name']}")
-        device_ids.append(dev_id)
         log_fn(f"  Found {info['name']}: {dev_id}")
-
-    log_fn(f"  Provisioning {len(device_ids)} devices to site {SITE_ID}...")
-    payload = {
-        "deviceManagementIpAddress": [
-            SWITCH_IPS[k]["loopback"] for k in SWITCH_IPS
-        ],
-        "siteNameHierarchy": SITE_HIERARCHY,
-    }
-    # Use provision intent API
-    for key, info in SWITCH_IPS.items():
-        dev_id = _get_device_id(s, info["name"])
-        p = [{"deviceManagementIpAddress": info["loopback"], "siteNameHierarchy": SITE_HIERARCHY}]
-        r = s.post(f"{CATC_BASE}/dna/intent/api/v1/network-device-site/provision", json=p)
-        if r.status_code not in (200, 201, 202):
-            log_fn(f"    Warning: provision {info['name']} → {r.status_code}: {r.text[:150]}")
+        if dev_id in already:
+            log_fn(f"    Already SDA-provisioned, skipping")
         else:
-            task_id = r.json().get("response", {}).get("taskId")
-            if task_id:
-                _wait_task(s, task_id, log_fn=log_fn, timeout=180)
-            log_fn(f"    Provisioned {info['name']}")
+            to_provision.append({"networkDeviceId": dev_id, "siteId": SITE_ID})
+
+    if not to_provision:
+        log_fn(f"  All devices already SDA-provisioned")
+        return True, "provision already done"
+
+    log_fn(f"  SDA-provisioning {len(to_provision)} device(s)...")
+    for p in to_provision:
+        r = s.post(f"{CATC_BASE}/dna/intent/api/v1/sda/provisionDevices", json=[p])
+        if r.status_code not in (200, 201, 202):
+            raise RuntimeError(f"SDA provision failed: {r.status_code} {r.text[:200]}")
+        task_id = r.json().get("response", {}).get("taskId")
+        if task_id:
+            _wait_task(s, task_id, log_fn=log_fn, timeout=300)
+        log_fn(f"    Provisioned {p['networkDeviceId']}")
 
     return True, "provision OK"
 
@@ -410,6 +461,11 @@ def step_anycast_gateways(log_fn=print):
         "vlanId": ag["vlanId"],
         "trafficType": ag["trafficType"],
         "securityGroupName": ag["sgName"],
+        "isCriticalPool": False,
+        "isLayer2FloodingEnabled": False,
+        "isWirelessPool": False,
+        "isIpDirectedBroadcast": False,
+        "isIntraSubnetRoutingEnabled": False,
         "isMultipleIpToMacAddresses": True,
         "isGroupBasedPolicyEnforcementEnabled": True,
     } for ag in to_create]
@@ -434,6 +490,24 @@ def step_transit(log_fn=print):
     }]
     _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/transitNetworks", payload, log_fn=log_fn, timeout=300)
     return True, "transit OK"
+
+
+def step_clean_fabric_vlans(log_fn=print):
+    """Remove conflicting VLANs/SVIs from all switches and resync in CatC before fabric add."""
+    s = _catc_session(log_fn)
+    log_fn(f"  Cleaning VLANs {FABRIC_CONFLICT_VLANS} from switches before fabric add...")
+    for key, info in SWITCH_IPS.items():
+        log_fn(f"  → {info['name']} ({info['mgmt']})")
+        _ssh_clean_switch_vlans(info["mgmt"], FABRIC_CONFLICT_VLANS, log_fn=log_fn)
+
+    log_fn(f"  Resyncing devices in CatC inventory...")
+    for key, info in SWITCH_IPS.items():
+        dev_id = _get_device_id(s, info["name"])
+        if dev_id:
+            log_fn(f"    Resyncing {info['name']}...")
+            _catc_resync_device(s, dev_id, log_fn=log_fn)
+    log_fn(f"  ✓ clean_fabric_vlans done")
+    return True, "clean_fabric_vlans OK"
 
 
 def step_fabric_devices(log_fn=print):
@@ -464,8 +538,8 @@ def step_fabric_devices(log_fn=print):
                 "layer3Settings": {
                     "localAutonomousSystemNumber": BORDER_ASN,
                     "importExternalRoutes": True,
-                    "borderPriority": 10,
-                    "prependAutonomousSystemCount": 0,
+                    "borderPriority": 8,
+                    "prependAutonomousSystemCount": 1,
                     "isDefaultExit": True,
                 },
             },
@@ -551,8 +625,9 @@ def step_port_assignments(log_fn=print):
         log_fn(f"  Port assignments already configured")
         return True, "port_assignments already configured"
 
-    log_fn(f"  Adding {len(to_add)} port assignment(s)...")
-    _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/portAssignments", to_add, log_fn=log_fn, timeout=300)
+    log_fn(f"  Adding {len(to_add)} port assignment(s) (one per device)...")
+    for entry in to_add:
+        _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/portAssignments", [entry], log_fn=log_fn, timeout=300)
     return True, "port_assignments OK"
 
 
@@ -929,6 +1004,7 @@ DEPLOY_STEPS = [
     ("virtual_networks",  step_virtual_networks),
     ("anycast_gateways",  step_anycast_gateways),
     ("transit",           step_transit),
+    ("clean_fabric_vlans", step_clean_fabric_vlans),
     ("fabric_devices",    step_fabric_devices),
     ("l3_handoff",        step_l3_handoff),
     ("port_assignments",  step_port_assignments),
