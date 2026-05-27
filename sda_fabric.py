@@ -1136,6 +1136,7 @@ def step_l3_handoff(log_fn=print):
 def step_port_assignments(log_fn=print):
     """Configure port assignments on Leaf1 and Leaf2:
       - Gi1/0/2: trunk, native VLAN 10, allowed 10,101,102 (AP port, No Auth)
+      - Gi1/0/1: access, Closed Authentication (client port → ISE → VRF assignment)
       - Gi1/0/3: access, Closed Authentication (client port → ISE → VRF assignment)
     """
     s = _catc_session(log_fn)
@@ -1161,14 +1162,15 @@ def step_port_assignments(log_fn=print):
                 "nativeVlanId": PORT_NATIVE_VLAN,
                 "allowedVlanRanges": PORT_ALLOWED_VLANS,
             })
-        # Gi1/0/3 — client port, Closed Authentication → ISE → VRF assignment
-        if (dev_id, "GigabitEthernet1/0/3") not in existing:
-            to_add.append({
-                "fabricId": fabric_id,
-                "networkDeviceId": dev_id,
-                "interfaceName": "GigabitEthernet1/0/3",
-                "connectedDeviceType": "USER_DEVICE",
-                "authenticateTemplateName": "Closed Authentication",
+        # Gi1/0/1 and Gi1/0/3 — client ports, Closed Authentication → ISE → VRF assignment
+        for client_iface in ["GigabitEthernet1/0/1", "GigabitEthernet1/0/3"]:
+            if (dev_id, client_iface) not in existing:
+                to_add.append({
+                    "fabricId": fabric_id,
+                    "networkDeviceId": dev_id,
+                    "interfaceName": client_iface,
+                    "connectedDeviceType": "USER_DEVICE",
+                    "authenticateTemplateName": "Closed Authentication",
             })
 
     if not to_add:
@@ -1184,6 +1186,11 @@ def step_port_assignments(log_fn=print):
     import time as _time
     closed_auth_cmds = [
         "conf t",
+        "interface GigabitEthernet1/0/1",
+        " dot1x timeout tx-period 7",
+        " dot1x max-reauth-req 3",
+        " source template DefaultWiredDot1xClosedAuth",
+        " spanning-tree bpduguard enable",
         "interface GigabitEthernet1/0/3",
         " dot1x timeout tx-period 7",
         " dot1x max-reauth-req 3",
