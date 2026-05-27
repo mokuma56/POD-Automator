@@ -3869,13 +3869,8 @@ function renderFabricGrid(podId, steps) {
     if (verifyBtn) verifyBtn.onclick = () => triggerFabric(podId, 'verify');
   }, 0);
 
-  // Render the CatC tile (lives outside _lastHtml gate — always re-rendered)
+  // Render the CatC tile inside the container we just created
   renderCatcTile(podId);
-
-  // Auto-refresh while any step is running
-  if (running) {
-    setTimeout(() => loadFabricStatus(podId), 4000);
-  }
 }
 
 // ── Base Config Reset ─────────────────────────────────────────────────────────
@@ -4523,17 +4518,11 @@ async function triggerFabric(podId, action) {
   const r = await fetch('/api/fabric/' + action + '/' + podId, { method: 'POST' });
   const data = await r.json();
   if (logEl) logEl.textContent += (data.message || JSON.stringify(data)) + '\\n';
-  // Poll for updates — stop as soon as nothing is running anymore
-  const maxPolls = action === 'verify' ? 12 : 60;
-  let polls = 0;
-  const poll = setInterval(async () => {
-    polls++;
-    const sr = await fetch('/api/fabric/status/' + podId).then(r => r.json());
-    const steps = sr.steps || {};
-    const stillRunning = Object.values(steps).some(s => s.status === 'running');
-    renderFabricGrid(podId, steps);
-    if (!stillRunning || polls >= maxPolls) clearInterval(poll);
-  }, 3000);
+  // Clear _lastHtml so the next global poll forces a re-render with running state
+  const grid = document.getElementById('fabric-grid');
+  if (grid) grid._lastHtml = null;
+  // Immediate refresh to show running state
+  await loadFabricStatus(podId);
 }
 
 async function loadCatcStatus(podId) {

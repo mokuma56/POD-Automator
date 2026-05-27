@@ -661,6 +661,11 @@ def _send_config(ip, config_block, label="", timeout=30):
             while time.time() < deadline:
                 if shell.recv_ready():
                     out += shell.recv(8192)
+                    # Answer interactive yes/no prompts automatically
+                    if b"[yes]:" in out or b"[yes/no]:" in out or b"continue?" in out.lower():
+                        shell.send("yes\n")
+                        time.sleep(0.5)
+                        continue
                     if b"#" in out[-50:]:
                         break
                 else:
@@ -673,7 +678,7 @@ def _send_config(ip, config_block, label="", timeout=30):
         output = ""
         for line in config_block.strip().splitlines():
             line = line.rstrip()
-            if not line:
+            if not line or line == "!":
                 continue
             output += _send(line, delay=0.3)
 
