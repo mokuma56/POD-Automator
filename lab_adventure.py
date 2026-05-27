@@ -2788,7 +2788,7 @@ function showResult() {{
     ? 'Segmentation Verified — Attack Contained'
     : 'Simulation Incomplete — Review Log';
   document.getElementById('result-msg').textContent = allOk
-    ? 'All three acts confirmed. VRF macro segmentation blocked cross-network pivoting. SGT micro segmentation stopped lateral movement within the campus. ISE CoA quarantined the compromised device instantly — without a single switch config change. Pseudoco\'s Zero Trust campus held.'
+    ? 'All three acts confirmed. VRF macro segmentation blocked cross-network pivoting. SGT micro segmentation stopped lateral movement within the campus. ISE CoA quarantined the compromised device instantly \u2014 without a single switch config change. Pseudoco\u2019s Zero Trust campus held.'
     : 'One or more simulation steps could not be verified. Check fabric reachability, CTS policy configuration, and ISE ERS API access. Consult your proctor.';
   const clone = document.getElementById('steps-list').cloneNode(true);
   clone.id = '';
