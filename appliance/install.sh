@@ -74,22 +74,10 @@ else
 fi
 
 # ── 3. uv ───────────────────────────────────────────────────────────────────
-if ! command -v uv &>/dev/null; then
-    info "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh >> "$LOG" 2>&1
-fi
-# Always copy the binary to /usr/local/bin so all users (including podmgr) can run it
-UV_BIN=$(find /root/.local/bin /usr/local/bin -name uv -type f 2>/dev/null | head -1)
-[[ -z "$UV_BIN" ]] && UV_BIN=$(find /home -name uv -type f 2>/dev/null | head -1)
-if [[ -n "$UV_BIN" ]]; then
-    if [[ "$UV_BIN" != "/usr/local/bin/uv" ]]; then
-        cp -f "$UV_BIN" /usr/local/bin/uv
-        chmod 755 /usr/local/bin/uv
-    fi
-    success "uv ready: $(/usr/local/bin/uv --version)"
-else
-    die "uv binary not found after install."
-fi
+info "Installing uv..."
+curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh >> "$LOG" 2>&1
+chmod 755 /usr/local/bin/uv
+success "uv ready: $(/usr/local/bin/uv --version)"
 
 # ── 4. Service user ─────────────────────────────────────────────────────────
 if ! id "$SERVICE_USER" &>/dev/null; then
