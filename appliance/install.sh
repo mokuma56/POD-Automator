@@ -111,7 +111,8 @@ uv sync --no-dev >> "$LOG" 2>&1 || uv pip install -r requirements.txt >> "$LOG" 
 success "Python dependencies installed."
 
 # ── 7. Data directory ───────────────────────────────────────────────────────
-install -d -m 755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$INSTALL_DIR/data"
+install -d -m 775 -o "$SERVICE_USER" -g "$SERVICE_USER" "$INSTALL_DIR/data"
+chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR"
 success "Data directory ready."
 
 # ── 8. Build Docker image ───────────────────────────────────────────────────
