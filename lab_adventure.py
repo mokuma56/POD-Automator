@@ -2733,17 +2733,6 @@ function updateStep(name, state, detail, output) {{
   }}
 }}
 
-function updateStep(name, state, detail) {{
-  const row = document.getElementById(stepKey(name));
-  if (!row) return;
-  // For breach: "ok" on a macro-seg ping means traffic was BLOCKED = green
-  row.className = 'step-row ' + state;
-  const dot = document.createElement('div');
-  dot.className = 'step-dot';
-  row.replaceChild(dot, row.firstChild);
-  if (detail) row.querySelector('.step-detail').textContent = detail;
-}}
-
 function updateProgress() {{
   const total = Math.max(STEPS.length + 1, stepData.length + 1);
   const pct = Math.min(94, (stepData.length / total) * 100);
@@ -2803,7 +2792,7 @@ function showResult() {{
     : 'Simulation Incomplete — Review Log';
   document.getElementById('result-msg').textContent = allOk
     ? 'All three acts confirmed. VRF macro segmentation blocked cross-network pivoting. SGT micro segmentation stopped lateral movement within the campus. ISE CoA quarantined the compromised device instantly \u2014 without a single switch config change. Pseudoco\u2019s Zero Trust campus held.'
-    : 'One or more simulation steps could not be verified. Check fabric reachability, CTS policy configuration, and ISE ERS API access. Consult your proctor.';
+    : 'One or more simulation steps could not be verified. Check fabric reachability, CTS policy configuration, and switch SSH access. Consult your proctor.';
   const clone = document.getElementById('steps-list').cloneNode(true);
   clone.id = '';
   const rl = document.getElementById('result-steps-list');
