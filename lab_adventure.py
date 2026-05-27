@@ -202,21 +202,21 @@ interface Vlan10
  vrf forwarding Main
  ip dhcp relay source-interface Loopback0
  ip address 10.10.255.1 255.255.255.0
- ip helper-address global 198.18.5.102
+ ip helper-address 198.18.5.102
  no shutdown
 interface Vlan101
  mac-address 0001.0001.0101
  vrf forwarding PROD
  ip dhcp relay source-interface Loopback0
  ip address 10.101.255.1 255.255.255.0
- ip helper-address global 198.18.5.102
+ ip helper-address 198.18.5.102
  no shutdown
 interface Vlan102
  mac-address 0001.0001.0102
  vrf forwarding IOT
  ip dhcp relay source-interface Loopback0
  ip address 10.102.255.1 255.255.255.0
- ip helper-address global 198.18.5.102
+ ip helper-address 198.18.5.102
  no shutdown"""
 
 L3VNI_SVIS_CFG = """\

@@ -930,8 +930,9 @@ def _fix_dhcp_relay_global(log_fn=print):
             for vlan in VRF_VLANS:
                 send(f"interface {vlan}")
                 send("ip dhcp relay source-interface Loopback0")
+                send("no ip helper-address global 198.18.5.102")
                 send("no ip helper-address 198.18.5.102")
-                send("ip helper-address global 198.18.5.102")
+                send("ip helper-address 198.18.5.102")
                 send("exit")
             send("end")
             chan.send("write memory\n")
@@ -941,7 +942,7 @@ def _fix_dhcp_relay_global(log_fn=print):
                 out += chan.recv(4096)
             saved = "[OK]" in out.decode(errors="ignore")
             client.close()
-            log_fn(f"    {key} ({mgmt_ip}): DHCP relay fixed (global), saved={saved}")
+            log_fn(f"    {key} ({mgmt_ip}): DHCP relay fixed (no global), saved={saved}")
         except Exception as e:
             log_fn(f"    WARNING: DHCP relay fix failed on {key} ({mgmt_ip}): {e}")
 
@@ -1031,11 +1032,12 @@ def step_deploy_anycast_gateways(log_fn=print):
     except Exception as e:
         log_fn(f"  WARNING: Leaf2 verification failed: {e}")
 
-    # Fix DHCP relay on both leaves: CatC pushes 'ip helper-address 198.18.5.102' without
-    # the 'global' keyword, which routes DHCP via VRF Main → OMP → hub (dead path).
-    # We must change it to 'ip helper-address global' so relay exits via the global routing
-    # table (Loopback0 → OSPF → Border Spine → router global → 198.18.5.102).
-    log_fn(f"  Fixing DHCP relay to use global routing table on both leaves...")
+    # Fix DHCP relay on both leaves: CatC may push 'ip helper-address global' which routes
+    # DHCP out the global table — but Leaf1/Leaf2 have no global route to 198.18.5.102.
+    # Correct: use plain 'ip helper-address 198.18.5.102' (VRF Main) with source Loopback0.
+    # LISP resolves 198.18.5.0/24 in VRF Main via proxy ETR (Border Spine → router → hub).
+    # DHCP reply returns to Loopback0 (172.30.255.1) which is reachable from hub via vrf 10 BGP.
+    log_fn(f"  Fixing DHCP relay (removing global keyword) on both leaves...")
     _fix_dhcp_relay_global(log_fn=log_fn)
 
     return True, "deploy_anycast_gateways OK"
