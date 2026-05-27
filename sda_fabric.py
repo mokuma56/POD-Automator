@@ -284,13 +284,22 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
         # class-maps live in NETCONF datastore pushed by CatC)
         try:
             from ncclient import manager as _ncm
-            m = _ncm.connect(
-                host=mgmt_ip, port=830, username=SWITCH_USER, password=SWITCH_PASS,
-                hostkey_verify=False, device_params={"name": "iosxe"}, timeout=30
-            )
-            reply = m.edit_config(target="running", config=NETCONF_DELETE_XML)
-            m.close_session()
-            log_fn(f"    {mgmt_ip}: auth config cleaned (NETCONF class-map delete: {'OK' if reply.ok else 'skipped'})")
+            # Pre-check port 830 reachability before attempting ncclient connect
+            # (ncclient ignores timeout on TCP connect — hangs if port is firewalled)
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            sock.settimeout(10)
+            reachable = sock.connect_ex((mgmt_ip, 830)) == 0
+            sock.close()
+            if not reachable:
+                log_fn(f"    {mgmt_ip}: NETCONF port 830 not reachable — skipping class-map delete")
+            else:
+                m = _ncm.connect(
+                    host=mgmt_ip, port=830, username=SWITCH_USER, password=SWITCH_PASS,
+                    hostkey_verify=False, device_params={"name": "iosxe"}, timeout=30
+                )
+                reply = m.edit_config(target="running", config=NETCONF_DELETE_XML)
+                m.close_session()
+                log_fn(f"    {mgmt_ip}: auth config cleaned (NETCONF class-map delete: {'OK' if reply.ok else 'skipped'})")
         except ImportError:
             log_fn(f"    {mgmt_ip}: auth config cleaned (ncclient not available — class-maps may remain)")
         except Exception as e:
