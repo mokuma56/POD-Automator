@@ -4,7 +4,7 @@
 # Tested on Ubuntu 24.04 LTS (server or desktop, x86_64)
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/maokuma_cisco/pod-automator/main/appliance/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/mokuma56/POD-Automator/main/appliance/install.sh | sudo bash
 #
 #   OR after cloning:
 #   sudo bash appliance/install.sh
@@ -20,7 +20,7 @@
 # =============================================================================
 set -euo pipefail
 
-REPO_URL="https://github.com/maokuma_cisco/pod-automator.git"
+REPO_URL="https://github.com/mokuma56/POD-Automator.git"
 INSTALL_DIR="/opt/pod-automator"
 SERVICE_USER="podmgr"
 DASHBOARD_PORT="5050"
@@ -132,7 +132,7 @@ info "Installing systemd service..."
 cat > /etc/systemd/system/pod-automator.service << EOF
 [Unit]
 Description=POD Automator Dashboard
-Documentation=https://github.com/maokuma_cisco/pod-automator
+Documentation=https://github.com/mokuma56/POD-Automator
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
