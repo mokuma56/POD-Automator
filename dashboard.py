@@ -1048,6 +1048,7 @@ def api_fabric_run(pod_id):
         log(pod_id, f"[fabric] stdout: {result.stdout[-500:].strip()}")
         if result.stderr:
             log(pod_id, f"[fabric] stderr: {result.stderr[-300:].strip()}")
+        _clear_stuck_running(pod_id, "fabric_steps")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "message": f"Fabric automation started for {pod_id} from step {from_step}"})
@@ -1080,6 +1081,7 @@ def api_fabric_verify(pod_id):
         log(pod_id, f"[fabric-verify] stdout: {result.stdout[-500:].strip()}")
         if result.stderr:
             log(pod_id, f"[fabric-verify] stderr: {result.stderr[-300:].strip()}")
+        _clear_stuck_running(pod_id, "fabric_steps")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "message": f"Fabric verify started for {pod_id}"})
@@ -1094,6 +1096,41 @@ def api_fabric_reset(pod_id):
     c.execute("DELETE FROM fabric_steps WHERE pod_id=?", (pod_id,))
     c.commit(); c.close()
     return jsonify({"status": "ok", "message": f"Fabric steps reset for {pod_id}"})
+
+
+# ---------------------------------------------------------------------------
+# Watchdog helper — clears stuck 'running' rows after a container exits
+# ---------------------------------------------------------------------------
+
+def _clear_stuck_running(pod_id, table, mode=None):
+    """After a docker container exits, any row still at status='running' for
+    this pod was never updated (container crashed/OOM/killed).  Mark them
+    failed so the UI doesn't show a forever-spinning badge.
+
+    Args:
+        pod_id: POD identifier string
+        table:  'sda_steps' or 'fabric_steps'
+        mode:   optional mode column filter (used by sda_steps which has a
+                'mode' column — 'deploy' or 'rollback')
+    """
+    try:
+        c = _db()
+        if mode:
+            c.execute(
+                f"UPDATE {table} SET status='failed', result='container exited unexpectedly' "
+                "WHERE pod_id=? AND mode=? AND status='running'",
+                (pod_id, mode)
+            )
+        else:
+            c.execute(
+                f"UPDATE {table} SET status='failed', result='container exited unexpectedly' "
+                "WHERE pod_id=? AND status='running'",
+                (pod_id,)
+            )
+        c.commit()
+        c.close()
+    except Exception as e:
+        log(pod_id, f"[watchdog] WARNING: could not clear stuck running rows in {table}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1216,7 @@ def api_sda_deploy(pod_id):
             if line:
                 log(pod_id, f"[sda/log] {line}")
         proc.wait()
+        _clear_stuck_running(pod_id, "sda_steps", mode="deploy")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "ok", "message": f"SDA deploy started for {pod_id}"})
@@ -1219,6 +1257,7 @@ def api_sda_rollback(pod_id):
             if line:
                 log(pod_id, f"[sda/log] {line}")
         proc.wait()
+        _clear_stuck_running(pod_id, "sda_steps", mode="rollback")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "ok", "message": f"SDA rollback started for {pod_id}"})
