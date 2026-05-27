@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request
 
-sys.path.insert(0, str(Path.home() / "sw_projects" / "pod_automator"))
+sys.path.insert(0, str(Path(__file__).parent))
 import onboard_router
 try:
     import kb as _kb
@@ -16,7 +16,7 @@ except Exception as _kb_err:
     _KB_AVAILABLE = False
     _kb_err_msg = str(_kb_err)
 
-DATA_DIR = Path.home() / "sw_projects" / "pod_automator"
+DATA_DIR = Path(__file__).parent
 DB_PATH = DATA_DIR / "data" / "pod_state.db"
 
 app = Flask(__name__)
