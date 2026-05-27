@@ -156,7 +156,6 @@ DAG_SVIS = """\
 interface Vlan10
  mac-address 0001.0001.0010
  vrf forwarding Main
- ip dhcp relay source-interface Loopback0
  ip address 10.10.255.1 255.255.255.0
  ip helper-address 198.18.5.102
  no shutdown
@@ -164,7 +163,6 @@ interface Vlan10
 interface Vlan101
  mac-address 0001.0001.0101
  vrf forwarding PROD
- ip dhcp relay source-interface Loopback0
  ip address 10.101.255.1 255.255.255.0
  ip helper-address 198.18.5.102
  no shutdown
@@ -172,7 +170,6 @@ interface Vlan101
 interface Vlan102
  mac-address 0001.0001.0102
  vrf forwarding IOT
- ip dhcp relay source-interface Loopback0
  ip address 10.102.255.1 255.255.255.0
  ip helper-address 198.18.5.102
  no shutdown

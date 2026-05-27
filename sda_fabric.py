@@ -896,14 +896,18 @@ def rollback_configure_handoff_interface(log_fn=print):
 def _fix_dhcp_relay_global(log_fn=print):
     """Fix DHCP relay on Leaf1 and Leaf2 after CatC pushes SVIs.
 
-    CatC pushes 'ip helper-address 198.18.5.102' without the 'global' keyword.
-    Without 'global' the relay packet is forwarded via VRF Main → router OMP →
-    hub — a path that is broken in this lab. With 'global' the relay exits via
-    the global routing table: Loopback0 → OSPF → Border Spine → router global →
-    198.18.5.102, which works reliably.
+    CatC may push 'ip helper-address global' or 'ip dhcp relay source-interface
+    Loopback0' — both are wrong for this topology:
 
-    Also ensures 'ip dhcp relay source-interface Loopback0' is set so the relay
-    GIADDR is the switch Loopback0 IP (reachable from the DHCP server).
+    - 'global' keyword: leaf has no global route to 198.18.5.102 — black hole.
+    - 'relay source-interface Loopback0': giaddr = 172.30.255.1 (global table).
+      The hub replies to 172.30.255.1 but that address is only reachable via
+      VRF 10 on the router — hub traceroute dies at 198.19.2.13.
+
+    Correct config: plain 'ip helper-address 198.18.5.102' (VRF-aware relay),
+    NO source-interface override. giaddr = SVI IP (e.g. 10.10.255.1).
+    The hub knows 10.10.255.0/24 via OMP → router BGP → Border Spine → Leaf.
+    Reply path works end-to-end.
     """
     import time as _time
     VRF_VLANS = ["Vlan10", "Vlan101", "Vlan102"]
@@ -929,7 +933,7 @@ def _fix_dhcp_relay_global(log_fn=print):
             send("configure terminal")
             for vlan in VRF_VLANS:
                 send(f"interface {vlan}")
-                send("ip dhcp relay source-interface Loopback0")
+                send("no ip dhcp relay source-interface Loopback0")
                 send("no ip helper-address global 198.18.5.102")
                 send("no ip helper-address 198.18.5.102")
                 send("ip helper-address 198.18.5.102")
