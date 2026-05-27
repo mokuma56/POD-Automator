@@ -102,6 +102,8 @@ else
     success "Repo cloned."
 fi
 
+# Allow root git operations on this directory (avoids "dubious ownership" error)
+git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR"
 
 # ── 6. Python dependencies ──────────────────────────────────────────────────
