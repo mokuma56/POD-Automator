@@ -721,7 +721,7 @@ def _ssh_configure_border_handoff(mgmt_ip, log_fn=print):
     This function only ensures:
       - Gi1/0/48 is an L2 trunk (with CTS) so CatC can push VLANs
       - Vlan5 SVI has IP 192.168.255.7/31 for CatC underlay OSPF
-      - VRF SVIs (Vlan10/101/102) have the correct VRF assigned and no conflicting IPs
+      - VRF SVIs (Vlan10/101/102) have the correct VRF + transit IPs for BGP peering
       - BGP neighbors use update-source pointing to the SVIs (Vlan10/101/102)
       - No sub-interfaces exist (they conflict with CatC SVI management)
     """
@@ -732,7 +732,7 @@ def _ssh_configure_border_handoff(mgmt_ip, log_fn=print):
     #   - No sub-interfaces exist (they conflict with CatC)
     #   - Gi1/0/48 is L2 trunk with CTS
     #   - Vlan5 SVI has IP for CatC underlay OSPF
-    #   - VRF SVIs (Vlan10/101/102) have correct VRF assigned (IPs pushed by CatC later)
+    #   - VRF SVIs (Vlan10/101/102) have transit IPs for BGP (IPs set here, anycast IPs on Leaves by CatC)
     #   - BGP update-source points to the SVIs
     cmds = [
         "terminal length 0",
@@ -756,20 +756,21 @@ def _ssh_configure_border_handoff(mgmt_ip, log_fn=print):
         "ip ospf 1 area 0",
         "no shutdown",
         "exit",
-        # VRF SVIs — assign VRF only; IPs will be pushed by CatC deploy_anycast_gateways
+        # VRF SVIs — assign VRF + transit IPs for BGP peering with router
+        # (CatC pushes anycast gateway IPs to Leaves only; Border Spine needs its own transit IPs)
         "interface Vlan10",
         "vrf forwarding Main",
-        "no ip address",
+        "ip address 192.168.255.1 255.255.255.254",
         "no shutdown",
         "exit",
         "interface Vlan101",
         "vrf forwarding PROD",
-        "no ip address",
+        "ip address 192.168.255.3 255.255.255.254",
         "no shutdown",
         "exit",
         "interface Vlan102",
         "vrf forwarding IOT",
-        "no ip address",
+        "ip address 192.168.255.5 255.255.255.254",
         "no shutdown",
         "exit",
         # BGP update-source must be the SVIs (not sub-interfaces)
