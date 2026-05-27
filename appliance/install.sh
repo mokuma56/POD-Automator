@@ -77,12 +77,15 @@ fi
 if ! command -v uv &>/dev/null; then
     info "Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh >> "$LOG" 2>&1
-    # Make uv available system-wide
-    ln -sf "$HOME/.local/bin/uv" /usr/local/bin/uv 2>/dev/null || true
-    ln -sf /root/.local/bin/uv  /usr/local/bin/uv 2>/dev/null || true
-    success "uv installed."
+fi
+# Always copy the binary to /usr/local/bin so all users (including podmgr) can run it
+UV_BIN=$(find /root/.local/bin /home/*/.local/bin /usr/local/bin -name uv -type f 2>/dev/null | head -1)
+if [[ -n "$UV_BIN" ]]; then
+    cp -f "$UV_BIN" /usr/local/bin/uv
+    chmod 755 /usr/local/bin/uv
+    success "uv installed: $(uv --version)"
 else
-    success "uv already present: $(uv --version)"
+    die "uv binary not found after install."
 fi
 
 # ── 4. Service user ─────────────────────────────────────────────────────────
@@ -101,6 +104,8 @@ if [[ -d "$INSTALL_DIR/.git" ]]; then
     info "Repo already cloned — pulling latest..."
     git -C "$INSTALL_DIR" pull --ff-only >> "$LOG" 2>&1 || warn "Pull failed — using existing code."
 else
+    # Remove any partial/failed clone from a previous run
+    rm -rf "$INSTALL_DIR"
     info "Cloning pod-automator to $INSTALL_DIR..."
     git clone "$REPO_URL" "$INSTALL_DIR" >> "$LOG" 2>&1
     success "Repo cloned."
@@ -110,11 +115,8 @@ chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR"
 
 # ── 6. Python dependencies ──────────────────────────────────────────────────
 info "Installing Python dependencies via uv..."
-sudo -u "$SERVICE_USER" bash -c "
-    cd '$INSTALL_DIR'
-    /usr/local/bin/uv sync --no-dev 2>&1 || \
-    /usr/local/bin/uv pip install -r requirements.txt 2>&1
-" >> "$LOG" 2>&1
+cd "$INSTALL_DIR"
+uv sync --no-dev >> "$LOG" 2>&1 || uv pip install -r requirements.txt >> "$LOG" 2>&1
 success "Python dependencies installed."
 
 # ── 7. Data directory ───────────────────────────────────────────────────────
