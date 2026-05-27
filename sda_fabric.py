@@ -715,61 +715,78 @@ def _ssh_border_restore_trunk(mgmt_ip, log_fn=print):
 
 
 def _ssh_configure_border_handoff(mgmt_ip, log_fn=print):
-    """Convert Border Spine Gi1/0/48 from L2 trunk to routed sub-interfaces for L3 handoff.
+    """Prepare Border Spine for L3 handoff to SD-WAN router via Gi1/0/48 (L2 trunk).
 
-    Sub-interfaces created:
-      Gi1/0/48.5   — 192.168.255.7/31  (CatC underlay, replaces Vlan5 SVI)
-      Gi1/0/48.10  — 192.168.255.1/31  VRF Main
-      Gi1/0/48.101 — 192.168.255.3/31  VRF PROD
-      Gi1/0/48.102 — 192.168.255.5/31  VRF IOT
+    CatC owns the SVI IPs (Vlan10/101/102) — it pushes them during deploy_anycast_gateways.
+    This function only ensures:
+      - Gi1/0/48 is an L2 trunk (with CTS) so CatC can push VLANs
+      - Vlan5 SVI has IP 192.168.255.7/31 for CatC underlay OSPF
+      - VRF SVIs (Vlan10/101/102) have the correct VRF assigned and no conflicting IPs
+      - BGP neighbors use update-source pointing to the SVIs (Vlan10/101/102)
+      - No sub-interfaces exist (they conflict with CatC SVI management)
     """
-    import time as _time, socket as _socket
+    import time as _time
 
+    # CatC pushes SVI IPs during deploy_anycast_gateways — we must NOT use sub-interfaces.
+    # This function only ensures:
+    #   - No sub-interfaces exist (they conflict with CatC)
+    #   - Gi1/0/48 is L2 trunk with CTS
+    #   - Vlan5 SVI has IP for CatC underlay OSPF
+    #   - VRF SVIs (Vlan10/101/102) have correct VRF assigned (IPs pushed by CatC later)
+    #   - BGP update-source points to the SVIs
     cmds = [
         "terminal length 0",
         "configure terminal",
-        # Remove CTS sub-mode first (blocks 'no switchport')
+        # Remove any sub-interfaces from prior runs
+        "no interface GigabitEthernet1/0/48.5",
+        "no interface GigabitEthernet1/0/48.10",
+        "no interface GigabitEthernet1/0/48.101",
+        "no interface GigabitEthernet1/0/48.102",
+        # Ensure Gi1/0/48 is L2 trunk with CTS
         "interface GigabitEthernet1/0/48",
-        "no cts manual",
-        "no cts role-based enforcement",
-        "no switchport mode trunk",
-        "no switchport",
-        # Re-apply CTS on routed parent so SGT propagates to SD-WAN sub-interfaces
+        "switchport mode trunk",
         "cts manual",
         " policy static sgt 2",
         "no cts role-based enforcement",
         "no shutdown",
-        # CatC underlay sub-interface (replaces Vlan5 SVI)
-        "interface GigabitEthernet1/0/48.5",
-        "encapsulation dot1Q 5",
+        "exit",
+        # Vlan5 SVI — CatC underlay OSPF
+        "interface Vlan5",
         "ip address 192.168.255.7 255.255.255.254",
         "ip ospf 1 area 0",
         "no shutdown",
-        # Disable Vlan5 SVI so its IP doesn't conflict
-        "interface Vlan5",
-        "no ip address",
-        "no ip ospf 1 area 0",
-        "shutdown",
-        # VRF sub-interfaces
-        "interface GigabitEthernet1/0/48.10",
-        "encapsulation dot1Q 10",
+        "exit",
+        # VRF SVIs — assign VRF only; IPs will be pushed by CatC deploy_anycast_gateways
+        "interface Vlan10",
         "vrf forwarding Main",
-        "ip address 192.168.255.1 255.255.255.254",
+        "no ip address",
         "no shutdown",
-        "interface GigabitEthernet1/0/48.101",
-        "encapsulation dot1Q 101",
+        "exit",
+        "interface Vlan101",
         "vrf forwarding PROD",
-        "ip address 192.168.255.3 255.255.255.254",
+        "no ip address",
         "no shutdown",
-        "interface GigabitEthernet1/0/48.102",
-        "encapsulation dot1Q 102",
+        "exit",
+        "interface Vlan102",
         "vrf forwarding IOT",
-        "ip address 192.168.255.5 255.255.255.254",
+        "no ip address",
         "no shutdown",
+        "exit",
+        # BGP update-source must be the SVIs (not sub-interfaces)
+        "router bgp 65535",
+        "address-family ipv4 vrf Main",
+        "neighbor 192.168.255.0 update-source Vlan10",
+        "exit-address-family",
+        "address-family ipv4 vrf PROD",
+        "neighbor 192.168.255.2 update-source Vlan101",
+        "exit-address-family",
+        "address-family ipv4 vrf IOT",
+        "neighbor 192.168.255.4 update-source Vlan102",
+        "exit-address-family",
+        "exit",
         "end",
     ]
 
-    # Push config — socket may drop after 'no switchport', that's expected
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -778,141 +795,78 @@ def _ssh_configure_border_handoff(mgmt_ip, log_fn=print):
         chan = client.invoke_shell()
         _time.sleep(0.8)
         for cmd in cmds:
-            try:
-                chan.send(cmd + "\n")
-                _time.sleep(0.5)
-                while chan.recv_ready():
-                    chan.recv(4096)
-            except (_socket.error, OSError):
-                log_fn(f"    Socket closed after '{cmd}' (expected during no-switchport)")
-                break
-        try:
-            client.close()
-        except Exception:
-            pass
+            chan.send(cmd + "\n")
+            _time.sleep(0.4)
+            while chan.recv_ready():
+                chan.recv(4096)
+        chan.send("write memory\n")
+        _time.sleep(4)
+        out = b""
+        while chan.recv_ready():
+            out += chan.recv(4096)
+        client.close()
+        if "[OK]" in out.decode(errors="ignore"):
+            log_fn(f"    {mgmt_ip}: handoff interface prepared and saved")
+        else:
+            log_fn(f"    {mgmt_ip}: write memory issued (no [OK] in output)")
     except Exception as e:
-        log_fn(f"    Config push error (may be OK if socket dropped): {e}")
-
-    # Reconnect after switch stabilises.
-    # After 'no switchport' drops the SSH session, the sub-interfaces exist but
-    # have no IPs. Re-apply IPs here, clear any conflicting SVI IPs, then save.
-    log_fn(f"    Waiting for switch to stabilise...")
-    _time.sleep(8)
-    ip_cmds = [
-        "terminal length 0",
-        "configure terminal",
-        # Clear conflicting SVI IPs that may have been left by a prior SDA run
-        "interface Vlan10",  "no ip address",  "exit",
-        "interface Vlan101", "no ip address",  "exit",
-        "interface Vlan102", "no ip address",  "exit",
-        # Apply IPs to sub-interfaces (VRF already set; must apply IP after vrf forwarding)
-        "interface GigabitEthernet1/0/48.5",
-        "ip address 192.168.255.7 255.255.255.254",
-        "ip ospf 1 area 0",
-        "no shutdown",
-        "exit",
-        "interface GigabitEthernet1/0/48.10",
-        "ip address 192.168.255.1 255.255.255.254",
-        "no shutdown",
-        "exit",
-        "interface GigabitEthernet1/0/48.101",
-        "ip address 192.168.255.3 255.255.255.254",
-        "no shutdown",
-        "exit",
-        "interface GigabitEthernet1/0/48.102",
-        "ip address 192.168.255.5 255.255.255.254",
-        "no shutdown",
-        "exit",
-        "end",
-    ]
-    for attempt in range(6):
-        try:
-            c2 = paramiko.SSHClient()
-            c2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            c2.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
-                       timeout=10, allow_agent=False, look_for_keys=False)
-            ch2 = c2.invoke_shell()
-            _time.sleep(0.5)
-            for cmd in ip_cmds:
-                ch2.send(cmd + "\n")
-                _time.sleep(0.4)
-                while ch2.recv_ready():
-                    ch2.recv(4096)
-            ch2.send("write memory\n")
-            _time.sleep(4)
-            out = b""
-            while ch2.recv_ready():
-                out += ch2.recv(4096)
-            c2.close()
-            if "[OK]" in out.decode(errors="ignore"):
-                log_fn(f"    {mgmt_ip}: sub-interfaces configured and saved")
-                return
-            log_fn(f"    write memory attempt {attempt+1}: no [OK] yet")
-        except Exception as e:
-            log_fn(f"    write memory attempt {attempt+1}: {e}")
-        _time.sleep(3)
-    raise RuntimeError(f"Could not save config on {mgmt_ip} after 6 attempts")
+        raise RuntimeError(f"Config push to {mgmt_ip} failed: {e}")
 
 
 def step_configure_handoff_interface(log_fn=print):
-    """Convert Border Spine Gi1/0/48 to routed sub-interfaces for per-VRF L3 handoff to SD-WAN.
+    """Prepare Border Spine Gi1/0/48 as L2 trunk for CatC L3 handoff.
 
-    Creates:
-      Gi1/0/48.5   (CatC underlay, replaces Vlan5 SVI)
-      Gi1/0/48.10  VRF Main  192.168.255.1/31
-      Gi1/0/48.101 VRF PROD  192.168.255.3/31
-      Gi1/0/48.102 VRF IOT   192.168.255.5/31
+    CatC owns the SVI IPs (Vlan10/101/102) — it pushes them during deploy_anycast_gateways.
+    This step only:
+      - Removes any sub-interfaces from prior runs (they conflict with CatC)
+      - Ensures Gi1/0/48 is an L2 trunk with CTS
+      - Ensures Vlan5 SVI has 192.168.255.7/31 for CatC underlay OSPF
+      - Sets VRF forwarding on Vlan10/101/102 (IPs pushed by CatC later)
+      - Sets BGP update-source to Vlan10/101/102
 
-    Skips if sub-interfaces already present with correct IPs.
+    Skips if already in correct state (no sub-interfaces, Gi1/0/48 trunk, Vlan5 has IP).
     """
     import time as _time
     border_ip = SWITCH_IPS["border_spine"]["mgmt"]
 
-    # Check if already configured with correct IPs.
-    # NOTE: VRF sub-interfaces don't appear in 'show ip interface brief' (no-VRF view).
-    # Use 'show run' to check IP addresses are present.
+    # Pre-check: skip if already clean (no sub-interfaces, Vlan5 has IP)
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(border_ip, username=SWITCH_USER, password=SWITCH_PASS,
                        timeout=15, allow_agent=False, look_for_keys=False)
-        _, out, _ = client.exec_command("show run | section GigabitEthernet1/0/48")
-        run_cfg = out.read().decode()
+        _, out, _ = client.exec_command("show ip interface brief | include Vlan5")
+        vlan5 = out.read().decode()
+        _, out2, _ = client.exec_command("show run | include GigabitEthernet1/0/48\.")
+        sub_ifaces = out2.read().decode()
         client.close()
-        # All 4 sub-interfaces must be present AND have IPs assigned
-        all_present = all(f"GigabitEthernet1/0/48.{s}" in run_cfg for s in ["5", "10", "101", "102"])
-        all_have_ip = (
-            "192.168.255.7" in run_cfg and
-            "192.168.255.1" in run_cfg and
-            "192.168.255.3" in run_cfg and
-            "192.168.255.5" in run_cfg
-        )
-        if all_present and all_have_ip:
-            log_fn(f"  Gi1/0/48 sub-interfaces already configured with IPs, skipping")
+        has_vlan5_ip = "192.168.255.7" in vlan5 and "unassigned" not in vlan5
+        has_sub_ifaces = "GigabitEthernet1/0/48." in sub_ifaces
+        if has_vlan5_ip and not has_sub_ifaces:
+            log_fn(f"  Handoff interface already clean — Vlan5 IP present, no sub-interfaces, skipping")
             return True, "configure_handoff_interface already done"
     except Exception as e:
         log_fn(f"  WARNING: pre-check failed ({e}), proceeding with config push")
 
-    log_fn(f"  Converting Gi1/0/48 to routed sub-interfaces on {border_ip}...")
+    log_fn(f"  Preparing Gi1/0/48 L2 trunk and VRF SVIs on {border_ip}...")
     _ssh_configure_border_handoff(border_ip, log_fn=log_fn)
 
-    # Verify sub-interfaces came up with correct IPs
-    _time.sleep(5)
+    # Verify
+    _time.sleep(3)
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(border_ip, username=SWITCH_USER, password=SWITCH_PASS,
                        timeout=15, allow_agent=False, look_for_keys=False)
-        _, out, _ = client.exec_command("show run | section GigabitEthernet1/0/48")
-        result = out.read().decode()
-        _, out2, _ = client.exec_command("show ip interface brief | include Gi1/0/48")
-        brief = out2.read().decode()
+        _, out, _ = client.exec_command("show ip interface brief | include Vlan5")
+        vlan5_result = out.read().decode()
+        _, out2, _ = client.exec_command("show interfaces GigabitEthernet1/0/48 | include line protocol")
+        gi48_result = out2.read().decode()
         client.close()
-        log_fn(f"  Interface state:\n{brief}")
-        if "GigabitEthernet1/0/48.10" not in result:
-            raise RuntimeError("Sub-interfaces not present after config push")
-        if "192.168.255.7" not in result:
-            raise RuntimeError("Gi1/0/48.5 has no IP — config push may have been incomplete")
+        log_fn(f"  Vlan5: {vlan5_result.strip()}")
+        log_fn(f"  Gi1/0/48: {gi48_result.strip()}")
+        if "192.168.255.7" not in vlan5_result:
+            raise RuntimeError("Vlan5 SVI missing 192.168.255.7 after config push")
     except RuntimeError:
         raise
     except Exception as e:
