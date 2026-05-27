@@ -1134,7 +1134,10 @@ def step_l3_handoff(log_fn=print):
 
 
 def step_port_assignments(log_fn=print):
-    """Set Gi1/0/2 on Leaf1 and Leaf2 as trunk, native VLAN 10, allowed 10,101,102."""
+    """Configure port assignments on Leaf1 and Leaf2:
+      - Gi1/0/2: trunk, native VLAN 10, allowed 10,101,102 (AP port, No Auth)
+      - Gi1/0/3: access, Closed Authentication (client port → ISE → VRF assignment)
+    """
     s = _catc_session(log_fn)
     fabric_id = _get_fabric_id(s)
     leaf1_id  = _get_device_id(s, "Leaf1")
@@ -1147,6 +1150,7 @@ def step_port_assignments(log_fn=print):
 
     to_add = []
     for dev_id in [leaf1_id, leaf2_id]:
+        # Gi1/0/2 — AP trunk port
         if (dev_id, PORT_ASSIGNMENT_INTERFACE) not in existing:
             to_add.append({
                 "fabricId": fabric_id,
@@ -1157,14 +1161,61 @@ def step_port_assignments(log_fn=print):
                 "nativeVlanId": PORT_NATIVE_VLAN,
                 "allowedVlanRanges": PORT_ALLOWED_VLANS,
             })
+        # Gi1/0/3 — client port, Closed Authentication → ISE → VRF assignment
+        if (dev_id, "GigabitEthernet1/0/3") not in existing:
+            to_add.append({
+                "fabricId": fabric_id,
+                "networkDeviceId": dev_id,
+                "interfaceName": "GigabitEthernet1/0/3",
+                "connectedDeviceType": "USER_DEVICE",
+                "authenticateTemplateName": "Closed Authentication",
+            })
 
     if not to_add:
         log_fn(f"  Port assignments already configured")
         return True, "port_assignments already configured"
 
-    log_fn(f"  Adding {len(to_add)} port assignment(s) (one per device)...")
+    log_fn(f"  Adding {len(to_add)} port assignment(s)...")
     for entry in to_add:
         _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/portAssignments", [entry], log_fn=log_fn, timeout=300)
+
+    # Also ensure closed auth template is applied via SSH (CatC may lag)
+    log_fn(f"  Ensuring Gi1/0/3 closed auth template applied via SSH on both leaves...")
+    import time as _time
+    closed_auth_cmds = [
+        "conf t",
+        "interface GigabitEthernet1/0/3",
+        " dot1x timeout tx-period 7",
+        " dot1x max-reauth-req 3",
+        " source template DefaultWiredDot1xClosedAuth",
+        " spanning-tree bpduguard enable",
+        "end",
+        "write memory",
+    ]
+    for key in ("leaf1", "leaf2"):
+        mgmt_ip = SWITCH_IPS[key]["mgmt"]
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                           timeout=15, allow_agent=False, look_for_keys=False)
+            chan = client.invoke_shell()
+            _time.sleep(0.5)
+            def send(cmd, w=0.6):
+                chan.send(cmd + "\n")
+                _time.sleep(w)
+                out = b""
+                while chan.recv_ready():
+                    out += chan.recv(4096)
+                return out.decode(errors="ignore")
+            send("terminal length 0")
+            for cmd in closed_auth_cmds:
+                send(cmd)
+            client.close()
+            log_fn(f"    {key} ({mgmt_ip}): Gi1/0/3 closed auth applied")
+        except Exception as e:
+            log_fn(f"    WARNING: SSH closed auth fix failed on {key} ({mgmt_ip}): {e}")
+
     return True, "port_assignments OK"
 
 
