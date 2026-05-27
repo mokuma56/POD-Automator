@@ -10,7 +10,7 @@ automates Cisco SD-WAN C8231-G2 router onboarding for dCloud lab sessions.
 | Component | Details |
 |-----------|---------|
 | **Dashboard** | Flask web UI at `http://<vm-ip>:5050` |
-| **Pipeline** | 16-step SD-WAN onboarding automation per POD |
+| **Pipeline** | 17-step SD-WAN onboarding automation per POD |
 | **Docker** | Per-POD isolated VPN + pipeline containers |
 | **AD Verify** | LDAP check that user accounts are correctly provisioned |
 | **cdFMC tab** | Terraform deploy status + FTD device verification |
@@ -157,7 +157,7 @@ Click **Connect All VPN** and wait for all POD rows to show a green dot
 in the VPN column (typically 15–30 seconds per POD).
 
 ### 4. Run Automation
-Click **Run All POD Automation**. The pipeline runs 16 steps per POD:
+Click **Run All POD Automation**. The pipeline runs 17 steps per POD:
 
 | Step | What it does |
 |------|-------------|
@@ -176,7 +176,8 @@ Click **Run All POD Automation**. The pipeline runs 16 steps per POD:
 | 13 | Verify Leaf 2 switch |
 | 14 | Check cdFMC / Terraform deployment |
 | 15 | Verify AD user provisioning |
-| 16 | Final ready check |
+| 16 | SDA fabric deploy |
+| 17 | Final ready check |
 
 Full automation takes **15–25 minutes** per POD.
 
