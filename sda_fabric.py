@@ -157,6 +157,148 @@ def _ssh_clean_switch_vlans(mgmt_ip, vlans, log_fn=print):
         log_fn(f"    WARNING: SSH to {mgmt_ip} failed: {e}")
 
 
+def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
+    """Remove AAA/dot1x/access-session config left by a previous SDA run.
+
+    CatC rejects fabric_devices if these configs are present on the switch.
+    Safe to run even if config is absent — all errors are silently ignored.
+
+    Steps:
+    1. Remove 'source template WIRED_*' from interfaces (holds class-map lock)
+    2. Remove WIRED_* templates (with confirm) and policy-maps
+    3. Use NETCONF edit-config to delete class-maps (CLI 'no class-map' silently
+       fails when class-maps live in NETCONF datastore, not CLI running-config)
+    4. Remove AAA/dot1x/access-session config
+    """
+    import time as _time, socket as _socket
+    TEMPLATES = ["WIRED_DOT1X_CLOSED", "WIRED_DOT1X_OPEN", "WIRED_MAB_CLOSED", "WIRED_MAB_OPEN"]
+    POLICY_MAPS = ["DOT1X_MAB_POLICY", "MAB_DOT1X_POLICY"]
+    CLASS_MAPS = [
+        "AAA_SVR_DOWN_AUTHD_HOST", "AAA_SVR_DOWN_UNAUTHD_HOST", "AUTHC_SUCCESS_AUTHZ_FAIL",
+        "DOT1X", "DOT1X_FAILED", "DOT1X_NO_RESP", "DOT1X_TIMEOUT",
+        "IN_CRITICAL_AUTH", "MAB", "MAB_FAILED", "NOT_IN_CRITICAL_AUTH",
+    ]
+    NETCONF_DELETE_CLASS_MAPS = "\n".join(
+        f'      <class-map xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-policy" xc:operation="remove">'
+        f'<name>{cm}</name></class-map>'
+        for cm in CLASS_MAPS
+    )
+    NETCONF_DELETE_XML = f"""
+<config xmlns:xc="urn:ietf:params:xml:ns:netconf:base:1.0">
+  <native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">
+    <policy>
+{NETCONF_DELETE_CLASS_MAPS}
+    </policy>
+  </native>
+</config>"""
+
+    # Ordered teardown: dependent commands first, then aaa new-model
+    pre_cmds = [
+        "no aaa accounting identity default start-stop group dnac-client-radius-group",
+        "no aaa accounting update newinfo periodic 2880",
+        "no aaa authorization network dnac-cts-list group dnac-client-radius-group",
+        "no aaa authorization network default group dnac-client-radius-group",
+        "no aaa authorization exec default local",
+        "no aaa authentication dot1x default group dnac-client-radius-group",
+        "no aaa authentication login dnac-cts-list group dnac-client-radius-group local",
+        "no aaa authentication login default local",
+        "no aaa group server radius dnac-client-radius-group",
+        "no aaa server radius dynamic-author",
+        "no dot1x system-auth-control",
+        "no access-session mac-move deny",
+        "no access-session attributes filter-list list ISE-DS-LIST",
+        "no access-session authentication attributes filter-spec include list ISE-DS-LIST",
+        "no access-session accounting attributes filter-spec include list ISE-DS-LIST",
+    ]
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=20, allow_agent=False, look_for_keys=False)
+        chan = client.invoke_shell()
+        _time.sleep(1); chan.recv(4096)
+
+        def send(cmd, wait=1.0):
+            chan.send(cmd + "\n")
+            _time.sleep(wait)
+            out = b""
+            while chan.recv_ready():
+                out += chan.recv(4096)
+            return out.decode(errors="ignore")
+
+        def ensure_config_mode():
+            chan.send("end\n"); _time.sleep(0.5); chan.recv(4096)
+            chan.send("configure terminal\n"); _time.sleep(0.5); chan.recv(4096)
+
+        send("terminal length 0", 0.5)
+        send("enable", 0.5)
+
+        # Step 1: Remove 'source template WIRED_*' from all interfaces
+        # First find which interfaces have it
+        send("configure terminal", 0.5)
+        for iface_prefix in ["GigabitEthernet1/0/1", "GigabitEthernet1/0/2", "GigabitEthernet1/0/3",
+                              "GigabitEthernet1/0/4", "GigabitEthernet1/0/5", "GigabitEthernet1/0/6",
+                              "GigabitEthernet1/0/7", "GigabitEthernet1/0/8", "GigabitEthernet1/0/9",
+                              "GigabitEthernet1/0/10", "GigabitEthernet1/0/11", "GigabitEthernet1/0/12"]:
+            send(f"interface {iface_prefix}", 0.3)
+            for tmpl in TEMPLATES:
+                send(f"no source template {tmpl}", 0.3)
+            send("exit", 0.3)
+        ensure_config_mode()
+
+        # Step 2: Remove templates (need to enter template, remove service-policy, exit, then delete)
+        for tmpl in TEMPLATES:
+            send(f"template {tmpl}", 0.5)
+            for pm in POLICY_MAPS:
+                send(f"no service-policy type control subscriber {pm}", 0.4)
+            send("end", 0.5); chan.recv(4096)
+            send("configure terminal", 0.5)
+            chan.send(f"no template {tmpl}\n"); _time.sleep(1.5)
+            out = chan.recv(4096).decode(errors="ignore")
+            if "[confirm]" in out or "CONFIRM" in out:
+                chan.send("\n"); _time.sleep(1.5); chan.recv(4096)
+            ensure_config_mode()
+
+        # Step 3: Remove policy-maps via CLI (may fail if still referenced — OK)
+        for pm in POLICY_MAPS:
+            send(f"no policy-map type control subscriber {pm}", 0.5)
+
+        # Step 4: Remove AAA/dot1x config
+        for cmd in pre_cmds:
+            send(cmd, 0.4)
+        # aaa new-model requires [confirm] on IOS-XE
+        chan.send("no aaa new-model\n"); _time.sleep(1)
+        out = chan.recv(4096).decode(errors="ignore")
+        if "[confirm]" in out or "Continue" in out:
+            chan.send("\n"); _time.sleep(1); chan.recv(4096)
+        send("no aaa session-id common", 0.5)
+        send("end", 0.5)
+        # write memory — use copy run start in case privilege dropped
+        chan.send("copy running-config startup-config\n"); _time.sleep(1)
+        out = chan.recv(4096).decode(errors="ignore")
+        if "?" in out or "filename" in out.lower():
+            chan.send("\n"); _time.sleep(3); chan.recv(4096)
+        client.close()
+
+        # Step 5: Delete class-maps via NETCONF (CLI delete silently fails when
+        # class-maps live in NETCONF datastore pushed by CatC)
+        try:
+            from ncclient import manager as _ncm
+            m = _ncm.connect(
+                host=mgmt_ip, port=830, username=SWITCH_USER, password=SWITCH_PASS,
+                hostkey_verify=False, device_params={"name": "iosxe"}, timeout=30
+            )
+            reply = m.edit_config(target="running", config=NETCONF_DELETE_XML)
+            m.close_session()
+            log_fn(f"    {mgmt_ip}: auth config cleaned (NETCONF class-map delete: {'OK' if reply.ok else 'skipped'})")
+        except ImportError:
+            log_fn(f"    {mgmt_ip}: auth config cleaned (ncclient not available — class-maps may remain)")
+        except Exception as e:
+            log_fn(f"    {mgmt_ip}: auth config cleaned (NETCONF class-map delete skipped: {e})")
+    except Exception as e:
+        log_fn(f"    WARNING: auth cleanup SSH to {mgmt_ip} failed: {e}")
+
+
 def _catc_resync_device(s, dev_id, log_fn=print):
     """Trigger inventory resync for a device and wait for it."""
     r = s.put(f"{CATC_BASE}/dna/intent/api/v1/network-device/sync", json=[dev_id])
@@ -493,12 +635,23 @@ def step_transit(log_fn=print):
 
 
 def step_clean_fabric_vlans(log_fn=print):
-    """Remove conflicting VLANs/SVIs from all switches and resync in CatC before fabric add."""
+    """Remove conflicting VLANs/SVIs and prior-run sub-interfaces from switches, resync CatC."""
     s = _catc_session(log_fn)
-    log_fn(f"  Cleaning VLANs {FABRIC_CONFLICT_VLANS} from switches before fabric add...")
+
+    log_fn(f"  Cleaning VLANs {FABRIC_CONFLICT_VLANS} and Gi1/0/48 sub-interfaces from switches...")
     for key, info in SWITCH_IPS.items():
         log_fn(f"  → {info['name']} ({info['mgmt']})")
         _ssh_clean_switch_vlans(info["mgmt"], FABRIC_CONFLICT_VLANS, log_fn=log_fn)
+
+    log_fn(f"  Removing any prior AAA/dot1x/access-session config from switches...")
+    for key, info in SWITCH_IPS.items():
+        log_fn(f"  → {info['name']} ({info['mgmt']})")
+        _ssh_clean_auth_config(info["mgmt"], log_fn=log_fn)
+
+    # Also clean Border Spine Gi1/0/48 sub-interfaces from any prior run
+    border_ip = SWITCH_IPS["border_spine"]["mgmt"]
+    log_fn(f"  Cleaning Gi1/0/48 sub-interfaces on Border Spine ({border_ip})...")
+    _ssh_border_restore_trunk(border_ip, log_fn=log_fn)
 
     log_fn(f"  Resyncing devices in CatC inventory...")
     for key, info in SWITCH_IPS.items():
@@ -508,6 +661,361 @@ def step_clean_fabric_vlans(log_fn=print):
             _catc_resync_device(s, dev_id, log_fn=log_fn)
     log_fn(f"  ✓ clean_fabric_vlans done")
     return True, "clean_fabric_vlans OK"
+
+
+def _ssh_border_restore_trunk(mgmt_ip, log_fn=print):
+    """Restore Gi1/0/48 on Border Spine to a clean L2 trunk (undo any prior routed conversion)."""
+    import time as _time, socket as _socket
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=20, allow_agent=False, look_for_keys=False)
+        chan = client.invoke_shell()
+        _time.sleep(0.8)
+
+        def send(cmd, wait=0.6):
+            try:
+                chan.send(cmd + "\n")
+                _time.sleep(wait)
+                out = b""
+                while chan.recv_ready():
+                    out += chan.recv(4096)
+                return out.decode(errors="ignore")
+            except (_socket.error, OSError):
+                return ""
+
+        send("terminal length 0", 0.3)
+        send("configure terminal", 0.3)
+        # Remove sub-interfaces from any prior run
+        for sub in ["5", "10", "101", "102"]:
+            send(f"no interface GigabitEthernet1/0/48.{sub}", 0.3)
+        # Restore Vlan5 SVI IP (CatC underlay) if it was moved to sub-interface
+        send("interface Vlan5", 0.3)
+        send("ip address 192.168.255.7 255.255.255.254", 0.3)
+        send("ip ospf 1 area 0", 0.3)
+        send("no shutdown", 0.3)
+        send("exit", 0.3)
+        # Ensure Gi1/0/48 is back to L2 trunk with CTS
+        send("interface GigabitEthernet1/0/48", 0.3)
+        send("no cts manual", 0.3)   # remove CTS sub-mode first
+        send("switchport", 0.5)      # convert routed → L2 before setting trunk
+        send("switchport mode trunk", 0.3)
+        send("cts manual", 0.3)
+        send(" policy static sgt 2", 0.3)
+        send("no cts role-based enforcement", 0.3)
+        send("no shutdown", 0.3)
+        send("exit", 0.3)
+        send("end", 0.5)
+        out = send("write memory", 3)
+        log_fn(f"    {mgmt_ip}: Gi1/0/48 restored to trunk — {'OK' if '[OK]' in out else 'write issued'}")
+        client.close()
+    except Exception as e:
+        log_fn(f"    WARNING: restore trunk on {mgmt_ip} failed: {e}")
+
+
+def _ssh_configure_border_handoff(mgmt_ip, log_fn=print):
+    """Convert Border Spine Gi1/0/48 from L2 trunk to routed sub-interfaces for L3 handoff.
+
+    Sub-interfaces created:
+      Gi1/0/48.5   — 192.168.255.7/31  (CatC underlay, replaces Vlan5 SVI)
+      Gi1/0/48.10  — 192.168.255.1/31  VRF Main
+      Gi1/0/48.101 — 192.168.255.3/31  VRF PROD
+      Gi1/0/48.102 — 192.168.255.5/31  VRF IOT
+    """
+    import time as _time, socket as _socket
+
+    cmds = [
+        "terminal length 0",
+        "configure terminal",
+        # Remove CTS sub-mode first (blocks 'no switchport')
+        "interface GigabitEthernet1/0/48",
+        "no cts manual",
+        "no cts role-based enforcement",
+        "no switchport mode trunk",
+        "no switchport",
+        # Re-apply CTS on routed parent so SGT propagates to SD-WAN sub-interfaces
+        "cts manual",
+        " policy static sgt 2",
+        "no cts role-based enforcement",
+        "no shutdown",
+        # CatC underlay sub-interface (replaces Vlan5 SVI)
+        "interface GigabitEthernet1/0/48.5",
+        "encapsulation dot1Q 5",
+        "ip address 192.168.255.7 255.255.255.254",
+        "ip ospf 1 area 0",
+        "no shutdown",
+        # Disable Vlan5 SVI so its IP doesn't conflict
+        "interface Vlan5",
+        "no ip address",
+        "no ip ospf 1 area 0",
+        "shutdown",
+        # VRF sub-interfaces
+        "interface GigabitEthernet1/0/48.10",
+        "encapsulation dot1Q 10",
+        "vrf forwarding Main",
+        "ip address 192.168.255.1 255.255.255.254",
+        "no shutdown",
+        "interface GigabitEthernet1/0/48.101",
+        "encapsulation dot1Q 101",
+        "vrf forwarding PROD",
+        "ip address 192.168.255.3 255.255.255.254",
+        "no shutdown",
+        "interface GigabitEthernet1/0/48.102",
+        "encapsulation dot1Q 102",
+        "vrf forwarding IOT",
+        "ip address 192.168.255.5 255.255.255.254",
+        "no shutdown",
+        "end",
+    ]
+
+    # Push config — socket may drop after 'no switchport', that's expected
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=20, allow_agent=False, look_for_keys=False)
+        chan = client.invoke_shell()
+        _time.sleep(0.8)
+        for cmd in cmds:
+            try:
+                chan.send(cmd + "\n")
+                _time.sleep(0.5)
+                while chan.recv_ready():
+                    chan.recv(4096)
+            except (_socket.error, OSError):
+                log_fn(f"    Socket closed after '{cmd}' (expected during no-switchport)")
+                break
+        try:
+            client.close()
+        except Exception:
+            pass
+    except Exception as e:
+        log_fn(f"    Config push error (may be OK if socket dropped): {e}")
+
+    # Reconnect after switch stabilises.
+    # After 'no switchport' drops the SSH session, the sub-interfaces exist but
+    # have no IPs. Re-apply IPs here, clear any conflicting SVI IPs, then save.
+    log_fn(f"    Waiting for switch to stabilise...")
+    _time.sleep(8)
+    ip_cmds = [
+        "terminal length 0",
+        "configure terminal",
+        # Clear conflicting SVI IPs that may have been left by a prior SDA run
+        "interface Vlan10",  "no ip address",  "exit",
+        "interface Vlan101", "no ip address",  "exit",
+        "interface Vlan102", "no ip address",  "exit",
+        # Apply IPs to sub-interfaces (VRF already set; must apply IP after vrf forwarding)
+        "interface GigabitEthernet1/0/48.5",
+        "ip address 192.168.255.7 255.255.255.254",
+        "ip ospf 1 area 0",
+        "no shutdown",
+        "exit",
+        "interface GigabitEthernet1/0/48.10",
+        "ip address 192.168.255.1 255.255.255.254",
+        "no shutdown",
+        "exit",
+        "interface GigabitEthernet1/0/48.101",
+        "ip address 192.168.255.3 255.255.255.254",
+        "no shutdown",
+        "exit",
+        "interface GigabitEthernet1/0/48.102",
+        "ip address 192.168.255.5 255.255.255.254",
+        "no shutdown",
+        "exit",
+        "end",
+    ]
+    for attempt in range(6):
+        try:
+            c2 = paramiko.SSHClient()
+            c2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c2.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=10, allow_agent=False, look_for_keys=False)
+            ch2 = c2.invoke_shell()
+            _time.sleep(0.5)
+            for cmd in ip_cmds:
+                ch2.send(cmd + "\n")
+                _time.sleep(0.4)
+                while ch2.recv_ready():
+                    ch2.recv(4096)
+            ch2.send("write memory\n")
+            _time.sleep(4)
+            out = b""
+            while ch2.recv_ready():
+                out += ch2.recv(4096)
+            c2.close()
+            if "[OK]" in out.decode(errors="ignore"):
+                log_fn(f"    {mgmt_ip}: sub-interfaces configured and saved")
+                return
+            log_fn(f"    write memory attempt {attempt+1}: no [OK] yet")
+        except Exception as e:
+            log_fn(f"    write memory attempt {attempt+1}: {e}")
+        _time.sleep(3)
+    raise RuntimeError(f"Could not save config on {mgmt_ip} after 6 attempts")
+
+
+def step_configure_handoff_interface(log_fn=print):
+    """Convert Border Spine Gi1/0/48 to routed sub-interfaces for per-VRF L3 handoff to SD-WAN.
+
+    Creates:
+      Gi1/0/48.5   (CatC underlay, replaces Vlan5 SVI)
+      Gi1/0/48.10  VRF Main  192.168.255.1/31
+      Gi1/0/48.101 VRF PROD  192.168.255.3/31
+      Gi1/0/48.102 VRF IOT   192.168.255.5/31
+
+    Skips if sub-interfaces already present with correct IPs.
+    """
+    import time as _time
+    border_ip = SWITCH_IPS["border_spine"]["mgmt"]
+
+    # Check if already configured with correct IPs.
+    # NOTE: VRF sub-interfaces don't appear in 'show ip interface brief' (no-VRF view).
+    # Use 'show run' to check IP addresses are present.
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(border_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=15, allow_agent=False, look_for_keys=False)
+        _, out, _ = client.exec_command("show run | section GigabitEthernet1/0/48")
+        run_cfg = out.read().decode()
+        client.close()
+        # All 4 sub-interfaces must be present AND have IPs assigned
+        all_present = all(f"GigabitEthernet1/0/48.{s}" in run_cfg for s in ["5", "10", "101", "102"])
+        all_have_ip = (
+            "192.168.255.7" in run_cfg and
+            "192.168.255.1" in run_cfg and
+            "192.168.255.3" in run_cfg and
+            "192.168.255.5" in run_cfg
+        )
+        if all_present and all_have_ip:
+            log_fn(f"  Gi1/0/48 sub-interfaces already configured with IPs, skipping")
+            return True, "configure_handoff_interface already done"
+    except Exception as e:
+        log_fn(f"  WARNING: pre-check failed ({e}), proceeding with config push")
+
+    log_fn(f"  Converting Gi1/0/48 to routed sub-interfaces on {border_ip}...")
+    _ssh_configure_border_handoff(border_ip, log_fn=log_fn)
+
+    # Verify sub-interfaces came up with correct IPs
+    _time.sleep(5)
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(border_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=15, allow_agent=False, look_for_keys=False)
+        _, out, _ = client.exec_command("show run | section GigabitEthernet1/0/48")
+        result = out.read().decode()
+        _, out2, _ = client.exec_command("show ip interface brief | include Gi1/0/48")
+        brief = out2.read().decode()
+        client.close()
+        log_fn(f"  Interface state:\n{brief}")
+        if "GigabitEthernet1/0/48.10" not in result:
+            raise RuntimeError("Sub-interfaces not present after config push")
+        if "192.168.255.7" not in result:
+            raise RuntimeError("Gi1/0/48.5 has no IP — config push may have been incomplete")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log_fn(f"  WARNING: post-check failed: {e}")
+
+    return True, "configure_handoff_interface OK"
+
+
+def rollback_configure_handoff_interface(log_fn=print):
+    """Restore Border Spine Gi1/0/48 to L2 trunk with CTS (undo configure_handoff_interface)."""
+    border_ip = SWITCH_IPS["border_spine"]["mgmt"]
+    log_fn(f"  Restoring Gi1/0/48 to L2 trunk on {border_ip}...")
+    _ssh_border_restore_trunk(border_ip, log_fn=log_fn)
+    return True, "rollback_configure_handoff_interface OK"
+
+
+def step_deploy_anycast_gateways(log_fn=print):
+    """Trigger CatC to push anycast gateway SVIs and DHCP helper-address to fabric devices.
+
+    Performs a PUT on all anycast gateways to trigger CatC's ICL config push,
+    resyncs devices first to ensure CatC reachability, and retries up to 3 times.
+    """
+    import time as _time
+    s = _catc_session(log_fn)
+    fabric_id = _get_fabric_id(s)
+    if not fabric_id:
+        raise RuntimeError("No fabric site found")
+
+    # Ensure devices are reachable before attempting deploy
+    log_fn(f"  Resyncing fabric devices to ensure CatC reachability...")
+    for key, info in SWITCH_IPS.items():
+        dev_id = _get_device_id(s, info["name"])
+        if dev_id:
+            _catc_resync_device(s, dev_id, log_fn=log_fn)
+
+    ags = s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/anycastGateways?fabricId={fabric_id}").json().get("response", [])
+    if not ags:
+        raise RuntimeError("No anycast gateways found — run step_anycast_gateways first")
+
+    payload = [{
+        "id": ag["id"],
+        "fabricId": fabric_id,
+        "virtualNetworkName": ag["virtualNetworkName"],
+        "ipPoolName": ag["ipPoolName"],
+        "vlanName": ag["vlanName"],
+        "vlanId": ag["vlanId"],
+        "trafficType": ag["trafficType"],
+        "isCriticalPool": False,
+        "isLayer2FloodingEnabled": False,
+        "isWirelessPool": False,
+        "isIpDirectedBroadcast": False,
+        "isIntraSubnetRoutingEnabled": False,
+        "isMultipleIpToMacAddresses": True,
+        "isGroupBasedPolicyEnforcementEnabled": True,
+    } for ag in ags]
+
+    for attempt in range(3):
+        log_fn(f"  Deploying anycast gateways to devices (attempt {attempt+1}/3)...")
+        r = s.put(f"{CATC_BASE}/dna/intent/api/v1/sda/anycastGateways", json=payload)
+        if r.status_code not in (200, 201, 202):
+            raise RuntimeError(f"PUT anycastGateways {r.status_code}: {r.text[:200]}")
+        task_id = r.json().get("response", {}).get("taskId")
+        try:
+            _wait_task(s, task_id, log_fn=log_fn, timeout=300)
+            log_fn(f"  ✓ Anycast gateway deploy task succeeded")
+            break
+        except RuntimeError as e:
+            log_fn(f"  Deploy attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                log_fn(f"  Resyncing devices and retrying...")
+                _time.sleep(5)
+                for key, info in SWITCH_IPS.items():
+                    dev_id = _get_device_id(s, info["name"])
+                    if dev_id:
+                        _catc_resync_device(s, dev_id, log_fn=log_fn)
+            else:
+                raise
+
+    # Verify SVIs appeared on Leaf2 (edge node — this is where clients connect)
+    import socket as _sock
+    leaf2_ip = SWITCH_IPS["leaf2"]["mgmt"]
+    log_fn(f"  Verifying SVIs on Leaf2 ({leaf2_ip})...")
+    _time.sleep(10)
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(leaf2_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=15, allow_agent=False, look_for_keys=False)
+        _, out, _ = client.exec_command("show ip interface brief | include Vlan1[^_]")
+        svi_out = out.read().decode()
+        _, out2, _ = client.exec_command("show run | include ip helper")
+        helper_out = out2.read().decode()
+        client.close()
+        log_fn(f"  SVIs: {svi_out.strip()}")
+        log_fn(f"  Helpers: {helper_out.strip()}")
+        if "Vlan10" not in svi_out:
+            log_fn(f"  WARNING: Vlan10 not yet present on Leaf2 — CatC may still be pushing")
+        if "198.18.5.102" not in helper_out:
+            log_fn(f"  WARNING: ip helper-address not yet pushed to Leaf2")
+    except Exception as e:
+        log_fn(f"  WARNING: Leaf2 verification failed: {e}")
+
+    return True, "deploy_anycast_gateways OK"
 
 
 def step_fabric_devices(log_fn=print):
@@ -632,15 +1140,16 @@ def step_port_assignments(log_fn=print):
 
 
 def step_verify(log_fn=print):
-    """Verify all fabric devices are reachable."""
+    """Verify fabric devices reachable, BGP per-VRF up, route to DHCP server in each VRF, SVIs on Leaf2."""
+    import time as _time
     s = _catc_session(log_fn)
     fabric_id = _get_fabric_id(s)
     if not fabric_id:
         raise RuntimeError("No fabric site found")
 
+    # 1. CatC reachability
     fabric_devs = s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}").json().get("response", [])
     log_fn(f"  {len(fabric_devs)} fabric device(s) configured")
-
     r = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
     devs = {d["id"]: d for d in r.json().get("response", [])}
     all_ok = True
@@ -652,10 +1161,71 @@ def step_verify(log_fn=print):
         if not ok:
             all_ok = False
         log_fn(f"    {name}: {status} {'✓' if ok else '✗'}")
-
     if not all_ok:
-        raise RuntimeError("One or more fabric devices not reachable")
-    return True, f"verify OK — {len(fabric_devs)} devices reachable"
+        raise RuntimeError("One or more fabric devices not reachable in CatC")
+
+    # 2. BGP per-VRF and route to DHCP server on Border Spine
+    border_ip = SWITCH_IPS["border_spine"]["mgmt"]
+    leaf2_ip   = SWITCH_IPS["leaf2"]["mgmt"]
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(border_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=15, allow_agent=False, look_for_keys=False)
+        bgp_issues = []
+        for vrf, peer in [("Main", "192.168.255.0"), ("PROD", "192.168.255.2"), ("IOT", "192.168.255.4")]:
+            _, out, _ = client.exec_command(f"show ip bgp vpnv4 vrf {vrf} summary | include {peer}")
+            line = out.read().decode().strip()
+            if not line:
+                bgp_issues.append(f"VRF {vrf}: no BGP entry for {peer}")
+                log_fn(f"    BGP VRF {vrf} ({peer}): ✗ not found")
+            elif "Idle" in line or "Active" in line:
+                bgp_issues.append(f"VRF {vrf}: BGP to {peer} is {line.split()[-1]}")
+                log_fn(f"    BGP VRF {vrf} ({peer}): ✗ {line.split()[-1]}")
+            else:
+                pfx = line.split()[-1]
+                log_fn(f"    BGP VRF {vrf} ({peer}): ✓ up, {pfx} prefixes")
+        _, out, _ = client.exec_command("show ip route vrf Main 198.18.5.102")
+        dhcp_route = out.read().decode()
+        if "198.18.5" in dhcp_route:
+            log_fn(f"    Route to DHCP (198.18.5.102) in Main VRF: ✓")
+        else:
+            bgp_issues.append("No route to 198.18.5.102 in Main VRF")
+            log_fn(f"    Route to DHCP (198.18.5.102) in Main VRF: ✗")
+        client.close()
+        if bgp_issues:
+            raise RuntimeError(f"BGP issues: {'; '.join(bgp_issues)}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log_fn(f"    WARNING: BGP check failed: {e}")
+
+    # 3. SVIs and DHCP helper on Leaf2
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(leaf2_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=15, allow_agent=False, look_for_keys=False)
+        _, out, _ = client.exec_command("show ip interface brief | include Vlan1[^_]")
+        svis = out.read().decode()
+        _, out2, _ = client.exec_command("show run | include ip helper")
+        helpers = out2.read().decode()
+        client.close()
+        svi_issues = [v for v in ["Vlan10", "Vlan101", "Vlan102"] if v not in svis]
+        if svi_issues:
+            log_fn(f"    Leaf2 SVIs missing: {svi_issues} ✗")
+            raise RuntimeError(f"Leaf2 SVIs not pushed by CatC: {svi_issues}")
+        log_fn(f"    Leaf2 SVIs Vlan10/101/102: ✓")
+        if "198.18.5.102" not in helpers:
+            log_fn(f"    Leaf2 ip helper-address: ✗ not configured")
+            raise RuntimeError("ip helper-address 198.18.5.102 not on Leaf2")
+        log_fn(f"    Leaf2 ip helper-address 198.18.5.102: ✓")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log_fn(f"    WARNING: Leaf2 SVI check failed: {e}")
+
+    return True, f"verify OK — {len(fabric_devs)} devices reachable, BGP up, SVIs pushed"
 
 
 # ---------------------------------------------------------------------------
@@ -998,33 +1568,36 @@ def rollback_l3_handoffs(log_fn=print):
 # ---------------------------------------------------------------------------
 
 DEPLOY_STEPS = [
-    ("discovery",         step_discovery),
-    ("provision",         step_provision),
-    ("fabric_site",       step_fabric_site),
-    ("virtual_networks",  step_virtual_networks),
-    ("anycast_gateways",  step_anycast_gateways),
-    ("transit",           step_transit),
-    ("clean_fabric_vlans", step_clean_fabric_vlans),
-    ("fabric_devices",    step_fabric_devices),
-    ("l3_handoff",        step_l3_handoff),
-    ("port_assignments",  step_port_assignments),
-    ("verify",            step_verify),
+    ("discovery",                    step_discovery),
+    ("provision",                    step_provision),
+    ("fabric_site",                  step_fabric_site),
+    ("virtual_networks",             step_virtual_networks),
+    ("anycast_gateways",             step_anycast_gateways),
+    ("transit",                      step_transit),
+    ("clean_fabric_vlans",           step_clean_fabric_vlans),
+    ("fabric_devices",               step_fabric_devices),
+    ("l3_handoff",                   step_l3_handoff),
+    ("configure_handoff_interface",  step_configure_handoff_interface),
+    ("deploy_anycast_gateways",      step_deploy_anycast_gateways),
+    ("port_assignments",             step_port_assignments),
+    ("verify",                       step_verify),
 ]
 
 ROLLBACK_STEPS = [
-    ("remove_port_assignments",  rollback_port_assignments),
-    ("remove_l3_handoffs",       rollback_l3_handoffs),
-    ("remove_fabric_devices",    rollback_fabric_devices),
-    ("remove_anycast_gateways",  rollback_anycast_gateways),
-    ("disable_gbac_policy",      rollback_gbac_policy),
-    ("remove_transit",           rollback_transit),
-    ("remove_vn_assignments",    rollback_vn_site_assignments),
-    ("remove_virtual_networks",  rollback_virtual_networks),
-    ("remove_fabric_site",       rollback_fabric_site),
-    ("delete_devices",           rollback_delete_devices),
-    ("delete_discovery",         rollback_delete_discovery),
-    ("delete_ise_nads",          rollback_delete_ise_nads),
-    ("remove_network_profile",   rollback_network_profile),
+    ("remove_port_assignments",          rollback_port_assignments),
+    ("remove_l3_handoffs",               rollback_l3_handoffs),
+    ("restore_handoff_interface",        rollback_configure_handoff_interface),
+    ("remove_fabric_devices",            rollback_fabric_devices),
+    ("remove_anycast_gateways",          rollback_anycast_gateways),
+    ("disable_gbac_policy",              rollback_gbac_policy),
+    ("remove_transit",                   rollback_transit),
+    ("remove_vn_assignments",            rollback_vn_site_assignments),
+    ("remove_virtual_networks",          rollback_virtual_networks),
+    ("remove_fabric_site",               rollback_fabric_site),
+    ("delete_devices",                   rollback_delete_devices),
+    ("delete_discovery",                 rollback_delete_discovery),
+    ("delete_ise_nads",                  rollback_delete_ise_nads),
+    ("remove_network_profile",           rollback_network_profile),
 ]
 
 
