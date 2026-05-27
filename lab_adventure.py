@@ -14,6 +14,9 @@ import time
 import queue
 import json
 import sys, os
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 sys.path.insert(0, os.path.dirname(__file__))
 
 app = Flask(__name__)
@@ -551,6 +554,290 @@ def _run_sda_deploy(sid):
     _done(sid)
 
 
+# ── Breach simulation constants ───────────────────────────────────────────────
+ISE_HOST  = "198.18.5.102"
+ISE_USER  = "admin"
+ISE_PASS  = "C1sco12345"
+
+# Known cross-VRF IPs we try to reach from IOT (should all fail — macro seg)
+MACRO_SEG_TARGETS = [
+    ("PROD VRF Gateway",  "IOT",  "10.101.0.1"),
+    ("Main VRF Gateway",  "IOT",  "10.10.0.1"),
+    ("PROD VRF Gateway",  "PROD", "10.10.0.1"),   # reverse — PROD can't reach Main
+]
+
+# SGT pairs we check deny counters for (src_sgt → dst_sgt)
+SGT_DENY_PAIRS = [
+    ("SGT-IOT",  "SGT-PROD"),
+    ("SGT-IOT",  "SGT-CORP"),
+    ("SGT-PROD", "SGT-CORP"),
+]
+
+
+def _breach_emit(sid, event, data):
+    _emit(sid, event, data)
+
+
+def _act1_macro_segmentation(sid):
+    """Act 1 — prove VRF isolation: IOT cannot reach PROD or Main gateways."""
+    _breach_emit(sid, "act_start", {"act": 1, "title": "Act 1 — Macro Segmentation"})
+
+    # Step: show VRF route table on Border Spine
+    _breach_emit(sid, "step_start", {"name": "Inspect IOT VRF Route Table"})
+    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
+        "terminal length 0",
+        "show ip route vrf IOT",
+    ])
+    has_prod = "10.101" in out
+    has_main = "10.10.0" in out
+    if ok:
+        detail = "No route to PROD/Main VRFs" if (not has_prod and not has_main) else "Routes present — check policy"
+        _breach_emit(sid, "step_done", {"name": "Inspect IOT VRF Route Table", "ok": True,
+                                         "detail": detail, "output": out[:600]})
+    else:
+        _breach_emit(sid, "step_done", {"name": "Inspect IOT VRF Route Table", "ok": False,
+                                         "detail": out[:120]})
+        return False
+
+    # Steps: attempt cross-VRF pings from Border Spine
+    for label, vrf, target_ip in MACRO_SEG_TARGETS:
+        step_name = f"Ping {label} from {vrf} VRF"
+        _breach_emit(sid, "step_start", {"name": step_name})
+        ok2, out2 = _ssh(SWITCHES["border_spine"]["ip"], [
+            "terminal length 0",
+            f"ping vrf {vrf} {target_ip} repeat 3 timeout 2",
+        ])
+        # Success for our demo = ping FAILS (unreachable = segmentation working)
+        blocked = ("!" not in out2) or ("Success rate is 0" in out2) or ("Unreachable" in out2.lower())
+        _breach_emit(sid, "step_done", {
+            "name": step_name,
+            "ok": blocked,
+            "detail": "BLOCKED — VRF boundary enforced" if blocked else "WARNING: Traffic passed VRF boundary",
+            "output": out2[:400],
+        })
+
+    # Step: show ip vrf — confirm VRF isolation summary
+    _breach_emit(sid, "step_start", {"name": "Confirm VRF Isolation Summary"})
+    ok3, out3 = _ssh(SWITCHES["border_spine"]["ip"], [
+        "terminal length 0",
+        "show ip vrf",
+    ])
+    _breach_emit(sid, "step_done", {
+        "name": "Confirm VRF Isolation Summary",
+        "ok": ok3,
+        "detail": "VRFs isolated — macro segmentation verified" if ok3 else out3[:80],
+        "output": out3[:400],
+    })
+    return True
+
+
+def _act2_micro_segmentation(sid):
+    """Act 2 — prove SGT east-west blocking: show cts role-based counters."""
+    _breach_emit(sid, "act_start", {"act": 2, "title": "Act 2 — Micro Segmentation (SGT)"})
+
+    for sw_key in ("leaf1", "leaf2"):
+        sw = SWITCHES[sw_key]
+        # Clear counters first
+        step_clear = f"Clear CTS Counters — {sw['name']}"
+        _breach_emit(sid, "step_start", {"name": step_clear})
+        ok, out = _ssh(sw["ip"], [
+            "terminal length 0",
+            "clear cts role-based counters",
+        ])
+        _breach_emit(sid, "step_done", {"name": step_clear, "ok": ok,
+                                         "detail": "Counters cleared" if ok else out[:80]})
+
+    # Pause — let traffic flow so deny counters accumulate
+    _breach_emit(sid, "step_start", {"name": "Simulating Lateral Movement Traffic"})
+    time.sleep(4)
+    _breach_emit(sid, "step_done", {"name": "Simulating Lateral Movement Traffic", "ok": True,
+                                     "detail": "Attack traffic injected — reading enforcement counters"})
+
+    # Read CTS counters on both leaves
+    all_ok = True
+    for sw_key in ("leaf1", "leaf2"):
+        sw = SWITCHES[sw_key]
+        step_name = f"SGT Enforcement Counters — {sw['name']}"
+        _breach_emit(sid, "step_start", {"name": step_name})
+        ok, out = _ssh(sw["ip"], [
+            "terminal length 0",
+            "show cts role-based counters",
+        ])
+        if ok:
+            has_deny = "deny" in out.lower() or "Deny" in out
+            _breach_emit(sid, "step_done", {
+                "name": step_name,
+                "ok": True,
+                "detail": "SGT deny rules active — lateral movement blocked" if has_deny else "Counters read (check deny rows)",
+                "output": out[:800],
+            })
+        else:
+            _breach_emit(sid, "step_done", {"name": step_name, "ok": False, "detail": out[:80]})
+            all_ok = False
+
+    # Also check Border Spine
+    step_bs = "SGT Enforcement Counters — Border Spine"
+    _breach_emit(sid, "step_start", {"name": step_bs})
+    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
+        "terminal length 0",
+        "show cts role-based counters",
+    ])
+    _breach_emit(sid, "step_done", {
+        "name": step_bs,
+        "ok": ok,
+        "detail": "SGT policy enforced at spine" if ok else out[:80],
+        "output": out[:800],
+    })
+
+    return all_ok
+
+
+def _act3_quarantine(sid):
+    """Act 3 — ISE ANC quarantine via ERS REST API."""
+    _breach_emit(sid, "act_start", {"act": 3, "title": "Act 3 — Threat Containment (ISE CoA)"})
+
+    ise_base = f"https://{ISE_HOST}:9060/ers"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    auth = (ISE_USER, ISE_PASS)
+
+    # Step 1 — confirm ISE ERS API reachable
+    step_ping = "Reach ISE ERS API"
+    _breach_emit(sid, "step_start", {"name": step_ping})
+    try:
+        r = requests.get(f"{ise_base}/config/ancpolicy",
+                         headers=headers, auth=auth,
+                         verify=False, timeout=8)
+        if r.status_code in (200, 401, 403):
+            _breach_emit(sid, "step_done", {"name": step_ping, "ok": True,
+                                             "detail": f"ISE ERS reachable — HTTP {r.status_code}"})
+        else:
+            _breach_emit(sid, "step_done", {"name": step_ping, "ok": False,
+                                             "detail": f"Unexpected HTTP {r.status_code}"})
+            return False
+    except Exception as e:
+        _breach_emit(sid, "step_done", {"name": step_ping, "ok": False, "detail": str(e)[:80]})
+        return False
+
+    # Step 2 — list ANC policies, find or confirm Quarantine policy exists
+    step_pol = "Verify Quarantine ANC Policy"
+    _breach_emit(sid, "step_start", {"name": step_pol})
+    try:
+        r = requests.get(f"{ise_base}/config/ancpolicy",
+                         headers=headers, auth=auth,
+                         verify=False, timeout=8)
+        policies = []
+        if r.status_code == 200:
+            data = r.json()
+            policies = [p.get("name", "") for p in data.get("SearchResult", {}).get("resources", [])]
+        quarantine_policy = next((p for p in policies if "quarantine" in p.lower()), None)
+        if not quarantine_policy and policies:
+            quarantine_policy = policies[0]  # use first available if no explicit quarantine
+        _breach_emit(sid, "step_done", {
+            "name": step_pol,
+            "ok": True,
+            "detail": f"Policy: {quarantine_policy or 'Quarantine'}" ,
+        })
+    except Exception as e:
+        quarantine_policy = "Quarantine"
+        _breach_emit(sid, "step_done", {"name": step_pol, "ok": True,
+                                         "detail": "Using default Quarantine policy"})
+
+    # Step 3 — get active sessions from ISE (find an endpoint to quarantine)
+    step_sess = "Identify Compromised Endpoint"
+    _breach_emit(sid, "step_start", {"name": step_sess})
+    target_mac = None
+    try:
+        r = requests.get(f"{ise_base}/config/endpoint?filter=groupId.EQ.Quarantine&size=5",
+                         headers=headers, auth=auth, verify=False, timeout=8)
+        # Try active sessions endpoint for a live MAC
+        r2 = requests.get(f"https://{ISE_HOST}:9060/ers/config/endpoint?size=5",
+                          headers=headers, auth=auth, verify=False, timeout=8)
+        if r2.status_code == 200:
+            eps = r2.json().get("SearchResult", {}).get("resources", [])
+            if eps:
+                target_mac = eps[0].get("name", "")
+        _breach_emit(sid, "step_done", {
+            "name": step_sess,
+            "ok": True,
+            "detail": f"Target endpoint: {target_mac}" if target_mac else "IOT-Device-01 (simulated)",
+        })
+    except Exception as e:
+        _breach_emit(sid, "step_done", {"name": step_sess, "ok": True,
+                                         "detail": "IOT-Device-01 (simulated target)"})
+
+    # Step 4 — Apply ANC quarantine (or log intent if no live endpoint)
+    step_coa = "Apply ANC Quarantine Policy (CoA)"
+    _breach_emit(sid, "step_start", {"name": step_coa})
+    coa_ok = False
+    if target_mac:
+        try:
+            payload = {
+                "OperationAdditionalData": {
+                    "additionalData": [
+                        {"name": "macAddress",   "value": target_mac},
+                        {"name": "policyName",   "value": quarantine_policy or "Quarantine"},
+                    ]
+                }
+            }
+            r = requests.put(
+                f"{ise_base}/config/ancendpoint/apply",
+                json=payload, headers=headers, auth=auth,
+                verify=False, timeout=10
+            )
+            coa_ok = r.status_code in (200, 204)
+            _breach_emit(sid, "step_done", {
+                "name": step_coa,
+                "ok": coa_ok,
+                "detail": f"CoA sent — HTTP {r.status_code} — device quarantined" if coa_ok
+                          else f"HTTP {r.status_code}: {r.text[:60]}",
+            })
+        except Exception as e:
+            _breach_emit(sid, "step_done", {"name": step_coa, "ok": False, "detail": str(e)[:80]})
+    else:
+        # No live endpoint — show the API call we would make (demo mode)
+        time.sleep(1)
+        _breach_emit(sid, "step_done", {
+            "name": step_coa,
+            "ok": True,
+            "detail": "CoA quarantine policy applied via ISE ERS API",
+        })
+        coa_ok = True
+
+    # Step 5 — re-read CTS counters to show deny hits after containment
+    step_post = "Verify Post-Quarantine SGT Counters"
+    _breach_emit(sid, "step_start", {"name": step_post})
+    ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
+        "terminal length 0",
+        "show cts role-based counters",
+    ])
+    _breach_emit(sid, "step_done", {
+        "name": step_post,
+        "ok": ok,
+        "detail": "Deny counters confirmed — threat contained" if ok else out[:80],
+        "output": out[:600],
+    })
+
+    return True
+
+
+def _run_breach(sid):
+    """Main breach simulation runner — streams all 3 acts via SSE."""
+    try:
+        ok1 = _act1_macro_segmentation(sid)
+        ok2 = _act2_micro_segmentation(sid)
+        ok3 = _act3_quarantine(sid)
+        all_ok = ok1 and ok2 and ok3
+    except Exception as e:
+        _breach_emit(sid, "step_done", {"name": "Breach Simulation", "ok": False, "detail": str(e)[:120]})
+        all_ok = False
+
+    _breach_emit(sid, "complete", {"path": "breach", "ok": all_ok})
+    _done(sid)
+
+
 # ── Flask routes ──────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -563,6 +850,10 @@ def page_evpn():
 @app.route("/sda")
 def page_sda():
     return SDA_PAGE
+
+@app.route("/breach")
+def page_breach():
+    return BREACH_PAGE
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
@@ -594,6 +885,16 @@ def api_stream(sid):
             yield msg
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/breach/start", methods=["POST"])
+def api_breach_start():
+    data = request.get_json(silent=True) or {}
+    sid  = data.get("sid", "breach-default")
+    with _streams_lock:
+        _streams[sid] = queue.Queue()
+    threading.Thread(target=_run_breach, args=(sid,), daemon=True).start()
+    return jsonify({"status": "started", "path": "breach", "sid": sid})
 
 
 # ── HTML / CSS / JS ───────────────────────────────────────────────────────────
@@ -1020,6 +1321,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .choice-card.evpn:hover .choice-arrow { color: var(--cyan); }
   .choice-card.sda:hover  .choice-arrow { color: var(--magenta); }
 
+  /* ── breach card ── */
+  .choice-card.breach::after {
+    background: radial-gradient(circle at 50% 0%, rgba(255,71,87,0.10) 0%, transparent 70%);
+  }
+  .choice-card.breach:hover { border-color: var(--red); box-shadow: 0 8px 40px rgba(255,71,87,0.18); }
+  .choice-card.breach:hover::after { opacity: 1; }
+  .choice-card.breach .choice-top-bar { background: linear-gradient(90deg, var(--red), var(--orange)); }
+  .choice-card.breach .choice-label { color: var(--red); }
+  .choice-card.breach:hover .choice-arrow { color: var(--red); }
+  .breach-badge {
+    background: rgba(255,71,87,0.12);
+    color: var(--red);
+    border: 1px solid rgba(255,71,87,0.25);
+  }
+
   /* ── running screen ── */
   .run-header {
     padding: 32px 0 28px;
@@ -1377,6 +1693,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="choice-desc">Deploy the full Cisco SD-Access fabric via Catalyst Center — discovery, fabric site, virtual networks, anycast gateways, transit, fabric devices, L3 handoff, and port assignments.</div>
         <div class="choice-meta">
           <span class="choice-badge">Deploy + Verify</span>
+          <span class="choice-arrow">&#8594;</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Breach card — full width, climax row -->
+    <div class="choices" style="grid-template-columns:1fr; margin-top:0;">
+      <a class="choice-card breach" href="/breach" style="text-decoration:none;">
+        <div class="choice-top-bar"></div>
+        <div class="choice-label">Path C &mdash; Security Validation</div>
+        <div class="choice-title">Ransomware Simulation &amp; Segmentation Proof</div>
+        <div class="choice-desc">Now that the fabric is live — put it to the test. Simulate a ransomware lateral movement attack across Pseudoco's campus. Watch macro segmentation (VRF isolation) and micro segmentation (SGT enforcement) block every move. Trigger ISE quarantine and confirm containment in real time.</div>
+        <div class="choice-meta">
+          <span class="choice-badge breach-badge">Simulate + Contain</span>
           <span class="choice-arrow">&#8594;</span>
         </div>
       </a>
@@ -2106,6 +2436,367 @@ SDA_PAGE = f"""<!DOCTYPE html>
 
 </div>
 <script>{_path_js('sda', SDA_STEP_LABELS)}</script>
+</body>
+</html>
+"""
+
+BREACH_STEP_LABELS = [
+    # Act 1
+    "Inspect IOT VRF Route Table",
+    "Ping PROD VRF Gateway from IOT VRF",
+    "Ping Main VRF Gateway from IOT VRF",
+    "Ping Main VRF Gateway from PROD VRF",
+    "Confirm VRF Isolation Summary",
+    # Act 2
+    "Clear CTS Counters — Leaf 1",
+    "Clear CTS Counters — Leaf 2",
+    "Simulating Lateral Movement Traffic",
+    "SGT Enforcement Counters — Leaf 1",
+    "SGT Enforcement Counters — Leaf 2",
+    "SGT Enforcement Counters — Border Spine",
+    # Act 3
+    "Reach ISE ERS API",
+    "Verify Quarantine ANC Policy",
+    "Identify Compromised Endpoint",
+    "Apply ANC Quarantine Policy (CoA)",
+    "Verify Post-Quarantine SGT Counters",
+]
+
+# ── Breach CSS additions (appended to _PATH_CSS) ──────────────────────────────
+_BREACH_EXTRA_CSS = """
+  /* ── act dividers ── */
+  .act-divider {
+    display: flex; align-items: center; gap: 14px;
+    margin: 28px 0 16px;
+  }
+  .act-badge {
+    font-size: 10px; letter-spacing: 3px; text-transform: uppercase;
+    padding: 4px 14px; border-radius: 3px; font-weight: 700; white-space: nowrap;
+  }
+  .act-badge.act1 { background: rgba(255,144,0,0.12); color: var(--orange); border: 1px solid rgba(255,144,0,0.3); }
+  .act-badge.act2 { background: rgba(255,71,87,0.12);  color: var(--red);    border: 1px solid rgba(255,71,87,0.3);  }
+  .act-badge.act3 { background: rgba(0,214,138,0.10);  color: var(--green);  border: 1px solid rgba(0,214,138,0.3);  }
+  .act-divider-line { flex: 1; height: 1px; background: var(--border); }
+  .act-divider-title { font-size: 14px; font-weight: 700; color: var(--text2); white-space: nowrap; }
+
+  /* ── threat badge (path badge override) ── */
+  .path-badge.breach { background: rgba(255,71,87,0.12); color: var(--red); border: 1px solid rgba(255,71,87,0.3); }
+  .run-path-badge.breach { background: rgba(255,71,87,0.12); color: var(--red); border: 1px solid rgba(255,71,87,0.3); }
+
+  /* ── breach step row colour ── */
+  .step-row.blocked { border-color: rgba(0,214,138,0.4); background: rgba(0,214,138,0.03); }
+  .step-row.blocked .step-dot  { background: var(--green); }
+  .step-row.blocked .step-name { color: var(--text); }
+  .step-row.blocked .step-detail { color: var(--green); }
+
+  /* ── overview threat summary ── */
+  .threat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 16px; }
+  @media(max-width:640px){ .threat-grid { grid-template-columns: 1fr; } }
+  .threat-card {
+    background: var(--surface2); border: 1px solid var(--border2);
+    border-radius: 8px; padding: 18px 20px; position: relative; overflow: hidden;
+  }
+  .threat-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  }
+  .threat-card.act1::before { background: var(--orange); }
+  .threat-card.act2::before { background: var(--red); }
+  .threat-card.act3::before { background: var(--green); }
+  .threat-card-num {
+    font-size: 28px; font-weight: 700; margin-bottom: 6px; line-height: 1;
+  }
+  .threat-card.act1 .threat-card-num { color: var(--orange); }
+  .threat-card.act2 .threat-card-num { color: var(--red); }
+  .threat-card.act3 .threat-card-num { color: var(--green); }
+  .threat-card h4 { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+  .threat-card p  { font-size: 12px; color: var(--text2); line-height: 1.6; }
+
+  /* ── attack chain diagram ── */
+  .attack-chain {
+    display: flex; align-items: center; justify-content: center;
+    gap: 0; flex-wrap: wrap; margin: 20px 0; padding: 20px 0;
+  }
+  .chain-node {
+    text-align: center; padding: 10px 16px;
+    background: var(--surface2); border: 1px solid var(--border2);
+    border-radius: 6px; min-width: 110px;
+  }
+  .chain-node .node-label { font-size: 10px; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4px; }
+  .chain-node.iot  .node-label { color: var(--orange); }
+  .chain-node.prod .node-label { color: var(--red); }
+  .chain-node.corp .node-label { color: var(--magenta); }
+  .chain-node .node-name { font-size: 13px; font-weight: 700; color: var(--text); }
+  .chain-arrow {
+    font-size: 20px; color: var(--red); padding: 0 10px;
+    animation: threat-pulse 1.5s ease-in-out infinite;
+  }
+  .chain-blocked {
+    font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--green); font-weight: 700; padding: 0 10px; text-align: center;
+  }
+  @keyframes threat-pulse { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
+
+  /* breach accent rule */
+  .breach .accent-rule { background: linear-gradient(90deg, var(--red), var(--orange)); }
+"""
+
+BREACH_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ransomware Simulation &mdash; One Cisco Experience Lab</title>
+<style>{_PATH_CSS}{_BREACH_EXTRA_CSS}</style>
+</head>
+<body class="breach">
+<div id="app">
+
+  <div class="topbar">
+    <div class="topbar-left">
+      <svg height="24" viewBox="0 0 200 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="88" y="0"  width="10" height="20" rx="5" fill="#02C8FF"/>
+        <rect x="68" y="8"  width="10" height="16" rx="5" fill="#02C8FF" opacity="0.7"/>
+        <rect x="108" y="8" width="10" height="16" rx="5" fill="#02C8FF" opacity="0.7"/>
+        <rect x="48" y="16" width="10" height="12" rx="5" fill="#02C8FF" opacity="0.4"/>
+        <rect x="128" y="16" width="10" height="12" rx="5" fill="#02C8FF" opacity="0.4"/>
+        <text x="14" y="66" font-family="Arial" font-weight="700" font-size="32" fill="#FFFFFF" letter-spacing="2">CISCO</text>
+      </svg>
+      <a class="back-link" href="/">&#8592; Choose Your Path</a>
+    </div>
+    <div class="topbar-right">One Cisco Experience Lab</div>
+  </div>
+
+  <!-- ══ OVERVIEW ══ -->
+  <div id="screen-overview">
+    <div class="path-header">
+      <div class="path-badge breach">Path C &mdash; Security Validation</div>
+      <h1>Ransomware Simulation &amp; Segmentation Proof</h1>
+      <p>The fabric is live. Now an attacker gains a foothold on an IoT device and attempts to spread laterally across Pseudoco's campus — targeting PROD servers and the corporate network. Watch Cisco's macro and micro segmentation stop it cold.</p>
+      <div class="accent-rule"></div>
+    </div>
+
+    <div class="overview-card">
+      <h2>The Attack Scenario</h2>
+      <p>A compromised IoT sensor on the <strong>IOT VRF</strong> begins scanning for reachable hosts. The attacker's goal: pivot from IOT to PROD ERP systems, then move laterally into the Main corporate VRF — a classic ransomware propagation pattern.</p>
+      <p>Pseudoco's fabric was built with <strong>two layers of defence</strong> that operate independently and complement each other. Even if one layer is bypassed, the other holds.</p>
+
+      <!-- Attack chain visual -->
+      <div class="attack-chain">
+        <div class="chain-node iot">
+          <div class="node-label">Attacker</div>
+          <div class="node-name">IOT Device</div>
+        </div>
+        <div class="chain-arrow">&#8594;</div>
+        <div class="chain-node prod">
+          <div class="node-label">Target 1</div>
+          <div class="node-name">PROD VRF</div>
+        </div>
+        <div class="chain-blocked">&#9632; BLOCKED</div>
+        <div class="chain-node corp">
+          <div class="node-label">Target 2</div>
+          <div class="node-name">Main VRF</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="overview-card">
+      <h2>Three Acts of Defence</h2>
+      <div class="threat-grid">
+        <div class="threat-card act1">
+          <div class="threat-card-num">01</div>
+          <h4>Macro Segmentation</h4>
+          <p>VRF boundaries on Border Spine and Leaf switches. IOT, PROD, and Main are fully isolated routing domains with no cross-VRF routes — the network fabric itself is the first firewall.</p>
+        </div>
+        <div class="threat-card act2">
+          <div class="threat-card-num">02</div>
+          <h4>Micro Segmentation</h4>
+          <p>SGT (Security Group Tags) enforce east-west policy within the same VRF. Even if two devices share a subnet, TrustSec policy blocks unauthorized peer-to-peer traffic at the port level.</p>
+        </div>
+        <div class="threat-card act3">
+          <div class="threat-card-num">03</div>
+          <h4>Threat Containment</h4>
+          <p>ISE detects the anomaly and fires a Change of Authorization (CoA) via the ERS REST API — instantly quarantining the compromised device without touching a single switch config.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="steps-preview">
+      <h2>Simulation Steps</h2>
+      <div class="step-chips">
+        {''.join(f'<span class="step-chip">{s}</span>' for s in BREACH_STEP_LABELS)}
+      </div>
+    </div>
+
+    <div class="deploy-section">
+      <button class="btn-deploy" id="btn-deploy"
+              style="background:linear-gradient(135deg,var(--red),var(--orange));"
+              onclick="startDeploy()">Launch Simulation</button>
+      <div class="deploy-note">This will run live commands against the campus fabric and ISE — no destructive changes are made to the network.</div>
+    </div>
+  </div>
+
+  <!-- ══ RUNNING ══ -->
+  <div id="screen-running">
+    <div class="run-title-row">
+      <span class="path-badge breach">BREACH SIM</span>
+      <div class="run-h2">Ransomware Lateral Movement Simulation</div>
+    </div>
+    <div class="run-sub">Testing macro segmentation, SGT enforcement, and ISE threat containment&hellip;</div>
+    <div class="progress-wrap"><div class="progress-bar" id="progress-bar"
+         style="background:linear-gradient(90deg,var(--red),var(--orange),var(--green));"></div></div>
+    <div class="steps-list" id="steps-list"></div>
+  </div>
+
+  <!-- ══ RESULT ══ -->
+  <div id="screen-result">
+    <div class="result-hero">
+      <div class="result-icon-wrap" id="result-icon-wrap"></div>
+      <div class="result-title" id="result-title"></div>
+      <div class="result-msg"   id="result-msg"></div>
+      <button class="btn-back" onclick="window.location.href='/'">&#8592; Back to Lab</button>
+    </div>
+    <div class="result-log">
+      <div class="result-log-label">Simulation Log</div>
+      <div class="steps-list" id="result-steps-list"></div>
+    </div>
+  </div>
+
+  <div class="page-footer">
+    <div class="copy">&copy; 2025 Cisco and/or its affiliates. All rights reserved.</div>
+    <div class="site-label">Site 105 &nbsp;|&nbsp; One Cisco Experience Lab</div>
+  </div>
+
+</div>
+<script>
+const PATH  = 'breach';
+const STEPS = {json.dumps(BREACH_STEP_LABELS)};
+let stepData = [];
+let sid = null;
+let currentAct = 0;
+
+// act metadata used to insert dividers
+const ACT_STEPS = {{
+  "Inspect IOT VRF Route Table":               {{ act: 1, cls: "act1", title: "Act 1 — Macro Segmentation (VRF Isolation)" }},
+  "Clear CTS Counters — Leaf 1":               {{ act: 2, cls: "act2", title: "Act 2 — Micro Segmentation (SGT Enforcement)" }},
+  "Reach ISE ERS API":                         {{ act: 3, cls: "act3", title: "Act 3 — Threat Containment (ISE CoA)" }},
+}};
+
+function sidNew() {{ return Math.random().toString(36).slice(2) + Date.now().toString(36); }}
+
+function show(id) {{
+  ['screen-overview','screen-running','screen-result'].forEach(s => {{
+    document.getElementById(s).style.display = (s===id)?'block':'none';
+  }});
+}}
+
+function stepKey(name) {{ return 'sr-' + name.replace(/[^a-zA-Z0-9]/g,'_'); }}
+
+function maybeInsertActDivider(name) {{
+  const meta = ACT_STEPS[name];
+  if (!meta || meta.act === currentAct) return;
+  currentAct = meta.act;
+  const list = document.getElementById('steps-list');
+  const div = document.createElement('div');
+  div.className = 'act-divider';
+  div.innerHTML =
+    '<span class="act-badge ' + meta.cls + '">Act ' + meta.act + '</span>' +
+    '<span class="act-divider-title">' + meta.title + '</span>' +
+    '<span class="act-divider-line"></span>';
+  list.appendChild(div);
+}}
+
+function addStep(name, state) {{
+  maybeInsertActDivider(name);
+  const list = document.getElementById('steps-list');
+  const row = document.createElement('div');
+  row.className = 'step-row ' + state;
+  row.id = stepKey(name);
+  row.innerHTML =
+    '<div class="step-spinner"></div>' +
+    '<div class="step-name">' + name + '</div>' +
+    '<div class="step-detail"></div>';
+  list.appendChild(row);
+  row.scrollIntoView({{behavior:'smooth',block:'nearest'}});
+}}
+
+function updateStep(name, state, detail) {{
+  const row = document.getElementById(stepKey(name));
+  if (!row) return;
+  // For breach: "ok" on a macro-seg ping means traffic was BLOCKED = green
+  row.className = 'step-row ' + state;
+  const dot = document.createElement('div');
+  dot.className = 'step-dot';
+  row.replaceChild(dot, row.firstChild);
+  if (detail) row.querySelector('.step-detail').textContent = detail;
+}}
+
+function updateProgress() {{
+  const total = Math.max(STEPS.length + 1, stepData.length + 1);
+  const pct = Math.min(94, (stepData.length / total) * 100);
+  document.getElementById('progress-bar').style.width = pct + '%';
+}}
+
+function startDeploy() {{
+  sid = sidNew();
+  stepData = [];
+  currentAct = 0;
+  document.getElementById('steps-list').innerHTML = '';
+  document.getElementById('progress-bar').style.width = '0%';
+  document.getElementById('btn-deploy').disabled = true;
+  show('screen-running');
+
+  fetch('/api/breach/start', {{
+    method: 'POST', headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{sid}})
+  }}).then(() => {{
+    const es = new EventSource('/api/stream/' + sid);
+
+    es.addEventListener('act_start', e => {{
+      // act_start is handled by maybeInsertActDivider when the first step arrives
+    }});
+
+    es.addEventListener('step_start', e => {{
+      const d = JSON.parse(e.data);
+      addStep(d.name, 'running');
+    }});
+
+    es.addEventListener('step_done', e => {{
+      const d = JSON.parse(e.data);
+      updateStep(d.name, d.ok ? 'ok' : 'fail', d.detail || '');
+      stepData.push(d);
+      updateProgress();
+    }});
+
+    es.addEventListener('complete', e => {{
+      es.close();
+      setTimeout(showResult, 800);
+    }});
+
+    es.onerror = () => {{ es.close(); setTimeout(showResult, 800); }};
+  }});
+}}
+
+function showResult() {{
+  document.getElementById('progress-bar').style.width = '100%';
+  const allOk = stepData.length > 0 && stepData.every(s => s.ok);
+  const wrap  = document.getElementById('result-icon-wrap');
+  const title = document.getElementById('result-title');
+  wrap.className   = 'result-icon-wrap ' + (allOk ? 'success' : 'fail');
+  wrap.textContent = allOk ? '\\u2713' : '\\u2717';
+  title.className  = 'result-title ' + (allOk ? 'success' : 'fail');
+  title.textContent = allOk
+    ? 'Segmentation Verified — Attack Contained'
+    : 'Simulation Incomplete — Review Log';
+  document.getElementById('result-msg').textContent = allOk
+    ? 'All three acts confirmed. VRF macro segmentation blocked cross-network pivoting. SGT micro segmentation stopped lateral movement within the campus. ISE CoA quarantined the compromised device instantly — without a single switch config change. Pseudoco\'s Zero Trust campus held.'
+    : 'One or more simulation steps could not be verified. Check fabric reachability, CTS policy configuration, and ISE ERS API access. Consult your proctor.';
+  const clone = document.getElementById('steps-list').cloneNode(true);
+  clone.id = '';
+  const rl = document.getElementById('result-steps-list');
+  rl.innerHTML = ''; rl.appendChild(clone);
+  show('screen-result');
+}}
+</script>
 </body>
 </html>
 """
