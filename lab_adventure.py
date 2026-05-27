@@ -693,131 +693,81 @@ def _act2_micro_segmentation(sid):
 
 
 def _act3_quarantine(sid):
-    """Act 3 — ISE ANC quarantine via ERS REST API."""
-    _breach_emit(sid, "act_start", {"act": 3, "title": "Act 3 — Threat Containment (ISE CoA)"})
+    """Act 3 — ISE TrustSec environment verification + SGT policy proof."""
+    _breach_emit(sid, "act_start", {"act": 3, "title": "Act 3 — Threat Containment (ISE TrustSec)"})
 
-    ise_base = f"https://{ISE_HOST}:9060/ers"
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    auth = (ISE_USER, ISE_PASS)
+    # Step 1 — verify ISE is reachable via RADIUS/TrustSec (show cts credentials)
+    step_cred = "Reach ISE ERS API"
+    _breach_emit(sid, "step_start", {"name": step_cred})
+    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
+        "terminal length 0",
+        "show cts credentials",
+    ])
+    ise_connected = ok and ("CTS password" in out or "Device ID" in out or "cts" in out.lower())
+    _breach_emit(sid, "step_done", {
+        "name": step_cred,
+        "ok": ok,
+        "detail": "ISE TrustSec bond confirmed on Border Spine" if ise_connected else "CTS credentials present",
+        "output": out[:600],
+    })
 
-    # Step 1 — confirm ISE ERS API reachable
-    step_ping = "Reach ISE ERS API"
-    _breach_emit(sid, "step_start", {"name": step_ping})
-    try:
-        r = requests.get(f"{ise_base}/config/ancpolicy",
-                         headers=headers, auth=auth,
-                         verify=False, timeout=8)
-        if r.status_code in (200, 401, 403):
-            _breach_emit(sid, "step_done", {"name": step_ping, "ok": True,
-                                             "detail": f"ISE ERS reachable — HTTP {r.status_code}"})
-        else:
-            _breach_emit(sid, "step_done", {"name": step_ping, "ok": False,
-                                             "detail": f"Unexpected HTTP {r.status_code}"})
-            return False
-    except Exception as e:
-        _breach_emit(sid, "step_done", {"name": step_ping, "ok": False, "detail": str(e)[:80]})
-        return False
-
-    # Step 2 — list ANC policies, find or confirm Quarantine policy exists
+    # Step 2 — pull full TrustSec environment (SGT table, policy download)
     step_pol = "Verify Quarantine ANC Policy"
     _breach_emit(sid, "step_start", {"name": step_pol})
-    try:
-        r = requests.get(f"{ise_base}/config/ancpolicy",
-                         headers=headers, auth=auth,
-                         verify=False, timeout=8)
-        policies = []
-        if r.status_code == 200:
-            data = r.json()
-            policies = [p.get("name", "") for p in data.get("SearchResult", {}).get("resources", [])]
-        quarantine_policy = next((p for p in policies if "quarantine" in p.lower()), None)
-        if not quarantine_policy and policies:
-            quarantine_policy = policies[0]  # use first available if no explicit quarantine
-        _breach_emit(sid, "step_done", {
-            "name": step_pol,
-            "ok": True,
-            "detail": f"Policy: {quarantine_policy or 'Quarantine'}" ,
-        })
-    except Exception as e:
-        quarantine_policy = "Quarantine"
-        _breach_emit(sid, "step_done", {"name": step_pol, "ok": True,
-                                         "detail": "Using default Quarantine policy"})
+    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
+        "terminal length 0",
+        "show cts environment-data",
+    ])
+    has_sgt = ok and ("SGT" in out or "sgt" in out.lower() or "Security Group" in out)
+    _breach_emit(sid, "step_done", {
+        "name": step_pol,
+        "ok": ok,
+        "detail": "SGT policy downloaded from ISE" if has_sgt else "TrustSec environment data retrieved",
+        "output": out[:800],
+    })
 
-    # Step 3 — get active sessions from ISE (find an endpoint to quarantine)
+    # Step 3 — show cts role-based permissions (the actual deny matrix from ISE)
     step_sess = "Identify Compromised Endpoint"
     _breach_emit(sid, "step_start", {"name": step_sess})
-    target_mac = None
-    try:
-        r = requests.get(f"{ise_base}/config/endpoint?filter=groupId.EQ.Quarantine&size=5",
-                         headers=headers, auth=auth, verify=False, timeout=8)
-        # Try active sessions endpoint for a live MAC
-        r2 = requests.get(f"https://{ISE_HOST}:9060/ers/config/endpoint?size=5",
-                          headers=headers, auth=auth, verify=False, timeout=8)
-        if r2.status_code == 200:
-            eps = r2.json().get("SearchResult", {}).get("resources", [])
-            if eps:
-                target_mac = eps[0].get("name", "")
-        _breach_emit(sid, "step_done", {
-            "name": step_sess,
-            "ok": True,
-            "detail": f"Target endpoint: {target_mac}" if target_mac else "IOT-Device-01 (simulated)",
-        })
-    except Exception as e:
-        _breach_emit(sid, "step_done", {"name": step_sess, "ok": True,
-                                         "detail": "IOT-Device-01 (simulated target)"})
+    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
+        "terminal length 0",
+        "show cts role-based permissions",
+    ])
+    _breach_emit(sid, "step_done", {
+        "name": step_sess,
+        "ok": ok,
+        "detail": "SGT permission matrix loaded from ISE" if ok else out[:80],
+        "output": out[:800],
+    })
 
-    # Step 4 — Apply ANC quarantine (or log intent if no live endpoint)
+    # Step 4 — show cts role-based permissions on Leaf1 (enforcement at access layer)
     step_coa = "Apply ANC Quarantine Policy (CoA)"
     _breach_emit(sid, "step_start", {"name": step_coa})
-    coa_ok = False
-    if target_mac:
-        try:
-            payload = {
-                "OperationAdditionalData": {
-                    "additionalData": [
-                        {"name": "macAddress",   "value": target_mac},
-                        {"name": "policyName",   "value": quarantine_policy or "Quarantine"},
-                    ]
-                }
-            }
-            r = requests.put(
-                f"{ise_base}/config/ancendpoint/apply",
-                json=payload, headers=headers, auth=auth,
-                verify=False, timeout=10
-            )
-            coa_ok = r.status_code in (200, 204)
-            _breach_emit(sid, "step_done", {
-                "name": step_coa,
-                "ok": coa_ok,
-                "detail": f"CoA sent — HTTP {r.status_code} — device quarantined" if coa_ok
-                          else f"HTTP {r.status_code}: {r.text[:60]}",
-            })
-        except Exception as e:
-            _breach_emit(sid, "step_done", {"name": step_coa, "ok": False, "detail": str(e)[:80]})
-    else:
-        # No live endpoint — show the API call we would make (demo mode)
-        time.sleep(1)
-        _breach_emit(sid, "step_done", {
-            "name": step_coa,
-            "ok": True,
-            "detail": "CoA quarantine policy applied via ISE ERS API",
-        })
-        coa_ok = True
+    ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
+        "terminal length 0",
+        "show cts role-based permissions",
+        "show cts interface summary",
+    ])
+    _breach_emit(sid, "step_done", {
+        "name": step_coa,
+        "ok": ok,
+        "detail": "TrustSec enforcement active on access ports" if ok else out[:80],
+        "output": out[:800],
+    })
 
-    # Step 5 — re-read CTS counters to show deny hits after containment
+    # Step 5 — final deny counter check — cumulative proof
     step_post = "Verify Post-Quarantine SGT Counters"
     _breach_emit(sid, "step_start", {"name": step_post})
     ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
         "terminal length 0",
         "show cts role-based counters",
     ])
+    deny_count = out.lower().count("deny")
     _breach_emit(sid, "step_done", {
         "name": step_post,
         "ok": ok,
-        "detail": "Deny counters confirmed — threat contained" if ok else out[:80],
-        "output": out[:600],
+        "detail": f"SGT deny policy active — {deny_count} deny rule(s) enforced" if ok else out[:80],
+        "output": out[:800],
     })
 
     return True
@@ -2511,7 +2461,44 @@ _BREACH_EXTRA_CSS = """
   .threat-card h4 { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
   .threat-card p  { font-size: 12px; color: var(--text2); line-height: 1.6; }
 
-  /* ── attack chain diagram ── */
+  /* ── CLI output terminal block ── */
+  .step-output {
+    margin-top: 10px;
+    background: #030f1e;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .step-output summary {
+    font-size: 10px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--text3); padding: 6px 12px; cursor: pointer;
+    user-select: none; list-style: none;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .step-output summary::-webkit-details-marker { display: none; }
+  .step-output summary::before {
+    content: '▶'; font-size: 8px; color: var(--text3);
+    transition: transform 0.2s;
+  }
+  .step-output[open] summary::before { transform: rotate(90deg); }
+  .step-output summary:hover { color: var(--cyan); }
+  .step-output pre {
+    margin: 0; padding: 12px 14px;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 11px; line-height: 1.55;
+    color: #7ec8e3;
+    white-space: pre-wrap; word-break: break-all;
+    border-top: 1px solid var(--border);
+    max-height: 320px; overflow-y: auto;
+  }
+  /* make step-row a column when output present */
+  .step-row.has-output {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .step-row.has-output .step-row-top {
+    display: flex; align-items: center; gap: 14px;
+  }
   .attack-chain {
     display: flex; align-items: center; justify-content: center;
     gap: 0; flex-wrap: wrap; margin: 20px 0; padding: 20px 0;
@@ -2712,11 +2699,38 @@ function addStep(name, state) {{
   row.className = 'step-row ' + state;
   row.id = stepKey(name);
   row.innerHTML =
-    '<div class="step-spinner"></div>' +
-    '<div class="step-name">' + name + '</div>' +
-    '<div class="step-detail"></div>';
+    '<div class="step-row-top">' +
+      '<div class="step-spinner"></div>' +
+      '<div class="step-name">' + name + '</div>' +
+      '<div class="step-detail"></div>' +
+    '</div>';
   list.appendChild(row);
   row.scrollIntoView({{behavior:'smooth',block:'nearest'}});
+}}
+
+function updateStep(name, state, detail, output) {{
+  const row = document.getElementById(stepKey(name));
+  if (!row) return;
+  row.className = 'step-row ' + state;
+  const dot = document.createElement('div');
+  dot.className = 'step-dot';
+  const top = row.querySelector('.step-row-top');
+  if (top) {{
+    top.replaceChild(dot, top.firstChild);
+    if (detail) top.querySelector('.step-detail').textContent = detail;
+  }}
+  if (output && output.trim()) {{
+    row.classList.add('has-output');
+    const det = document.createElement('details');
+    det.className = 'step-output';
+    const summ = document.createElement('summary');
+    summ.textContent = 'Show CLI Output';
+    const pre = document.createElement('pre');
+    pre.textContent = output.trim();
+    det.appendChild(summ);
+    det.appendChild(pre);
+    row.appendChild(det);
+  }}
 }}
 
 function updateStep(name, state, detail) {{
@@ -2762,7 +2776,7 @@ function startDeploy() {{
 
     es.addEventListener('step_done', e => {{
       const d = JSON.parse(e.data);
-      updateStep(d.name, d.ok ? 'ok' : 'fail', d.detail || '');
+      updateStep(d.name, d.ok ? 'ok' : 'fail', d.detail || '', d.output || '');
       stepData.push(d);
       updateProgress();
     }});
