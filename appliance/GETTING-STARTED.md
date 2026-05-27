@@ -58,7 +58,7 @@ qm start 200
 
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/maokuma_cisco/pod-automator/main/appliance/install.sh \
+  https://raw.githubusercontent.com/mokuma56/POD-Automator/main/appliance/install.sh \
   | sudo bash
 ```
 
@@ -69,6 +69,30 @@ The script will:
 - Build the `pod-automator:latest` Docker image
 - Start the dashboard as a systemd service on port **5050**
 - Open port 5050 in UFW
+
+### Verify the install succeeded
+
+The script prints a success banner when complete:
+```
+[OK]    ======================================================
+[OK]     Installation complete!
+[OK]     Dashboard: http://<server-ip>:5050
+[OK]     Docs:      /opt/pod-automator/appliance/GETTING-STARTED.md
+[OK]     Logs:      journalctl -u pod-automator -f
+[OK]     ======================================================
+```
+
+Check the install log at any time (including during the install):
+```bash
+sudo tail -50 /var/log/pod-automator-install.log
+```
+
+Check the service is running:
+```bash
+systemctl status pod-automator
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:5050
+# Should print: 200
+```
 
 ---
 
@@ -206,18 +230,46 @@ At the top of the dashboard, the **Software Upgrade Images** card lets you:
 systemctl status pod-automator
 
 # Restart dashboard
-systemctl restart pod-automator
+sudo systemctl restart pod-automator
 
-# Live logs
+# Live logs (follow)
 journalctl -u pod-automator -f
 
-# Stop
-systemctl stop pod-automator
+# Last 50 log lines
+journalctl -u pod-automator -n 50 --no-pager
 
-# Update to latest code
-cd /opt/pod-automator && git pull
-docker build -f docker/Dockerfile -t pod-automator:latest .
-systemctl restart pod-automator
+# Stop
+sudo systemctl stop pod-automator
+```
+
+---
+
+## Keeping the appliance up to date
+
+The service does **not** auto-pull updates — you control when to update.
+
+### Manual update
+```bash
+sudo git config --global --add safe.directory /opt/pod-automator
+sudo git -C /opt/pod-automator pull
+sudo docker build -f /opt/pod-automator/docker/Dockerfile -t pod-automator:latest /opt/pod-automator
+sudo systemctl restart pod-automator
+```
+
+### Set up a daily auto-update (optional)
+This creates a cron job that pulls and restarts at 3 AM daily:
+```bash
+sudo tee /etc/cron.d/pod-automator-update << 'EOF'
+0 3 * * * root \
+  git -C /opt/pod-automator pull --ff-only && \
+  docker build -f /opt/pod-automator/docker/Dockerfile -t pod-automator:latest /opt/pod-automator && \
+  systemctl restart pod-automator
+EOF
+```
+
+To remove the auto-update:
+```bash
+sudo rm /etc/cron.d/pod-automator-update
 ```
 
 ---
@@ -303,11 +355,44 @@ with the step name, error text, and POD ID. Proctors can:
 
 ## Troubleshooting
 
+### Check install log
+```bash
+sudo tail -50 /var/log/pod-automator-install.log
+```
+
 ### Dashboard won't start
 ```bash
-journalctl -u pod-automator -n 100
-# Common cause: port 5050 in use
+# See exactly why it's failing
+journalctl -u pod-automator -n 50 --no-pager
+
+# Common: port 5050 already in use
 ss -tlnp | grep 5050
+
+# Common: data directory permissions
+sudo mkdir -p /opt/pod-automator/data
+sudo chown -R podmgr:podmgr /opt/pod-automator/data
+sudo systemctl restart pod-automator
+```
+
+### Install script stops with no error message
+The script uses `set -euo pipefail` — any error causes a silent exit.
+Check the log immediately:
+```bash
+sudo tail -20 /var/log/pod-automator-install.log
+```
+Then re-run with the cache-busting timestamp to get the latest script:
+```bash
+sudo rm -rf /opt/pod-automator
+curl -fsSL \
+  "https://raw.githubusercontent.com/mokuma56/POD-Automator/main/appliance/install.sh?$(date +%s)" \
+  | sudo bash
+```
+
+### git pull fails with "dubious ownership"
+```bash
+sudo git config --global --add safe.directory /opt/pod-automator
+sudo git -C /opt/pod-automator pull
+sudo systemctl restart pod-automator
 ```
 
 ### VPN won't connect
@@ -328,10 +413,10 @@ The upgrade pipeline SSHes to the Ubuntu PC, which then connects to switches.
 
 ### Docker image outdated after code update
 ```bash
-cd /opt/pod-automator
-git pull
-docker build -f docker/Dockerfile -t pod-automator:latest .
+sudo git -C /opt/pod-automator pull
+sudo docker build -f /opt/pod-automator/docker/Dockerfile -t pod-automator:latest /opt/pod-automator
 # Running containers are unaffected until next POD launch
+sudo systemctl restart pod-automator
 ```
 
 ---
