@@ -1101,16 +1101,18 @@ def api_fabric_reset(pod_id):
 # ---------------------------------------------------------------------------
 
 SDA_DEPLOY_STEPS   = ["discovery", "provision", "fabric_site", "virtual_networks",
-                       "anycast_gateways", "transit", "fabric_devices", "l3_handoff",
+                       "anycast_gateways", "transit", "clean_fabric_vlans", "fabric_devices",
+                       "l3_handoff", "configure_handoff_interface", "deploy_anycast_gateways",
                        "port_assignments", "verify"]
-SDA_ROLLBACK_STEPS = ["remove_fabric_devices", "remove_anycast_gateways", "disable_gbac_policy",
+SDA_ROLLBACK_STEPS = ["remove_port_assignments", "remove_l3_handoffs", "restore_handoff_interface",
+                       "remove_fabric_devices", "remove_anycast_gateways", "disable_gbac_policy",
                        "remove_transit", "remove_vn_assignments", "remove_virtual_networks",
                        "remove_fabric_site", "delete_devices", "delete_discovery",
                        "delete_ise_nads", "remove_network_profile"]
 
 
-SDA_DEPLOY_STEP_KEYS   = ["discovery","provision","fabric_site","virtual_networks","anycast_gateways","transit","fabric_devices","l3_handoff","port_assignments","verify"]
-SDA_ROLLBACK_STEP_KEYS = ["remove_fabric_devices","remove_anycast_gateways","disable_gbac_policy","remove_transit","remove_vn_assignments","remove_virtual_networks","remove_fabric_site","delete_devices","delete_discovery","delete_ise_nads","remove_network_profile"]
+SDA_DEPLOY_STEP_KEYS   = ["discovery","provision","fabric_site","virtual_networks","anycast_gateways","transit","clean_fabric_vlans","fabric_devices","l3_handoff","configure_handoff_interface","deploy_anycast_gateways","port_assignments","verify"]
+SDA_ROLLBACK_STEP_KEYS = ["remove_port_assignments","remove_l3_handoffs","restore_handoff_interface","remove_fabric_devices","remove_anycast_gateways","disable_gbac_policy","remove_transit","remove_vn_assignments","remove_virtual_networks","remove_fabric_site","delete_devices","delete_discovery","delete_ise_nads","remove_network_profile"]
 
 
 def _ensure_sda_table():
@@ -1274,6 +1276,15 @@ def api_catc_discover(pod_id):
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "message": f"Catalyst Center discovery started for {pod_id}"})
+
+
+@app.route("/api/catc/clear/<pod_id>", methods=["POST"])
+def api_catc_clear(pod_id):
+    """Clear CatC discovery step logs so the tile resets to pending."""
+    c = _db()
+    c.execute("DELETE FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[catc:step]%'", (pod_id,))
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "message": f"CatC discovery reset for {pod_id}"})
 
 
 @app.route("/api/catc/status/<pod_id>")
@@ -1466,38 +1477,38 @@ def api_baseconfig_reset(pod_id, switch_key):
                 ok_val, detail_val = False, "timed out after 300s"
             except Exception as e:
                 ok_val, detail_val = False, str(e)
-                status_str = "OK" if ok_val else "FAILED"
-                log(pod_id, f"[baseconfig/{key}] {status_str}: {_sanitize(detail_val)}")
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[baseconfig/{key}] {status_str}: {_sanitize(detail_val)}")
 
-                # Auto-verify after successful reset
-                if ok_val:
-                    import datetime as _dt2
-                    ts2 = _dt2.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                    log(pod_id, f"[verify/{key}] RUNNING started_at={ts2}: connecting to {BASECONFIG_SWITCHES[key]['ip']}...")
-                    vscript = (
-                        "import sys, os; sys.path.insert(0, '.'); import onboard_router; "
-                        f"ok, detail = onboard_router.phase_baseconfig_verify('{key}'); "
-                        "print(repr((ok, detail)))"
-                    )
+            # Auto-verify after successful reset
+            if ok_val:
+                import datetime as _dt2
+                ts2 = _dt2.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                log(pod_id, f"[verify/{key}] RUNNING started_at={ts2}: connecting to {BASECONFIG_SWITCHES[key]['ip']}...")
+                vscript = (
+                    "import sys, os; sys.path.insert(0, '.'); import onboard_router; "
+                    f"ok, detail = onboard_router.phase_baseconfig_verify('{key}'); "
+                    "print(repr((ok, detail)))"
+                )
+                try:
+                    vresult = subprocess.run([
+                        "docker", "run", "--rm",
+                        "--network", f"container:vpn-{pod_id}",
+                        "-v", f"{os.path.abspath(DATA_DIR / 'base_configs')}:/pipeline/base_configs:ro",
+                        "-e", "BASE_CONFIGS_DIR=/pipeline/base_configs",
+                        "--entrypoint", "python3",
+                        "pod-automator:latest", "-c", vscript
+                    ], capture_output=True, text=True, timeout=60)
+                    vout = vresult.stdout.strip()
+                    vlast = vout.splitlines()[-1] if vout else ""
                     try:
-                        vresult = subprocess.run([
-                            "docker", "run", "--rm",
-                            "--network", f"container:vpn-{pod_id}",
-                            "-v", f"{os.path.abspath(DATA_DIR / 'base_configs')}:/pipeline/base_configs:ro",
-                            "-e", "BASE_CONFIGS_DIR=/pipeline/base_configs",
-                            "--entrypoint", "python3",
-                            "pod-automator:latest", "-c", vscript
-                        ], capture_output=True, text=True, timeout=60)
-                        vout = vresult.stdout.strip()
-                        vlast = vout.splitlines()[-1] if vout else ""
-                        try:
-                            vok, vdetail = eval(vlast)
-                        except Exception:
-                            vok, vdetail = False, f"parse error: {vout[:200]}"
-                    except Exception as ve:
-                        vok, vdetail = False, str(ve)
-                    vstatus = "OK" if vok else "FAILED"
-                    log(pod_id, f"[verify/{key}] {vstatus}: {_sanitize(vdetail)}")
+                        vok, vdetail = eval(vlast)
+                    except Exception:
+                        vok, vdetail = False, f"parse error: {vout[:200]}"
+                except Exception as ve:
+                    vok, vdetail = False, str(ve)
+                vstatus = "OK" if vok else "FAILED"
+                log(pod_id, f"[verify/{key}] {vstatus}: {_sanitize(vdetail)}")
 
         # After all switches, clean up ISE NADs (only when resetting all)
         if switch_key == "all":
@@ -3887,59 +3898,68 @@ const BASECONFIG_SWITCHES = {
 
 const SDA_DEPLOY_STEP_KEYS = [
   "discovery","provision","fabric_site","virtual_networks",
-  "anycast_gateways","transit","fabric_devices","l3_handoff",
+  "anycast_gateways","transit","clean_fabric_vlans","fabric_devices","l3_handoff",
+  "configure_handoff_interface","deploy_anycast_gateways",
   "port_assignments","verify"
 ];
 const SDA_DEPLOY_STEP_LABELS = {
-  discovery:        "Discovery (Loopbacks)",
-  provision:        "Provision to MAIN Site",
-  fabric_site:      "Create Fabric Site",
-  virtual_networks: "Create L3 VNs",
-  anycast_gateways: "Anycast Gateways",
-  transit:          "XAR-Transit",
-  fabric_devices:   "Fabric Devices",
-  l3_handoff:       "L3 Handoff",
-  port_assignments: "Trunk Port Assignments",
-  verify:           "Verify Fabric",
+  discovery:                    "Discovery (Loopbacks)",
+  provision:                    "Provision to MAIN Site",
+  fabric_site:                  "Create Fabric Site",
+  virtual_networks:             "Create L3 VNs",
+  anycast_gateways:             "Anycast Gateways",
+  transit:                      "XAR-Transit",
+  clean_fabric_vlans:           "Clean Conflicting VLANs",
+  fabric_devices:               "Fabric Devices",
+  l3_handoff:                   "L3 Handoff",
+  configure_handoff_interface:  "Configure Handoff Interface",
+  deploy_anycast_gateways:      "Deploy Anycast Gateways",
+  port_assignments:             "Trunk Port Assignments",
+  verify:                       "Verify Fabric",
 };
 const SDA_DEPLOY_STEP_TARGETS = {
-  discovery:        "172.30.255.1–3",
-  provision:        "All 3 switches",
-  fabric_site:      "Site-105/MAIN",
-  virtual_networks: "Main / PROD / IOT",
-  anycast_gateways: "VLAN 10 / 101 / 102",
-  transit:          "BGP ASN 65534",
-  fabric_devices:   "Border+CP + Leaf1+Leaf2",
-  l3_handoff:       "Gi1/0/48 per VN",
-  port_assignments: "Gi1/0/2 Leaf1+Leaf2",
-  verify:           "Catalyst Center",
+  discovery:                    "172.30.255.1–3",
+  provision:                    "All 3 switches",
+  fabric_site:                  "Site-105/MAIN",
+  virtual_networks:             "Main / PROD / IOT",
+  anycast_gateways:             "VLAN 10 / 101 / 102",
+  transit:                      "BGP ASN 65534",
+  clean_fabric_vlans:           "All 3 switches",
+  fabric_devices:               "Border+CP + Leaf1+Leaf2",
+  l3_handoff:                   "CatC API",
+  configure_handoff_interface:  "Gi1/0/48 sub-ints",
+  deploy_anycast_gateways:      "CatC → Leaf2 SVIs",
+  port_assignments:             "Gi1/0/2 Leaf1+Leaf2",
+  verify:                       "Catalyst Center",
 };
 
 const SDA_ROLLBACK_STEP_KEYS = [
-  "remove_port_assignments","remove_l3_handoffs",
+  "remove_port_assignments","remove_l3_handoffs","restore_handoff_interface",
   "remove_fabric_devices","remove_anycast_gateways","disable_gbac_policy",
   "remove_transit","remove_vn_assignments","remove_virtual_networks",
   "remove_fabric_site","delete_devices","delete_discovery",
   "delete_ise_nads","remove_network_profile"
 ];
 const SDA_ROLLBACK_STEP_LABELS = {
-  remove_port_assignments: "Remove Port Assignments",
-  remove_l3_handoffs:      "Remove L3 Handoffs",
-  remove_fabric_devices:   "Remove Fabric Devices",
-  remove_anycast_gateways: "Remove Anycast Gateways",
-  disable_gbac_policy:     "Disable GBAC Policy",
-  remove_transit:          "Remove XAR-Transit",
-  remove_vn_assignments:   "Remove VN Site Assignments",
-  remove_virtual_networks: "Delete L3 VNs",
-  remove_fabric_site:      "Delete Fabric Site",
-  delete_devices:          "Delete from Inventory",
-  delete_discovery:        "Delete Discovery Job",
-  delete_ise_nads:         "Delete ISE NADs",
-  remove_network_profile:  "Remove Network Profile",
+  remove_port_assignments:     "Remove Port Assignments",
+  remove_l3_handoffs:          "Remove L3 Handoffs",
+  restore_handoff_interface:   "Restore Gi1/0/48 to Trunk",
+  remove_fabric_devices:       "Remove Fabric Devices",
+  remove_anycast_gateways:     "Remove Anycast Gateways",
+  disable_gbac_policy:         "Disable GBAC Policy",
+  remove_transit:              "Remove XAR-Transit",
+  remove_vn_assignments:       "Remove VN Site Assignments",
+  remove_virtual_networks:     "Delete L3 VNs",
+  remove_fabric_site:          "Delete Fabric Site",
+  delete_devices:              "Delete from Inventory",
+  delete_discovery:            "Delete Discovery Job",
+  delete_ise_nads:             "Delete ISE NADs",
+  remove_network_profile:      "Remove Network Profile",
 };
 const SDA_ROLLBACK_STEP_TARGETS = {
-  remove_port_assignments: "Gi1/0/2 Leaf1+Leaf2",
-  remove_l3_handoffs:      "Gi1/0/48 Border Spine",
+  remove_port_assignments:     "Gi1/0/2 Leaf1+Leaf2",
+  remove_l3_handoffs:          "CatC API",
+  restore_handoff_interface:   "Border Spine Gi1/0/48",
   remove_fabric_devices:   "Edge nodes first",
   remove_anycast_gateways: "VLAN 10 / 101 / 102",
   disable_gbac_policy:     "CATC GBAC",
@@ -3993,11 +4013,11 @@ function renderSdaGrid(podId, data) {
   // ── Progress bar ──────────────────────────────────────────────────────────
   html += '<div style="margin-bottom:14px;">';
   html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
-  html += '<span>' + labelText + '</span>';
-  html += '<span>' + dPct + '% (' + dDone + '/' + dTotal + ')</span>';
+  html += '<span id="sda-deploy-label">' + labelText + '</span>';
+  html += '<span id="sda-deploy-pct">' + dPct + '% (' + dDone + '/' + dTotal + ')</span>';
   html += '</div>';
   html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
-  html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + dPct + '%;transition:width 0.4s;"></div>';
+  html += '<div id="sda-deploy-bar" style="height:100%;border-radius:4px;background:' + barColor + ';width:' + dPct + '%;transition:width 0.4s;"></div>';
   html += '</div></div>';
 
   // ── Deploy step cards ─────────────────────────────────────────────────────
@@ -4007,14 +4027,12 @@ function renderSdaGrid(podId, data) {
     const st     = info.status || 'pending';
     const result = (info.result || '').substring(0, 200);
     const dur    = formatDur(info.started_at, info.completed_at);
-    const cardBorder = st === 'failed'    ? 'border-left:3px solid #ff4757;'
-                     : st === 'running'   ? 'border-left:3px solid #02c8ff;'
-                     : st === 'completed' ? 'border-left:3px solid #00e68a;' : '';
-    html += '<div class="step-card" style="' + cardBorder + '">';
+    const borderColor = st === 'failed' ? '#ff4757' : st === 'running' ? '#02c8ff' : st === 'completed' ? '#00e68a' : 'transparent';
+    html += '<div id="sda-card-deploy-' + s + '" class="step-card" style="border-left:3px solid ' + borderColor + ';">';
     html += '<div class="step-num">Step ' + (i + 1) + '/' + dTotal + '</div>';
     html += '<div class="step-name">' + (SDA_DEPLOY_STEP_LABELS[s] || s) + '</div>';
     html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (SDA_DEPLOY_STEP_TARGETS[s] || '') + '</div>';
-    html += pipelineBadge(st);
+    html += '<span class="sda-badge">' + pipelineBadge(st) + '</span>';
     if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
     if (dur)    html += '<div class="step-dur">' + dur + '</div>';
     html += '</div>';
@@ -4048,21 +4066,19 @@ function renderSdaGrid(podId, data) {
     const st     = info.status || 'pending';
     const result = (info.result || '').substring(0, 200);
     const dur    = formatDur(info.started_at, info.completed_at);
-    const cardBorder = st === 'failed'    ? 'border-left:3px solid #ff4757;'
-                     : st === 'running'   ? 'border-left:3px solid #e67e22;'
-                     : st === 'completed' ? 'border-left:3px solid #00e68a;' : '';
-    html += '<div class="step-card" style="' + cardBorder + '">';
+    const borderColor = st === 'failed' ? '#ff4757' : st === 'running' ? '#e67e22' : st === 'completed' ? '#00e68a' : 'transparent';
+    html += '<div id="sda-card-rollback-' + s + '" class="step-card" style="border-left:3px solid ' + borderColor + ';">';
     html += '<div class="step-num">Step ' + (i + 1) + '/' + rTotal + '</div>';
     html += '<div class="step-name">' + (SDA_ROLLBACK_STEP_LABELS[s] || s) + '</div>';
     html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (SDA_ROLLBACK_STEP_TARGETS[s] || '') + '</div>';
-    html += pipelineBadge(st);
+    html += '<span class="sda-badge">' + pipelineBadge(st) + '</span>';
     if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
     if (dur)    html += '<div class="step-dur">' + dur + '</div>';
     html += '</div>';
   });
   html += '</div>';
 
-  if (grid._lastHtml === html && !dRunning && !rRunning) return;
+  if (grid._lastHtml === html) return;
   grid._lastHtml = html;
   grid.innerHTML = html;
 
@@ -4084,23 +4100,30 @@ function renderSdaCatcTile(podId) {
   const container = document.getElementById('sda-catc-tile-container');
   if (!container || !podId) return;
 
-  container.innerHTML =
-    '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
-      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
-        '<div>' +
-          '<span style="font-size:13px;font-weight:600;color:#cdd6e0;">Catalyst Center Discovery</span>' +
-          '<span style="font-size:10px;color:#667788;margin-left:8px;">198.18.5.100</span>' +
+  // Only build the shell once — avoids re-wiring buttons and flickering on every poll
+  if (!container._initialized) {
+    container._initialized = true;
+    container.innerHTML =
+      '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+          '<div>' +
+            '<span style="font-size:13px;font-weight:600;color:#cdd6e0;">Catalyst Center Discovery</span>' +
+            '<span style="font-size:10px;color:#667788;margin-left:8px;">198.18.5.100</span>' +
+          '</div>' +
+          '<div style="display:flex;gap:6px;">' +
+            '<button id="sda-catc-discover-btn" style="background:#7b4fff;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#128269; Discover</button>' +
+            '<button id="sda-catc-rerun-btn" style="background:#1a2d4a;color:#8899aa;border:1px solid #2a3d5a;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#8635; Re-run</button>' +
+            '<button id="sda-catc-reset-btn" style="background:#1a2d4a;color:#e74c3c;border:1px solid #e74c3c;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#10006; Reset</button>' +
+          '</div>' +
         '</div>' +
-        '<div style="display:flex;gap:6px;">' +
-          '<button id="sda-catc-discover-btn" style="background:#7b4fff;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#128269; Discover</button>' +
-          '<button id="sda-catc-rerun-btn" style="background:#1a2d4a;color:#8899aa;border:1px solid #2a3d5a;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#8635; Re-run</button>' +
-        '</div>' +
-      '</div>' +
-      '<div id="sda-catc-progress-area"></div>' +
-    '</div>';
+        '<div id="sda-catc-progress-area"></div>' +
+      '</div>';
 
-  document.getElementById('sda-catc-discover-btn').addEventListener('click', () => triggerSdaCatcDiscover(podId));
-  document.getElementById('sda-catc-rerun-btn').addEventListener('click',    () => triggerSdaCatcDiscover(podId));
+    document.getElementById('sda-catc-discover-btn').addEventListener('click', () => triggerSdaCatcDiscover(podId));
+    document.getElementById('sda-catc-rerun-btn').addEventListener('click',    () => triggerSdaCatcDiscover(podId));
+    document.getElementById('sda-catc-reset-btn').addEventListener('click',    () => resetSdaCatcDiscover(podId));
+  }
+
   loadSdaCatcStatus(podId);
 }
 
@@ -4168,10 +4191,23 @@ async function triggerSdaCatcDiscover(podId) {
     const sr = await loadSdaCatcStatus(podId);
     if (!sr || !sr.running || polls >= 60) {
       clearInterval(poll);
+      // Final refresh to ensure terminal state is rendered
+      await loadSdaCatcStatus(podId);
       if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
       if (rerun) { rerun.disabled = false; }
     }
   }, 3000);
+}
+
+async function resetSdaCatcDiscover(podId) {
+  if (!confirm('Reset Catalyst Center discovery for ' + podId + '? This clears the step log so you can re-run from scratch.')) return;
+  const btn  = document.getElementById('sda-catc-reset-btn');
+  const area = document.getElementById('sda-catc-progress-area');
+  if (btn)  { btn.disabled = true; btn.textContent = 'Resetting...'; }
+  await fetch('/api/catc/clear/' + podId, { method: 'POST' });
+  if (area) area.innerHTML = '<div style="color:#8899aa;font-size:11px;">Reset — ready to discover.</div>';
+  if (btn)  { btn.disabled = false; btn.innerHTML = '&#10006; Reset'; }
+  loadSdaCatcStatus(podId);
 }
 
 async function loadSdaStatus(podId) {
@@ -4179,22 +4215,85 @@ async function loadSdaStatus(podId) {
   if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
   const data = await fetch('/api/sda/status/' + podId).then(r => r.json());
   renderSdaGrid(podId, data);
-  // Auto-poll if anything is running
+  // Only start poller if something is genuinely running
   const isRunning = s => (s || {}).status === 'running';
   const anyRunning = [...Object.values(data.deploy || {}), ...Object.values(data.rollback || {})].some(isRunning);
   if (anyRunning) _sdaStartPoller(podId);
 }
 
 function _sdaStartPoller(podId) {
+  if (window._sdaPoller) clearInterval(window._sdaPoller);
   let polls = 0;
   const isRunning = s => (s || {}).status === 'running';
-  const poll = setInterval(async () => {
+  window._sdaPoller = setInterval(async () => {
     polls++;
     const data = await fetch('/api/sda/status/' + podId).then(r => r.json());
-    renderSdaGrid(podId, data);
     const anyRunning = [...Object.values(data.deploy || {}), ...Object.values(data.rollback || {})].some(isRunning);
-    if ((!anyRunning && polls > 3) || polls > 300) clearInterval(poll);
+    if (!anyRunning || polls > 300) {
+      clearInterval(window._sdaPoller);
+      window._sdaPoller = null;
+      renderSdaGrid(podId, data);
+      return;
+    }
+    _sdaUpdateCards(data);
   }, 3000);
+}
+
+function _sdaUpdateCards(data) {
+  const deploy   = data.deploy   || {};
+  const rollback = data.rollback || {};
+
+  // Update progress bar text + fill
+  const dSteps  = SDA_DEPLOY_STEP_KEYS;
+  const dDone   = dSteps.filter(s => (deploy[s]||{}).status === 'completed').length;
+  const dFailed = dSteps.filter(s => (deploy[s]||{}).status === 'failed').length > 0;
+  const dRun    = dSteps.some(s => (deploy[s]||{}).status === 'running');
+  const dTotal  = dSteps.length;
+  const dPct    = Math.min(100, Math.round(dDone / dTotal * 100));
+  const barColor = dFailed ? '#ff4757' : dRun ? '#02c8ff' : dDone === dTotal && dDone > 0 ? '#00e68a' : '#445566';
+  const labelText = dFailed ? 'Failed at step ' + (dDone + 1) + '/' + dTotal
+                  : dRun    ? 'Running \u2014 ' + dDone + '/' + dTotal
+                  : dDone === dTotal && dDone > 0 ? 'Complete! All ' + dTotal + ' steps done'
+                  : dDone === 0 ? 'Not started' : 'Paused \u2014 ' + dDone + '/' + dTotal;
+
+  const bar = document.getElementById('sda-deploy-bar');
+  const barLabel = document.getElementById('sda-deploy-label');
+  const barPct   = document.getElementById('sda-deploy-pct');
+  if (bar)      { bar.style.width = dPct + '%'; bar.style.background = barColor; }
+  if (barLabel) barLabel.textContent = labelText;
+  if (barPct)   barPct.textContent   = dPct + '% (' + dDone + '/' + dTotal + ')';
+
+  // Update each deploy step card in-place
+  dSteps.forEach(s => {
+    const info = deploy[s] || {};
+    const st   = info.status || 'pending';
+    const card = document.getElementById('sda-card-deploy-' + s);
+    if (!card) return;
+    const borderColor = st === 'failed' ? '#ff4757' : st === 'running' ? '#02c8ff' : st === 'completed' ? '#00e68a' : 'transparent';
+    card.style.borderLeftColor = borderColor;
+    const badge = card.querySelector('.sda-badge');
+    if (badge) badge.outerHTML = '<span class="sda-badge">' + pipelineBadge(st) + '</span>';
+    const res = card.querySelector('.step-result');
+    const resText = (info.result || '').substring(0, 200).split('\\n')[0];
+    if (res) res.textContent = resText;
+    else if (resText) {
+      const dur = card.querySelector('.step-dur');
+      if (dur) dur.insertAdjacentHTML('beforebegin', '<div class="step-result">' + resText + '</div>');
+    }
+  });
+
+  // Update rollback cards
+  const rSteps = SDA_ROLLBACK_STEP_KEYS;
+  rSteps.forEach(s => {
+    const info = rollback[s] || {};
+    const st   = info.status || 'pending';
+    const card = document.getElementById('sda-card-rollback-' + s);
+    if (!card) return;
+    const borderColor = st === 'failed' ? '#ff4757' : st === 'running' ? '#e67e22' : st === 'completed' ? '#00e68a' : 'transparent';
+    card.style.borderLeftColor = borderColor;
+    const badge = card.querySelector('.sda-badge');
+    if (badge) badge.outerHTML = '<span class="sda-badge">' + pipelineBadge(st) + '</span>';
+  });
 }
 
 async function triggerSda(podId, action) {
@@ -4392,9 +4491,8 @@ function renderBaseConfigGrid(podId, statusData) {
 
   html += '<div id="baseconfig-log" style="margin-top:14px;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:10px;font-size:11px;font-family:monospace;color:#8899aa;max-height:160px;overflow-y:auto;display:none;"></div>';
 
-  // Only rebuild DOM if content changed — but always re-render when something is running
-  const anyRunning = Object.values(statusData || {}).some(s => (s.reset||'').includes('RUNNING') || (s.verify||'').includes('RUNNING'));
-  if (!anyRunning && grid._lastHtml === html) return;
+  // Only rebuild DOM if content changed
+  if (grid._lastHtml === html) return;
   grid._lastHtml = html;
   grid.innerHTML = html;
 
@@ -4576,23 +4674,30 @@ function renderCatcTile(podId) {
   const container = document.getElementById('catc-tile-container');
   if (!container || !podId) return;
 
-  container.innerHTML =
-    '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
-      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
-        '<div>' +
-          '<span style="font-size:13px;font-weight:600;color:#cdd6e0;">Catalyst Center Discovery</span>' +
-          '<span style="font-size:10px;color:#667788;margin-left:8px;">198.18.5.100</span>' +
+  // Only build the shell once — avoids re-wiring buttons and flickering on every poll
+  if (!container._initialized) {
+    container._initialized = true;
+    container.innerHTML =
+      '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+          '<div>' +
+            '<span style="font-size:13px;font-weight:600;color:#cdd6e0;">Catalyst Center Discovery</span>' +
+            '<span style="font-size:10px;color:#667788;margin-left:8px;">198.18.5.100</span>' +
+          '</div>' +
+          '<div style="display:flex;gap:6px;">' +
+            '<button id="catc-discover-btn" style="background:#7b4fff;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#128269; Discover</button>' +
+            '<button id="catc-rerun-btn" style="background:#1a2d4a;color:#8899aa;border:1px solid #2a3d5a;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#8635; Re-run</button>' +
+            '<button id="catc-reset-btn" style="background:#1a2d4a;color:#e74c3c;border:1px solid #e74c3c;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#10006; Reset</button>' +
+          '</div>' +
         '</div>' +
-        '<div style="display:flex;gap:6px;">' +
-          '<button id="catc-discover-btn" style="background:#7b4fff;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#128269; Discover</button>' +
-          '<button id="catc-rerun-btn" style="background:#1a2d4a;color:#8899aa;border:1px solid #2a3d5a;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#8635; Re-run</button>' +
-        '</div>' +
-      '</div>' +
-      '<div id="catc-progress-area"></div>' +
-    '</div>';
+        '<div id="catc-progress-area"></div>' +
+      '</div>';
 
-  document.getElementById('catc-discover-btn').addEventListener('click', () => triggerCatcDiscover(podId));
-  document.getElementById('catc-rerun-btn').addEventListener('click',    () => triggerCatcDiscover(podId));
+    document.getElementById('catc-discover-btn').addEventListener('click', () => triggerCatcDiscover(podId));
+    document.getElementById('catc-rerun-btn').addEventListener('click',    () => triggerCatcDiscover(podId));
+    document.getElementById('catc-reset-btn').addEventListener('click',    () => resetCatcDiscover(podId));
+  }
+
   loadCatcStatus(podId);
 }
 
@@ -4620,10 +4725,23 @@ async function triggerCatcDiscover(podId) {
     const sr = await loadCatcStatus(podId);
     if (!sr || !sr.running || polls >= 60) {
       clearInterval(poll);
+      // Final refresh to ensure terminal state is rendered
+      await loadCatcStatus(podId);
       if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
       if (rerun) { rerun.disabled = false; }
     }
   }, 3000);
+}
+
+async function resetCatcDiscover(podId) {
+  if (!confirm('Reset Catalyst Center discovery for ' + podId + '? This clears the step log so you can re-run from scratch.')) return;
+  const btn   = document.getElementById('catc-reset-btn');
+  const area  = document.getElementById('catc-progress-area');
+  if (btn)  { btn.disabled = true; btn.textContent = 'Resetting...'; }
+  await fetch('/api/catc/clear/' + podId, { method: 'POST' });
+  if (area) area.innerHTML = '<div style="color:#8899aa;font-size:11px;">Reset — ready to discover.</div>';
+  if (btn)  { btn.disabled = false; btn.innerHTML = '&#10006; Reset'; }
+  loadCatcStatus(podId);
 }
 
 function closeDetail() {
