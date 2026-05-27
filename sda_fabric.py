@@ -883,6 +883,59 @@ def rollback_configure_handoff_interface(log_fn=print):
     return True, "rollback_configure_handoff_interface OK"
 
 
+def _fix_dhcp_relay_global(log_fn=print):
+    """Fix DHCP relay on Leaf1 and Leaf2 after CatC pushes SVIs.
+
+    CatC pushes 'ip helper-address 198.18.5.102' without the 'global' keyword.
+    Without 'global' the relay packet is forwarded via VRF Main → router OMP →
+    hub — a path that is broken in this lab. With 'global' the relay exits via
+    the global routing table: Loopback0 → OSPF → Border Spine → router global →
+    198.18.5.102, which works reliably.
+
+    Also ensures 'ip dhcp relay source-interface Loopback0' is set so the relay
+    GIADDR is the switch Loopback0 IP (reachable from the DHCP server).
+    """
+    import time as _time
+    VRF_VLANS = ["Vlan10", "Vlan101", "Vlan102"]
+    for key in ("leaf1", "leaf2"):
+        mgmt_ip = SWITCH_IPS[key]["mgmt"]
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                           timeout=15, allow_agent=False, look_for_keys=False)
+            chan = client.invoke_shell()
+            _time.sleep(0.8)
+
+            def send(cmd, w=0.6):
+                chan.send(cmd + "\n")
+                _time.sleep(w)
+                out = b""
+                while chan.recv_ready():
+                    out += chan.recv(4096)
+                return out.decode(errors="ignore")
+
+            send("terminal length 0")
+            send("configure terminal")
+            for vlan in VRF_VLANS:
+                send(f"interface {vlan}")
+                send("ip dhcp relay source-interface Loopback0")
+                send("no ip helper-address 198.18.5.102")
+                send("ip helper-address global 198.18.5.102")
+                send("exit")
+            send("end")
+            chan.send("write memory\n")
+            _time.sleep(3)
+            out = b""
+            while chan.recv_ready():
+                out += chan.recv(4096)
+            saved = "[OK]" in out.decode(errors="ignore")
+            client.close()
+            log_fn(f"    {key} ({mgmt_ip}): DHCP relay fixed (global), saved={saved}")
+        except Exception as e:
+            log_fn(f"    WARNING: DHCP relay fix failed on {key} ({mgmt_ip}): {e}")
+
+
 def step_deploy_anycast_gateways(log_fn=print):
     """Trigger CatC to push anycast gateway SVIs and DHCP helper-address to fabric devices.
 
@@ -946,7 +999,6 @@ def step_deploy_anycast_gateways(log_fn=print):
                 raise
 
     # Verify SVIs appeared on Leaf2 (edge node — this is where clients connect)
-    import socket as _sock
     leaf2_ip = SWITCH_IPS["leaf2"]["mgmt"]
     log_fn(f"  Verifying SVIs on Leaf2 ({leaf2_ip})...")
     _time.sleep(10)
@@ -968,6 +1020,13 @@ def step_deploy_anycast_gateways(log_fn=print):
             log_fn(f"  WARNING: ip helper-address not yet pushed to Leaf2")
     except Exception as e:
         log_fn(f"  WARNING: Leaf2 verification failed: {e}")
+
+    # Fix DHCP relay on both leaves: CatC pushes 'ip helper-address 198.18.5.102' without
+    # the 'global' keyword, which routes DHCP via VRF Main → OMP → hub (dead path).
+    # We must change it to 'ip helper-address global' so relay exits via the global routing
+    # table (Loopback0 → OSPF → Border Spine → router global → 198.18.5.102).
+    log_fn(f"  Fixing DHCP relay to use global routing table on both leaves...")
+    _fix_dhcp_relay_global(log_fn=log_fn)
 
     return True, "deploy_anycast_gateways OK"
 
