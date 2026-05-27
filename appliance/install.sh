@@ -138,6 +138,7 @@ Type=simple
 User=${SERVICE_USER}
 WorkingDirectory=${INSTALL_DIR}
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+ExecStartPre=git -C ${INSTALL_DIR} pull --ff-only
 ExecStart=/usr/local/bin/uv run python3 dashboard.py
 Restart=on-failure
 RestartSec=10
