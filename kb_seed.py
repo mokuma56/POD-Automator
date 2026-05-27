@@ -2,7 +2,8 @@
 KB seeder and ingestion helpers.
 
 Usage:
-  uv run python3 kb_seed.py seed       # seed from AGENTS.md
+  uv run python3 kb_seed.py seed       # seed from AGENTS.md + curated articles
+  uv run python3 kb_seed.py articles   # seed curated articles only
   uv run python3 kb_seed.py ingest     # ingest a file passed as argv[2]
   uv run python3 kb_seed.py clear      # wipe all published+draft articles (careful)
 
@@ -199,6 +200,134 @@ def seed_from_agents_md(db_path=None, agents_md=None):
 
 
 # ---------------------------------------------------------------------------
+# Curated articles
+# ---------------------------------------------------------------------------
+
+CURATED_ARTICLES = [
+    {
+        "title": "Verify SDA Fabric Operations Commands",
+        "category": "sda-fabric",
+        "tags": "sda,fabric,lisp,bgp,ise,dhcp,verify,troubleshooting",
+        "body": """\
+### Verify SDA Fabric Operations Commands
+
+Use these commands to verify the health of an SDA fabric after deployment or troubleshooting.
+
+---
+
+## Control Plane (LISP)
+
+Run on Leaf switches unless noted.
+
+    show lisp instance-id 4100 ipv4 map-cache        ! Main VRF — entries resolving?
+    show lisp instance-id 4099 ipv4 map-cache        ! PROD
+    show lisp instance-id 4101 ipv4 map-cache        ! IOT
+    show lisp site                                    ! Border Spine only — registered EIDs
+    show lisp instance-id 4100 ipv4 database         ! Leaf — what endpoints are registered
+
+Look for `complete` entries in the map-cache with a valid locator (172.30.255.3).
+A `Negative cache` entry means the map-server has no registration for that prefix.
+`show lisp site` on Border Spine should show EIDs registered from Leaf1 (172.30.255.1) and Leaf2 (172.30.255.2).
+
+---
+
+## BGP (Border Spine <-> Router)
+
+Run on Border Spine.
+
+    show bgp vpnv4 unicast all summary               ! all 3 VRF peers up? (192.168.255.0/.2/.4)
+    show ip route vrf Main                           ! 198.18.5.0/24 present via 192.168.255.0?
+    show ip route vrf PROD
+    show ip route vrf IOT
+
+Expected BGP neighbors: 192.168.255.0 (Main), 192.168.255.2 (PROD), 192.168.255.4 (IOT).
+All should show a numeric prefix count in State/PfxRcd — not Idle or Active.
+Each VRF table must contain 198.18.5.0/24 (DHCP server route) — if missing, relay traffic has no return path.
+
+---
+
+## Authentication / ISE (Leaf Switches)
+
+Run on Leaf1 or Leaf2.
+
+    show authentication sessions                     ! any active sessions?
+    show authentication sessions interface Gi1/0/1   ! is the client authenticated?
+    show authentication sessions interface Gi1/0/3
+    show access-session                              ! SGT assigned?
+
+Look for Status: Authorized and a valid VLAN/Domain. If Unauthorized, dot1x/MAB has not completed.
+If show authentication sessions shows no sessions on Gi1/0/1 or Gi1/0/3, verify the port has
+`source template DefaultWiredDot1xClosedAuth` applied — this was the root cause of DHCP failure in this lab.
+
+---
+
+## DHCP Relay
+
+Run on Leaf switches.
+
+    show ip helper-address                           ! no 'global', no source-interface
+    show ip dhcp snooping statistics                 ! packets forwarded vs dropped
+
+Correct relay config:
+- Helper address: 198.18.5.102
+- NO 'global' keyword — relay must stay in VRF (LISP resolves the path)
+- NO 'ip dhcp relay source-interface Loopback0' — giaddr must be the SVI IP (e.g. 10.10.255.1)
+  so the DHCP server reply can route back via OMP
+
+---
+
+## Fabric Edge (Leaf)
+
+    show vlan brief                                  ! VLANs 10, 101, 102 active
+    show ip interface brief | include Vlan           ! SVIs up/up
+    ping vrf Main 198.18.5.102 repeat 3             ! relay path reachable?
+
+All three SVIs (Vlan10, Vlan101, Vlan102) must be up/up with anycast IPs (10.10.255.1, 10.101.255.1, 10.102.255.1).
+
+---
+
+## Quick Health Check — Border Spine
+
+    show ip bgp vpnv4 all summary | include 192.168.255
+    show ip route vrf Main | include 198.18.5
+    show lisp site summary
+
+---
+
+## Key Points
+
+Two most telling commands:
+- `show authentication sessions` on a leaf — confirms clients are hitting ISE and authorized into the correct VRF
+- `show lisp site` on Border Spine — confirms endpoints are registered in the LISP control plane
+""",
+    },
+]
+
+
+def seed_curated_articles(db_path=None):
+    """Insert curated hand-written KB articles (skips if title already exists)."""
+    db_path = db_path or DB_PATH
+    kb.ensure_kb_table(db_path)
+    existing_titles = {a["title"] for a in kb.list_articles(db_path, status=None, limit=1000)}
+    added = 0
+    for art in CURATED_ARTICLES:
+        if art["title"] in existing_titles:
+            print(f"  skip (exists): {art['title'][:70]}")
+            continue
+        aid = kb.add_article(
+            db_path=db_path,
+            title=art["title"],
+            body=art["body"],
+            tags=art["tags"],
+            category=art["category"],
+            status="published",
+        )
+        print(f"  [{aid}] {art['title'][:70]}")
+        added += 1
+    print(f"Seeded {added} curated article(s)")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -208,6 +337,12 @@ if __name__ == "__main__":
     if cmd == "seed":
         print(f"Seeding KB from {AGENTS_MD} ...")
         seed_from_agents_md()
+        print(f"\nSeeding curated articles ...")
+        seed_curated_articles()
+
+    elif cmd == "articles":
+        print("Seeding curated articles ...")
+        seed_curated_articles()
 
     elif cmd == "ingest":
         if len(sys.argv) < 3:
