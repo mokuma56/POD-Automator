@@ -9,6 +9,7 @@ dependencies = [
     "flask>=3.1",
     "paramiko>=3.0",
     "reportlab>=4.5.1",
+    "ncclient>=0.6",
     "requests>=2.31",
     "urllib3>=2.0",
     "sentence-transformers>=3.0",
