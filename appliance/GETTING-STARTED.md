@@ -229,7 +229,7 @@ At the top of the dashboard, the **Software Upgrade Images** card lets you:
 # Status
 systemctl status pod-automator
 
-# Restart dashboard
+# Restart dashboard (also pulls latest code automatically)
 sudo systemctl restart pod-automator
 
 # Live logs (follow)
@@ -246,30 +246,55 @@ sudo systemctl stop pod-automator
 
 ## Keeping the appliance up to date
 
-The service does **not** auto-pull updates — you control when to update.
+The service automatically pulls the latest code from GitHub **every time it starts**
+(on boot or on `systemctl restart`). No manual update steps are needed for normal
+code changes to `dashboard.py`, `onboard_router.py`, `sda_fabric.py`, etc.
 
-### Manual update
+### How it works
+The systemd service runs `git pull` before starting the dashboard:
+```
+ExecStartPre=git -C /opt/pod-automator pull --ff-only
+ExecStart=uv run python3 dashboard.py
+```
+So pushing to `main` on GitHub → `systemctl restart pod-automator` on the server
+is all it takes to deploy an update.
+
+### To deploy your latest push immediately
 ```bash
-sudo git config --global --add safe.directory /opt/pod-automator
+sudo systemctl restart pod-automator
+```
+
+### When a Docker image rebuild is also needed
+Only required if you changed `docker/Dockerfile` or `onboard.py` (the pipeline
+container entrypoint). Code-only changes to dashboard/pipeline Python files do
+**not** need a rebuild.
+```bash
 sudo git -C /opt/pod-automator pull
 sudo docker build -f /opt/pod-automator/docker/Dockerfile -t pod-automator:latest /opt/pod-automator
 sudo systemctl restart pod-automator
 ```
 
-### Set up a daily auto-update (optional)
-This creates a cron job that pulls and restarts at 3 AM daily:
+### Optional — auto-update every 15 minutes
+If you want the server to pick up pushes without any manual step:
 ```bash
 sudo tee /etc/cron.d/pod-automator-update << 'EOF'
-0 3 * * * root \
-  git -C /opt/pod-automator pull --ff-only && \
-  docker build -f /opt/pod-automator/docker/Dockerfile -t pod-automator:latest /opt/pod-automator && \
-  systemctl restart pod-automator
+*/15 * * * * root systemctl restart pod-automator
 EOF
 ```
-
-To remove the auto-update:
+Because the service already does `git pull` on start, this is all that's needed.
+To remove it:
 ```bash
 sudo rm /etc/cron.d/pod-automator-update
+```
+
+To check if the cron job is installed:
+```bash
+sudo cat /etc/cron.d/pod-automator-update
+```
+
+To see recent cron activity:
+```bash
+grep pod-automator /var/log/syslog | tail -20
 ```
 
 ---
