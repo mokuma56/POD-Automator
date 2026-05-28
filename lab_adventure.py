@@ -3005,7 +3005,7 @@ function resetBreachDemo() {{
       const ok = d.status === 'ok' || d.status === 'partial';
       const detail = Object.entries(d.switches || {{}})
         .map(([k,v]) => k + ': ' + v).join(' | ');
-      alert((ok ? '✓ Reset complete\n' : '⚠ Partial reset\n') + detail);
+      alert((ok ? '\u2713 Reset complete\\n' : '\u26a0 Partial reset\\n') + detail);
       if (btn) {{ btn.disabled = false; btn.textContent = origText || 'Reset Demo'; }}
     }})
     .catch(e => {{
