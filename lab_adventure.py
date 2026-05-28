@@ -635,12 +635,12 @@ def _act1_macro_segmentation(sid):
 
 
 def _act2_micro_segmentation(sid):
-    """Act 2 — prove SGT east-west blocking: show cts role-based counters."""
+    """Act 2 — prove SGT east-west blocking via live host traffic."""
     _breach_emit(sid, "act_start", {"act": 2, "title": "Act 2 — Micro Segmentation (SGT)"})
 
-    for sw_key in ("leaf1", "leaf2"):
+    # Step 1 — clear counters on all 3 switches
+    for sw_key in ("leaf1", "leaf2", "border_spine"):
         sw = SWITCHES[sw_key]
-        # Clear counters first
         step_clear = f"Clear CTS Counters — {sw['name']}"
         _breach_emit(sid, "step_start", {"name": step_clear})
         ok, out = _ssh(sw["ip"], [
@@ -648,17 +648,91 @@ def _act2_micro_segmentation(sid):
             "clear cts role-based counters",
         ])
         _breach_emit(sid, "step_done", {"name": step_clear, "ok": ok,
-                                         "detail": "Counters cleared" if ok else out[:80]})
+                                         "detail": "Counters zeroed" if ok else out[:80]})
 
-    # Pause — let traffic flow so deny counters accumulate
-    _breach_emit(sid, "step_start", {"name": "Simulating Lateral Movement Traffic"})
-    time.sleep(4)
-    _breach_emit(sid, "step_done", {"name": "Simulating Lateral Movement Traffic", "ok": True,
-                                     "detail": "Attack traffic injected — reading enforcement counters"})
+    # Step 2 — instruct student to start pings, then poll for deny counters
+    wait_step = "Waiting for Host Traffic (SGT Enforcement)"
+    _breach_emit(sid, "step_start", {"name": wait_step})
+    _breach_emit(sid, "step_waiting", {
+        "name": wait_step,
+        "detail": (
+            "ACTION REQUIRED: Start a continuous ping between two hosts on different "
+            "segments (e.g. PROD → IOT, or IOT → Main). "
+            "The SGT policy will block the traffic and increment deny counters. "
+            "Polling every 5 seconds — up to 2 minutes..."
+        ),
+    })
 
-    # Read CTS counters on both leaves
+    # Poll Leaf1 + Leaf2 counters every 5s for up to 120s
+    POLL_INTERVAL = 5
+    POLL_MAX = 24  # 24 × 5s = 120s
+    denied_out = ""
+    triggered = False
+    for poll in range(POLL_MAX):
+        time.sleep(POLL_INTERVAL)
+        # Check Leaf1 first (access layer — most likely to see deny)
+        ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
+            "terminal length 0",
+            "show cts role-based counters",
+        ])
+        if ok:
+            # Parse any non-zero deny counters (SW-Denied col=3, HW-Denied col=4)
+            lines = out.splitlines()
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 5 and parts[0] not in ("From", "*", "Role-based"):
+                    try:
+                        sw_denied = int(parts[2])
+                        hw_denied = int(parts[3])
+                        if sw_denied > 0 or hw_denied > 0:
+                            triggered = True
+                    except (ValueError, IndexError):
+                        pass
+            if triggered:
+                denied_out = out
+                break
+        # Also check Leaf2
+        ok2, out2 = _ssh(SWITCHES["leaf2"]["ip"], [
+            "terminal length 0",
+            "show cts role-based counters",
+        ])
+        if ok2:
+            lines = out2.splitlines()
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 5 and parts[0] not in ("From", "*", "Role-based"):
+                    try:
+                        sw_denied = int(parts[2])
+                        hw_denied = int(parts[3])
+                        if sw_denied > 0 or hw_denied > 0:
+                            triggered = True
+                    except (ValueError, IndexError):
+                        pass
+            if triggered:
+                denied_out = out2
+                break
+
+    if triggered:
+        _breach_emit(sid, "step_done", {
+            "name": wait_step,
+            "ok": True,
+            "detail": "Host traffic detected — SGT deny counters are incrementing",
+        })
+    else:
+        # Timed out — grab latest counter snapshot anyway and continue
+        _, denied_out = _ssh(SWITCHES["leaf1"]["ip"], [
+            "terminal length 0",
+            "show cts role-based counters",
+        ])
+        _breach_emit(sid, "step_done", {
+            "name": wait_step,
+            "ok": True,
+            "detail": "Timeout reached — displaying current counter snapshot (start pings to see live deny counts)",
+        })
+
+    # Step 3 — show final counter table on all 3 switches
     all_ok = True
-    for sw_key in ("leaf1", "leaf2"):
+    for sw_key in ("leaf1", "leaf2", "border_spine"):
         sw = SWITCHES[sw_key]
         step_name = f"SGT Enforcement Counters — {sw['name']}"
         _breach_emit(sid, "step_start", {"name": step_name})
@@ -667,30 +741,25 @@ def _act2_micro_segmentation(sid):
             "show cts role-based counters",
         ])
         if ok:
-            has_deny = "deny" in out.lower() or "Deny" in out
+            # Check for any non-zero deny counts
+            has_deny = False
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0] not in ("From", "*", "Role-based"):
+                    try:
+                        if int(parts[2]) > 0 or int(parts[3]) > 0:
+                            has_deny = True
+                    except (ValueError, IndexError):
+                        pass
             _breach_emit(sid, "step_done", {
                 "name": step_name,
                 "ok": True,
-                "detail": "SGT deny rules active — lateral movement blocked" if has_deny else "Counters read (check deny rows)",
+                "detail": "SGT deny counters active — lateral movement BLOCKED" if has_deny else "SGT policy configured — start cross-segment pings to trigger deny counters",
                 "output": out[:800],
             })
         else:
             _breach_emit(sid, "step_done", {"name": step_name, "ok": False, "detail": out[:80]})
             all_ok = False
-
-    # Also check Border Spine
-    step_bs = "SGT Enforcement Counters — Border Spine"
-    _breach_emit(sid, "step_start", {"name": step_bs})
-    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
-        "terminal length 0",
-        "show cts role-based counters",
-    ])
-    _breach_emit(sid, "step_done", {
-        "name": step_bs,
-        "ok": ok,
-        "detail": "SGT policy enforced at spine" if ok else out[:80],
-        "output": out[:800],
-    })
 
     return all_ok
 
@@ -2030,13 +2099,16 @@ _PATH_CSS = """
   .step-row.running { border-color:var(--cyan); background:rgba(2,200,255,0.04); animation:pulse-row 2s ease-in-out infinite; }
   .step-row.ok      { border-color:rgba(0,214,138,0.4); background:rgba(0,214,138,0.03); }
   .step-row.fail    { border-color:rgba(255,71,87,0.4); background:rgba(255,71,87,0.04); }
-  @keyframes pulse-row { 0%,100%{box-shadow:0 0 0 0 rgba(2,200,255,0)} 50%{box-shadow:0 0 0 3px rgba(2,200,255,0.1)} }
+  .step-row.waiting { border-color:rgba(255,165,0,0.6); background:rgba(255,165,0,0.05); animation:pulse-amber 1.5s ease-in-out infinite; }
+  @keyframes pulse-row   { 0%,100%{box-shadow:0 0 0 0 rgba(2,200,255,0)} 50%{box-shadow:0 0 0 3px rgba(2,200,255,0.1)} }
+  @keyframes pulse-amber { 0%,100%{box-shadow:0 0 0 0 rgba(255,165,0,0)} 50%{box-shadow:0 0 0 4px rgba(255,165,0,0.2)} }
 
   .step-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
   .step-row.running .step-dot { background:var(--cyan); animation:blink 1s ease-in-out infinite; }
   .step-row.ok      .step-dot { background:var(--green); }
   .step-row.fail    .step-dot { background:var(--red); }
-  .step-row:not(.running):not(.ok):not(.fail) .step-dot { background:var(--border2); }
+  .step-row.waiting .step-dot { background:orange; animation:blink 0.8s ease-in-out infinite; }
+  .step-row:not(.running):not(.ok):not(.fail):not(.waiting) .step-dot { background:var(--border2); }
   @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
   .step-spinner { width:16px; height:16px; flex-shrink:0; border:2px solid rgba(2,200,255,0.2); border-top-color:var(--cyan); border-radius:50%; animation:spin 0.7s linear infinite; }
@@ -2403,7 +2475,8 @@ BREACH_STEP_LABELS = [
     # Act 2
     "Clear CTS Counters — Leaf 1",
     "Clear CTS Counters — Leaf 2",
-    "Simulating Lateral Movement Traffic",
+    "Clear CTS Counters — Border Spine",
+    "Waiting for Host Traffic (SGT Enforcement)",
     "SGT Enforcement Counters — Leaf 1",
     "SGT Enforcement Counters — Leaf 2",
     "SGT Enforcement Counters — Border Spine",
@@ -2764,6 +2837,11 @@ function startDeploy() {{
     es.addEventListener('step_start', e => {{
       const d = JSON.parse(e.data);
       addStep(d.name, 'running');
+    }});
+
+    es.addEventListener('step_waiting', e => {{
+      const d = JSON.parse(e.data);
+      updateStep(d.name, 'waiting', d.detail || '', '');
     }});
 
     es.addEventListener('step_done', e => {{
