@@ -2125,7 +2125,7 @@ _PATH_CSS = """
   .step-row.fail    { border-color:rgba(255,71,87,0.4); background:rgba(255,71,87,0.04); }
   .step-row.waiting { border-color:rgba(255,165,0,0.6); background:rgba(255,165,0,0.05); animation:pulse-amber 1.5s ease-in-out infinite; }
   @keyframes pulse-row   { 0%,100%{box-shadow:0 0 0 0 rgba(2,200,255,0)} 50%{box-shadow:0 0 0 3px rgba(2,200,255,0.1)} }
-  @keyframes pulse-amber { 0%,100%{box-shadow:0 0 0 0 rgba(255,165,0,0)} 50%{box-shadow:0 0 0 4px rgba(255,165,0,0.2)} }
+  @keyframes pulse-amber { 0%,100%{box-shadow:0 0 0 0 rgba(255,165,0,0)} 50%{box-shadow:0 0 0 6px rgba(255,165,0,0.25)} }
 
   .step-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
   .step-row.running .step-dot { background:var(--cyan); animation:blink 1s ease-in-out infinite; }
@@ -2134,6 +2134,33 @@ _PATH_CSS = """
   .step-row.waiting .step-dot { background:orange; animation:blink 0.8s ease-in-out infinite; }
   .step-row:not(.running):not(.ok):not(.fail):not(.waiting) .step-dot { background:var(--border2); }
   @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  /* ── waiting action banner ── */
+  .waiting-banner {
+    display: flex; align-items: flex-start; gap: 16px;
+    margin: 12px 0 6px;
+    padding: 16px 20px;
+    background: rgba(255,140,0,0.10);
+    border: 1.5px solid rgba(255,140,0,0.5);
+    border-radius: 8px;
+    animation: pulse-amber 1.5s ease-in-out infinite;
+  }
+  .waiting-icon {
+    font-size: 28px; line-height: 1; flex-shrink: 0;
+    color: orange; animation: blink 1s ease-in-out infinite;
+  }
+  .waiting-body { flex: 1; }
+  .waiting-title {
+    font-size: 12px; font-weight: 800; letter-spacing: 2px;
+    text-transform: uppercase; color: orange; margin-bottom: 8px;
+  }
+  .waiting-instruction {
+    font-size: 14px; color: var(--text); line-height: 1.6;
+  }
+  .waiting-countdown {
+    margin-top: 12px; font-size: 13px; font-weight: 700;
+    color: orange; letter-spacing: 1px;
+  }
 
   .step-spinner { width:16px; height:16px; flex-shrink:0; border:2px solid rgba(2,200,255,0.2); border-top-color:var(--cyan); border-radius:50%; animation:spin 0.7s linear infinite; }
   @keyframes spin { to{transform:rotate(360deg)} }
@@ -2875,11 +2902,50 @@ function startDeploy() {{
 
     es.addEventListener('step_waiting', e => {{
       const d = JSON.parse(e.data);
-      updateStep(d.name, 'waiting', d.detail || '', '');
+      const row = document.getElementById(stepKey(d.name));
+      if (!row) return;
+      row.className = 'step-row waiting';
+      const top = row.querySelector('.step-row-top');
+      if (top) {{
+        const dot = document.createElement('div');
+        dot.className = 'step-dot';
+        top.replaceChild(dot, top.firstChild);
+        top.querySelector('.step-detail').textContent = 'Waiting for host pings...';
+      }}
+      // Inject a full-width action banner below the top row
+      const banner = document.createElement('div');
+      banner.className = 'waiting-banner';
+      banner.id = 'waiting-banner-' + stepKey(d.name);
+      banner.innerHTML =
+        '<div class="waiting-icon">&#9888;</div>' +
+        '<div class="waiting-body">' +
+          '<div class="waiting-title">ACTION REQUIRED — Student Task</div>' +
+          '<div class="waiting-instruction">' +
+            'On both PROD workstations, start a <strong>continuous ping</strong> to the other PROD host.<br>' +
+            '<code style="font-size:13px;background:rgba(0,0,0,0.3);padding:2px 8px;border-radius:4px;display:inline-block;margin-top:6px;">' +
+            'ping 10.101.255.x -t &nbsp;(Windows)&nbsp;&nbsp;|&nbsp;&nbsp; ping -t 0 10.101.255.x &nbsp;(Mac/Linux)' +
+            '</code><br>' +
+            '<span style="margin-top:8px;display:block;opacity:0.75;font-size:13px;">Leave the pings running. The simulation will push the SGT deny policy and block the traffic automatically.</span>' +
+          '</div>' +
+          '<div class="waiting-countdown" id="wc-' + stepKey(d.name) + '">30s remaining</div>' +
+        '</div>';
+      row.appendChild(banner);
+      // Countdown timer
+      let secs = 30;
+      const wc = document.getElementById('wc-' + stepKey(d.name));
+      const iv = setInterval(() => {{
+        secs--;
+        if (wc) wc.textContent = secs > 0 ? secs + 's remaining' : 'Pushing policy...';
+        if (secs <= 0) clearInterval(iv);
+      }}, 1000);
+      row.scrollIntoView({{behavior:'smooth', block:'center'}});
     }});
 
     es.addEventListener('step_done', e => {{
       const d = JSON.parse(e.data);
+      // Remove waiting banner if present
+      const banner = document.getElementById('waiting-banner-' + stepKey(d.name));
+      if (banner) banner.remove();
       updateStep(d.name, d.ok ? 'ok' : 'fail', d.detail || '', d.output || '');
       stepData.push(d);
       updateProgress();
