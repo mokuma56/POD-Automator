@@ -561,12 +561,15 @@ ISE_PASS  = "C1sco12345"
 
 # Known cross-VRF IPs we try to reach from IOT (should all fail — macro seg)
 MACRO_SEG_TARGETS = [
-    ("PROD VRF Gateway",  "IOT",  "10.101.255.1"),
-    ("PROD VRF Host",     "IOT",  "10.101.255.100"),
-    ("Main VRF Gateway",  "IOT",  "10.10.255.1"),
-    ("Main VRF Host",     "IOT",  "10.10.255.100"),
-    ("Main VRF Gateway",  "PROD", "10.10.255.1"),
-    ("Main VRF Host",     "PROD", "10.10.255.100"),
+    # (label, vrf, target_ip, expect_pass)
+    # From PROD VRF — own loopback should pass, other VRF loopbacks should be blocked
+    ("PROD WAN Loopback (own VRF — should reach)",  "PROD", "100.100.101.105", True),
+    ("Main WAN Loopback (cross-VRF — should block)", "PROD", "100.100.10.105",  False),
+    ("IoT WAN Loopback (cross-VRF — should block)",  "PROD", "100.100.102.105", False),
+    # From IoT VRF — own loopback should pass, others blocked
+    ("IoT WAN Loopback (own VRF — should reach)",   "IOT",  "100.100.102.105", True),
+    ("PROD WAN Loopback (cross-VRF — should block)", "IOT",  "100.100.101.105", False),
+    ("Main WAN Loopback (cross-VRF — should block)", "IOT",  "100.100.10.105",  False),
 ]
 
 # SGT pairs we check deny counters for (src_sgt → dst_sgt)
@@ -585,37 +588,45 @@ def _act1_macro_segmentation(sid):
     """Act 1 — prove VRF isolation: IOT cannot reach PROD or Main gateways."""
     _breach_emit(sid, "act_start", {"act": 1, "title": "Act 1 — Macro Segmentation"})
 
-    # Step: show VRF route table on Border Spine
-    _breach_emit(sid, "step_start", {"name": "Inspect IOT VRF Route Table"})
+    # Step: show VRF route table on Border Spine — confirm 100.100.x.x WAN loopbacks are present
+    _breach_emit(sid, "step_start", {"name": "Inspect WAN Loopback Routes"})
     ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
         "terminal length 0",
-        "show ip route vrf IOT",
+        "show ip route vrf PROD 100.100.101.105",
+        "show ip route vrf IOT  100.100.102.105",
     ])
-    has_prod = "10.101.255" in out
-    has_main = "10.10.255" in out
-    if ok:
-        detail = "No route to PROD/Main VRFs" if (not has_prod and not has_main) else "Routes present — check policy"
-        _breach_emit(sid, "step_done", {"name": "Inspect IOT VRF Route Table", "ok": True,
-                                         "detail": detail, "output": out[:600]})
-    else:
-        _breach_emit(sid, "step_done", {"name": "Inspect IOT VRF Route Table", "ok": False,
-                                         "detail": out[:120]})
+    _breach_emit(sid, "step_done", {
+        "name": "Inspect WAN Loopback Routes",
+        "ok": ok,
+        "detail": "WAN loopback routes visible via SD-WAN" if ok else out[:120],
+        "output": out[:600],
+    })
+    if not ok:
         return False
 
-    # Steps: attempt cross-VRF pings from Border Spine
-    for label, vrf, target_ip in MACRO_SEG_TARGETS:
-        step_name = f"Ping {label} from {vrf} VRF"
+    # Steps: ping WAN loopbacks from each VRF — own VRF should pass, cross-VRF should block
+    for label, vrf, target_ip, expect_pass in MACRO_SEG_TARGETS:
+        step_name = f"Ping {label}"
         _breach_emit(sid, "step_start", {"name": step_name})
         ok2, out2 = _ssh(SWITCHES["border_spine"]["ip"], [
             "terminal length 0",
             f"ping vrf {vrf} {target_ip} repeat 3 timeout 2",
         ])
-        # Success for our demo = ping FAILS (unreachable = segmentation working)
-        blocked = ("!" not in out2) or ("Success rate is 0" in out2) or ("Unreachable" in out2.lower())
+        passed = "!" in out2 and "Success rate is 0" not in out2
+        if expect_pass:
+            # Should reach — intra-VRF connectivity
+            result_ok = passed
+            detail = (f"REACHABLE — {vrf} VRF can reach own WAN loopback ({target_ip})"
+                      if passed else f"FAIL — expected reachable but got no reply from {target_ip}")
+        else:
+            # Should be blocked — cross-VRF macro segmentation
+            result_ok = not passed
+            detail = (f"BLOCKED — {vrf} VRF cannot reach {target_ip} (macro seg enforced)"
+                      if not passed else f"WARNING — {target_ip} reachable from {vrf} VRF (segmentation gap?)")
         _breach_emit(sid, "step_done", {
             "name": step_name,
-            "ok": blocked,
-            "detail": "BLOCKED — VRF boundary enforced" if blocked else "WARNING: Traffic passed VRF boundary",
+            "ok": result_ok,
+            "detail": detail,
             "output": out2[:400],
         })
 
@@ -2518,10 +2529,13 @@ SDA_PAGE = f"""<!DOCTYPE html>
 
 BREACH_STEP_LABELS = [
     # Act 1
-    "Inspect IOT VRF Route Table",
-    "Ping PROD VRF Gateway from IOT VRF",
-    "Ping Main VRF Gateway from IOT VRF",
-    "Ping Main VRF Gateway from PROD VRF",
+    "Inspect WAN Loopback Routes",
+    "Ping PROD WAN Loopback (own VRF — should reach)",
+    "Ping Main WAN Loopback (cross-VRF — should block)",
+    "Ping IoT WAN Loopback (cross-VRF — should block)",
+    "Ping IoT WAN Loopback (own VRF — should reach)",
+    "Ping PROD WAN Loopback (cross-VRF — should block)",
+    "Ping Main WAN Loopback (cross-VRF — should block)",
     "Confirm VRF Isolation Summary",
     # Act 2
     "Verify PROD Intra-Segment Policy (Pre-Push)",
@@ -2529,8 +2543,8 @@ BREACH_STEP_LABELS = [
     "Clear CTS Counters — Leaf 2",
     "Clear CTS Counters — Border Spine",
     "Waiting for PROD Host Pings (Lateral Movement)",
-    "Push ISE TrustSec SGACL — PROD→PROD Deny",
-    "Verify SGT Deny Counters (19→19)",
+    "Push ISE TrustSec SGACL — PROD\u2192PROD Deny",
+    "Verify SGT Deny Counters (19\u219219)",
     "SGT Enforcement Counters — Leaf 1",
     "SGT Enforcement Counters — Leaf 2",
     "SGT Enforcement Counters — Border Spine",
@@ -2800,7 +2814,7 @@ let currentAct = 0;
 
 // act metadata used to insert dividers
 const ACT_STEPS = {{
-  "Inspect IOT VRF Route Table":               {{ act: 1, cls: "act1", title: "Act 1 — Macro Segmentation (VRF Isolation)" }},
+  "Inspect WAN Loopback Routes":               {{ act: 1, cls: "act1", title: "Act 1 — Macro Segmentation (VRF Isolation)" }},
   "Verify PROD Intra-Segment Policy (Pre-Push)": {{ act: 2, cls: "act2", title: "Act 2 — Micro Segmentation (SGT Enforcement)" }},
   "Reach ISE ERS API":                         {{ act: 3, cls: "act3", title: "Act 3 — Threat Containment (ISE CoA)" }},
 }};
