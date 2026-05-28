@@ -975,6 +975,7 @@ def api_breach_confirm():
 
 
 
+@app.route("/api/breach/reset", methods=["POST"])
 def api_breach_reset():
     """Remove 19->19 DENY_ALL from all switches, clear counters — ready for next demo run."""
     results = {}
