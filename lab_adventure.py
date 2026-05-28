@@ -926,6 +926,23 @@ def api_breach_start():
     return jsonify({"status": "started", "path": "breach", "sid": sid})
 
 
+@app.route("/api/breach/reset", methods=["POST"])
+def api_breach_reset():
+    """Remove 19->19 DENY_ALL from all switches, clear counters — ready for next demo run."""
+    results = {}
+    for sw_key, sw in SWITCHES.items():
+        ok, out = _ssh(sw["ip"], [
+            "terminal length 0",
+            "conf t",
+            "no cts role-based permissions from 19 to 19",
+            "end",
+            "clear cts role-based counters",
+        ])
+        results[sw["name"]] = "ok" if ok else out[:120]
+    all_ok = all(v == "ok" for v in results.values())
+    return jsonify({"status": "ok" if all_ok else "partial", "switches": results})
+
+
 # ── HTML / CSS / JS ───────────────────────────────────────────────────────────
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -2704,6 +2721,9 @@ BREACH_PAGE = f"""<!DOCTYPE html>
       <button class="btn-deploy" id="btn-deploy"
               style="background:linear-gradient(135deg,var(--red),var(--orange));"
               onclick="startDeploy()">Launch Simulation</button>
+      <button class="btn-deploy" id="btn-reset"
+              style="background:rgba(255,255,255,0.06);border:1px solid var(--border2);color:var(--text2);margin-left:12px;"
+              onclick="resetBreachDemo()">Reset Demo</button>
       <div class="deploy-note">This will run live commands against the campus fabric and ISE — no destructive changes are made to the network.</div>
     </div>
   </div>
@@ -2726,7 +2746,11 @@ BREACH_PAGE = f"""<!DOCTYPE html>
       <div class="result-icon-wrap" id="result-icon-wrap"></div>
       <div class="result-title" id="result-title"></div>
       <div class="result-msg"   id="result-msg"></div>
-      <button class="btn-back" onclick="window.location.href='/'">&#8592; Back to Lab</button>
+      <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:8px;">
+        <button class="btn-back" onclick="window.location.href='/'">&#8592; Back to Lab</button>
+        <button class="btn-back" style="background:rgba(255,255,255,0.06);border:1px solid var(--border2);color:var(--text2);" onclick="resetBreachDemo()">Reset Demo</button>
+        <button class="btn-back" onclick="location.reload()">Run Again</button>
+      </div>
     </div>
     <div class="result-log">
       <div class="result-log-label">Simulation Log</div>
@@ -2889,6 +2913,25 @@ function showResult() {{
   const rl = document.getElementById('result-steps-list');
   rl.innerHTML = ''; rl.appendChild(clone);
   show('screen-result');
+}}
+
+function resetBreachDemo() {{
+  const btn = event && event.target ? event.target : document.getElementById('btn-reset');
+  const origText = btn ? btn.textContent : '';
+  if (btn) {{ btn.disabled = true; btn.textContent = 'Resetting...'; }}
+  fetch('/api/breach/reset', {{ method: 'POST' }})
+    .then(r => r.json())
+    .then(d => {{
+      const ok = d.status === 'ok' || d.status === 'partial';
+      const detail = Object.entries(d.switches || {{}})
+        .map(([k,v]) => k + ': ' + v).join(' | ');
+      alert((ok ? '✓ Reset complete\n' : '⚠ Partial reset\n') + detail);
+      if (btn) {{ btn.disabled = false; btn.textContent = origText || 'Reset Demo'; }}
+    }})
+    .catch(e => {{
+      alert('Reset failed: ' + e);
+      if (btn) {{ btn.disabled = false; btn.textContent = origText || 'Reset Demo'; }}
+    }});
 }}
 </script>
 </body>
