@@ -561,9 +561,12 @@ ISE_PASS  = "C1sco12345"
 
 # Known cross-VRF IPs we try to reach from IOT (should all fail — macro seg)
 MACRO_SEG_TARGETS = [
-    ("PROD VRF Gateway",  "IOT",  "10.101.0.1"),
-    ("Main VRF Gateway",  "IOT",  "10.10.0.1"),
-    ("PROD VRF Gateway",  "PROD", "10.10.0.1"),   # reverse — PROD can't reach Main
+    ("PROD VRF Gateway",  "IOT",  "10.101.255.1"),
+    ("PROD VRF Host",     "IOT",  "10.101.255.100"),
+    ("Main VRF Gateway",  "IOT",  "10.10.255.1"),
+    ("Main VRF Host",     "IOT",  "10.10.255.100"),
+    ("Main VRF Gateway",  "PROD", "10.10.255.1"),
+    ("Main VRF Host",     "PROD", "10.10.255.100"),
 ]
 
 # SGT pairs we check deny counters for (src_sgt → dst_sgt)
@@ -588,8 +591,8 @@ def _act1_macro_segmentation(sid):
         "terminal length 0",
         "show ip route vrf IOT",
     ])
-    has_prod = "10.101" in out
-    has_main = "10.10.0" in out
+    has_prod = "10.101.255" in out
+    has_main = "10.10.255" in out
     if ok:
         detail = "No route to PROD/Main VRFs" if (not has_prod and not has_main) else "Routes present — check policy"
         _breach_emit(sid, "step_done", {"name": "Inspect IOT VRF Route Table", "ok": True,
