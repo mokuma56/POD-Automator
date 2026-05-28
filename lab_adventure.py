@@ -559,9 +559,21 @@ def _run_sda_deploy(sid):
 
 
 # ── Breach simulation constants ───────────────────────────────────────────────
-ISE_HOST  = "198.18.5.102"
+ISE_HOST  = "198.18.5.101"
 ISE_USER  = "admin"
 ISE_PASS  = "C1sco12345"
+
+# ISE ERS object IDs (queried once, static for this lab)
+# SGT 19 = Production
+ISE_SGT_PRODUCTION_ID   = "55cb393a-f713-44e0-be5a-d7c8413c081b"
+# SGACL: "Permit IP"  (permit ip — reset / open state for demo start)
+ISE_SGACL_PERMIT_IP_ID  = "92951ac0-8c01-11e6-996c-525400b48521"
+# SGACL: "Deny IP"  (deny ip — full block)
+ISE_SGACL_DENY_IP_ID    = "92919850-8c01-11e6-996c-525400b48521"
+# SGACL: "DENY_ICMP"  (deny icmp log — original lab state, kept for reference)
+ISE_SGACL_DENY_ICMP_ID  = "6f66b2c0-61bd-11f0-bcf8-2a16930c5df2"
+# Egress matrix cell: Production → Production (id discovered via ERS)
+ISE_CELL_PROD_PROD_ID   = "9510f1c0-c0b3-11f0-a397-d23657e2e017"
 
 # Macro seg ping targets — run from ROUTER VRF loopbacks (100.100.x.105)
 # (label, vrf_id, src_loopback, target_ip, expect_pass)
@@ -655,6 +667,50 @@ def _act1_macro_segmentation(sid):
     return True
 
 
+def _ise_ers_update_cell(cell_id, sgacl_id, enable=True):
+    """PUT updated SGACL + status onto an ISE EgressMatrixCell via ERS API.
+    ISE rejects having the same SGACL in both sgacls[] and defaultRule, so we
+    use defaultRule exclusively and leave sgacls empty.
+    Returns (ok: bool, message: str).
+    """
+    import urllib.request, urllib.error, ssl as _ssl, base64, json as _json
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    url = "https://{}:9060/ers/config/egressmatrixcell/{}".format(ISE_HOST, cell_id)
+    if sgacl_id == ISE_SGACL_DENY_IP_ID:
+        default_rule = "DENY_IP"
+    elif sgacl_id == ISE_SGACL_PERMIT_IP_ID:
+        default_rule = "PERMIT_IP"
+    else:
+        default_rule = "NONE"
+    payload = _json.dumps({
+        "EgressMatrixCell": {
+            "id":               cell_id,
+            "name":             "Production-Production",
+            "sourceSgtId":      ISE_SGT_PRODUCTION_ID,
+            "destinationSgtId": ISE_SGT_PRODUCTION_ID,
+            "matrixCellStatus": "ENABLED" if enable else "DISABLED",
+            "defaultRule":      default_rule,
+            "sgacls":           [],
+            "matrixId":         "9fa3a33a-329e-43cb-a4cf-7bd38df16e7b",
+        }
+    }).encode()
+    req = urllib.request.Request(url, data=payload, method="PUT")
+    creds = base64.b64encode("{}:{}".format(ISE_USER, ISE_PASS).encode()).decode()
+    req.add_header("Authorization", "Basic " + creds)
+    req.add_header("Accept", "application/json")
+    req.add_header("Content-Type", "application/json")
+    try:
+        r = urllib.request.urlopen(req, context=ctx, timeout=10)
+        return True, "ISE ERS updated (HTTP {})".format(r.getcode())
+    except urllib.error.HTTPError as e:
+        body = e.read(300).decode("utf-8", "replace")
+        return False, "ISE ERS HTTP {}: {}".format(e.code, body)
+    except Exception as e:
+        return False, "ISE ERS error: {}".format(str(e))
+
+
 def _act2_micro_segmentation(sid):
     """Act 2 — prove SGT intra-segment blocking via ISE TrustSec policy push."""
     _breach_emit(sid, "act_start", {"act": 2, "title": "Act 2 — Micro Segmentation (SGT)"})
@@ -668,7 +724,7 @@ def _act2_micro_segmentation(sid):
         "terminal length 0",
         "show cts role-based permissions",
     ])
-    has_19_19 = "19:Production to group 19:Production" in out or "from group 19 to group 19" in out.lower()
+    has_19_19 = ("19:Production to group 19:Production" in out or "from group 19 to group 19" in out.lower()) and ("Deny IP" in out or "DENY" in out.upper())
     _breach_emit(sid, "step_done", {
         "name": step_policy,
         "ok": ok,
@@ -678,8 +734,8 @@ def _act2_micro_segmentation(sid):
     })
     time.sleep(2)
 
-    # Step 2 — clear counters on all 3 switches
-    for sw_key in ("leaf1", "leaf2", "border_spine"):
+    # Step 2 — clear counters on leaf switches only
+    for sw_key in ("leaf1", "leaf2"):
         sw = SWITCHES[sw_key]
         step_clear = f"Zero Enforcement Counters — {sw['name']}"
         _breach_emit(sid, "step_start", {"name": step_clear})
@@ -718,53 +774,68 @@ def _act2_micro_segmentation(sid):
     })
     time.sleep(2)
 
-    # Step 4 — ISE TrustSec policy push: deploy 19->19 DENY_ALL
+    # Step 4 — ISE TrustSec Response: update ISE matrix + force policy re-download on switches
     step_push = "ISE TrustSec Response — Deploying SGACL to Block PROD Lateral Movement"
     _breach_emit(sid, "step_start", {"name": step_push})
     time.sleep(1)
-    push_ok = True
-    push_detail = []
+
+    # 4a — update ISE Production→Production cell to Deny IP
+    ise_ok, ise_msg = _ise_ers_update_cell(ISE_CELL_PROD_PROD_ID, ISE_SGACL_DENY_IP_ID)
+    push_ok = ise_ok
+    push_detail = ["ISE: " + ise_msg]
+    print(f"[act2] ISE PUT result: ok={ise_ok} msg={ise_msg}", flush=True)
+    time.sleep(1)
+
+    # 4b — clear cached CTS policy + refresh on all 3 switches so they re-download from ISE
     for sw_key in ("leaf1", "leaf2", "border_spine"):
         sw = SWITCHES[sw_key]
         ok, out = _ssh(sw["ip"], [
             "terminal length 0",
-            "conf t",
-            "cts role-based permissions from 19 to 19 DENY_ALL",
-            "end",
+            "clear cts policy",
+            "cts refresh policy",
         ])
-        push_detail.append(f"{sw['name']}: {'pushed' if ok else 'FAIL'}")
+        label = "refreshed" if ok else "FAIL " + out[:60]
+        push_detail.append("{}: {}".format(sw["name"], label))
+        print(f"[act2] {sw['name']} CTS refresh: ok={ok} {label}", flush=True)
         if not ok:
             push_ok = False
-        time.sleep(1)
+        time.sleep(0.5)
+
+    # Wait for ISE to deliver updated policy to all switches (~15s)
+    time.sleep(15)
+
     _breach_emit(sid, "step_done", {
         "name": step_push,
         "ok": push_ok,
-        "detail": "SGACL deployed to all switches in 0.3 seconds — " + ", ".join(push_detail),
+        "detail": "SGACL deployed via ISE TrustSec — " + ", ".join(push_detail),
     })
     time.sleep(2)
 
-    # Step 5 — poll counters for up to 60s waiting for 19->19 denies to appear
+    # Step 5 — poll counters for up to 60s waiting for 19->19 denies to appear on leaf1 or leaf2
     poll_step = "Confirm Kill — Watching SGT Deny Counters"
     _breach_emit(sid, "step_start", {"name": poll_step})
     triggered = False
     final_out = ""
     for _ in range(12):  # 12 × 5s = 60s
         time.sleep(5)
-        ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
-            "terminal length 0",
-            "show cts role-based counters",
-        ])
-        if ok:
-            final_out = out
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[0] == "19" and parts[1] == "19":
-                    try:
-                        if int(parts[2]) > 0 or int(parts[3]) > 0:
-                            triggered = True
-                            break
-                    except (ValueError, IndexError):
-                        pass
+        for poll_sw in ("leaf1", "leaf2"):
+            ok, out = _ssh(SWITCHES[poll_sw]["ip"], [
+                "terminal length 0",
+                "show cts role-based counters",
+            ])
+            if ok:
+                final_out += f"--- {SWITCHES[poll_sw]['name']} ---\n{out}\n"
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[0] == "19" and parts[1] == "19":
+                        try:
+                            if int(parts[2]) > 0 or int(parts[3]) > 0:
+                                triggered = True
+                                break
+                        except (ValueError, IndexError):
+                            pass
+            if triggered:
+                break
         if triggered:
             break
     _breach_emit(sid, "step_done", {
@@ -776,9 +847,9 @@ def _act2_micro_segmentation(sid):
     })
     time.sleep(2)
 
-    # Step 6 — show counter table on all 3 switches
+    # Step 6 — show counter table on leaf1 + leaf2 only (enforcement at access layer)
     all_ok = True
-    for sw_key in ("leaf1", "leaf2", "border_spine"):
+    for sw_key in ("leaf1", "leaf2"):
         sw = SWITCHES[sw_key]
         step_name = f"SGT Enforcement Report — {sw['name']}"
         _breach_emit(sid, "step_start", {"name": step_name})
@@ -813,48 +884,60 @@ def _act3_quarantine(sid):
     """Act 3 — ISE TrustSec environment verification + SGT policy proof."""
     _breach_emit(sid, "act_start", {"act": 3, "title": "Act 3 — Threat Containment (ISE TrustSec)"})
 
-    # Step 1 — verify ISE is reachable via RADIUS/TrustSec (show cts credentials)
+    # Step 1 — verify ISE is reachable via RADIUS/TrustSec (show cts credentials) on both leaves
     step_cred = "Reach ISE ERS API"
     _breach_emit(sid, "step_start", {"name": step_cred})
-    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
-        "terminal length 0",
-        "show cts credentials",
-    ])
-    ise_connected = ok and ("CTS password" in out or "Device ID" in out or "cts" in out.lower())
+    combined = ""
+    all_ok = True
+    for sw_key in ("leaf1", "leaf2"):
+        sw = SWITCHES[sw_key]
+        ok, out = _ssh(sw["ip"], ["terminal length 0", "show cts credentials"])
+        combined += f"--- {sw['name']} ---\n{out[:300]}\n"
+        if not ok:
+            all_ok = False
+    ise_connected = "CTS password" in combined or "Device ID" in combined or "cts" in combined.lower()
     _breach_emit(sid, "step_done", {
         "name": step_cred,
-        "ok": ok,
-        "detail": "ISE TrustSec bond confirmed on Border Spine" if ise_connected else "CTS credentials present",
-        "output": out[:600],
+        "ok": all_ok,
+        "detail": "ISE TrustSec bond confirmed on Leaf 1 & Leaf 2" if ise_connected else "CTS credentials present",
+        "output": combined[:600],
     })
 
-    # Step 2 — pull full TrustSec environment (SGT table, policy download)
+    # Step 2 — pull full TrustSec environment on both leaves
     step_pol = "Verify Quarantine ANC Policy"
     _breach_emit(sid, "step_start", {"name": step_pol})
-    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
-        "terminal length 0",
-        "show cts environment-data",
-    ])
-    has_sgt = ok and ("SGT" in out or "sgt" in out.lower() or "Security Group" in out)
+    combined = ""
+    all_ok = True
+    for sw_key in ("leaf1", "leaf2"):
+        sw = SWITCHES[sw_key]
+        ok, out = _ssh(sw["ip"], ["terminal length 0", "show cts environment-data"])
+        combined += f"--- {sw['name']} ---\n{out[:400]}\n"
+        if not ok:
+            all_ok = False
+    has_sgt = "SGT" in combined or "sgt" in combined.lower() or "Security Group" in combined
     _breach_emit(sid, "step_done", {
         "name": step_pol,
-        "ok": ok,
-        "detail": "SGT policy downloaded from ISE" if has_sgt else "TrustSec environment data retrieved",
-        "output": out[:800],
+        "ok": all_ok,
+        "detail": "SGT policy downloaded from ISE on access switches" if has_sgt else "TrustSec environment data retrieved",
+        "output": combined[:800],
     })
 
-    # Step 3 — show cts role-based permissions (the actual deny matrix from ISE)
+    # Step 3 — show cts role-based permissions on both leaves (enforcement at access layer)
     step_sess = "Identify Compromised Endpoint"
     _breach_emit(sid, "step_start", {"name": step_sess})
-    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
-        "terminal length 0",
-        "show cts role-based permissions",
-    ])
+    combined = ""
+    all_ok = True
+    for sw_key in ("leaf1", "leaf2"):
+        sw = SWITCHES[sw_key]
+        ok, out = _ssh(sw["ip"], ["terminal length 0", "show cts role-based permissions"])
+        combined += f"--- {sw['name']} ---\n{out[:400]}\n"
+        if not ok:
+            all_ok = False
     _breach_emit(sid, "step_done", {
         "name": step_sess,
-        "ok": ok,
-        "detail": "SGT permission matrix loaded from ISE" if ok else out[:80],
-        "output": out[:800],
+        "ok": all_ok,
+        "detail": "SGT permission matrix loaded from ISE on access switches" if all_ok else combined[:80],
+        "output": combined[:800],
     })
 
     # Step 4 — show cts role-based permissions on Leaf1 (enforcement at access layer)
@@ -863,7 +946,6 @@ def _act3_quarantine(sid):
     ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
         "terminal length 0",
         "show cts role-based permissions",
-        "show cts interface summary",
     ])
     _breach_emit(sid, "step_done", {
         "name": step_coa,
@@ -873,18 +955,24 @@ def _act3_quarantine(sid):
     })
 
     # Step 5 — final deny counter check — cumulative proof
+    # Step 5 — final deny counter check on both leaves — cumulative proof
     step_post = "Verify Post-Quarantine SGT Counters"
     _breach_emit(sid, "step_start", {"name": step_post})
-    ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
-        "terminal length 0",
-        "show cts role-based counters",
-    ])
-    deny_count = out.lower().count("deny")
+    combined = ""
+    all_ok = True
+    deny_count = 0
+    for sw_key in ("leaf1", "leaf2"):
+        sw = SWITCHES[sw_key]
+        ok, out = _ssh(sw["ip"], ["terminal length 0", "show cts role-based counters"])
+        combined += f"--- {sw['name']} ---\n{out[:400]}\n"
+        deny_count += out.lower().count("deny")
+        if not ok:
+            all_ok = False
     _breach_emit(sid, "step_done", {
         "name": step_post,
-        "ok": ok,
-        "detail": f"SGT deny policy active — {deny_count} deny rule(s) enforced" if ok else out[:80],
-        "output": out[:800],
+        "ok": all_ok,
+        "detail": f"SGT deny policy active — {deny_count} deny rule(s) enforced across Leaf 1 & Leaf 2" if all_ok else combined[:80],
+        "output": combined[:800],
     })
 
     return True
@@ -977,18 +1065,22 @@ def api_breach_confirm():
 
 @app.route("/api/breach/reset", methods=["POST"])
 def api_breach_reset():
-    """Remove 19->19 DENY_ALL from all switches, clear counters — ready for next demo run."""
-    results = {}
+    """Revert ISE Production->Production cell to Permit IP, flush CTS cache on switches, clear counters.
+    Policy is ISE-only — no conf t on switches."""
+    # 1 — revert ISE Production→Production cell to Permit IP ENABLED
+    ise_ok, ise_msg = _ise_ers_update_cell(ISE_CELL_PROD_PROD_ID, ISE_SGACL_PERMIT_IP_ID, enable=True)
+    results = {"ISE": ise_msg}
+
+    # 2 — flush CTS policy cache so switches re-download Permit IP from ISE, then clear counters
     for sw_key, sw in SWITCHES.items():
         ok, out = _ssh(sw["ip"], [
             "terminal length 0",
-            "conf t",
-            "no cts role-based permissions from 19 to 19",
-            "end",
+            "clear cts policy",
+            "cts refresh policy",
             "clear cts role-based counters",
         ])
         results[sw["name"]] = "ok" if ok else out[:120]
-    all_ok = all(v == "ok" for v in results.values())
+    all_ok = ise_ok and all(v == "ok" or k == "ISE" for k, v in results.items())
     return jsonify({"status": "ok" if all_ok else "partial", "switches": results})
 
 
@@ -1494,16 +1586,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   .steps-list { display: flex; flex-direction: column; gap: 8px; }
 
-  .step-row {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 13px 18px;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    transition: border-color 0.3s, background 0.3s;
-  }
+   .step-row {
+     background: var(--surface);
+     border: 1px solid var(--border);
+     border-radius: 8px;
+     padding: 13px 18px;
+     display: flex;
+     align-items: flex-start;
+     gap: 14px;
+     transition: border-color 0.3s, background 0.3s;
+   }
   .step-row.running {
     border-color: var(--cyan);
     background: rgba(2,200,255,0.04);
@@ -1543,34 +1635,129 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .step-row.running .step-name { color: var(--text); }
   .step-row.ok      .step-name { color: var(--text); }
 
-  .step-detail {
-    font-size: 11px;
-    color: var(--text3);
-    max-width: 220px;
-    text-align: right;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
+   .step-detail {
+     font-size: 11px;
+     color: var(--text3);
+     text-align: right;
+     white-space: normal;
+     word-break: break-word;
+   }
   .step-row.ok   .step-detail { color: var(--green); }
   .step-row.fail .step-detail { color: var(--red); }
 
   /* ── result screen ── */
-  .result-hero {
+   .result-hero {
     text-align: center;
-    padding: 48px 0 36px;
+    padding: 56px 32px 48px;
+    margin-top: 40px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: rgba(0,0,0,0.2);
+    position: relative;
+    overflow: hidden;
   }
+  .result-hero.success-hero {
+    border-color: rgba(0,214,138,0.4);
+    background: rgba(0,214,138,0.04);
+    box-shadow: 0 0 60px rgba(0,214,138,0.08), inset 0 0 40px rgba(0,214,138,0.03);
+    animation: heroGlow 2s ease-in-out infinite alternate;
+  }
+  @keyframes heroGlow {
+    from { box-shadow: 0 0 40px rgba(0,214,138,0.08), inset 0 0 30px rgba(0,214,138,0.03); }
+    to   { box-shadow: 0 0 80px rgba(0,214,138,0.18), inset 0 0 60px rgba(0,214,138,0.06); }
+  }
+
+  /* ── Summary card ── */
+  @keyframes summaryReveal {
+    from { opacity:0; transform:translateY(24px); }
+    to   { opacity:1; transform:translateY(0); }
+  }
+  @keyframes pulse-green {
+    0%,100% { box-shadow: 0 0 0 0 rgba(0,214,138,0); }
+    50%     { box-shadow: 0 0 0 8px rgba(0,214,138,0.18); }
+  }
+  #summary-card {
+    margin: 40px 0 32px;
+    animation: summaryReveal 0.7s ease forwards, pulse-green 2s ease-in-out 3;
+    border-radius: 8px;
+    border: 1px solid rgba(0,214,138,0.45);
+    background: rgba(0,214,138,0.04);
+    overflow: hidden;
+  }
+  .summary-card-inner { padding: 36px 32px 32px; }
+  .summary-eyebrow {
+    font-size: 12px; font-weight: 700; letter-spacing: 3px;
+    text-transform: uppercase; color: var(--green);
+    margin-bottom: 28px;
+  }
+  .summary-acts {
+    display: grid; grid-template-columns: repeat(3,1fr); gap: 16px;
+    margin-bottom: 32px;
+  }
+  @media(max-width:700px) { .summary-acts { grid-template-columns:1fr; } }
+  .summary-act {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border);
+    border-radius: 6px; padding: 16px;
+  }
+  .summary-act-badge {
+    display: inline-block; font-size: 10px; font-weight: 700;
+    letter-spacing: 2px; text-transform: uppercase;
+    padding: 3px 10px; border-radius: 3px; margin-bottom: 10px;
+  }
+  .summary-act-badge.act1 { background:rgba(255,144,0,0.15); color:var(--orange); border:1px solid rgba(255,144,0,0.3); }
+  .summary-act-badge.act2 { background:rgba(255,71,87,0.15);  color:var(--red);    border:1px solid rgba(255,71,87,0.3); }
+  .summary-act-badge.act3 { background:rgba(0,214,138,0.12);  color:var(--green);  border:1px solid rgba(0,214,138,0.3); }
+  .summary-act-title { font-size:13px; font-weight:700; color:var(--text); margin-bottom:8px; }
+  .summary-act-desc  { font-size:12px; color:var(--text2); line-height:1.65; }
+  .summary-cisco {
+    border-top: 1px solid var(--border);
+    padding-top: 24px;
+  }
+  .summary-cisco-title {
+    font-size: 13px; font-weight: 700; color: var(--cyan);
+    letter-spacing: 1px; text-transform: uppercase; margin-bottom: 16px;
+  }
+  .summary-cisco-grid {
+    display: grid; grid-template-columns: repeat(2,1fr); gap: 12px;
+  }
+  @media(max-width:700px) { .summary-cisco-grid { grid-template-columns:1fr; } }
+  .summary-cisco-item {
+    display: flex; gap: 10px; align-items: flex-start;
+    font-size: 12px; color: var(--text2); line-height: 1.6;
+  }
+  .sci-bullet {
+    color: var(--green); font-size: 13px; flex-shrink: 0; margin-top: 1px;
+  }
+  .summary-cisco-item strong { color: var(--text); }
   .result-icon-wrap {
-    width: 80px; height: 80px;
+    width: 100px; height: 100px;
     border-radius: 50%;
-    margin: 0 auto 20px;
+    margin: 0 auto 24px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 36px;
+    font-size: 48px;
   }
-  .result-icon-wrap.success { background: rgba(0,214,138,0.12); border: 2px solid rgba(0,214,138,0.3); }
-  .result-icon-wrap.fail    { background: rgba(255,71,87,0.10); border: 2px solid rgba(255,71,87,0.25); }
+  .result-icon-wrap.success {
+    background: rgba(0,214,138,0.12);
+    border: 2px solid rgba(0,214,138,0.5);
+    box-shadow: 0 0 30px rgba(0,214,138,0.2);
+    animation: iconPulse 1.8s ease-in-out infinite alternate;
+  }
+  .result-icon-wrap.fail { background: rgba(255,71,87,0.10); border: 2px solid rgba(255,71,87,0.25); }
+  @keyframes iconPulse {
+    from { box-shadow: 0 0 20px rgba(0,214,138,0.15); }
+    to   { box-shadow: 0 0 45px rgba(0,214,138,0.40); }
+  }
+  .result-eyebrow {
+    font-size: 11px;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    color: var(--green);
+    margin-bottom: 12px;
+    font-weight: 700;
+  }
 
   .result-title {
     font-size: 28px;
@@ -1828,7 +2015,47 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <!-- ════════════════════════════════════════
        RESULT SCREEN
   ════════════════════════════════════════ -->
-  <div id="screen-result">
+   <div id="screen-result">
+    <div class="result-log">
+      <div class="result-log-label">Simulation Log</div>
+      <div class="steps-list" id="result-steps-list"></div>
+    </div>
+
+    <!-- inline summary card injected by showResult() when allOk -->
+    <div id="summary-card" style="display:none">
+      <div class="summary-card-inner">
+        <div class="summary-eyebrow">&#x2713;&nbsp; Mission Complete — Ransomware Attack Neutralised</div>
+        <div class="summary-acts">
+          <div class="summary-act">
+            <div class="summary-act-badge act1">Act 1</div>
+            <div class="summary-act-title">Macro Segmentation</div>
+            <div class="summary-act-desc">VRF isolation confined the attacker to the IoT segment. Cross-VRF pivoting to PROD and Main was blocked at the routing boundary — zero firewall rules required.</div>
+          </div>
+          <div class="summary-act">
+            <div class="summary-act-badge act2">Act 2</div>
+            <div class="summary-act-title">Micro Segmentation (SGT)</div>
+            <div class="summary-act-desc">ISE pushed a Deny IP SGACL to the Production SGT pair via TrustSec. Lateral movement between PROD workstations was killed at the ASIC — without touching a single switch config.</div>
+          </div>
+          <div class="summary-act">
+            <div class="summary-act-badge act3">Act 3</div>
+            <div class="summary-act-title">Threat Containment (ISE CoA)</div>
+            <div class="summary-act-desc">ISE verified TrustSec policy across the access layer. SGT counters confirmed the block was enforced in hardware. The attacker's foothold was quarantined and contained in real time.</div>
+          </div>
+        </div>
+        <div class="summary-cisco">
+          <div class="summary-cisco-title">&#x26A1; Why Cisco Wins</div>
+          <div class="summary-cisco-grid">
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Single Policy Plane</strong> — ISE is the sole source of truth. One change propagates to every switch instantly via TrustSec.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Hardware-Enforced at Line Rate</strong> — SGACLs execute in the ASIC. No performance penalty, no packet-by-packet inspection overhead.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Identity-Based, Not IP-Based</strong> — Policy follows the user and device, not the subnet. Workstations moving ports stay protected automatically.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Zero Touch Containment</strong> — ISE CoA quarantines compromised endpoints without any manual switch intervention or network downtime.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Fabric + Security Unified</strong> — Catalyst Center, ISE, and the switching fabric operate as one integrated platform — no stitching of third-party tools.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Proven at Scale</strong> — The same architecture protects Fortune 500 campuses. What you just saw works identically across thousands of switches.</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="result-hero">
       <div class="result-icon-wrap" id="result-icon-wrap">
         <span id="result-icon"></span>
@@ -1836,10 +2063,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="result-title" id="result-title"></div>
       <div class="result-msg"   id="result-msg"></div>
       <button class="btn-restart" onclick="restart()">&#8592; Choose Another Path</button>
-    </div>
-    <div class="result-log">
-      <div class="result-log-label">Deployment Log</div>
-      <div class="steps-list" id="result-steps-list"></div>
     </div>
   </div>
 
@@ -2018,6 +2241,19 @@ function showResult(path) {
   rl.appendChild(clone);
 
   show('screen-result');
+
+  // Show summary card at the bottom when successful
+  const card = document.getElementById('summary-card');
+  if (allOk) {
+    card.style.display = 'block';
+    // Reset animation so it plays fresh every time
+    card.style.animation = 'none';
+    card.offsetHeight; // force reflow
+    card.style.animation = 'summaryReveal 0.7s ease forwards, pulse-green 2s ease-in-out 3';
+    setTimeout(() => card.scrollIntoView({behavior: 'smooth', block: 'start'}), 800);
+  } else {
+    card.style.display = 'none';
+  }
 }
 
 function restart() {
@@ -2164,11 +2400,11 @@ _PATH_CSS = """
   .progress-bar  { height:100%; width:0%; background:var(--grad); transition:width 0.5s ease; border-radius:4px; }
 
   .steps-list { display:flex; flex-direction:column; gap:8px; }
-  .step-row {
-    background:var(--surface); border:1px solid var(--border); border-radius:8px;
-    padding:13px 18px; display:flex; align-items:center; gap:14px;
-    transition:border-color 0.3s, background 0.3s;
-  }
+   .step-row {
+     background:var(--surface); border:1px solid var(--border); border-radius:8px;
+     padding:13px 18px; display:flex; align-items:flex-start; gap:14px;
+     transition:border-color 0.3s, background 0.3s;
+   }
   .step-row.running { border-color:var(--cyan); background:rgba(2,200,255,0.04); animation:pulse-row 2s ease-in-out infinite; }
   .step-row.ok      { border-color:rgba(0,214,138,0.4); background:rgba(0,214,138,0.03); }
   .step-row.fail    { border-color:rgba(255,71,87,0.4); background:rgba(255,71,87,0.04); }
@@ -2226,7 +2462,7 @@ _PATH_CSS = """
   .step-name   { flex:1; font-size:14px; font-weight:600; color:var(--text2); }
   .step-row.running .step-name { color:var(--text); }
   .step-row.ok      .step-name { color:var(--text); }
-  .step-detail { font-size:11px; color:var(--text3); max-width:220px; text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+   .step-detail { font-size:11px; color:var(--text3); text-align:right; white-space:normal; word-break:break-word; }
   .step-row.ok   .step-detail { color:var(--green); }
   .step-row.fail .step-detail { color:var(--red); }
 
@@ -2589,13 +2825,11 @@ BREACH_STEP_LABELS = [
     "Threat Intel \u2014 Scanning PROD Segment for Lateral Movement Paths",
     "Zero Enforcement Counters \u2014 Leaf 1",
     "Zero Enforcement Counters \u2014 Leaf 2",
-    "Zero Enforcement Counters \u2014 Border Spine",
     "Lateral Movement in Progress \u2014 Pat and Kit Workstations",
     "ISE TrustSec Response \u2014 Deploying SGACL to Block PROD Lateral Movement",
     "Confirm Kill \u2014 Watching SGT Deny Counters",
     "SGT Enforcement Report \u2014 Leaf 1",
     "SGT Enforcement Report \u2014 Leaf 2",
-    "SGT Enforcement Report \u2014 Border Spine",
     # Act 3
     "Reach ISE ERS API",
     "Verify Quarantine ANC Policy",
@@ -2717,6 +2951,104 @@ _BREACH_EXTRA_CSS = """
 
   /* breach accent rule */
   .breach .accent-rule { background: linear-gradient(90deg, var(--red), var(--orange)); }
+
+  /* ── summary card ── */
+  @keyframes summaryReveal {
+    from { opacity:0; transform:translateY(32px) scale(0.98); }
+    to   { opacity:1; transform:translateY(0)    scale(1);    }
+  }
+  @keyframes pulse-green {
+    0%   { box-shadow: 0 0 0 0 rgba(0,214,138,0), 0 0 40px rgba(0,214,138,0); }
+    40%  { box-shadow: 0 0 0 12px rgba(0,214,138,0.12), 0 0 60px rgba(0,214,138,0.15); }
+    100% { box-shadow: 0 0 0 0 rgba(0,214,138,0), 0 0 40px rgba(0,214,138,0); }
+  }
+  #breach-summary-card {
+    margin: 48px 0 40px;
+    border-radius: 12px;
+    border: 1px solid rgba(0,214,138,0.5);
+    background: linear-gradient(135deg, rgba(0,214,138,0.06) 0%, rgba(0,180,255,0.04) 100%);
+    overflow: hidden;
+    position: relative;
+  }
+  #breach-summary-card::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(135deg, rgba(0,214,138,0.08) 0%, transparent 60%);
+    pointer-events: none;
+  }
+  .summary-card-inner { padding: 40px 36px 36px; position: relative; }
+  .summary-eyebrow {
+    font-size: 11px; font-weight: 800; letter-spacing: 4px;
+    text-transform: uppercase; color: var(--green); margin-bottom: 6px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .summary-eyebrow::after {
+    content: ''; flex: 1; height: 1px;
+    background: linear-gradient(90deg, rgba(0,214,138,0.4), transparent);
+  }
+  .summary-headline {
+    font-size: 22px; font-weight: 800; color: var(--text);
+    margin-bottom: 32px; line-height: 1.3;
+    background: linear-gradient(90deg, #fff 60%, rgba(0,214,138,0.8));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .summary-acts {
+    display: grid; grid-template-columns: repeat(3,1fr); gap: 16px; margin-bottom: 36px;
+  }
+  @media(max-width:700px) { .summary-acts { grid-template-columns:1fr; } }
+  .summary-act {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px; padding: 20px;
+    transition: border-color 0.2s;
+  }
+  .summary-act:hover { border-color: rgba(255,255,255,0.18); }
+  .summary-act-badge {
+    display: inline-block; font-size: 10px; font-weight: 800;
+    letter-spacing: 2px; text-transform: uppercase;
+    padding: 4px 12px; border-radius: 20px; margin-bottom: 12px;
+  }
+  .summary-act-badge.act1 { background:rgba(255,144,0,0.15); color:#ff9000; border:1px solid rgba(255,144,0,0.35); }
+  .summary-act-badge.act2 { background:rgba(255,71,87,0.15);  color:#ff4757; border:1px solid rgba(255,71,87,0.35); }
+  .summary-act-badge.act3 { background:rgba(0,214,138,0.12);  color:var(--green); border:1px solid rgba(0,214,138,0.35); }
+  .summary-act-title { font-size:14px; font-weight:700; color:var(--text); margin-bottom:10px; }
+  .summary-act-desc  { font-size:12px; color:var(--text2); line-height:1.7; }
+  .summary-cisco {
+    border-top: 1px solid rgba(255,255,255,0.08);
+    padding-top: 28px;
+  }
+  .summary-cisco-title {
+    font-size: 11px; font-weight: 800; color: var(--cyan);
+    letter-spacing: 4px; text-transform: uppercase; margin-bottom: 20px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .summary-cisco-title::after {
+    content: ''; flex:1; height:1px;
+    background: linear-gradient(90deg, rgba(2,200,255,0.4), transparent);
+  }
+  .summary-cisco-grid {
+    display: grid; grid-template-columns: repeat(2,1fr); gap: 14px;
+  }
+  @media(max-width:700px) { .summary-cisco-grid { grid-template-columns:1fr; } }
+  .summary-cisco-item {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 8px; padding: 14px;
+    font-size: 12px; color: var(--text2); line-height: 1.65;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .summary-cisco-item:hover {
+    border-color: rgba(0,214,138,0.25);
+    background: rgba(0,214,138,0.04);
+  }
+  .sci-bullet {
+    width: 22px; height: 22px; border-radius: 50%;
+    background: rgba(0,214,138,0.15); border: 1px solid rgba(0,214,138,0.4);
+    color: var(--green); font-size: 12px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .summary-cisco-item strong { color: var(--text); display:block; margin-bottom:3px; font-size:13px; }
 """
 
 BREACH_PAGE = f"""<!DOCTYPE html>
@@ -2845,6 +3177,43 @@ BREACH_PAGE = f"""<!DOCTYPE html>
       <div class="result-log-label">Simulation Log</div>
       <div class="steps-list" id="result-steps-list"></div>
     </div>
+
+    <!-- Summary card — shown only on success -->
+    <div id="breach-summary-card" style="display:none">
+      <div class="summary-card-inner">
+        <div class="summary-eyebrow">&#x2713;&nbsp; Mission Complete</div>
+        <div class="summary-headline">Ransomware Attack Neutralised &mdash; Zero Trust Campus Held</div>
+        <div class="summary-acts">
+          <div class="summary-act">
+            <div class="summary-act-badge act1">Act 1</div>
+            <div class="summary-act-title">Macro Segmentation</div>
+            <div class="summary-act-desc">VRF isolation confined the attacker to the IoT segment. Cross-VRF pivoting to PROD and Main was blocked at the routing boundary &mdash; zero firewall rules required.</div>
+          </div>
+          <div class="summary-act">
+            <div class="summary-act-badge act2">Act 2</div>
+            <div class="summary-act-title">Micro Segmentation (SGT)</div>
+            <div class="summary-act-desc">ISE pushed a Deny IP SGACL to the Production SGT pair via TrustSec. Lateral movement between PROD workstations was killed at the ASIC &mdash; without touching a single switch config.</div>
+          </div>
+          <div class="summary-act">
+            <div class="summary-act-badge act3">Act 3</div>
+            <div class="summary-act-title">Threat Containment (ISE CoA)</div>
+            <div class="summary-act-desc">ISE verified TrustSec policy across the access layer. SGT counters confirmed the block was enforced in hardware. The attacker&rsquo;s foothold was quarantined and contained in real time.</div>
+          </div>
+        </div>
+        <div class="summary-cisco">
+          <div class="summary-cisco-title">&#x26A1; Why Cisco Wins</div>
+          <div class="summary-cisco-grid">
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Single Policy Plane</strong> &mdash; ISE is the sole source of truth. One change propagates to every switch instantly via TrustSec.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Hardware-Enforced at Line Rate</strong> &mdash; SGACLs execute in the ASIC. No performance penalty, no packet-by-packet inspection overhead.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Identity-Based, Not IP-Based</strong> &mdash; Policy follows the user and device, not the subnet. Workstations moving ports stay protected automatically.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Zero Touch Containment</strong> &mdash; ISE CoA quarantines compromised endpoints without any manual switch intervention or network downtime.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Fabric + Security Unified</strong> &mdash; ISE and the switching fabric operate as one integrated platform &mdash; no stitching of third-party tools.</div></div>
+            <div class="summary-cisco-item"><span class="sci-bullet">&#x2714;</span><div><strong>Proven at Scale</strong> &mdash; The same architecture protects Fortune 500 campuses. What you just saw works identically across thousands of switches.</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </div>
 
   <div class="page-footer">
@@ -3014,18 +3383,32 @@ function startDeploy() {{
 
     es.addEventListener('complete', e => {{
       es.close();
-      setTimeout(showResult, 800);
+      const d = JSON.parse(e.data || '{{}}');
+      setTimeout(() => showResult(d.ok !== false), 800);
     }});
 
-    es.onerror = () => {{ es.close(); setTimeout(showResult, 800); }};
+    es.onerror = () => {{ es.close(); setTimeout(() => showResult(false), 800); }};
   }});
 }}
 
-function showResult() {{
+function showResult(allOk) {{
+  if (allOk === undefined) allOk = stepData.length > 0 && stepData.every(s => s.ok);
   document.getElementById('progress-bar').style.width = '100%';
-  const allOk = stepData.length > 0 && stepData.every(s => s.ok);
+  const hero  = document.querySelector('#screen-result .result-hero');
   const wrap  = document.getElementById('result-icon-wrap');
   const title = document.getElementById('result-title');
+
+  if (allOk) {{
+    hero.classList.add('success-hero');
+    if (!document.getElementById('result-eyebrow')) {{
+      const eyebrow = document.createElement('div');
+      eyebrow.id = 'result-eyebrow';
+      eyebrow.className = 'result-eyebrow';
+      eyebrow.textContent = 'Ransomware Attack Neutralised';
+      hero.insertBefore(eyebrow, wrap);
+    }}
+  }}
+
   wrap.className   = 'result-icon-wrap ' + (allOk ? 'success' : 'fail');
   wrap.textContent = allOk ? '\\u2713' : '\\u2717';
   title.className  = 'result-title ' + (allOk ? 'success' : 'fail');
@@ -3040,6 +3423,15 @@ function showResult() {{
   const rl = document.getElementById('result-steps-list');
   rl.innerHTML = ''; rl.appendChild(clone);
   show('screen-result');
+  if (allOk) {{
+    // Show summary card — scroll directly to it, no hero jump
+    const card = document.getElementById('breach-summary-card');
+    card.style.display = 'block';
+    card.style.animation = 'none';
+    card.offsetHeight;
+    card.style.animation = 'summaryReveal 0.8s ease forwards, pulse-green 2.2s ease-in-out 4';
+    setTimeout(() => card.scrollIntoView({{behavior:'smooth', block:'start'}}), 600);
+  }}
 }}
 
 function confirmPingsStarted() {{
