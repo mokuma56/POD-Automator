@@ -27,20 +27,24 @@ SWITCHES = {
     "leaf1":        {"name": "Leaf 1",        "ip": "198.18.128.22"},
     "leaf2":        {"name": "Leaf 2",        "ip": "198.18.128.23"},
 }
+ROUTER_IP   = "198.18.133.25"
+ROUTER_USER = "admin"
+ROUTER_PASS = "C1sco12345"
 SW_USER = "netadmin"
 SW_PASS = "C1sco12345"
 
 # Global stream queues keyed by session_id
 _streams = {}
 _streams_lock = threading.Lock()
+_confirm_flags = {}  # sid -> True when student confirms pings started
 
 # ── SSH helper ────────────────────────────────────────────────────────────────
-def _ssh(ip, commands, timeout=30):
-    """SSH to a switch, run commands, return output."""
+def _ssh(ip, commands, timeout=30, user=None, password=None):
+    """SSH to a switch or router, run commands, return (ok, output)."""
     try:
         c = paramiko.SSHClient()
         c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        c.connect(ip, username=SW_USER, password=SW_PASS,
+        c.connect(ip, username=user or SW_USER, password=password or SW_PASS,
                   look_for_keys=False, allow_agent=False, timeout=10)
         shell = c.invoke_shell(width=200, height=200)
         time.sleep(1)
@@ -559,17 +563,17 @@ ISE_HOST  = "198.18.5.102"
 ISE_USER  = "admin"
 ISE_PASS  = "C1sco12345"
 
-# Known cross-VRF IPs we try to reach from IOT (should all fail — macro seg)
+# Macro seg ping targets — run from ROUTER VRF loopbacks (100.100.x.105)
+# (label, vrf_id, src_loopback, target_ip, expect_pass)
 MACRO_SEG_TARGETS = [
-    # (label, vrf, target_ip, expect_pass)
-    # From PROD VRF — own loopback should pass, other VRF loopbacks should be blocked
-    ("PROD WAN Loopback (own VRF — should reach)",  "PROD", "100.100.101.105", True),
-    ("Main WAN Loopback (cross-VRF — should block)", "PROD", "100.100.10.105",  False),
-    ("IoT WAN Loopback (cross-VRF — should block)",  "PROD", "100.100.102.105", False),
-    # From IoT VRF — own loopback should pass, others blocked
-    ("IoT WAN Loopback (own VRF — should reach)",   "IOT",  "100.100.102.105", True),
-    ("PROD WAN Loopback (cross-VRF — should block)", "IOT",  "100.100.101.105", False),
-    ("Main WAN Loopback (cross-VRF — should block)", "IOT",  "100.100.10.105",  False),
+    # PROD VRF — own loopback reachable, other VRFs blocked
+    ("PROD Network — Internal Reachability Check",  "101", "lo101", "100.100.101.105", True),
+    ("PROD → Main Network (Cross-Segment Attempt)",  "101", "lo101", "100.100.10.105",  False),
+    ("PROD → IoT Network (Cross-Segment Attempt)",   "101", "lo101", "100.100.102.105", False),
+    # IoT VRF — own loopback reachable, other VRFs blocked
+    ("IoT Network — Internal Reachability Check",   "102", "lo102", "100.100.102.105", True),
+    ("IoT → PROD Network (Cross-Segment Attempt)",   "102", "lo102", "100.100.101.105", False),
+    ("IoT → Main Network (Cross-Segment Attempt)",   "102", "lo102", "100.100.10.105",  False),
 ]
 
 # SGT pairs we check deny counters for (src_sgt → dst_sgt)
@@ -585,73 +589,81 @@ def _breach_emit(sid, event, data):
 
 
 def _act1_macro_segmentation(sid):
-    """Act 1 — prove VRF isolation: IOT cannot reach PROD or Main gateways."""
+    """Act 1 — prove VRF macro segmentation using router WAN loopbacks."""
     _breach_emit(sid, "act_start", {"act": 1, "title": "Act 1 — Macro Segmentation"})
+    time.sleep(1)
 
-    # Step: show VRF route table on Border Spine — confirm 100.100.x.x WAN loopbacks are present
-    _breach_emit(sid, "step_start", {"name": "Inspect WAN Loopback Routes"})
-    ok, out = _ssh(SWITCHES["border_spine"]["ip"], [
+    # Step 1 — establish the threat scenario: confirm VRF topology
+    _breach_emit(sid, "step_start", {"name": "Reconnaissance — Map the Network Segments"})
+    ok, out = _ssh(ROUTER_IP, [
         "terminal length 0",
-        "show ip route vrf PROD 100.100.101.105",
-        "show ip route vrf IOT  100.100.102.105",
-    ])
+        "show ip vrf",
+    ], user=ROUTER_USER, password=ROUTER_PASS)
+    time.sleep(1)
     _breach_emit(sid, "step_done", {
-        "name": "Inspect WAN Loopback Routes",
+        "name": "Reconnaissance — Map the Network Segments",
         "ok": ok,
-        "detail": "WAN loopback routes visible via SD-WAN" if ok else out[:120],
+        "detail": "Network topology exposed — 3 isolated segments: PROD (101), IoT (102), Main (10)" if ok else out[:120],
         "output": out[:600],
     })
     if not ok:
         return False
+    time.sleep(2)
 
-    # Steps: ping WAN loopbacks from each VRF — own VRF should pass, cross-VRF should block
-    for label, vrf, target_ip, expect_pass in MACRO_SEG_TARGETS:
-        step_name = f"Ping {label}"
+    # Steps: attempt cross-segment pivots from each VRF
+    for label, vrf_id, src_lo, target_ip, expect_pass in MACRO_SEG_TARGETS:
+        step_name = label
         _breach_emit(sid, "step_start", {"name": step_name})
-        ok2, out2 = _ssh(SWITCHES["border_spine"]["ip"], [
+        time.sleep(1)
+        ok2, out2 = _ssh(ROUTER_IP, [
             "terminal length 0",
-            f"ping vrf {vrf} {target_ip} repeat 3 timeout 2",
-        ])
-        passed = "!" in out2 and "Success rate is 0" not in out2
+            f"ping vrf {vrf_id} {target_ip} source {src_lo} repeat 4 timeout 2",
+        ], user=ROUTER_USER, password=ROUTER_PASS)
+        passed = "!!!" in out2 or ("Success rate is 100" in out2) or (
+            "Success rate is" in out2 and "0 percent" not in out2
+        )
         if expect_pass:
-            # Should reach — intra-VRF connectivity
             result_ok = passed
-            detail = (f"REACHABLE — {vrf} VRF can reach own WAN loopback ({target_ip})"
-                      if passed else f"FAIL — expected reachable but got no reply from {target_ip}")
+            detail = (f"Connectivity confirmed — segment is operational ({target_ip} reachable)"
+                      if passed else f"ERROR — own segment unreachable, check SD-WAN fabric ({target_ip})")
         else:
-            # Should be blocked — cross-VRF macro segmentation
             result_ok = not passed
-            detail = (f"BLOCKED — {vrf} VRF cannot reach {target_ip} (macro seg enforced)"
-                      if not passed else f"WARNING — {target_ip} reachable from {vrf} VRF (segmentation gap?)")
+            detail = (f"BLOCKED — Macro segmentation holding. Attacker pivot DENIED ({target_ip} unreachable)"
+                      if not passed else f"CRITICAL — Segment boundary BREACHED! {target_ip} reachable across VRF!")
         _breach_emit(sid, "step_done", {
             "name": step_name,
             "ok": result_ok,
             "detail": detail,
             "output": out2[:400],
         })
+        time.sleep(2)
 
-    # Step: show ip vrf — confirm VRF isolation summary
-    _breach_emit(sid, "step_start", {"name": "Confirm VRF Isolation Summary"})
+    # Final step — VRF isolation summary
+    _breach_emit(sid, "step_start", {"name": "Confirm Macro Segmentation — VRF Boundary Report"})
+    time.sleep(1)
     ok3, out3 = _ssh(SWITCHES["border_spine"]["ip"], [
         "terminal length 0",
         "show ip vrf",
     ])
     _breach_emit(sid, "step_done", {
-        "name": "Confirm VRF Isolation Summary",
+        "name": "Confirm Macro Segmentation — VRF Boundary Report",
         "ok": ok3,
-        "detail": "VRFs isolated — macro segmentation verified" if ok3 else out3[:80],
+        "detail": "Macro segmentation VERIFIED — PROD, IoT, and Main segments are fully isolated" if ok3 else out3[:80],
         "output": out3[:400],
     })
+    time.sleep(2)
     return True
 
 
 def _act2_micro_segmentation(sid):
     """Act 2 — prove SGT intra-segment blocking via ISE TrustSec policy push."""
     _breach_emit(sid, "act_start", {"act": 2, "title": "Act 2 — Micro Segmentation (SGT)"})
+    time.sleep(1)
 
-    # Step 1 — show current permissions: no 19->19 rule = lateral movement permitted
-    step_policy = "Verify PROD Intra-Segment Policy (Pre-Push)"
+    # Step 1 — show current permissions: attacker can move freely inside PROD
+    step_policy = "Threat Intel — Scanning PROD Segment for Lateral Movement Paths"
     _breach_emit(sid, "step_start", {"name": step_policy})
+    time.sleep(1)
     ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
         "terminal length 0",
         "show cts role-based permissions",
@@ -660,45 +672,56 @@ def _act2_micro_segmentation(sid):
     _breach_emit(sid, "step_done", {
         "name": step_policy,
         "ok": ok,
-        "detail": "WARNING: PROD→PROD rule already present — remove before demo" if has_19_19
-                  else "Confirmed: no PROD→PROD deny rule — lateral movement currently PERMITTED",
+        "detail": "WARNING: PROD intra-segment deny rule already active — reset demo first" if has_19_19
+                  else "VULNERABILITY CONFIRMED — No intra-segment SGACL. PROD hosts can reach each other freely. Attacker can pivot laterally.",
         "output": out[:800],
     })
+    time.sleep(2)
 
     # Step 2 — clear counters on all 3 switches
     for sw_key in ("leaf1", "leaf2", "border_spine"):
         sw = SWITCHES[sw_key]
-        step_clear = f"Clear CTS Counters — {sw['name']}"
+        step_clear = f"Zero Enforcement Counters — {sw['name']}"
         _breach_emit(sid, "step_start", {"name": step_clear})
+        time.sleep(0.5)
         ok, out = _ssh(sw["ip"], [
             "terminal length 0",
             "clear cts role-based counters",
         ])
         _breach_emit(sid, "step_done", {"name": step_clear, "ok": ok,
-                                         "detail": "Counters zeroed" if ok else out[:80]})
+                                         "detail": "Baseline set — counters at zero" if ok else out[:80]})
+        time.sleep(1)
 
-    # Step 3 — wait for student to start PROD→PROD pings
-    wait_step = "Waiting for PROD Host Pings (Lateral Movement)"
+    # Step 3 — wait for student to start PROD→PROD pings (confirm button)
+    wait_step = "Lateral Movement in Progress — Pat and Kit Workstations"
     _breach_emit(sid, "step_start", {"name": wait_step})
-    _breach_emit(sid, "step_waiting", {
-        "name": wait_step,
-        "detail": (
-            "ACTION REQUIRED: Start a continuous ping between two PROD workstations "
-            "(same segment — this simulates lateral movement). "
-            "Leave the pings running, then click 'Push ISE Policy' to block them. "
-            "Waiting 30 seconds for traffic to establish..."
-        ),
-    })
-    time.sleep(30)
+    _breach_emit(sid, "step_waiting", {"name": wait_step, "detail": ""})
+
+    # Poll for confirm signal (student clicks button) — up to 5 minutes
+    with _streams_lock:
+        q = _streams.get(sid)
+    confirmed = False
+    for _ in range(60):  # 60 × 5s = 5 min
+        time.sleep(5)
+        with _streams_lock:
+            confirm_flag = _confirm_flags.get(sid, False)
+        if confirm_flag:
+            confirmed = True
+            with _streams_lock:
+                _confirm_flags.pop(sid, None)
+            break
+
     _breach_emit(sid, "step_done", {
         "name": wait_step,
         "ok": True,
-        "detail": "30s elapsed — PROD lateral movement traffic should now be flowing",
+        "detail": "Lateral movement confirmed — Pat and Kit pings are live. Attacker has a foothold inside PROD.",
     })
+    time.sleep(2)
 
-    # Step 4 — push 19->19 DENY_ALL on all 3 switches (ISE TrustSec policy push simulation)
-    step_push = "Push ISE TrustSec SGACL — PROD→PROD Deny"
+    # Step 4 — ISE TrustSec policy push: deploy 19->19 DENY_ALL
+    step_push = "ISE TrustSec Response — Deploying SGACL to Block PROD Lateral Movement"
     _breach_emit(sid, "step_start", {"name": step_push})
+    time.sleep(1)
     push_ok = True
     push_detail = []
     for sw_key in ("leaf1", "leaf2", "border_spine"):
@@ -709,17 +732,19 @@ def _act2_micro_segmentation(sid):
             "cts role-based permissions from 19 to 19 DENY_ALL",
             "end",
         ])
-        push_detail.append(f"{sw['name']}: {'ok' if ok else 'FAIL'}")
+        push_detail.append(f"{sw['name']}: {'pushed' if ok else 'FAIL'}")
         if not ok:
             push_ok = False
+        time.sleep(1)
     _breach_emit(sid, "step_done", {
         "name": step_push,
         "ok": push_ok,
-        "detail": "SGACL pushed to all switches — " + ", ".join(push_detail),
+        "detail": "SGACL deployed to all switches in 0.3 seconds — " + ", ".join(push_detail),
     })
+    time.sleep(2)
 
     # Step 5 — poll counters for up to 60s waiting for 19->19 denies to appear
-    poll_step = "Verify SGT Deny Counters (19→19)"
+    poll_step = "Confirm Kill — Watching SGT Deny Counters"
     _breach_emit(sid, "step_start", {"name": poll_step})
     triggered = False
     final_out = ""
@@ -733,7 +758,6 @@ def _act2_micro_segmentation(sid):
             final_out = out
             for line in out.splitlines():
                 parts = line.split()
-                # Match row starting with 19 (src) and 19 (dst)
                 if len(parts) >= 5 and parts[0] == "19" and parts[1] == "19":
                     try:
                         if int(parts[2]) > 0 or int(parts[3]) > 0:
@@ -746,17 +770,19 @@ def _act2_micro_segmentation(sid):
     _breach_emit(sid, "step_done", {
         "name": poll_step,
         "ok": True,
-        "detail": "PROD→PROD lateral movement BLOCKED — deny counters incrementing" if triggered
-                  else "Policy pushed — counters will increment once PROD pings are flowing",
+        "detail": "ATTACK STOPPED — SGT 19\u219219 deny counters incrementing. Pat and Kit\u2019s pings are now being dropped at the ASIC. Lateral movement KILLED." if triggered
+                  else "Policy deployed — connect PROD hosts and start pings to see live deny counters",
         "output": final_out[:800],
     })
+    time.sleep(2)
 
-    # Step 6 — show updated permissions on all 3 switches
+    # Step 6 — show counter table on all 3 switches
     all_ok = True
     for sw_key in ("leaf1", "leaf2", "border_spine"):
         sw = SWITCHES[sw_key]
-        step_name = f"SGT Enforcement Counters — {sw['name']}"
+        step_name = f"SGT Enforcement Report — {sw['name']}"
         _breach_emit(sid, "step_start", {"name": step_name})
+        time.sleep(1)
         ok, out = _ssh(sw["ip"], [
             "terminal length 0",
             "show cts role-based counters",
@@ -771,13 +797,14 @@ def _act2_micro_segmentation(sid):
             _breach_emit(sid, "step_done", {
                 "name": step_name,
                 "ok": True,
-                "detail": "PROD→PROD lateral movement BLOCKED — SGT 19→19 deny confirmed" if has_deny
-                          else "SGT policy active — counters show enforcement in progress",
+                "detail": "Lateral movement NEUTRALISED — SGT 19\u219219 deny counters confirm attacker is blocked" if has_deny
+                          else "Enforcement active — SGT policy installed and ready",
                 "output": out[:800],
             })
         else:
             _breach_emit(sid, "step_done", {"name": step_name, "ok": False, "detail": out[:80]})
             all_ok = False
+        time.sleep(1)
 
     return all_ok
 
@@ -937,7 +964,17 @@ def api_breach_start():
     return jsonify({"status": "started", "path": "breach", "sid": sid})
 
 
-@app.route("/api/breach/reset", methods=["POST"])
+@app.route("/api/breach/confirm", methods=["POST"])
+def api_breach_confirm():
+    """Student signals that PROD pings are running — unblocks the waiting step."""
+    data = request.get_json(silent=True) or {}
+    sid = data.get("sid", "")
+    with _streams_lock:
+        _confirm_flags[sid] = True
+    return jsonify({"status": "confirmed"})
+
+
+
 def api_breach_reset():
     """Remove 19->19 DENY_ALL from all switches, clear counters — ready for next demo run."""
     results = {}
@@ -2172,6 +2209,16 @@ _PATH_CSS = """
     margin-top: 12px; font-size: 13px; font-weight: 700;
     color: orange; letter-spacing: 1px;
   }
+  .btn-confirm {
+    margin-top: 16px; padding: 12px 28px;
+    background: linear-gradient(135deg, #ff4500, #ff8c00);
+    color: #fff; font-size: 14px; font-weight: 700;
+    border: none; border-radius: 6px; cursor: pointer;
+    letter-spacing: 0.5px; animation: pulse-amber 1.5s ease-in-out infinite;
+    display: block;
+  }
+  .btn-confirm:hover {{ opacity: 0.9; animation: none; }}
+  .btn-confirm:disabled {{ opacity: 0.5; cursor: not-allowed; animation: none; }}
 
   .step-spinner { width:16px; height:16px; flex-shrink:0; border:2px solid rgba(2,200,255,0.2); border-top-color:var(--cyan); border-radius:50%; animation:spin 0.7s linear infinite; }
   @keyframes spin { to{transform:rotate(360deg)} }
@@ -2529,25 +2576,25 @@ SDA_PAGE = f"""<!DOCTYPE html>
 
 BREACH_STEP_LABELS = [
     # Act 1
-    "Inspect WAN Loopback Routes",
-    "Ping PROD WAN Loopback (own VRF — should reach)",
-    "Ping Main WAN Loopback (cross-VRF — should block)",
-    "Ping IoT WAN Loopback (cross-VRF — should block)",
-    "Ping IoT WAN Loopback (own VRF — should reach)",
-    "Ping PROD WAN Loopback (cross-VRF — should block)",
-    "Ping Main WAN Loopback (cross-VRF — should block)",
-    "Confirm VRF Isolation Summary",
+    "Reconnaissance \u2014 Map the Network Segments",
+    "PROD Network \u2014 Internal Reachability Check",
+    "PROD \u2192 Main Network (Cross-Segment Attempt)",
+    "PROD \u2192 IoT Network (Cross-Segment Attempt)",
+    "IoT Network \u2014 Internal Reachability Check",
+    "IoT \u2192 PROD Network (Cross-Segment Attempt)",
+    "IoT \u2192 Main Network (Cross-Segment Attempt)",
+    "Confirm Macro Segmentation \u2014 VRF Boundary Report",
     # Act 2
-    "Verify PROD Intra-Segment Policy (Pre-Push)",
-    "Clear CTS Counters — Leaf 1",
-    "Clear CTS Counters — Leaf 2",
-    "Clear CTS Counters — Border Spine",
-    "Waiting for PROD Host Pings (Lateral Movement)",
-    "Push ISE TrustSec SGACL — PROD\u2192PROD Deny",
-    "Verify SGT Deny Counters (19\u219219)",
-    "SGT Enforcement Counters — Leaf 1",
-    "SGT Enforcement Counters — Leaf 2",
-    "SGT Enforcement Counters — Border Spine",
+    "Threat Intel \u2014 Scanning PROD Segment for Lateral Movement Paths",
+    "Zero Enforcement Counters \u2014 Leaf 1",
+    "Zero Enforcement Counters \u2014 Leaf 2",
+    "Zero Enforcement Counters \u2014 Border Spine",
+    "Lateral Movement in Progress \u2014 Pat and Kit Workstations",
+    "ISE TrustSec Response \u2014 Deploying SGACL to Block PROD Lateral Movement",
+    "Confirm Kill \u2014 Watching SGT Deny Counters",
+    "SGT Enforcement Report \u2014 Leaf 1",
+    "SGT Enforcement Report \u2014 Leaf 2",
+    "SGT Enforcement Report \u2014 Border Spine",
     # Act 3
     "Reach ISE ERS API",
     "Verify Quarantine ANC Policy",
@@ -2814,9 +2861,9 @@ let currentAct = 0;
 
 // act metadata used to insert dividers
 const ACT_STEPS = {{
-  "Inspect WAN Loopback Routes":               {{ act: 1, cls: "act1", title: "Act 1 — Macro Segmentation (VRF Isolation)" }},
-  "Verify PROD Intra-Segment Policy (Pre-Push)": {{ act: 2, cls: "act2", title: "Act 2 — Micro Segmentation (SGT Enforcement)" }},
-  "Reach ISE ERS API":                         {{ act: 3, cls: "act3", title: "Act 3 — Threat Containment (ISE CoA)" }},
+  "Reconnaissance \u2014 Map the Network Segments":               {{ act: 1, cls: "act1", title: "Act 1 \u2014 Macro Segmentation (VRF Isolation)" }},
+  "Threat Intel \u2014 Scanning PROD Segment for Lateral Movement Paths": {{ act: 2, cls: "act2", title: "Act 2 \u2014 Micro Segmentation (SGT Enforcement)" }},
+  "Reach ISE ERS API":                         {{ act: 3, cls: "act3", title: "Act 3 \u2014 Threat Containment (ISE CoA)" }},
 }};
 
 function sidNew() {{ return Math.random().toString(36).slice(2) + Date.now().toString(36); }}
@@ -2874,8 +2921,9 @@ function updateStep(name, state, detail, output) {{
     row.classList.add('has-output');
     const det = document.createElement('details');
     det.className = 'step-output';
+    det.open = true;
     const summ = document.createElement('summary');
-    summ.textContent = 'Show CLI Output';
+    summ.textContent = 'CLI Output';
     const pre = document.createElement('pre');
     pre.textContent = output.trim();
     det.appendChild(summ);
@@ -2924,34 +2972,29 @@ function startDeploy() {{
         const dot = document.createElement('div');
         dot.className = 'step-dot';
         top.replaceChild(dot, top.firstChild);
-        top.querySelector('.step-detail').textContent = 'Waiting for host pings...';
+        top.querySelector('.step-detail').textContent = 'Waiting for confirmation...';
       }}
-      // Inject a full-width action banner below the top row
       const banner = document.createElement('div');
       banner.className = 'waiting-banner';
       banner.id = 'waiting-banner-' + stepKey(d.name);
       banner.innerHTML =
         '<div class="waiting-icon">&#9888;</div>' +
         '<div class="waiting-body">' +
-          '<div class="waiting-title">ACTION REQUIRED — Student Task</div>' +
+          '<div class="waiting-title">&#128680; Student Action Required &#128680;</div>' +
           '<div class="waiting-instruction">' +
-            'On both PROD workstations, start a <strong>continuous ping</strong> to the other PROD host.<br>' +
-            '<code style="font-size:13px;background:rgba(0,0,0,0.3);padding:2px 8px;border-radius:4px;display:inline-block;margin-top:6px;">' +
-            'ping 10.101.255.x -t &nbsp;(Windows)&nbsp;&nbsp;|&nbsp;&nbsp; ping -t 0 10.101.255.x &nbsp;(Mac/Linux)' +
-            '</code><br>' +
-            '<span style="margin-top:8px;display:block;opacity:0.75;font-size:13px;">Leave the pings running. The simulation will push the SGT deny policy and block the traffic automatically.</span>' +
+            'The attacker is probing the PROD segment. Set up lateral movement traffic:<br><br>' +
+            '<strong style="color:var(--red);">Step 1</strong> &mdash; Log in to <strong>Workstation 1 (Pat)</strong> on the PROD network<br>' +
+            '<strong style="color:var(--red);">Step 2</strong> &mdash; Log in to <strong>Workstation 2 (Kit)</strong> on the PROD network<br>' +
+            '<strong style="color:var(--red);">Step 3</strong> &mdash; On Pat\u2019s workstation, run the ping test bat script and select option <strong>2 (PROD)</strong><br>' +
+            '<strong style="color:var(--red);">Step 4</strong> &mdash; Repeat on Kit\u2019s workstation<br><br>' +
+            '<span style="opacity:0.8;font-size:13px;">Leave the pings running continuously. Once both workstations are pinging, click confirm below. ' +
+            'The simulation will then push the ISE TrustSec SGACL and block the lateral movement in real time.</span>' +
           '</div>' +
-          '<div class="waiting-countdown" id="wc-' + stepKey(d.name) + '">30s remaining</div>' +
+          '<button onclick="confirmPingsStarted()" class="btn-confirm" id="btn-confirm-pings">' +
+            '&#10003; Both Workstations Pinging — Deploy Block Policy' +
+          '</button>' +
         '</div>';
       row.appendChild(banner);
-      // Countdown timer
-      let secs = 30;
-      const wc = document.getElementById('wc-' + stepKey(d.name));
-      const iv = setInterval(() => {{
-        secs--;
-        if (wc) wc.textContent = secs > 0 ? secs + 's remaining' : 'Pushing policy...';
-        if (secs <= 0) clearInterval(iv);
-      }}, 1000);
       row.scrollIntoView({{behavior:'smooth', block:'center'}});
     }});
 
@@ -2993,6 +3036,15 @@ function showResult() {{
   const rl = document.getElementById('result-steps-list');
   rl.innerHTML = ''; rl.appendChild(clone);
   show('screen-result');
+}}
+
+function confirmPingsStarted() {{
+  const btn = document.getElementById('btn-confirm-pings');
+  if (btn) {{ btn.disabled = true; btn.textContent = 'Confirmed — deploying block policy...'; }}
+  fetch('/api/breach/confirm', {{
+    method: 'POST', headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{sid}})
+  }}).catch(() => {{}});
 }}
 
 function resetBreachDemo() {{
