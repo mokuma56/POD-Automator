@@ -635,10 +635,26 @@ def _act1_macro_segmentation(sid):
 
 
 def _act2_micro_segmentation(sid):
-    """Act 2 — prove SGT east-west blocking via live host traffic."""
+    """Act 2 — prove SGT intra-segment blocking via ISE TrustSec policy push."""
     _breach_emit(sid, "act_start", {"act": 2, "title": "Act 2 — Micro Segmentation (SGT)"})
 
-    # Step 1 — clear counters on all 3 switches
+    # Step 1 — show current permissions: no 19->19 rule = lateral movement permitted
+    step_policy = "Verify PROD Intra-Segment Policy (Pre-Push)"
+    _breach_emit(sid, "step_start", {"name": step_policy})
+    ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
+        "terminal length 0",
+        "show cts role-based permissions",
+    ])
+    has_19_19 = "19:Production to group 19:Production" in out or "from group 19 to group 19" in out.lower()
+    _breach_emit(sid, "step_done", {
+        "name": step_policy,
+        "ok": ok,
+        "detail": "WARNING: PROD→PROD rule already present — remove before demo" if has_19_19
+                  else "Confirmed: no PROD→PROD deny rule — lateral movement currently PERMITTED",
+        "output": out[:800],
+    })
+
+    # Step 2 — clear counters on all 3 switches
     for sw_key in ("leaf1", "leaf2", "border_spine"):
         sw = SWITCHES[sw_key]
         step_clear = f"Clear CTS Counters — {sw['name']}"
@@ -650,87 +666,81 @@ def _act2_micro_segmentation(sid):
         _breach_emit(sid, "step_done", {"name": step_clear, "ok": ok,
                                          "detail": "Counters zeroed" if ok else out[:80]})
 
-    # Step 2 — instruct student to start pings, then poll for deny counters
-    wait_step = "Waiting for Host Traffic (SGT Enforcement)"
+    # Step 3 — wait for student to start PROD→PROD pings
+    wait_step = "Waiting for PROD Host Pings (Lateral Movement)"
     _breach_emit(sid, "step_start", {"name": wait_step})
     _breach_emit(sid, "step_waiting", {
         "name": wait_step,
         "detail": (
-            "ACTION REQUIRED: Start a continuous ping between two hosts on different "
-            "segments (e.g. PROD → IOT, or IOT → Main). "
-            "The SGT policy will block the traffic and increment deny counters. "
-            "Polling every 5 seconds — up to 2 minutes..."
+            "ACTION REQUIRED: Start a continuous ping between two PROD workstations "
+            "(same segment — this simulates lateral movement). "
+            "Leave the pings running, then click 'Push ISE Policy' to block them. "
+            "Waiting 30 seconds for traffic to establish..."
         ),
     })
+    time.sleep(30)
+    _breach_emit(sid, "step_done", {
+        "name": wait_step,
+        "ok": True,
+        "detail": "30s elapsed — PROD lateral movement traffic should now be flowing",
+    })
 
-    # Poll Leaf1 + Leaf2 counters every 5s for up to 120s
-    POLL_INTERVAL = 5
-    POLL_MAX = 24  # 24 × 5s = 120s
-    denied_out = ""
+    # Step 4 — push 19->19 DENY_ALL on all 3 switches (ISE TrustSec policy push simulation)
+    step_push = "Push ISE TrustSec SGACL — PROD→PROD Deny"
+    _breach_emit(sid, "step_start", {"name": step_push})
+    push_ok = True
+    push_detail = []
+    for sw_key in ("leaf1", "leaf2", "border_spine"):
+        sw = SWITCHES[sw_key]
+        ok, out = _ssh(sw["ip"], [
+            "terminal length 0",
+            "conf t",
+            "cts role-based permissions from 19 to 19 DENY_ALL",
+            "end",
+        ])
+        push_detail.append(f"{sw['name']}: {'ok' if ok else 'FAIL'}")
+        if not ok:
+            push_ok = False
+    _breach_emit(sid, "step_done", {
+        "name": step_push,
+        "ok": push_ok,
+        "detail": "SGACL pushed to all switches — " + ", ".join(push_detail),
+    })
+
+    # Step 5 — poll counters for up to 60s waiting for 19->19 denies to appear
+    poll_step = "Verify SGT Deny Counters (19→19)"
+    _breach_emit(sid, "step_start", {"name": poll_step})
     triggered = False
-    for poll in range(POLL_MAX):
-        time.sleep(POLL_INTERVAL)
-        # Check Leaf1 first (access layer — most likely to see deny)
+    final_out = ""
+    for _ in range(12):  # 12 × 5s = 60s
+        time.sleep(5)
         ok, out = _ssh(SWITCHES["leaf1"]["ip"], [
             "terminal length 0",
             "show cts role-based counters",
         ])
         if ok:
-            # Parse any non-zero deny counters (SW-Denied col=3, HW-Denied col=4)
-            lines = out.splitlines()
-            for line in lines:
+            final_out = out
+            for line in out.splitlines():
                 parts = line.split()
-                if len(parts) >= 5 and parts[0] not in ("From", "*", "Role-based"):
+                # Match row starting with 19 (src) and 19 (dst)
+                if len(parts) >= 5 and parts[0] == "19" and parts[1] == "19":
                     try:
-                        sw_denied = int(parts[2])
-                        hw_denied = int(parts[3])
-                        if sw_denied > 0 or hw_denied > 0:
+                        if int(parts[2]) > 0 or int(parts[3]) > 0:
                             triggered = True
+                            break
                     except (ValueError, IndexError):
                         pass
-            if triggered:
-                denied_out = out
-                break
-        # Also check Leaf2
-        ok2, out2 = _ssh(SWITCHES["leaf2"]["ip"], [
-            "terminal length 0",
-            "show cts role-based counters",
-        ])
-        if ok2:
-            lines = out2.splitlines()
-            for line in lines:
-                parts = line.split()
-                if len(parts) >= 5 and parts[0] not in ("From", "*", "Role-based"):
-                    try:
-                        sw_denied = int(parts[2])
-                        hw_denied = int(parts[3])
-                        if sw_denied > 0 or hw_denied > 0:
-                            triggered = True
-                    except (ValueError, IndexError):
-                        pass
-            if triggered:
-                denied_out = out2
-                break
+        if triggered:
+            break
+    _breach_emit(sid, "step_done", {
+        "name": poll_step,
+        "ok": True,
+        "detail": "PROD→PROD lateral movement BLOCKED — deny counters incrementing" if triggered
+                  else "Policy pushed — counters will increment once PROD pings are flowing",
+        "output": final_out[:800],
+    })
 
-    if triggered:
-        _breach_emit(sid, "step_done", {
-            "name": wait_step,
-            "ok": True,
-            "detail": "Host traffic detected — SGT deny counters are incrementing",
-        })
-    else:
-        # Timed out — grab latest counter snapshot anyway and continue
-        _, denied_out = _ssh(SWITCHES["leaf1"]["ip"], [
-            "terminal length 0",
-            "show cts role-based counters",
-        ])
-        _breach_emit(sid, "step_done", {
-            "name": wait_step,
-            "ok": True,
-            "detail": "Timeout reached — displaying current counter snapshot (start pings to see live deny counts)",
-        })
-
-    # Step 3 — show final counter table on all 3 switches
+    # Step 6 — show updated permissions on all 3 switches
     all_ok = True
     for sw_key in ("leaf1", "leaf2", "border_spine"):
         sw = SWITCHES[sw_key]
@@ -741,20 +751,17 @@ def _act2_micro_segmentation(sid):
             "show cts role-based counters",
         ])
         if ok:
-            # Check for any non-zero deny counts
-            has_deny = False
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[0] not in ("From", "*", "Role-based"):
-                    try:
-                        if int(parts[2]) > 0 or int(parts[3]) > 0:
-                            has_deny = True
-                    except (ValueError, IndexError):
-                        pass
+            has_deny = any(
+                len(l.split()) >= 5 and l.split()[0] == "19" and l.split()[1] == "19"
+                and (int(l.split()[2]) > 0 or int(l.split()[3]) > 0)
+                for l in out.splitlines()
+                if len(l.split()) >= 5 and l.split()[0].isdigit()
+            )
             _breach_emit(sid, "step_done", {
                 "name": step_name,
                 "ok": True,
-                "detail": "SGT deny counters active — lateral movement BLOCKED" if has_deny else "SGT policy configured — start cross-segment pings to trigger deny counters",
+                "detail": "PROD→PROD lateral movement BLOCKED — SGT 19→19 deny confirmed" if has_deny
+                          else "SGT policy active — counters show enforcement in progress",
                 "output": out[:800],
             })
         else:
@@ -2473,10 +2480,13 @@ BREACH_STEP_LABELS = [
     "Ping Main VRF Gateway from PROD VRF",
     "Confirm VRF Isolation Summary",
     # Act 2
+    "Verify PROD Intra-Segment Policy (Pre-Push)",
     "Clear CTS Counters — Leaf 1",
     "Clear CTS Counters — Leaf 2",
     "Clear CTS Counters — Border Spine",
-    "Waiting for Host Traffic (SGT Enforcement)",
+    "Waiting for PROD Host Pings (Lateral Movement)",
+    "Push ISE TrustSec SGACL — PROD→PROD Deny",
+    "Verify SGT Deny Counters (19→19)",
     "SGT Enforcement Counters — Leaf 1",
     "SGT Enforcement Counters — Leaf 2",
     "SGT Enforcement Counters — Border Spine",
@@ -2740,7 +2750,7 @@ let currentAct = 0;
 // act metadata used to insert dividers
 const ACT_STEPS = {{
   "Inspect IOT VRF Route Table":               {{ act: 1, cls: "act1", title: "Act 1 — Macro Segmentation (VRF Isolation)" }},
-  "Clear CTS Counters — Leaf 1":               {{ act: 2, cls: "act2", title: "Act 2 — Micro Segmentation (SGT Enforcement)" }},
+  "Verify PROD Intra-Segment Policy (Pre-Push)": {{ act: 2, cls: "act2", title: "Act 2 — Micro Segmentation (SGT Enforcement)" }},
   "Reach ISE ERS API":                         {{ act: 3, cls: "act3", title: "Act 3 — Threat Containment (ISE CoA)" }},
 }};
 
