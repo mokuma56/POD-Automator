@@ -2985,10 +2985,13 @@ function startDeploy() {{
             'The attacker is probing the PROD segment. Set up lateral movement traffic:<br><br>' +
             '<strong style="color:var(--red);">Step 1</strong> &mdash; Log in to <strong>Workstation 1 (Pat)</strong> on the PROD network<br>' +
             '<strong style="color:var(--red);">Step 2</strong> &mdash; Log in to <strong>Workstation 2 (Kit)</strong> on the PROD network<br>' +
-            '<strong style="color:var(--red);">Step 3</strong> &mdash; On Pat\u2019s workstation, run the ping test bat script and select option <strong>2 (PROD)</strong><br>' +
-            '<strong style="color:var(--red);">Step 4</strong> &mdash; Repeat on Kit\u2019s workstation<br><br>' +
-            '<span style="opacity:0.8;font-size:13px;">Leave the pings running continuously. Once both workstations are pinging, click confirm below. ' +
-            'The simulation will then push the ISE TrustSec SGACL and block the lateral movement in real time.</span>' +
+            '<strong style="color:var(--red);">Step 3</strong> &mdash; On each workstation, run the ping test bat script and select option <strong>5 (What is my IP?)</strong> &mdash; note down both IP addresses<br>' +
+            '<strong style="color:var(--red);">Step 4</strong> &mdash; On Pat\u2019s workstation, start a continuous ping to Kit\u2019s IP address:<br>' +
+            '<code style="font-size:13px;background:rgba(0,0,0,0.4);padding:4px 10px;border-radius:4px;display:inline-block;margin:4px 0;">ping &lt;Kit\u2019s IP&gt; -t</code><br>' +
+            '<strong style="color:var(--red);">Step 5</strong> &mdash; On Kit\u2019s workstation, start a continuous ping back to Pat\u2019s IP address:<br>' +
+            '<code style="font-size:13px;background:rgba(0,0,0,0.4);padding:4px 10px;border-radius:4px;display:inline-block;margin:4px 0;">ping &lt;Pat\u2019s IP&gt; -t</code><br><br>' +
+            '<span style="opacity:0.8;font-size:13px;">Leave both pings running continuously &mdash; this simulates an attacker moving laterally inside the PROD segment. ' +
+            'Once both workstations are pinging each other, click confirm below.</span>' +
           '</div>' +
           '<button onclick="confirmPingsStarted()" class="btn-confirm" id="btn-confirm-pings">' +
             '&#10003; Both Workstations Pinging — Deploy Block Policy' +
