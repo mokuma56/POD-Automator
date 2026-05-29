@@ -111,6 +111,10 @@ ISE_PASS  = "C1sco12345"
 SITE_ID        = "919ce2a1-39b7-4c1f-a7ec-c76e50170ab7"  # Site-105/MAIN
 SITE_HIERARCHY = "Global/NORTH CAROLINA/Durham/Site-105/MAIN"
 
+WLC_IP      = "198.18.5.103"
+WLC_SITE_ID = "ac7aeac8-fba7-4776-9b3e-feb20384bb44"  # Global/CALIFORNIA/San Jose/DC-Site-10/MAIN
+WLC_SITE    = "Global/CALIFORNIA/San Jose/DC-Site-10/MAIN"
+
 SWITCH_IPS = {
     "border_spine": {"loopback": "172.30.255.3", "mgmt": "198.18.128.24", "name": "Site_105-Border-Spine"},
     "leaf1":        {"loopback": "172.30.255.1", "mgmt": "198.18.128.22", "name": "Site_105-Leaf1"},
@@ -544,9 +548,91 @@ def step_discovery(log_fn=print):
         log_fn(f"    {len(reachable)}/3 switches reachable...")
         if len(reachable) >= 3:
             log_fn(f"  All 3 switches discovered and reachable")
-            return True, "discovery OK"
+            break
         time.sleep(15)
-    raise RuntimeError("Discovery timed out — switches not reachable after 5 min")
+    else:
+        raise RuntimeError("Discovery timed out — switches not reachable after 5 min")
+
+    # Discover C9800-WLC (198.18.5.103) → Global/CALIFORNIA/San Jose/DC-Site-10/MAIN
+    log_fn(f"  Checking C9800-WLC ({WLC_IP}) in inventory...")
+    r_inv = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
+    inv   = {d["managementIpAddress"]: d for d in r_inv.json().get("response", [])}
+    wlc   = inv.get(WLC_IP)
+
+    if wlc and wlc.get("reachabilityStatus") in ("Reachable", "Success"):
+        log_fn(f"  C9800-WLC already in inventory and reachable")
+    else:
+        log_fn(f"  Creating discovery job for C9800-WLC ({WLC_IP})...")
+        wlc_job = f"NaC-WLC-{int(time.time())}"
+        wlc_payload = {
+            "name":                    wlc_job,
+            "discoveryType":           "Range",
+            "ipAddressList":           WLC_IP,
+            "protocolOrder":           "SSH",
+            "globalCredentialIdList":  GLOBAL_CRED_IDS,
+            "retryCount":              3,
+            "timeOut":                 5,
+            "netconfPort":             "830",
+        }
+        r_wlc = s.post(f"{CATC_BASE}/dna/intent/api/v1/discovery", json=wlc_payload)
+        if r_wlc.status_code not in (200, 201, 202):
+            log_fn(f"  WARNING: WLC discovery create failed ({r_wlc.status_code}) — continuing")
+        else:
+            # Wait for job to appear then poll for completion
+            wlc_disc_id = None
+            for _ in range(15):
+                r_list = s.get(f"{CATC_BASE}/dna/intent/api/v1/discovery/1/500")
+                for d in r_list.json().get("response", []):
+                    if d.get("name") == wlc_job:
+                        wlc_disc_id = d["id"]
+                        break
+                if wlc_disc_id:
+                    break
+                time.sleep(2)
+
+            if wlc_disc_id:
+                log_fn(f"  Polling WLC discovery {wlc_disc_id}...")
+                deadline_wlc = time.time() + 180
+                while time.time() < deadline_wlc:
+                    r_d = s.get(f"{CATC_BASE}/dna/intent/api/v1/discovery/{wlc_disc_id}")
+                    if r_d.json().get("response", {}).get("discoveryStatus") == "Inactive":
+                        break
+                    time.sleep(10)
+
+            r_inv2 = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
+            wlc = {d["managementIpAddress"]: d
+                   for d in r_inv2.json().get("response", [])}.get(WLC_IP)
+            if wlc and wlc.get("reachabilityStatus") in ("Reachable", "Success"):
+                log_fn(f"  C9800-WLC discovered and reachable")
+            else:
+                log_fn(f"  WARNING: C9800-WLC not reachable after discovery — continuing")
+
+    # Assign WLC to Global/CALIFORNIA/San Jose/DC-Site-10/MAIN
+    if wlc:
+        if WLC_SITE_ID in (wlc.get("siteHierarchyId") or ""):
+            log_fn(f"  C9800-WLC already assigned to {WLC_SITE}")
+        else:
+            log_fn(f"  Assigning C9800-WLC to {WLC_SITE}...")
+            r_asgn = s.post(
+                f"{CATC_BASE}/dna/intent/api/v1/assign-device-to-site/{WLC_SITE_ID}/device",
+                json={"device": [{"ip": WLC_IP}]})
+            if r_asgn.status_code not in (200, 202):
+                log_fn(f"  WARNING: WLC site assignment failed ({r_asgn.status_code}) — continuing")
+            else:
+                exec_id = r_asgn.json().get("executionId")
+                if exec_id:
+                    deadline_e = time.time() + 90
+                    while time.time() < deadline_e:
+                        r_e = s.get(f"{CATC_BASE}/dna/intent/api/v1/dnacaap/management/execution-status/{exec_id}")
+                        status = r_e.json().get("status", "")
+                        if status in ("SUCCESS", "FAILURE"):
+                            break
+                        time.sleep(5)
+                log_fn(f"  C9800-WLC assigned to {WLC_SITE}")
+    else:
+        log_fn(f"  WARNING: C9800-WLC not in inventory — skipping site assignment")
+
+    return True, "discovery OK"
 
 
 def step_provision(log_fn=print):
