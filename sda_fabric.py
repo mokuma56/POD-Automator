@@ -692,20 +692,43 @@ def step_transit(log_fn=print):
 
 def step_clean_fabric_vlans(log_fn=print):
     """Remove conflicting VLANs/SVIs and prior-run sub-interfaces from switches."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
+
     log_fn(f"  Cleaning VLANs {FABRIC_CONFLICT_VLANS} and Gi1/0/48 sub-interfaces from switches...")
     for key, info in SWITCH_IPS.items():
         log_fn(f"  → {info['name']} ({info['mgmt']})")
-        _ssh_clean_switch_vlans(info["mgmt"], FABRIC_CONFLICT_VLANS, log_fn=log_fn)
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_ssh_clean_switch_vlans, info["mgmt"], FABRIC_CONFLICT_VLANS, log_fn)
+            try:
+                fut.result(timeout=60)
+            except _TimeoutError:
+                log_fn(f"    WARNING: VLAN cleanup on {info['mgmt']} timed out after 60s — continuing")
+            except Exception as e:
+                log_fn(f"    WARNING: VLAN cleanup on {info['mgmt']} failed: {e}")
 
     log_fn(f"  Removing any prior AAA/dot1x/access-session config from switches...")
     for key, info in SWITCH_IPS.items():
         log_fn(f"  → {info['name']} ({info['mgmt']})")
-        _ssh_clean_auth_config(info["mgmt"], log_fn=log_fn)
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_ssh_clean_auth_config, info["mgmt"], log_fn)
+            try:
+                fut.result(timeout=90)
+            except _TimeoutError:
+                log_fn(f"    WARNING: auth cleanup on {info['mgmt']} timed out after 90s — continuing")
+            except Exception as e:
+                log_fn(f"    WARNING: auth cleanup on {info['mgmt']} failed: {e}")
 
     # Also clean Border Spine Gi1/0/48 sub-interfaces from any prior run
     border_ip = SWITCH_IPS["border_spine"]["mgmt"]
     log_fn(f"  Cleaning Gi1/0/48 sub-interfaces on Border Spine ({border_ip})...")
-    _ssh_border_restore_trunk(border_ip, log_fn=log_fn)
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_ssh_border_restore_trunk, border_ip, log_fn)
+        try:
+            fut.result(timeout=60)
+        except _TimeoutError:
+            log_fn(f"    WARNING: trunk restore on {border_ip} timed out after 60s — continuing")
+        except Exception as e:
+            log_fn(f"    WARNING: trunk restore on {border_ip} failed: {e}")
 
     log_fn(f"  ✓ clean_fabric_vlans done")
     return True, "clean_fabric_vlans OK"
