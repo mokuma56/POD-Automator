@@ -761,6 +761,14 @@ CATC_WLC = {
     "name":    "C9800-WLC",
     "site_id": CATC_WLC_SITE_ID,
     "site":    "Global/CALIFORNIA/San Jose/DC-Site-10/MAIN",
+    "cred_ids": [
+        "498ac0e2-c14f-4e2a-8365-249055daf3ee",  # CLI admin/C1sco12345 (WLC)
+        "e6b5e009-5aa3-41b2-a576-d92e6a4c8f02",  # SNMPv2 Read
+        "07d96097-7dac-4929-a9d6-622eb43f3d3e",  # SNMPv2 Write
+        "d6e2d122-0a7b-42a9-87cf-6a21f1d12e2a",  # NETCONF
+        "a21757fb-057d-43c1-baa4-6187b0d13cd9",  # HTTP Read
+        "64b9020e-923f-4577-ae3b-6397d3feb94a",  # HTTP Write
+    ],
 }
 
 
@@ -1013,14 +1021,7 @@ def phase_catc_discover(log_fn=print):
             "timeout":       5,
             "retry":         2,
             "netconfPort":   "830",
-            "globalCredentialIdList": [
-                "82d24eba-dcc0-4fb8-8810-137d190bf90f",
-                "e6b5e009-5aa3-41b2-a576-d92e6a4c8f02",
-                "07d96097-7dac-4929-a9d6-622eb43f3d3e",
-                "d6e2d122-0a7b-42a9-87cf-6a21f1d12e2a",
-                "a21757fb-057d-43c1-baa4-6187b0d13cd9",
-                "64b9020e-923f-4577-ae3b-6397d3feb94a",
-            ],
+            "globalCredentialIdList": CATC_WLC["cred_ids"],
         }
         r_wlc = requests.post(f"{CATC_BASE}/dna/intent/api/v1/discovery",
                               headers=headers, json=wlc_payload, verify=False, timeout=15)

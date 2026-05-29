@@ -114,6 +114,14 @@ SITE_HIERARCHY = "Global/NORTH CAROLINA/Durham/Site-105/MAIN"
 WLC_IP      = "198.18.5.103"
 WLC_SITE_ID = "ac7aeac8-fba7-4776-9b3e-feb20384bb44"  # Global/CALIFORNIA/San Jose/DC-Site-10/MAIN
 WLC_SITE    = "Global/CALIFORNIA/San Jose/DC-Site-10/MAIN"
+WLC_CRED_IDS = [
+    "498ac0e2-c14f-4e2a-8365-249055daf3ee",  # CLI admin/C1sco12345 (WLC)
+    "e6b5e009-5aa3-41b2-a576-d92e6a4c8f02",  # SNMPv2 Read
+    "07d96097-7dac-4929-a9d6-622eb43f3d3e",  # SNMPv2 Write
+    "d6e2d122-0a7b-42a9-87cf-6a21f1d12e2a",  # NETCONF
+    "a21757fb-057d-43c1-baa4-6187b0d13cd9",  # HTTP Read
+    "64b9020e-923f-4577-ae3b-6397d3feb94a",  # HTTP Write
+]
 
 SWITCH_IPS = {
     "border_spine": {"loopback": "172.30.255.3", "mgmt": "198.18.128.24", "name": "Site_105-Border-Spine"},
@@ -569,7 +577,7 @@ def step_discovery(log_fn=print):
             "discoveryType":           "Range",
             "ipAddressList":           WLC_IP,
             "protocolOrder":           "SSH",
-            "globalCredentialIdList":  GLOBAL_CRED_IDS,
+            "globalCredentialIdList":  WLC_CRED_IDS,
             "retryCount":              3,
             "timeOut":                 5,
             "netconfPort":             "830",
