@@ -646,9 +646,7 @@ def step_transit(log_fn=print):
 
 
 def step_clean_fabric_vlans(log_fn=print):
-    """Remove conflicting VLANs/SVIs and prior-run sub-interfaces from switches, resync CatC."""
-    s = _catc_session(log_fn)
-
+    """Remove conflicting VLANs/SVIs and prior-run sub-interfaces from switches."""
     log_fn(f"  Cleaning VLANs {FABRIC_CONFLICT_VLANS} and Gi1/0/48 sub-interfaces from switches...")
     for key, info in SWITCH_IPS.items():
         log_fn(f"  → {info['name']} ({info['mgmt']})")
@@ -664,12 +662,6 @@ def step_clean_fabric_vlans(log_fn=print):
     log_fn(f"  Cleaning Gi1/0/48 sub-interfaces on Border Spine ({border_ip})...")
     _ssh_border_restore_trunk(border_ip, log_fn=log_fn)
 
-    log_fn(f"  Resyncing devices in CatC inventory (fire-and-forget)...")
-    for key, info in SWITCH_IPS.items():
-        dev_id = _get_device_id(s, info["name"])
-        if dev_id:
-            log_fn(f"    Resyncing {info['name']}...")
-            _catc_resync_device(s, dev_id, log_fn=log_fn, wait=False)
     log_fn(f"  ✓ clean_fabric_vlans done")
     return True, "clean_fabric_vlans OK"
 
