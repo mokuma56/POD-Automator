@@ -133,6 +133,7 @@ def _ssh_clean_switch_vlans(mgmt_ip, vlans, log_fn=print):
         client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
                        timeout=20, allow_agent=False, look_for_keys=False)
         chan = client.invoke_shell()
+        chan.settimeout(10)
         import time as _time
 
         def send(cmd, wait=1.5):
@@ -140,7 +141,10 @@ def _ssh_clean_switch_vlans(mgmt_ip, vlans, log_fn=print):
             _time.sleep(wait)
             out = b""
             while chan.recv_ready():
-                out += chan.recv(4096)
+                try:
+                    out += chan.recv(4096)
+                except Exception:
+                    break
             return out.decode(errors="ignore")
 
         send("terminal length 0", 0.5)
@@ -216,19 +220,35 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
         client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
                        timeout=20, allow_agent=False, look_for_keys=False)
         chan = client.invoke_shell()
-        _time.sleep(1); chan.recv(4096)
+        chan.settimeout(10)
+        _time.sleep(1)
+        try:
+            chan.recv(4096)
+        except Exception:
+            pass
 
         def send(cmd, wait=1.0):
             chan.send(cmd + "\n")
             _time.sleep(wait)
             out = b""
             while chan.recv_ready():
-                out += chan.recv(4096)
+                try:
+                    out += chan.recv(4096)
+                except Exception:
+                    break
             return out.decode(errors="ignore")
 
         def ensure_config_mode():
-            chan.send("end\n"); _time.sleep(0.5); chan.recv(4096)
-            chan.send("configure terminal\n"); _time.sleep(0.5); chan.recv(4096)
+            chan.send("end\n"); _time.sleep(0.5)
+            try:
+                chan.recv(4096)
+            except Exception:
+                pass
+            chan.send("configure terminal\n"); _time.sleep(0.5)
+            try:
+                chan.recv(4096)
+            except Exception:
+                pass
 
         send("terminal length 0", 0.5)
         send("enable", 0.5)
@@ -251,12 +271,23 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
             send(f"template {tmpl}", 0.5)
             for pm in POLICY_MAPS:
                 send(f"no service-policy type control subscriber {pm}", 0.4)
-            send("end", 0.5); chan.recv(4096)
+            send("end", 0.5)
+            try:
+                chan.recv(4096)
+            except Exception:
+                pass
             send("configure terminal", 0.5)
             chan.send(f"no template {tmpl}\n"); _time.sleep(1.5)
-            out = chan.recv(4096).decode(errors="ignore")
+            try:
+                out = chan.recv(4096).decode(errors="ignore")
+            except Exception:
+                out = ""
             if "[confirm]" in out or "CONFIRM" in out:
-                chan.send("\n"); _time.sleep(1.5); chan.recv(4096)
+                chan.send("\n"); _time.sleep(1.5)
+                try:
+                    chan.recv(4096)
+                except Exception:
+                    pass
             ensure_config_mode()
 
         # Step 3: Remove policy-maps via CLI (may fail if still referenced — OK)
@@ -268,16 +299,30 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
             send(cmd, 0.4)
         # aaa new-model requires [confirm] on IOS-XE
         chan.send("no aaa new-model\n"); _time.sleep(1)
-        out = chan.recv(4096).decode(errors="ignore")
+        try:
+            out = chan.recv(4096).decode(errors="ignore")
+        except Exception:
+            out = ""
         if "[confirm]" in out or "Continue" in out:
-            chan.send("\n"); _time.sleep(1); chan.recv(4096)
+            chan.send("\n"); _time.sleep(1)
+            try:
+                chan.recv(4096)
+            except Exception:
+                pass
         send("no aaa session-id common", 0.5)
         send("end", 0.5)
         # write memory — use copy run start in case privilege dropped
         chan.send("copy running-config startup-config\n"); _time.sleep(1)
-        out = chan.recv(4096).decode(errors="ignore")
+        try:
+            out = chan.recv(4096).decode(errors="ignore")
+        except Exception:
+            out = ""
         if "?" in out or "filename" in out.lower():
-            chan.send("\n"); _time.sleep(3); chan.recv(4096)
+            chan.send("\n"); _time.sleep(3)
+            try:
+                chan.recv(4096)
+            except Exception:
+                pass
         client.close()
 
         # Step 5: Delete class-maps via NETCONF (CLI delete silently fails when
@@ -675,6 +720,7 @@ def _ssh_border_restore_trunk(mgmt_ip, log_fn=print):
         client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
                        timeout=20, allow_agent=False, look_for_keys=False)
         chan = client.invoke_shell()
+        chan.settimeout(10)
         _time.sleep(0.8)
 
         def send(cmd, wait=0.6):
@@ -683,7 +729,10 @@ def _ssh_border_restore_trunk(mgmt_ip, log_fn=print):
                 _time.sleep(wait)
                 out = b""
                 while chan.recv_ready():
-                    out += chan.recv(4096)
+                    try:
+                        out += chan.recv(4096)
+                    except Exception:
+                        break
                 return out.decode(errors="ignore")
             except (_socket.error, OSError):
                 return ""
