@@ -1015,7 +1015,7 @@ def phase_catc_discover(log_fn=print):
         wlc_job = f"NaC-WLC-{_time.strftime('%Y%m%d-%H%M%S')}"
         wlc_payload = {
             "name":          wlc_job,
-            "discoveryType": "Range",
+            "discoveryType": "Single",
             "ipAddressList": wlc_ip,
             "protocolOrder": "ssh",
             "timeout":       5,
