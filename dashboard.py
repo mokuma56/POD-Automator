@@ -2643,7 +2643,7 @@ async function load() {
     // Only refresh the active tab to avoid re-rendering all tabs and causing page jumps
     const activeTab = document.querySelector('.tab-btn.active');
     const tabName = activeTab ? activeTab.getAttribute('onclick').match(/switchTab\(this,\s*'(\w+)'\)/)?.[1] : null;
-    if (tabName === 'pipeline' || !tabName) loadSteps(detailId);
+    if (tabName === 'steps' || tabName === 'pipeline' || !tabName) loadSteps(detailId);
     else if (tabName === 'switches')  loadSwitches(detailId);
     else if (tabName === 'cdfmc')     loadCdfmc(detailId);
     else if (tabName === 'ad')        loadAd(detailId);
