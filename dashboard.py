@@ -2806,6 +2806,13 @@ async function runPod(podId) {
   status.textContent = data.message || 'Done';
   setTimeout(() => status.textContent = '', 8000);
   load();
+  if (data.status === 'ok') {
+    // Open the detail panel and start polling pipeline cards immediately
+    await showPipeline(podId);
+    if (!stepPollId) {
+      stepPollId = setInterval(() => loadSteps(podId), 5000);
+    }
+  }
 }
 
 async function deletePod(podId) {
