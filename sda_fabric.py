@@ -308,15 +308,17 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
         log_fn(f"    WARNING: auth cleanup SSH to {mgmt_ip} failed: {e}")
 
 
-def _catc_resync_device(s, dev_id, log_fn=print):
-    """Trigger inventory resync for a device and wait for it."""
+def _catc_resync_device(s, dev_id, log_fn=print, wait=True):
+    """Trigger inventory resync for a device, optionally waiting for completion."""
     r = s.put(f"{CATC_BASE}/dna/intent/api/v1/network-device/sync", json=[dev_id])
     if r.status_code not in (200, 201, 202):
         log_fn(f"    WARNING: resync {dev_id} → {r.status_code}")
         return
     task_id = r.json().get("response", {}).get("taskId")
-    if task_id:
+    if task_id and wait:
         _wait_task(s, task_id, log_fn=log_fn, timeout=120)
+    elif task_id:
+        log_fn(f"    Resync triggered (fire-and-forget), task={task_id}")
 
 DISCOVERY_NAME  = "Site-105-Discovery"
 DISCOVERY_RANGE = "172.30.255.1-172.30.255.3"
@@ -662,12 +664,12 @@ def step_clean_fabric_vlans(log_fn=print):
     log_fn(f"  Cleaning Gi1/0/48 sub-interfaces on Border Spine ({border_ip})...")
     _ssh_border_restore_trunk(border_ip, log_fn=log_fn)
 
-    log_fn(f"  Resyncing devices in CatC inventory...")
+    log_fn(f"  Resyncing devices in CatC inventory (fire-and-forget)...")
     for key, info in SWITCH_IPS.items():
         dev_id = _get_device_id(s, info["name"])
         if dev_id:
             log_fn(f"    Resyncing {info['name']}...")
-            _catc_resync_device(s, dev_id, log_fn=log_fn)
+            _catc_resync_device(s, dev_id, log_fn=log_fn, wait=False)
     log_fn(f"  ✓ clean_fabric_vlans done")
     return True, "clean_fabric_vlans OK"
 
