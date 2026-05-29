@@ -348,6 +348,7 @@ router bgp 65535
 ACCESS_PORTS = """\
 interface GigabitEthernet1/0/1
  description Client
+ switchport access vlan 10
  switchport mode access
  device-tracking attach-policy IPDT_POLICY
  source template WIRED_DOT1X_CLOSED
@@ -366,6 +367,7 @@ interface GigabitEthernet1/0/2
 !
 interface GigabitEthernet1/0/3
  description Client
+ switchport access vlan 10
  switchport mode access
  device-tracking attach-policy IPDT_POLICY
  source template WIRED_DOT1X_CLOSED
