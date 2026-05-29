@@ -2081,6 +2081,19 @@ def delete_pod(pod_id):
     return jsonify({"status": "ok", "message": f"{pod_id} deleted"})
 
 
+@app.route("/api/reset-pipeline/<pod_id>", methods=["POST"])
+def reset_pipeline(pod_id):
+    """Reset all pipeline steps to pending so the pipeline can be re-run."""
+    conn = _db()
+    conn.execute("DELETE FROM pipeline_steps WHERE pod_id=?", (pod_id,))
+    conn.execute("DELETE FROM pipeline_logs WHERE pod_id=?", (pod_id,))
+    conn.execute("""UPDATE pods SET status='pending', sdwan_online='', notes='',
+                    updated_at=datetime('now') WHERE pod_id=?""", (pod_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok", "message": f"{pod_id} pipeline reset — ready to re-run"})
+
+
 @app.route("/api/pod-assigned/<pod_id>", methods=["POST"])
 def pod_assigned(pod_id):
     """Update the assigned_to field for a POD."""
@@ -2789,6 +2802,7 @@ function renderTable(pods) {
       <td style="display:flex;gap:4px;flex-wrap:wrap;">
         <button class="btn-start" onclick="connectVpn('${p.pod_id}')">Connect VPN</button>
          <button class="btn-reconnect" onclick="runPod('${p.pod_id}')" style="background:#7c3aed;border-color:#7c3aed;color:#fff;">&#9654; Run Automation</button>
+         <button class="btn-reconnect" onclick="resetPipeline('${p.pod_id}')" style="background:#b45309;border-color:#b45309;color:#fff;" title="Clear all pipeline steps and logs so the pipeline can be re-run">&#8635; Reset Pipeline</button>
          <button class="btn-reconnect" onclick="reconnectVpn('${p.pod_id}')">Reconnect VPN</button>
          <button class="btn-reconnect" onclick="disconnectVpn('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;">Disconnect VPN</button>
          <button class="btn-reconnect" onclick="deletePod('${p.pod_id}')" style="color:#ff4757;border-color:#ff4757;background:#2a0a0a;" title="Delete POD from DB">&#x1F5D1;</button>
@@ -2823,6 +2837,23 @@ async function deletePod(podId) {
     load();
   } else {
     alert('Error: ' + (data.message || 'Unknown error'));
+  }
+}
+
+async function resetPipeline(podId) {
+  if (!confirm('Reset pipeline for ' + podId + '?\n\nThis clears all step statuses and logs so the pipeline can be re-run from scratch.')) return;
+  const status = document.getElementById('docker-status');
+  status.textContent = 'Resetting pipeline for ' + podId + '...';
+  const r = await fetch('/api/reset-pipeline/' + podId, { method: 'POST' });
+  const data = await r.json();
+  status.textContent = data.message || 'Done';
+  setTimeout(() => status.textContent = '', 5000);
+  load();
+  // Refresh the detail panel if it's open for this POD
+  const detailEl = document.getElementById('detail-pod-id');
+  if (detailEl && detailEl.dataset.podId === podId) {
+    loadSteps(podId);
+    loadLogs(podId);
   }
 }
 
