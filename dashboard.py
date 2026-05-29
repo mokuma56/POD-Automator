@@ -2841,7 +2841,7 @@ async function deletePod(podId) {
 }
 
 async function resetPipeline(podId) {
-  if (!confirm('Reset pipeline for ' + podId + '?\n\nThis clears all step statuses and logs so the pipeline can be re-run from scratch.')) return;
+  if (!confirm('Reset pipeline for ' + podId + '? This clears all step statuses and logs so the pipeline can be re-run from scratch.')) return;
   const status = document.getElementById('docker-status');
   status.textContent = 'Resetting pipeline for ' + podId + '...';
   const r = await fetch('/api/reset-pipeline/' + podId, { method: 'POST' });
@@ -3027,7 +3027,7 @@ async function loadSteps(podId) {
       rebootHtml =
         '<div class="step-dur" style="color:#ffa502">' + elStr + '</div>' +
         '<div class="step-reboot-bar-bg"><div class="step-reboot-bar-fill" style="width:' + pct + '%"></div></div>' +
-        '<div class="step-reboot-eta">' + pct + '% \u2014 ' + remStr + '</div>';
+        '<div class="step-reboot-eta">' + pct + '% &mdash; ' + remStr + '</div>';
     }
 
     return '<div class="step-card" style="' + cardBorder + '">' +
