@@ -574,7 +574,7 @@ def step_discovery(log_fn=print):
         wlc_job = f"NaC-WLC-{int(time.time())}"
         wlc_payload = {
             "name":                    wlc_job,
-            "discoveryType":           "Range",
+            "discoveryType":           "Single",
             "ipAddressList":           WLC_IP,
             "protocolOrder":           "SSH",
             "globalCredentialIdList":  WLC_CRED_IDS,
