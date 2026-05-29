@@ -348,7 +348,6 @@ router bgp 65535
 ACCESS_PORTS = """\
 interface GigabitEthernet1/0/1
  description Client
- switchport access vlan 10
  switchport mode access
  device-tracking attach-policy IPDT_POLICY
  source template WIRED_DOT1X_CLOSED
@@ -367,7 +366,6 @@ interface GigabitEthernet1/0/2
 !
 interface GigabitEthernet1/0/3
  description Client
- switchport access vlan 10
  switchport mode access
  device-tracking attach-policy IPDT_POLICY
  source template WIRED_DOT1X_CLOSED
@@ -424,6 +422,9 @@ access-session authentication attributes filter-spec include list ISE-DS-LIST
 access-session accounting attributes filter-spec include list ISE-DS-LIST
 !
 dot1x system-auth-control
+aaa authentication dot1x default group dnac-client-radius-group
+aaa authorization network default group dnac-client-radius-group
+aaa accounting dot1x default start-stop group dnac-client-radius-group
 no ip dhcp snooping information option
 !
 service-template CRITICAL_DATA_ACCESS
