@@ -1337,7 +1337,7 @@ def api_catc_status(pod_id):
     c.close()
 
     # Steps in order
-    step_order = ["auth", "check_inventory", "create_discovery", "verify_results", "assign_site", "provision"]
+    step_order = ["auth", "check_inventory", "create_discovery", "verify_results", "assign_site", "provision", "discover_wlc", "assign_wlc_site"]
     step_labels = {
         "auth":             "Authenticate to Catalyst Center",
         "check_inventory":  "Check Existing Inventory",
@@ -1345,6 +1345,8 @@ def api_catc_status(pod_id):
         "verify_results":   "Verify Reachability",
         "assign_site":      "Assign to Site (MAIN)",
         "provision":        "Provision / Sync with Site",
+        "discover_wlc":     "Discover C9800-WLC",
+        "assign_wlc_site":  "Assign WLC to Site",
     }
 
     # Parse log lines: [catc:step] <step> | <status> | <message>
