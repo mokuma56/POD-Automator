@@ -3945,10 +3945,11 @@ function renderFabricGrid(podId, steps) {
   html += '</div>';
 
   // Only update DOM if content changed — prevents scroll jump on re-render
-  const newHtml = html;
+  // Include podId in the key so switching PODs always forces a re-render + button rewire
+  const newHtml = podId + '|' + html;
   if (grid._lastHtml === newHtml) return;
   grid._lastHtml = newHtml;
-  grid.innerHTML = newHtml;
+  grid.innerHTML = html;
 
   setTimeout(() => {
     const runBtn    = document.getElementById('fabric-run-btn');
@@ -4157,8 +4158,9 @@ function renderSdaGrid(podId, data) {
   });
   html += '</div>';
 
-  if (grid._lastHtml === html) return;
-  grid._lastHtml = html;
+  // Include podId in the key so switching PODs always forces a re-render + button rewire
+  if (grid._lastHtml === podId + '|' + html) return;
+  grid._lastHtml = podId + '|' + html;
   grid.innerHTML = html;
 
   // Wire buttons
