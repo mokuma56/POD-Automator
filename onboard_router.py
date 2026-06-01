@@ -762,7 +762,7 @@ CATC_WLC = {
     "site_id": CATC_WLC_SITE_ID,
     "site":    "Global/CALIFORNIA/San Jose/DC-Site-10/MAIN",
     "cred_ids": [
-        "498ac0e2-c14f-4e2a-8365-249055daf3ee",  # CLI admin/C1sco12345 (WLC)
+        "82d24eba-dcc0-4fb8-8810-137d190bf90f",  # CLI netadmin (shared across all PODs)
         "e6b5e009-5aa3-41b2-a576-d92e6a4c8f02",  # SNMPv2 Read
         "07d96097-7dac-4929-a9d6-622eb43f3d3e",  # SNMPv2 Write
         "d6e2d122-0a7b-42a9-87cf-6a21f1d12e2a",  # NETCONF
