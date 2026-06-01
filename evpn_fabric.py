@@ -58,6 +58,10 @@ SWITCHES = {
 SWITCH_USER = "netadmin"
 SWITCH_PASS = "C1sco12345"
 
+# ISE RADIUS shared secret — must match what CatC/ISE have configured
+ISE_RADIUS_KEY = "C1sco12345"
+ISE_IP         = "198.18.5.101"
+
 DB_PATH = os.environ.get("DB_PATH", "data/pod_state.db")
 POD_ID  = os.environ.get("POD_ID", "")
 
@@ -387,9 +391,29 @@ interface GigabitEthernet1/0/3
 #  - CTS role-based enforcement on data VLANs
 #  - Critical-auth service templates for ISE AAA-down survivability
 #
-DOT1X_SECURITY = """\
+DOT1X_SECURITY = f"""\
+service password-encryption
+no logging console
+no ip domain lookup
+no ip tftp blocksize
+ip tftp source-interface GigabitEthernet0/0
+ip ssh version 2
+!
 cdp run
 lldp run
+!
+radius server ISE
+ address ipv4 {ISE_IP} auth-port 1812 acct-port 1813
+ pac key {ISE_RADIUS_KEY}
+!
+aaa group server radius dnac-client-radius-group
+ server name ISE
+ ip vrf forwarding Mgmt-vrf
+ ip radius source-interface GigabitEthernet0/0
+!
+aaa authentication dot1x default group dnac-client-radius-group
+aaa authorization network default group dnac-client-radius-group
+aaa accounting dot1x default start-stop group dnac-client-radius-group
 !
 device-tracking policy IPDT_POLICY
  no protocol udp
@@ -415,19 +439,16 @@ device sensor filter-spec cdp include list CDP-SENSOR-LIST
 device sensor filter-spec lldp include list LLDP-SENSOR-LIST
 device sensor notify all-changes
 !
-access-session attributes filter-list list ISE-DS-LIST
+access-session attributes filter-list list ISE-DS-list
  vlan-id
  cdp
  lldp
  dhcp
  http
-access-session authentication attributes filter-spec include list ISE-DS-LIST
-access-session accounting attributes filter-spec include list ISE-DS-LIST
+access-session authentication attributes filter-spec include list ISE-DS-list
+access-session accounting attributes filter-spec include list ISE-DS-list
 !
 dot1x system-auth-control
-aaa authentication dot1x default group dnac-client-radius-group
-aaa authorization network default group dnac-client-radius-group
-aaa accounting dot1x default start-stop group dnac-client-radius-group
 no ip dhcp snooping information option
 !
 service-template CRITICAL_DATA_ACCESS
