@@ -404,12 +404,10 @@ lldp run
 !
 radius server ISE
  address ipv4 {ISE_IP} auth-port 1812 acct-port 1813
- pac key {ISE_RADIUS_KEY}
+ key {ISE_RADIUS_KEY}
 !
 aaa group server radius dnac-client-radius-group
  server name ISE
- ip vrf forwarding Mgmt-vrf
- ip radius source-interface GigabitEthernet0/0
 !
 aaa authentication dot1x default group dnac-client-radius-group
 aaa authorization network default group dnac-client-radius-group
