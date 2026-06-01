@@ -766,9 +766,10 @@ CATC_WLC = {
         "e6b5e009-5aa3-41b2-a576-d92e6a4c8f02",  # SNMPv2 Read
         "07d96097-7dac-4929-a9d6-622eb43f3d3e",  # SNMPv2 Write
         "d6e2d122-0a7b-42a9-87cf-6a21f1d12e2a",  # NETCONF
-        "a21757fb-057d-43c1-baa4-6187b0d13cd9",  # HTTP Read
-        "64b9020e-923f-4577-ae3b-6397d3feb94a",  # HTTP Write
     ],
+    # HTTP creds passed as separate fields in the discovery payload (not globalCredentialIdList)
+    "http_read_id":  "a21757fb-057d-43c1-baa4-6187b0d13cd9",
+    "http_write_id": "64b9020e-923f-4577-ae3b-6397d3feb94a",
 }
 
 
@@ -1013,15 +1014,19 @@ def phase_catc_discover(log_fn=print):
     else:
         log_fn(f"[catc:step] discover_wlc | running | Creating discovery job for {wlc_name} ({wlc_ip})")
         wlc_job = f"NaC-WLC-{_time.strftime('%Y%m%d-%H%M%S')}"
+        # C9800 WLC is primarily managed via HTTPS; include both https and ssh
+        # HTTP creds must be passed as separate fields (not globalCredentialIdList)
         wlc_payload = {
             "name":          wlc_job,
             "discoveryType": "Single",
             "ipAddressList": wlc_ip,
-            "protocolOrder": "ssh",
+            "protocolOrder": "https,ssh",
             "timeout":       5,
-            "retry":         2,
+            "retry":         3,
             "netconfPort":   "830",
             "globalCredentialIdList": CATC_WLC["cred_ids"],
+            "httpReadCredential":  {"id": CATC_WLC["http_read_id"]},
+            "httpWriteCredential": {"id": CATC_WLC["http_write_id"]},
         }
         r_wlc = requests.post(f"{CATC_BASE}/dna/intent/api/v1/discovery",
                               headers=headers, json=wlc_payload, verify=False, timeout=15)
