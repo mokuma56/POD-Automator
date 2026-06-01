@@ -4179,7 +4179,7 @@ function renderSdaCatcTile(podId) {
   const container = document.getElementById('sda-catc-tile-container');
   if (!container || !podId) return;
 
-  // Only build the shell once — avoids re-wiring buttons and flickering on every poll
+  // Build HTML shell only once; always rewire buttons for current podId
   if (!container._initialized) {
     container._initialized = true;
     container.innerHTML =
@@ -4197,11 +4197,11 @@ function renderSdaCatcTile(podId) {
         '</div>' +
         '<div id="sda-catc-progress-area"></div>' +
       '</div>';
-
-    document.getElementById('sda-catc-discover-btn').addEventListener('click', () => triggerSdaCatcDiscover(podId));
-    document.getElementById('sda-catc-rerun-btn').addEventListener('click',    () => triggerSdaCatcDiscover(podId));
-    document.getElementById('sda-catc-reset-btn').addEventListener('click',    () => resetSdaCatcDiscover(podId));
   }
+  // Always rewire so switching PODs updates the target (onclick replaces any prior handler)
+  document.getElementById('sda-catc-discover-btn').onclick = () => triggerSdaCatcDiscover(podId);
+  document.getElementById('sda-catc-rerun-btn').onclick    = () => triggerSdaCatcDiscover(podId);
+  document.getElementById('sda-catc-reset-btn').onclick    = () => resetSdaCatcDiscover(podId);
 
   loadSdaCatcStatus(podId);
 }
@@ -4753,7 +4753,7 @@ function renderCatcTile(podId) {
   const container = document.getElementById('catc-tile-container');
   if (!container || !podId) return;
 
-  // Only build the shell once — avoids re-wiring buttons and flickering on every poll
+  // Build HTML shell only once; always rewire buttons for current podId
   if (!container._initialized) {
     container._initialized = true;
     container.innerHTML =
@@ -4771,11 +4771,11 @@ function renderCatcTile(podId) {
         '</div>' +
         '<div id="catc-progress-area"></div>' +
       '</div>';
-
-    document.getElementById('catc-discover-btn').addEventListener('click', () => triggerCatcDiscover(podId));
-    document.getElementById('catc-rerun-btn').addEventListener('click',    () => triggerCatcDiscover(podId));
-    document.getElementById('catc-reset-btn').addEventListener('click',    () => resetCatcDiscover(podId));
   }
+  // Always rewire so switching PODs updates the target (onclick replaces any prior handler)
+  document.getElementById('catc-discover-btn').onclick = () => triggerCatcDiscover(podId);
+  document.getElementById('catc-rerun-btn').onclick    = () => triggerCatcDiscover(podId);
+  document.getElementById('catc-reset-btn').onclick    = () => resetCatcDiscover(podId);
 
   loadCatcStatus(podId);
 }
