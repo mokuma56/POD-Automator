@@ -115,7 +115,7 @@ WLC_IP      = "198.18.5.103"
 WLC_SITE_ID = "ac7aeac8-fba7-4776-9b3e-feb20384bb44"  # Global/CALIFORNIA/San Jose/DC-Site-10/MAIN
 WLC_SITE    = "Global/CALIFORNIA/San Jose/DC-Site-10/MAIN"
 WLC_CRED_IDS = [
-    "498ac0e2-c14f-4e2a-8365-249055daf3ee",  # CLI admin/C1sco12345 (WLC)
+    "82d24eba-dcc0-4fb8-8810-137d190bf90f",  # CLI netadmin (same cred as switches)
     "e6b5e009-5aa3-41b2-a576-d92e6a4c8f02",  # SNMPv2 Read
     "07d96097-7dac-4929-a9d6-622eb43f3d3e",  # SNMPv2 Write
     "d6e2d122-0a7b-42a9-87cf-6a21f1d12e2a",  # NETCONF
@@ -532,7 +532,7 @@ def step_discovery(log_fn=print):
             "name": DISCOVERY_NAME,
             "discoveryType": "Range",
             "ipAddressList": DISCOVERY_RANGE,
-            "protocolOrder": "SSH",
+            "protocolOrder": "ssh",
             "globalCredentialIdList": GLOBAL_CRED_IDS,
             "preferredMgmtIPMethod": "UseLoopBack",
             "siteId": SITE_ID,
@@ -576,7 +576,7 @@ def step_discovery(log_fn=print):
             "name":                    wlc_job,
             "discoveryType":           "Single",
             "ipAddressList":           WLC_IP,
-            "protocolOrder":           "SSH",
+            "protocolOrder":           "ssh",
             "globalCredentialIdList":  WLC_CRED_IDS,
             "retryCount":              3,
             "timeOut":                 5,
