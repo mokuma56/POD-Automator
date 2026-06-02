@@ -388,60 +388,26 @@ interface GigabitEthernet1/0/3
 #  - Critical-auth service templates for ISE AAA-down survivability
 #
 DOT1X_SECURITY = """\
-cdp run
-lldp run
-!
-device-tracking policy IPDT_POLICY
- no protocol udp
- tracking enable
-!
-device sensor filter-list dhcp list DHCP-SENSOR-LIST
- option name host-name
- option name requested-address
- option name parameter-request-list
- option name class-identifier
- option name client-identifier
-device sensor filter-list cdp list CDP-SENSOR-LIST
- tlv name device-name
- tlv name address-type
- tlv name capabilities-type
- tlv name platform-type
-device sensor filter-list lldp list LLDP-SENSOR-LIST
- tlv name system-name
- tlv name system-description
- tlv name system-capabilities
-device sensor filter-spec dhcp include list DHCP-SENSOR-LIST
-device sensor filter-spec cdp include list CDP-SENSOR-LIST
-device sensor filter-spec lldp include list LLDP-SENSOR-LIST
-device sensor notify all-changes
-!
-access-session attributes filter-list list ISE-DS-LIST
+service password-encryption
+no logging console
+no ip domain lookup
+netconf-yang
+no ip dhcp snooping information option
+no ip tftp blocksize
+access-session attributes filter-list list ISE-DS-list
  vlan-id
  cdp
  lldp
  dhcp
  http
-access-session authentication attributes filter-spec include list ISE-DS-LIST
-access-session accounting attributes filter-spec include list ISE-DS-LIST
-!
-dot1x system-auth-control
-aaa authentication dot1x default group dnac-client-radius-group
-aaa authorization network default group dnac-client-radius-group
-aaa accounting dot1x default start-stop group dnac-client-radius-group
-no ip dhcp snooping information option
-!
+access-session authentication attributes filter-spec include list ISE-DS-list
+access-session accounting attributes filter-spec include list ISE-DS-list
 service-template CRITICAL_DATA_ACCESS
  access-group PERMIT-ISE
 service-template CRITICAL_VOICE_ACCESS
  access-group PERMIT-ISE
  voice vlan
-!
-ip access-list extended PERMIT-ISE
- 10 permit ip any any
-!
-cts role-based enforcement
-cts role-based enforcement vlan-list 10,101-102
-!
+dot1x system-auth-control
 class-map type control subscriber match-all AAA_SVR_DOWN_AUTHD_HOST
  match result-type aaa-timeout
  match authorization-status authorized
@@ -627,6 +593,17 @@ template WIRED_MAB_OPEN
  authentication periodic
  authentication timer reauthenticate server
  service-policy type control subscriber MAB_DOT1X_POLICY
+!
+ip tftp source-interface GigabitEthernet0/0
+ip ssh version 2
+ip access-list extended PERMIT-ISE
+ 10 permit ip any any
+!
+cts role-based enforcement
+cts role-based enforcement vlan-list 10,101-102
+device-tracking policy IPDT_POLICY
+ no protocol udp
+ tracking enable
 """
 
 # ── SSH helpers ───────────────────────────────────────────────────────────────
