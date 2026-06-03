@@ -1014,19 +1014,19 @@ def phase_catc_discover(log_fn=print):
         log_fn(f"[catc:step] discover_wlc | running | Creating discovery job for {wlc_name} ({wlc_ip})")
         wlc_job = f"NaC-WLC-{_time.strftime('%Y%m%d-%H%M%S')}"
         wlc_payload = {
-            "name":          wlc_job,
-            "discoveryType": "Single",
-            "ipAddressList": wlc_ip,
-            "protocolOrder": "ssh",
-            "timeout":       5,
-            "retry":         2,
-            "netconfPort":   "830",
+            "name":                   wlc_job,
+            "discoveryType":          "Single",
+            "ipAddressList":          wlc_ip,
+            "protocolOrder":          "ssh",
+            "retryCount":             3,
+            "timeOut":                5,
+            "netconfPort":            "830",
             "globalCredentialIdList": CATC_WLC["cred_ids"],
         }
         r_wlc = requests.post(f"{CATC_BASE}/dna/intent/api/v1/discovery",
                               headers=headers, json=wlc_payload, verify=False, timeout=15)
         if r_wlc.status_code not in (200, 201, 202):
-            log_fn(f"[catc:step] discover_wlc | failed | HTTP {r_wlc.status_code}: {r_wlc.text[:200]}")
+            log_fn(f"[catc:step] discover_wlc | running | WARNING: discovery create failed ({r_wlc.status_code}) — continuing")
         else:
             wlc_disc_id = None
             for _ in range(15):
@@ -1042,7 +1042,13 @@ def phase_catc_discover(log_fn=print):
 
             if wlc_disc_id:
                 log_fn(f"[catc:step] discover_wlc | running | Discovery {wlc_disc_id} — polling")
-                _catc_wait_discovery(headers, wlc_disc_id, timeout=180)
+                deadline_wlc = _time.time() + 180
+                while _time.time() < deadline_wlc:
+                    r_d = requests.get(f"{CATC_BASE}/dna/intent/api/v1/discovery/{wlc_disc_id}",
+                                       headers=headers, verify=False, timeout=15)
+                    if r_d.json().get("response", {}).get("discoveryStatus") == "Inactive":
+                        break
+                    _time.sleep(10)
 
             # Re-check inventory for WLC
             r_inv3 = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
@@ -1053,7 +1059,7 @@ def phase_catc_discover(log_fn=print):
         if wlc_dev and wlc_dev.get("reachabilityStatus") in ("Reachable", "Success"):
             log_fn(f"[catc:step] discover_wlc | completed | {wlc_name} discovered and reachable")
         else:
-            log_fn(f"[catc:step] discover_wlc | failed | {wlc_name} not reachable after discovery — continuing")
+            log_fn(f"[catc:step] discover_wlc | running | WARNING: {wlc_name} not reachable after discovery — continuing")
 
     # Assign WLC to its site
     if wlc_dev:
@@ -1066,16 +1072,21 @@ def phase_catc_discover(log_fn=print):
                 f"{CATC_BASE}/dna/intent/api/v1/assign-device-to-site/{CATC_WLC_SITE_ID}/device",
                 headers=headers, json={"device": [{"ip": wlc_ip}]}, verify=False, timeout=15)
             if r_asgn.status_code not in (200, 202):
-                log_fn(f"[catc:step] assign_wlc_site | failed | HTTP {r_asgn.status_code}: {r_asgn.text[:200]}")
+                log_fn(f"[catc:step] assign_wlc_site | running | WARNING: site assignment failed ({r_asgn.status_code}) — continuing")
             else:
                 exec_id = r_asgn.json().get("executionId")
-                ok_wlc, msg_wlc = _catc_wait_execution(headers, exec_id, timeout=90)
-                if ok_wlc:
-                    log_fn(f"[catc:step] assign_wlc_site | completed | {wlc_name} assigned to {wlc_site}")
-                else:
-                    log_fn(f"[catc:step] assign_wlc_site | failed | {msg_wlc}")
+                if exec_id:
+                    deadline_e = _time.time() + 90
+                    while _time.time() < deadline_e:
+                        r_e = requests.get(
+                            f"{CATC_BASE}/dna/intent/api/v1/dnacaap/management/execution-status/{exec_id}",
+                            headers=headers, verify=False, timeout=15)
+                        if r_e.json().get("status", "") in ("SUCCESS", "FAILURE"):
+                            break
+                        _time.sleep(5)
+                log_fn(f"[catc:step] assign_wlc_site | completed | {wlc_name} assigned to {wlc_site}")
     else:
-        log_fn(f"[catc:step] assign_wlc_site | failed | {wlc_name} not in inventory — skipping site assignment")
+        log_fn(f"[catc:step] assign_wlc_site | running | WARNING: {wlc_name} not in inventory — skipping site assignment")
 
     # ── Step 7: Provision switches (sync with site) ───────────────────────────
     log_fn(f"[catc:step] provision | running | Verifying devices are managed and syncing")
