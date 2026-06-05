@@ -118,6 +118,35 @@ def _migrate():
         conn.execute("ALTER TABLE pods ADD COLUMN duo_host TEXT DEFAULT ''")
     except Exception:
         pass
+    # Migration: add Secure Access API credentials columns
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN sa_org_id TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN sa_api_key TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN sa_api_secret TEXT DEFAULT ''")
+    except Exception:
+        pass
+    # Org-level credentials (keyed by org number; pods link at runtime via scc_org)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS org_credentials (
+            org_number   TEXT PRIMARY KEY,
+            duo_ikey     TEXT DEFAULT '',
+            duo_skey     TEXT DEFAULT '',
+            duo_host     TEXT DEFAULT '',
+            scc_api_key  TEXT DEFAULT '',
+            scc_api_secret TEXT DEFAULT '',
+            scc_org_uuid TEXT DEFAULT '',
+            sa_org_id    TEXT DEFAULT '',
+            sa_api_key   TEXT DEFAULT '',
+            sa_api_secret TEXT DEFAULT '',
+            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pipeline_steps (
             pod_id TEXT, step_name TEXT, status TEXT, started_at TEXT,
@@ -1151,7 +1180,7 @@ def _clear_stuck_running(pod_id, table, mode=None):
 # ---------------------------------------------------------------------------
 
 SDA_DEPLOY_STEPS   = ["discovery", "provision", "fabric_site", "virtual_networks",
-                       "anycast_gateways", "transit", "clean_fabric_vlans", "fabric_devices",
+                       "anycast_gateways", "transit", "fabric_devices",
                        "l3_handoff", "configure_handoff_interface", "deploy_anycast_gateways",
                        "port_assignments", "verify"]
 SDA_ROLLBACK_STEPS = ["remove_port_assignments", "remove_l3_handoffs", "restore_handoff_interface",
@@ -1161,7 +1190,7 @@ SDA_ROLLBACK_STEPS = ["remove_port_assignments", "remove_l3_handoffs", "restore_
                        "delete_ise_nads", "remove_network_profile"]
 
 
-SDA_DEPLOY_STEP_KEYS   = ["discovery","provision","fabric_site","virtual_networks","anycast_gateways","transit","clean_fabric_vlans","fabric_devices","l3_handoff","configure_handoff_interface","deploy_anycast_gateways","port_assignments","verify"]
+SDA_DEPLOY_STEP_KEYS   = ["discovery","provision","fabric_site","virtual_networks","anycast_gateways","transit","fabric_devices","l3_handoff","configure_handoff_interface","deploy_anycast_gateways","port_assignments","verify"]
 SDA_ROLLBACK_STEP_KEYS = ["remove_port_assignments","remove_l3_handoffs","restore_handoff_interface","remove_fabric_devices","remove_anycast_gateways","disable_gbac_policy","remove_transit","remove_vn_assignments","remove_virtual_networks","remove_fabric_site","delete_devices","delete_discovery","delete_ise_nads","remove_network_profile"]
 
 
@@ -1189,7 +1218,17 @@ def api_sda_status(pod_id):
             "started_at":   started_at or "",
             "completed_at": completed_at or "",
         }
-    return jsonify({"pod_id": pod_id, "deploy": steps["deploy"], "rollback": steps["rollback"]})
+    # Compute overall from deploy steps
+    deploy_statuses = [v["status"] for v in steps["deploy"].values()]
+    if "running" in deploy_statuses:
+        overall = "running"
+    elif "failed" in deploy_statuses:
+        overall = "failed"
+    elif deploy_statuses and all(s == "completed" for s in deploy_statuses):
+        overall = "completed"
+    else:
+        overall = "pending"
+    return jsonify({"pod_id": pod_id, "overall": overall, "deploy": steps["deploy"], "rollback": steps["rollback"]})
 
 
 @app.route("/api/sda/deploy/<pod_id>", methods=["POST"])
@@ -2162,8 +2201,8 @@ def get_duo_keys(pod_id):
         return jsonify({"duo_ikey": "", "duo_skey": "", "duo_host": ""})
     return jsonify({
         "duo_ikey": row["duo_ikey"] or "",
-        "duo_skey":  row["duo_skey"] or "",
-        "duo_host":  row["duo_host"] or "",
+        "duo_skey": row["duo_skey"] or "",
+        "duo_host": row["duo_host"] or "",
     })
 
 
@@ -2184,7 +2223,170 @@ def save_duo_keys(pod_id):
     return jsonify({"status": "ok"})
 
 
-@app.route("/api/run-pod/<pod_id>", methods=["POST"])
+@app.route("/api/pod-sa-keys/<pod_id>", methods=["GET"])
+def get_sa_keys(pod_id):
+    """Return Secure Access API credentials for a POD."""
+    conn = _db()
+    row = conn.execute(
+        "SELECT sa_org_id, sa_api_key, sa_api_secret FROM pods WHERE pod_id=?", (pod_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"sa_org_id": "", "sa_api_key": "", "sa_api_secret": ""})
+    return jsonify({
+        "sa_org_id":     row["sa_org_id"] or "",
+        "sa_api_key":    row["sa_api_key"] or "",
+        "sa_api_secret": row["sa_api_secret"] or "",
+    })
+
+
+@app.route("/api/pod-sa-keys/<pod_id>", methods=["POST"])
+def save_sa_keys(pod_id):
+    """Save Secure Access API credentials for a POD."""
+    data = request.get_json(force=True)
+    org_id = data.get("sa_org_id", "").strip()
+    key    = data.get("sa_api_key", "").strip()
+    secret = data.get("sa_api_secret", "").strip()
+    conn = _db()
+    conn.execute(
+        "UPDATE pods SET sa_org_id=?, sa_api_key=?, sa_api_secret=?, updated_at=datetime('now') WHERE pod_id=?",
+        (org_id, key, secret, pod_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+
+# ── Org-level credentials (shared across all PODs of the same org) ────────────
+
+@app.route("/api/org-credentials", methods=["GET"])
+def list_org_credentials():
+    """List all org numbers that have credentials configured."""
+    conn = _db()
+    rows = conn.execute(
+        "SELECT org_number, scc_org_uuid, updated_at FROM org_credentials ORDER BY CAST(org_number AS INTEGER)"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/org-credentials/<org_number>", methods=["GET"])
+def get_org_credentials(org_number):
+    """Return all credentials for a given org number."""
+    conn = _db()
+    row = conn.execute(
+        "SELECT * FROM org_credentials WHERE org_number=?", (org_number,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"org_number": org_number, "duo_ikey": "", "duo_skey": "", "duo_host": "",
+                        "scc_api_key": "", "scc_api_secret": "", "scc_org_uuid": "",
+                        "sa_org_id": "", "sa_api_key": "", "sa_api_secret": ""})
+    return jsonify(dict(row))
+
+
+@app.route("/api/org-credentials/<org_number>", methods=["POST"])
+def save_org_credentials(org_number):
+    """Create or update credentials for a given org number."""
+    data = request.get_json(force=True)
+    conn = _db()
+    conn.execute("""
+        INSERT INTO org_credentials
+            (org_number, duo_ikey, duo_skey, duo_host,
+             scc_api_key, scc_api_secret, scc_org_uuid,
+             sa_org_id, sa_api_key, sa_api_secret, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))
+        ON CONFLICT(org_number) DO UPDATE SET
+            duo_ikey=excluded.duo_ikey, duo_skey=excluded.duo_skey, duo_host=excluded.duo_host,
+            scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret, scc_org_uuid=excluded.scc_org_uuid,
+            sa_org_id=excluded.sa_org_id, sa_api_key=excluded.sa_api_key, sa_api_secret=excluded.sa_api_secret,
+            updated_at=datetime('now')
+    """, (
+        org_number,
+        data.get("duo_ikey", "").strip(), data.get("duo_skey", "").strip(), data.get("duo_host", "").strip(),
+        data.get("scc_api_key", "").strip(), data.get("scc_api_secret", "").strip(), data.get("scc_org_uuid", "").strip(),
+        data.get("sa_org_id", "").strip(), data.get("sa_api_key", "").strip(), data.get("sa_api_secret", "").strip(),
+    ))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+
+ORG_CSV_COLS = [
+    "org_number", "duo_ikey", "duo_skey", "duo_host",
+    "scc_org_uuid", "scc_api_key", "scc_api_secret",
+    "sa_org_id", "sa_api_key", "sa_api_secret",
+]
+
+
+@app.route("/api/org-credentials/export.csv")
+def export_org_credentials_csv():
+    """Download all org credentials as a CSV file."""
+    import csv, io
+    conn = _db()
+    rows = conn.execute(
+        "SELECT " + ",".join(ORG_CSV_COLS) + " FROM org_credentials ORDER BY CAST(org_number AS INTEGER)"
+    ).fetchall()
+    conn.close()
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=ORG_CSV_COLS)
+    w.writeheader()
+    for r in rows:
+        w.writerow(dict(r))
+    output = buf.getvalue()
+    return output, 200, {
+        "Content-Type": "text/csv",
+        "Content-Disposition": "attachment; filename=org_credentials.csv",
+    }
+
+
+@app.route("/api/org-credentials/import", methods=["POST"])
+def import_org_credentials_csv():
+    """Bulk upsert org credentials from an uploaded CSV file."""
+    import csv, io
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file uploaded"}), 400
+    try:
+        text = f.read().decode("utf-8-sig")  # strip BOM if present
+        reader = csv.DictReader(io.StringIO(text))
+        # Validate header
+        missing = [c for c in ORG_CSV_COLS if c not in (reader.fieldnames or [])]
+        if missing:
+            return jsonify({"error": "Missing columns: " + ", ".join(missing)}), 400
+        conn = _db()
+        imported = 0
+        skipped = 0
+        for row in reader:
+            org_num = row.get("org_number", "").strip()
+            if not org_num:
+                skipped += 1
+                continue
+            conn.execute("""
+                INSERT INTO org_credentials
+                    (org_number, duo_ikey, duo_skey, duo_host,
+                     scc_api_key, scc_api_secret, scc_org_uuid,
+                     sa_org_id, sa_api_key, sa_api_secret, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))
+                ON CONFLICT(org_number) DO UPDATE SET
+                    duo_ikey=excluded.duo_ikey, duo_skey=excluded.duo_skey, duo_host=excluded.duo_host,
+                    scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret, scc_org_uuid=excluded.scc_org_uuid,
+                    sa_org_id=excluded.sa_org_id, sa_api_key=excluded.sa_api_key, sa_api_secret=excluded.sa_api_secret,
+                    updated_at=datetime('now')
+            """, (
+                org_num,
+                row.get("duo_ikey", "").strip(), row.get("duo_skey", "").strip(), row.get("duo_host", "").strip(),
+                row.get("scc_api_key", "").strip(), row.get("scc_api_secret", "").strip(), row.get("scc_org_uuid", "").strip(),
+                row.get("sa_org_id", "").strip(), row.get("sa_api_key", "").strip(), row.get("sa_api_secret", "").strip(),
+            ))
+            imported += 1
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok", "imported": imported, "skipped": skipped})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def run_pod(pod_id):
     """Run the pipeline for a single POD (VPN must already be connected)."""
     import subprocess, os, tempfile
@@ -2334,6 +2536,9 @@ DASHBOARD_HTML = """
   .upload-zone:hover { border-color: #02c8ff; }
   .upload-zone.dragover { border-color: #00e68a; background: #0a1f3d; }
   .upload-zone input[type=file] { display: none; }
+  .org-card { background:#0d1e30; border:1px solid #1a3a5a; border-radius:6px; padding:10px 12px; cursor:pointer; transition:border-color 0.15s,background 0.15s; }
+  .org-card:hover { border-color:#02c8ff; }
+  .org-card.selected { border-color:#02c8ff; background:#0a1f3a; }
   .upload-zone .hint { color: #667788; font-size: 12px; margin-top: 6px; }
   .upload-result { margin-top: 8px; font-size: 13px; }
 
@@ -2516,9 +2721,46 @@ DASHBOARD_HTML = """
       <div id="router-image-status" style="font-size:11px;color:#667788;margin-top:6px;"></div>
     </div>
 
-  </div>
+   </div>
 
-  <div class="summary" id="summary"></div>
+   <!-- Org Credentials -->
+   <div class="upload-section" id="org-creds-section" style="margin-bottom:20px;padding:0;">
+     <!-- Collapsed header (always visible) -->
+     <div id="org-creds-header" onclick="toggleOrgCreds()" style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;cursor:pointer;user-select:none;">
+       <div style="display:flex;align-items:center;gap:10px;">
+         <span id="org-creds-chevron" style="font-size:12px;color:#445566;transition:transform 0.2s;">&#9654;</span>
+         <h3 style="margin:0;">Org Credentials</h3>
+         <span id="org-creds-count" style="font-size:11px;color:#445566;background:#0d1e30;border:1px solid #1a3a5a;border-radius:10px;padding:1px 8px;"></span>
+       </div>
+       <span style="font-size:11px;color:#445566;">click to expand</span>
+     </div>
+     <!-- Expandable body -->
+     <div id="org-creds-body" style="display:none;padding:0 16px 16px 16px;border-top:1px solid #1a2d4a;">
+       <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:10px 0 8px 0;">
+         <a href="/api/org-credentials/export.csv" download style="padding:5px 12px;background:#0d1e30;border:1px solid #00e68a;color:#00e68a;border-radius:4px;cursor:pointer;font-size:11px;text-decoration:none;">&#8595; Export CSV</a>
+         <label style="padding:5px 12px;background:#0d1e30;border:1px solid #ffa502;color:#ffa502;border-radius:4px;cursor:pointer;font-size:11px;">
+           &#8593; Import CSV
+           <input type="file" accept=".csv" style="display:none;" onchange="importOrgCsv(this)">
+         </label>
+         <span id="org-import-status" style="font-size:11px;color:#667788;"></span>
+         <button onclick="orgCredsNew()" style="padding:5px 12px;background:#0d1e30;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">+ New Org</button>
+       </div>
+       <div id="org-creds-list" style="margin-bottom:10px;"></div>
+       <div id="org-new-row" style="display:none;margin-bottom:10px;">
+         <div style="display:flex;gap:8px;align-items:center;">
+           <input id="org-num-input" type="text" placeholder="Org number e.g. 5001"
+             style="background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:5px 8px;font-size:12px;width:150px;">
+           <button onclick="loadOrgCreds(document.getElementById('org-num-input').value.trim())"
+             style="padding:5px 10px;background:#0d1e30;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">Create / Load</button>
+           <button onclick="document.getElementById('org-new-row').style.display='none'"
+             style="padding:5px 10px;background:transparent;border:1px solid #334455;color:#667788;border-radius:4px;cursor:pointer;font-size:11px;">Cancel</button>
+         </div>
+       </div>
+       <div id="org-creds-form" style="display:none;"></div>
+     </div>
+   </div>
+
+   <div class="summary" id="summary"></div>
 
   <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
     <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
@@ -2566,6 +2808,7 @@ DASHBOARD_HTML = """
       <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
       <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
       <button class="tab-btn" onclick="switchTab(this, 'duo')">Duo Setup</button>
+      <button class="tab-btn" onclick="switchTab(this, 'sa')">Secure Access</button>
       <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
        <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
        <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
@@ -2606,6 +2849,11 @@ DASHBOARD_HTML = """
       <div class="tab-content" id="tab-duo">
         <div id="duo-grid" style="padding:16px;min-height:260px;">
           <div style="color:#667788;font-size:13px;">Select a POD to manage Duo setup</div>
+        </div>
+      </div>
+      <div class="tab-content" id="tab-sa">
+        <div id="sa-grid" style="padding:16px;min-height:260px;">
+          <div style="color:#667788;font-size:13px;">Select a POD to manage Secure Access keys</div>
         </div>
       </div>
       <div class="tab-content" id="tab-scc">
@@ -2716,6 +2964,7 @@ async function load() {
     else if (tabName === 'cdfmc')     loadCdfmc(detailId);
     else if (tabName === 'ad')        loadAd(detailId);
     else if (tabName === 'duo')       loadDuoPanel(detailId);
+    else if (tabName === 'sa')        loadSaPanel(detailId);
     else if (tabName === 'upgrade')   loadUpgrade(detailId);
     else if (tabName === 'scc')       loadSccChecklist(detailId);
     else if (tabName === 'fabric')    loadFabricStatus(detailId);
@@ -3599,6 +3848,170 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
+// ── Org Credentials Management ───────────────────────────────────────────────
+async function initOrgCredsList() {
+  const listEl   = document.getElementById('org-creds-list');
+  const countEl  = document.getElementById('org-creds-count');
+  if (!listEl) return;
+  try {
+    const r = await fetch('/api/org-credentials');
+    const orgs = await r.json();
+    // Always update the count badge regardless of panel state
+    if (countEl) countEl.textContent = orgs.length + ' org' + (orgs.length !== 1 ? 's' : '');
+    if (!orgs.length) {
+      listEl.innerHTML = '<div style="font-size:12px;color:#445566;padding:6px 0;">No orgs configured yet. Click <strong style="color:#02c8ff">+ New Org</strong> to add one.</div>';
+    } else {
+      let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:8px;">';
+      orgs.forEach(o => {
+        const upd = (o.updated_at||'').substring(0,10);
+        const uuid = o.scc_org_uuid ? o.scc_org_uuid.substring(0,8) + '\u2026' : '\u2014';
+        html += '<div class="org-card" data-org="' + escHtml(o.org_number) + '">'
+          + '<div style="font-size:14px;font-weight:700;color:#02c8ff;">Org ' + escHtml(o.org_number) + '</div>'
+          + '<div style="font-size:10px;color:#556677;margin-top:3px;font-family:monospace;">' + escHtml(uuid) + '</div>'
+          + '<div style="font-size:10px;color:#334455;margin-top:2px;">' + escHtml(upd) + '</div>'
+          + '</div>';
+      });
+      html += '</div>';
+      listEl.innerHTML = html;
+      setTimeout(() => {
+        listEl.querySelectorAll('.org-card').forEach(el => {
+          el.onclick = () => loadOrgCreds(el.dataset.org);
+        });
+      }, 0);
+    }
+  } catch(e) { listEl.innerHTML = ''; }
+}
+
+function toggleOrgCreds() {
+  const body    = document.getElementById('org-creds-body');
+  const chevron = document.getElementById('org-creds-chevron');
+  const hint    = document.querySelector('#org-creds-header span:last-child');
+  const open    = body.style.display === 'none';
+  body.style.display   = open ? 'block' : 'none';
+  chevron.style.transform = open ? 'rotate(90deg)' : '';
+  if (hint) hint.textContent = open ? 'click to collapse' : 'click to expand';
+  if (open && !document.querySelector('#org-creds-list .org-card')) initOrgCredsList();
+}
+
+function orgCredsNew() {
+  // Ensure panel is open first
+  const body = document.getElementById('org-creds-body');
+  if (body.style.display === 'none') toggleOrgCreds();
+  const row = document.getElementById('org-new-row');
+  row.style.display = 'flex';
+  const inp = document.getElementById('org-num-input');
+  inp.value = '';
+  inp.focus();
+}
+
+function closeOrgCredsForm() {
+  document.getElementById('org-creds-form').style.display = 'none';
+  document.getElementById('org-new-row').style.display = 'none';
+  document.querySelectorAll('.org-card.selected').forEach(el => el.classList.remove('selected'));
+}
+
+async function importOrgCsv(input) {
+  const statusEl = document.getElementById('org-import-status');
+  if (!input.files.length) return;
+  const fd = new FormData();
+  fd.append('file', input.files[0]);
+  input.value = '';  // reset so same file can be re-uploaded
+  statusEl.style.color = '#ffa502'; statusEl.textContent = 'Importing...';
+  try {
+    const r = await fetch('/api/org-credentials/import', {method:'POST', body: fd});
+    const d = await r.json();
+    if (d.error) {
+      statusEl.style.color = '#ff4757'; statusEl.textContent = '\u2717 ' + d.error;
+    } else {
+      statusEl.style.color = '#00e68a';
+      statusEl.textContent = '\u2713 ' + d.imported + ' imported' + (d.skipped ? ', ' + d.skipped + ' skipped' : '');
+      await initOrgCredsList();
+    }
+  } catch(e) {
+    statusEl.style.color = '#ff4757'; statusEl.textContent = '\u2717 ' + e.message;
+  }
+  setTimeout(() => { statusEl.textContent = ''; }, 6000);
+}
+
+async function loadOrgCreds(orgNum) {
+  if (!orgNum) return;
+  document.getElementById('org-new-row').style.display = 'none';
+  // Highlight selected card
+  document.querySelectorAll('.org-card').forEach(el => el.classList.remove('selected'));
+  const card = document.querySelector('.org-card[data-org="' + orgNum + '"]');
+  if (card) card.classList.add('selected');
+
+  const formEl = document.getElementById('org-creds-form');
+  formEl.style.display = 'block';
+  formEl.innerHTML = '<div style="color:#667788;font-size:12px;">Loading...</div>';
+
+  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', scc_api_key:'', scc_api_secret:'', scc_org_uuid:'', sa_org_id:'', sa_api_key:'', sa_api_secret:''};
+  try {
+    const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum));
+    d = await r.json();
+  } catch(e) {}
+
+  const inp = (id, val, ph, pw) =>
+    '<input id="oc-' + id + '" type="' + (pw ? 'password' : 'text') + '" value="' + escHtml(val||'') + '" placeholder="' + escHtml(ph) + '"'
+    + ' style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:4px 7px;font-size:11px;font-family:monospace;box-sizing:border-box;">';
+  const lbl = t => '<div style="font-size:10px;color:#667788;margin-bottom:2px;text-transform:uppercase;">' + t + '</div>';
+  const col = (label, id, val, ph, pw) => '<div>' + lbl(label) + inp(id, val, ph, pw) + '</div>';
+
+  formEl.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">'
+    + '<div style="font-size:12px;font-weight:600;color:#e0e8f0;">Editing: Org ' + escHtml(orgNum) + '</div>'
+    + '<button id="oc-close-btn" style="background:transparent;border:1px solid #334455;color:#667788;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;">&#x2715; Close</button>'
+    + '</div>'
+    + '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px;">'
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;">Duo Admin API</div>'
+    + col('Integration Key (ikey)', 'duo_ikey', d.duo_ikey, 'DIRIBLQ...', false)
+    + col('Secret Key (skey)', 'duo_skey', d.duo_skey, 'Secret...', true)
+    + col('API Hostname', 'duo_host', d.duo_host, 'api-xxxxx.duosecurity.com', false)
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Security Cloud Control (SCC)</div>'
+    + col('SCC Org UUID', 'scc_org_uuid', d.scc_org_uuid, '52ba65f9-...', false)
+    + col('API Key / Key ID', 'scc_api_key', d.scc_api_key, 'e8b04af7-...', false)
+    + col('API Secret / Bearer Token', 'scc_api_secret', d.scc_api_secret, 'Secret or eyJ...', true)
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Secure Access (SA)</div>'
+    + col('SA Org ID', 'sa_org_id', d.sa_org_id, '8381539', false)
+    + col('API Key', 'sa_api_key', d.sa_api_key, '6671146f...', false)
+    + col('API Secret', 'sa_api_secret', d.sa_api_secret, 'Secret...', true)
+    + '</div>'
+    + '<div style="display:flex;gap:8px;align-items:center;margin-top:4px;">'
+    + '<button id="oc-save-btn" style="padding:5px 14px;background:#0d4f6e;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:12px;">Save Org ' + escHtml(orgNum) + '</button>'
+    + '<span id="oc-status" style="font-size:11px;color:#667788;"></span>'
+    + '</div>';
+
+  setTimeout(() => {
+    const closeBtn = document.getElementById('oc-close-btn');
+    if (closeBtn) closeBtn.onclick = closeOrgCredsForm;
+    const btn = document.getElementById('oc-save-btn');
+    if (!btn) return;
+    btn.onclick = async () => {
+      const status = document.getElementById('oc-status');
+      status.style.color = '#ffa502'; status.textContent = 'Saving...';
+      const payload = {
+        duo_ikey:      document.getElementById('oc-duo_ikey').value.trim(),
+        duo_skey:      document.getElementById('oc-duo_skey').value.trim(),
+        duo_host:      document.getElementById('oc-duo_host').value.trim(),
+        scc_org_uuid:  document.getElementById('oc-scc_org_uuid').value.trim(),
+        scc_api_key:   document.getElementById('oc-scc_api_key').value.trim(),
+        scc_api_secret:document.getElementById('oc-scc_api_secret').value.trim(),
+        sa_org_id:     document.getElementById('oc-sa_org_id').value.trim(),
+        sa_api_key:    document.getElementById('oc-sa_api_key').value.trim(),
+        sa_api_secret: document.getElementById('oc-sa_api_secret').value.trim(),
+      };
+      try {
+        const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum),
+          {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        if (r.ok) {
+          status.style.color = '#00e68a'; status.textContent = '\u2713 Saved';
+          initOrgCredsList();
+        } else { status.style.color = '#ff4757'; status.textContent = '\u2717 Save failed'; }
+      } catch(e) { status.style.color = '#ff4757'; status.textContent = '\u2717 ' + e.message; }
+    };
+  }, 0);
+}
+
 // ── SCC Reset Checklist ──────────────────────────────────────────
 const SCC_AUTO_ITEMS = [
   { key: 'access_policy_rules',  label: 'Access Policy Rules cleared',
@@ -3672,7 +4085,8 @@ async function loadDuoPanel(podId) {
 
   grid.innerHTML =
     '<div class="switch-card" style="margin-bottom:12px;">'
-    + '<div class="switch-card-title"><span class="role-tag cc">KEYS</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Duo Admin API Credentials</span></div>'
+    + '<div class="switch-card-title"><span class="role-tag cc">OVERRIDE</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Duo Credentials — POD Override</span></div>'
+    + '<div style="font-size:11px;color:#445566;margin-bottom:6px;">Org-level credentials are used by default. Fill in below only to override for this POD (e.g. if a key was rotated).</div>'
     + '<div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:center;margin-top:6px;">'
     + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">Integration Key (ikey)</div>'
     + '<input id="duo-ikey-input" type="text" value="' + escHtml(keysD.duo_ikey || '') + '" placeholder="DIRIBLQ..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
@@ -3732,8 +4146,76 @@ async function loadDuoPanel(podId) {
     const skeyEl = document.getElementById('duo-skey-input');
     const hostEl = document.getElementById('duo-host-input');
     if (ikeyEl) ikeyEl.addEventListener('input', () => { window._duoKeysDirty = true; });
-    if (skeyEl) skeyEl.addEventListener('input', () => { window._duoKeysDirty = true; });
-    if (hostEl) hostEl.addEventListener('input', () => { window._duoKeysDirty = true; });
+     if (skeyEl) skeyEl.addEventListener('input', () => { window._duoKeysDirty = true; });
+     if (hostEl) hostEl.addEventListener('input', () => { window._duoKeysDirty = true; });
+  }, 0);
+}
+
+// ── Secure Access Keys Panel ─────────────────────────────────────────────────
+async function loadSaPanel(podId) {
+  const grid = document.getElementById('sa-grid');
+  if (!grid) return;
+
+  let keysD = {sa_org_id: '', sa_api_key: '', sa_api_secret: ''};
+  try {
+    const kr = await fetch('/api/pod-sa-keys/' + podId);
+    keysD = await kr.json();
+  } catch(e) {}
+
+  const hasKeys = keysD.sa_api_key && keysD.sa_api_secret;
+
+  grid.innerHTML =
+    '<div class="switch-card" style="margin-bottom:12px;">'
+    + '<div class="switch-card-title"><span class="role-tag cc">OVERRIDE</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Secure Access Credentials — POD Override</span></div>'
+    + '<div style="font-size:11px;color:#445566;margin-bottom:6px;">Org-level credentials are used by default. Fill in below only to override for this POD.</div>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:center;margin-top:6px;">'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">Org ID</div>'
+    + '<input id="sa-orgid-input" type="text" value="' + escHtml(keysD.sa_org_id || '') + '" placeholder="8381539" style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">API Key</div>'
+    + '<input id="sa-apikey-input" type="text" value="' + escHtml(keysD.sa_api_key || '') + '" placeholder="6671146f..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">API Secret</div>'
+    + '<input id="sa-secret-input" type="password" value="' + escHtml(keysD.sa_api_secret || '') + '" placeholder="Secret..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<button id="sa-keys-save-btn" class="btn-reconnect" style="margin-top:16px;white-space:nowrap;">Save</button>'
+    + '</div>'
+    + '<div id="sa-keys-status" style="font-size:11px;color:#667788;margin-top:4px;min-height:16px;">'
+    + (hasKeys ? '&#10003; Keys stored in DB' : '') + '</div>'
+    + '</div>'
+    + '<div class="switch-card">'
+    + '<div class="switch-card-title"><span class="role-tag cc">INFO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automation Status</span></div>'
+    + '<div style="font-size:12px;color:#667788;margin-top:6px;">SA automation (SCIM token provisioning, SAML/SSO) is pending DevTools capture of internal API endpoints. Keys stored here will be used once automation is implemented.</div>'
+    + '</div>';
+
+  setTimeout(() => {
+    const saveBtn = document.getElementById('sa-keys-save-btn');
+    if (saveBtn) saveBtn.onclick = async () => {
+      const org_id = document.getElementById('sa-orgid-input').value.trim();
+      const key    = document.getElementById('sa-apikey-input').value.trim();
+      const secret = document.getElementById('sa-secret-input').value.trim();
+      const statusEl = document.getElementById('sa-keys-status');
+      if (!org_id || !key || !secret) {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ org_id, api_key, and api_secret are all required';
+        return;
+      }
+      statusEl.style.color = '#ffa502';
+      statusEl.textContent = 'Saving...';
+      try {
+        const res = await fetch('/api/pod-sa-keys/' + podId, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({sa_org_id: org_id, sa_api_key: key, sa_api_secret: secret})
+        });
+        if (res.ok) {
+          statusEl.style.color = '#00e68a';
+          statusEl.textContent = '✓ Saved to DB';
+        } else {
+          statusEl.style.color = '#ff4757';
+          statusEl.textContent = '✗ Save failed';
+        }
+      } catch(e) {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ ' + e.message;
+      }
+    };
   }, 0);
 }
 
@@ -3948,6 +4430,10 @@ function switchTab(btn, name) {
     const podId = document.getElementById('detail-pod-id').dataset.podId;
     if (podId) loadDuoPanel(podId);
   }
+  if (name === 'sa') {
+    const podId = document.getElementById('detail-pod-id').dataset.podId;
+    if (podId) loadSaPanel(podId);
+  }
   if (name === 'fabric') {
     const podId = document.getElementById('detail-pod-id').dataset.podId;
     if (podId) loadFabricStatus(podId);
@@ -4143,7 +4629,7 @@ const BASECONFIG_SWITCHES = {
 
 const SDA_DEPLOY_STEP_KEYS = [
   "discovery","provision","fabric_site","virtual_networks",
-  "anycast_gateways","transit","clean_fabric_vlans","fabric_devices","l3_handoff",
+  "anycast_gateways","transit","fabric_devices","l3_handoff",
   "configure_handoff_interface","deploy_anycast_gateways",
   "port_assignments","verify"
 ];
@@ -4154,7 +4640,6 @@ const SDA_DEPLOY_STEP_LABELS = {
   virtual_networks:             "Create L3 VNs",
   anycast_gateways:             "Anycast Gateways",
   transit:                      "XAR-Transit",
-  clean_fabric_vlans:           "Clean Conflicting VLANs",
   fabric_devices:               "Fabric Devices",
   l3_handoff:                   "L3 Handoff",
   configure_handoff_interface:  "Configure Handoff Interface",
@@ -4169,7 +4654,6 @@ const SDA_DEPLOY_STEP_TARGETS = {
   virtual_networks:             "Main / PROD / IOT",
   anycast_gateways:             "VLAN 10 / 101 / 102",
   transit:                      "BGP ASN 65534",
-  clean_fabric_vlans:           "All 3 switches",
   fabric_devices:               "Border+CP + Leaf1+Leaf2",
   l3_handoff:                   "CatC API",
   configure_handoff_interface:  "Gi1/0/48 sub-ints",
@@ -4346,10 +4830,16 @@ function renderSdaCatcTile(podId) {
   const container = document.getElementById('sda-catc-tile-container');
   if (!container || !podId) return;
 
-  // Only build the shell once — avoids re-wiring buttons and flickering on every poll
-  if (!container._initialized) {
-    container._initialized = true;
-    container.innerHTML =
+  // Re-initialize if podId changed — avoids stale closure on buttons when switching PODs
+  if (container._initialized && container._podId === podId) {
+    loadSdaCatcStatus(podId);
+    return;
+  }
+  container._initialized = true;
+  container._podId = podId;
+  // Clear any stale poll from previous POD
+  if (window._sdaCatcPoll) { clearInterval(window._sdaCatcPoll); window._sdaCatcPoll = null; }
+  container.innerHTML =
       '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
         '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
           '<div>' +
@@ -4365,10 +4855,9 @@ function renderSdaCatcTile(podId) {
         '<div id="sda-catc-progress-area"></div>' +
       '</div>';
 
-    document.getElementById('sda-catc-discover-btn').addEventListener('click', () => triggerSdaCatcDiscover(podId));
-    document.getElementById('sda-catc-rerun-btn').addEventListener('click',    () => triggerSdaCatcDiscover(podId));
-    document.getElementById('sda-catc-reset-btn').addEventListener('click',    () => resetSdaCatcDiscover(podId));
-  }
+  document.getElementById('sda-catc-discover-btn').addEventListener('click', () => triggerSdaCatcDiscover(podId));
+  document.getElementById('sda-catc-rerun-btn').addEventListener('click',    () => triggerSdaCatcDiscover(podId));
+  document.getElementById('sda-catc-reset-btn').addEventListener('click',    () => resetSdaCatcDiscover(podId));
 
   loadSdaCatcStatus(podId);
 }
@@ -4415,6 +4904,9 @@ async function loadSdaCatcStatus(podId) {
 }
 
 async function triggerSdaCatcDiscover(podId) {
+  // Clear any stale poll (re-click or POD switch mid-run)
+  if (window._sdaCatcPoll) { clearInterval(window._sdaCatcPoll); window._sdaCatcPoll = null; }
+
   const btn   = document.getElementById('sda-catc-discover-btn');
   const rerun = document.getElementById('sda-catc-rerun-btn');
   const area  = document.getElementById('sda-catc-progress-area');
@@ -4432,11 +4924,12 @@ async function triggerSdaCatcDiscover(podId) {
   }
 
   let polls = 0;
-  const poll = setInterval(async () => {
+  window._sdaCatcPoll = setInterval(async () => {
     polls++;
     const sr = await loadSdaCatcStatus(podId);
     if (!sr || !sr.running || polls >= 60) {
-      clearInterval(poll);
+      clearInterval(window._sdaCatcPoll);
+      window._sdaCatcPoll = null;
       // Final refresh to ensure terminal state is rendered
       await loadSdaCatcStatus(podId);
       if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
@@ -4457,6 +4950,8 @@ async function resetSdaCatcDiscover(podId) {
 }
 
 async function loadSdaStatus(podId) {
+  // Always kill any stale poller from a previous POD before rendering
+  if (window._sdaPoller) { clearInterval(window._sdaPoller); window._sdaPoller = null; }
   const grid = document.getElementById('sda-grid');
   if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
   const data = await fetch('/api/sda/status/' + podId).then(r => r.json());
@@ -4921,10 +5416,16 @@ function renderCatcTile(podId) {
   const container = document.getElementById('catc-tile-container');
   if (!container || !podId) return;
 
-  // Only build the shell once — avoids re-wiring buttons and flickering on every poll
-  if (!container._initialized) {
-    container._initialized = true;
-    container.innerHTML =
+  // Re-initialize if podId changed — avoids stale closure on buttons when switching PODs
+  if (container._initialized && container._podId === podId) {
+    loadCatcStatus(podId);
+    return;
+  }
+  container._initialized = true;
+  container._podId = podId;
+  // Clear any stale poll from previous POD
+  if (window._catcPoll) { clearInterval(window._catcPoll); window._catcPoll = null; }
+  container.innerHTML =
       '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
         '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
           '<div>' +
@@ -4940,15 +5441,17 @@ function renderCatcTile(podId) {
         '<div id="catc-progress-area"></div>' +
       '</div>';
 
-    document.getElementById('catc-discover-btn').addEventListener('click', () => triggerCatcDiscover(podId));
-    document.getElementById('catc-rerun-btn').addEventListener('click',    () => triggerCatcDiscover(podId));
-    document.getElementById('catc-reset-btn').addEventListener('click',    () => resetCatcDiscover(podId));
-  }
+  document.getElementById('catc-discover-btn').addEventListener('click', () => triggerCatcDiscover(podId));
+  document.getElementById('catc-rerun-btn').addEventListener('click',    () => triggerCatcDiscover(podId));
+  document.getElementById('catc-reset-btn').addEventListener('click',    () => resetCatcDiscover(podId));
 
   loadCatcStatus(podId);
 }
 
 async function triggerCatcDiscover(podId) {
+  // Clear any stale poll (re-click or POD switch mid-run)
+  if (window._catcPoll) { clearInterval(window._catcPoll); window._catcPoll = null; }
+
   const btn   = document.getElementById('catc-discover-btn');
   const rerun = document.getElementById('catc-rerun-btn');
   const area  = document.getElementById('catc-progress-area');
@@ -4967,11 +5470,12 @@ async function triggerCatcDiscover(podId) {
 
   // Poll until done
   let polls = 0;
-  const poll = setInterval(async () => {
+  window._catcPoll = setInterval(async () => {
     polls++;
     const sr = await loadCatcStatus(podId);
     if (!sr || !sr.running || polls >= 60) {
-      clearInterval(poll);
+      clearInterval(window._catcPoll);
+      window._catcPoll = null;
       // Final refresh to ensure terminal state is rendered
       await loadCatcStatus(podId);
       if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
@@ -4998,6 +5502,14 @@ function closeDetail() {
   el.dataset.podId = '';
   if (logPollId) clearInterval(logPollId);
   if (stepPollId) { clearInterval(stepPollId); stepPollId = null; }
+  // Clear CatC tile polls and reset _initialized so buttons re-wire on next open
+  if (window._catcPoll) { clearInterval(window._catcPoll); window._catcPoll = null; }
+  if (window._sdaCatcPoll) { clearInterval(window._sdaCatcPoll); window._sdaCatcPoll = null; }
+  if (window._sdaPoller) { clearInterval(window._sdaPoller); window._sdaPoller = null; }
+  const ct = document.getElementById('catc-tile-container');
+  if (ct) { ct._initialized = false; ct._podId = null; }
+  const sct = document.getElementById('sda-catc-tile-container');
+  if (sct) { sct._initialized = false; sct._podId = null; }
 }
 
 async function connectAllVpn() {
@@ -5035,6 +5547,7 @@ async function dockerDown() {
 load();
 setInterval(load, 5000);
 loadUpgradeConfig();
+initOrgCredsList();
 
 // ── Knowledge Base ────────────────────────────────────────────────────────────
 let _kbCurrentId = null;

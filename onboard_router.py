@@ -1050,6 +1050,18 @@ def phase_catc_discover(log_fn=print):
                         break
                     _time.sleep(10)
 
+                # Job Inactive ≠ inventory collection done — poll per-device until Managed
+                log_fn(f"[catc:step] discover_wlc | running | Waiting for inventory collection")
+                deadline_coll = _time.time() + 120
+                while _time.time() < deadline_coll:
+                    r_dev = requests.get(
+                        f"{CATC_BASE}/dna/intent/api/v1/discovery/{wlc_disc_id}/network-device",
+                        headers=headers, verify=False, timeout=15)
+                    devs = r_dev.json().get("response", [])
+                    if devs and devs[0].get("inventoryCollectionStatus", "") not in ("In Progress", ""):
+                        break
+                    _time.sleep(5)
+
             # Re-check inventory for WLC
             r_inv3 = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
                                   headers=headers, verify=False, timeout=15)
@@ -1059,7 +1071,7 @@ def phase_catc_discover(log_fn=print):
         if wlc_dev and wlc_dev.get("reachabilityStatus") in ("Reachable", "Success"):
             log_fn(f"[catc:step] discover_wlc | completed | {wlc_name} discovered and reachable")
         else:
-            log_fn(f"[catc:step] discover_wlc | running | WARNING: {wlc_name} not reachable after discovery — continuing")
+            log_fn(f"[catc:step] discover_wlc | failed | {wlc_name} not reachable after discovery — continuing")
 
     # Assign WLC to its site
     if wlc_dev:
@@ -1086,7 +1098,7 @@ def phase_catc_discover(log_fn=print):
                         _time.sleep(5)
                 log_fn(f"[catc:step] assign_wlc_site | completed | {wlc_name} assigned to {wlc_site}")
     else:
-        log_fn(f"[catc:step] assign_wlc_site | running | WARNING: {wlc_name} not in inventory — skipping site assignment")
+        log_fn(f"[catc:step] assign_wlc_site | failed | {wlc_name} not in inventory — skipping site assignment")
 
     # ── Step 7: Provision switches (sync with site) ───────────────────────────
     log_fn(f"[catc:step] provision | running | Verifying devices are managed and syncing")
@@ -2097,10 +2109,9 @@ def phase_duo_setup():
 
     Requires:
       - AD users already provisioned (phase_detect_pod_number passed)
-      - duo_ikey, duo_skey, duo_host stored in pods DB for this POD
+      - Duo credentials in DB (duo_ikey/skey/host) OR data/duo_keys/duo_keys_<org>.json
     Returns (ok, result_string).
     """
-    import sqlite3 as _sql
     from duo_automation import (
         duo_verify_credentials, duo_reset_org,
         duo_create_groups, duo_create_users,
@@ -2113,25 +2124,18 @@ def phase_duo_setup():
     # ── 1. Load Duo credentials from DB ──────────────────────────────────────
     print(f"     Loading Duo credentials from DB for {POD_ID}...")
     try:
-        db = _sql.connect(DB_PATH)
-        db.row_factory = _sql.Row
-        row = db.execute(
-            "SELECT duo_ikey, duo_skey, duo_host FROM pods WHERE pod_id=?",
-            (POD_ID,)
-        ).fetchone()
-        db.close()
-    except Exception as e:
-        return False, f"DB read failed: {e}"
-
-    if not row or not row["duo_ikey"]:
+        keys = _duo_load_keys(POD_ID)
+    except KeyError:
         return False, (
             "Duo credentials not configured for this POD — "
-            "enter ikey/skey/host in the dashboard Duo panel first"
+            "enter ikey/skey/host in the dashboard Duo Setup panel"
         )
+    except Exception as e:
+        return False, f"Failed to load Duo keys: {e}"
 
-    ikey = row["duo_ikey"].strip()
-    skey = row["duo_skey"].strip()
-    host = row["duo_host"].strip()
+    ikey = keys["duo_ikey"].strip()
+    skey = keys["duo_skey"].strip()
+    host = keys["duo_host"].strip()
 
     # ── 2. Verify credentials ─────────────────────────────────────────────────
     print(f"     Verifying Duo API credentials ({host})...")
@@ -2358,14 +2362,48 @@ SCC_KEYS_DIR = os.environ.get(
     "/pipeline/host-data/scc_keys"
 )
 
+def _extract_org_number(scc_org: str) -> str:
+    """Extract numeric org number from scc_org (e.g. 'pseudoco-5001--...' → '5001')."""
+    import re as _re
+    if not scc_org:
+        return ""
+    m = _re.search(r"pseudoco-(\d+)", scc_org)
+    if m:
+        return m.group(1)
+    if scc_org.strip().isdigit():
+        return scc_org.strip()
+    return ""
+
+
+def _org_credentials(org_number: str) -> dict:
+    """
+    Load credentials from the org_credentials table for the given org number.
+    Returns an empty dict if not found.
+    """
+    if not org_number:
+        return {}
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    try:
+        import sqlite3 as _sqlite3
+        with _sqlite3.connect(db_path) as conn:
+            conn.row_factory = _sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM org_credentials WHERE org_number=?", (org_number,)
+            ).fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
 def _scc_load_keys(org_number: str, pod_id: str = None) -> dict:
     """
-    Load SCC API keys for the given org.
+    Load SCC API keys.
     Priority:
-      1. DB row for pod_id (scc_api_key / scc_api_secret columns)
-      2. JSON file at SCC_KEYS_DIR/scc_keys_<org>.json (legacy fallback)
+      1. Per-POD override in pods table (scc_api_key / scc_api_secret)
+      2. org_credentials table keyed by org_number
+      3. JSON file at SCC_KEYS_DIR/scc_keys_<org>.json (legacy)
     """
-    # 1. Try DB first if pod_id provided
+    # 1. Per-POD override
     if pod_id:
         try:
             db_path = os.environ.get("DB_PATH", os.environ.get("POD_STATE_DB", "/pipeline/host-data/pod_state.db"))
@@ -2378,20 +2416,97 @@ def _scc_load_keys(org_number: str, pod_id: str = None) -> dict:
             if row and row[0] and row[1]:
                 return {"scc_api_key": row[0], "scc_api_secret": row[1]}
         except Exception:
-            pass  # fall through to file
+            pass
 
-    # 2. Fallback to JSON file
+    # 2. org_credentials table
+    if org_number:
+        oc = _org_credentials(org_number)
+        if oc.get("scc_api_key") and oc.get("scc_api_secret"):
+            return {"scc_api_key": oc["scc_api_key"], "scc_api_secret": oc["scc_api_secret"]}
+
+    # 3. JSON file (legacy fallback)
     path = os.path.join(SCC_KEYS_DIR, f"scc_keys_{org_number}.json")
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"SCC keys not found in DB (pod_id={pod_id!r}) or file ({path})"
+            f"SCC keys not found for org={org_number!r} (pod_id={pod_id!r}, file={path})"
         )
     with open(path) as f:
         return json.load(f)
 
 
+# ── Duo keys ──────────────────────────────────────────────────────────────────
+
+def _duo_load_keys(pod_id: str) -> dict:
+    """
+    Load Duo Admin API keys.
+    Priority:
+      1. Per-POD override in pods table (duo_ikey / duo_skey / duo_host)
+      2. org_credentials table keyed by org number derived from scc_org
+    Raises KeyError if credentials are not found.
+    """
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    import sqlite3 as _sqlite3
+    with _sqlite3.connect(db_path) as conn:
+        conn.row_factory = _sqlite3.Row
+        row = conn.execute(
+            "SELECT duo_ikey, duo_skey, duo_host, scc_org FROM pods WHERE pod_id=?",
+            (pod_id,)
+        ).fetchone()
+
+    # 1. Per-POD override
+    if row and row["duo_ikey"] and row["duo_skey"] and row["duo_host"]:
+        return {"duo_ikey": row["duo_ikey"], "duo_skey": row["duo_skey"], "duo_host": row["duo_host"]}
+
+    # 2. org_credentials table
+    if row:
+        org_num = _extract_org_number(row["scc_org"] or "")
+        if org_num:
+            oc = _org_credentials(org_num)
+            if oc.get("duo_ikey") and oc.get("duo_skey") and oc.get("duo_host"):
+                return {"duo_ikey": oc["duo_ikey"], "duo_skey": oc["duo_skey"], "duo_host": oc["duo_host"]}
+
+    raise KeyError(f"Duo credentials not found for pod_id={pod_id!r} — configure in Org Credentials or POD override")
+
+
+def _sa_load_keys(pod_id: str) -> dict:
+    """
+    Load Secure Access API keys.
+    Priority:
+      1. Per-POD override in pods table (sa_api_key / sa_api_secret)
+      2. org_credentials table keyed by org number derived from scc_org
+    Raises KeyError if credentials are not found.
+    """
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    import sqlite3 as _sqlite3
+    with _sqlite3.connect(db_path) as conn:
+        conn.row_factory = _sqlite3.Row
+        row = conn.execute(
+            "SELECT sa_org_id, sa_api_key, sa_api_secret, scc_org FROM pods WHERE pod_id=?",
+            (pod_id,)
+        ).fetchone()
+
+    # 1. Per-POD override
+    if row and row["sa_api_key"] and row["sa_api_secret"]:
+        return {"sa_org_id": row["sa_org_id"] or "", "sa_api_key": row["sa_api_key"], "sa_api_secret": row["sa_api_secret"]}
+
+    # 2. org_credentials table
+    if row:
+        org_num = _extract_org_number(row["scc_org"] or "")
+        if org_num:
+            oc = _org_credentials(org_num)
+            if oc.get("sa_api_key") and oc.get("sa_api_secret"):
+                return {"sa_org_id": oc.get("sa_org_id", ""), "sa_api_key": oc["sa_api_key"], "sa_api_secret": oc["sa_api_secret"]}
+
+    raise KeyError(f"SA credentials not found for pod_id={pod_id!r} — configure in Org Credentials or POD override")
+
+
 def _scc_token(key_id: str, key_secret: str) -> str:
-    """Obtain a short-lived bearer token from SSE auth API."""
+    """Obtain a bearer token for the SSE API.
+    If key_secret is already a JWT (starts with 'eyJ'), use it directly.
+    Otherwise exchange key_id + key_secret via the /auth/v2/token endpoint.
+    """
+    if key_secret and key_secret.startswith("eyJ"):
+        return key_secret
     r = requests.post(
         "https://api.sse.cisco.com/auth/v2/token",
         auth=(key_id, key_secret),
@@ -2403,8 +2518,7 @@ def _scc_token(key_id: str, key_secret: str) -> str:
 
 
 def _scc_org_number_from_pod() -> str:
-    """Extract org number from scc_org stored in DB (e.g. 'pseudoco-523--...' → '523')."""
-    import re as _re
+    """Extract org number from scc_org stored in DB for the current POD."""
     db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     pod_id  = os.environ.get("POD_ID", "")
     try:
@@ -2413,13 +2527,8 @@ def _scc_org_number_from_pod() -> str:
         c.row_factory = _sq.Row
         row = c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         c.close()
-        if row and row["scc_org"]:
-            m = _re.search(r"pseudoco-(\d+)--", row["scc_org"]) or _re.search(r"pseudoco-(\d+)", row["scc_org"])
-            if m:
-                return m.group(1)
-            # Fallback: if scc_org is already just a number
-            if row["scc_org"].isdigit():
-                return row["scc_org"]
+        if row:
+            return _extract_org_number(row["scc_org"] or "")
     except Exception:
         pass
     return ""
