@@ -1939,15 +1939,23 @@ def _ad_query_users():
     for name in AD_TARGET_USERS:
         conn.search(AD_BASE_DN,
                     f"(&(objectClass=user)(cn={name}))",
-                    attributes=["cn", "mail", "userPrincipalName", "sAMAccountName"])
+                    attributes=["cn", "mail", "userPrincipalName", "sAMAccountName", "memberOf"])
         for e in conn.entries:
             mail = str(e.mail) if e.mail else ""
             upn  = str(e.userPrincipalName) if e.userPrincipalName else ""
+            # Extract CN from each memberOf DN, e.g. "CN=MAIN,OU=Groups,..." → "MAIN"
+            member_of_raw = e.memberOf.values if e.memberOf else []
+            groups = []
+            for dn in member_of_raw:
+                m = re.match(r"CN=([^,]+)", str(dn), re.I)
+                if m:
+                    groups.append(m.group(1))
             results.append({
-                "cn":   str(e.cn),
-                "sam":  str(e.sAMAccountName),
-                "mail": mail,
-                "upn":  upn,
+                "cn":     str(e.cn),
+                "sam":    str(e.sAMAccountName),
+                "mail":   mail,
+                "upn":    upn,
+                "groups": groups,
             })
     conn.unbind()
     return results
@@ -2073,6 +2081,142 @@ def phase_ad_rerun():
     print("     Re-verifying AD after PS1 run...")
     ok, result = phase_ad_verify()
     return ok, f"PS1 ran OK | {result}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Duo org setup (pre-create users from AD data, no AD directory sync needed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def phase_duo_setup():
+    """
+    Reset the Duo org and pre-create Kit/Lee/Pat/Nik with:
+      - Emails derived from their current AD mail attribute
+        (e.g. kit@rtp16.corp.pseudoco.com)
+      - Group assignments derived from their AD memberOf attribute
+        (IoT / MAIN / PROD only; other groups are ignored)
+
+    Requires:
+      - AD users already provisioned (phase_detect_pod_number passed)
+      - duo_ikey, duo_skey, duo_host stored in pods DB for this POD
+    Returns (ok, result_string).
+    """
+    import sqlite3 as _sql
+    from duo_automation import (
+        duo_verify_credentials, duo_reset_org,
+        duo_create_groups, duo_create_users,
+        duo_set_permitted_domain, DUO_GROUPS,
+    )
+
+    DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    POD_ID  = os.environ.get("POD_ID", "")
+
+    # ── 1. Load Duo credentials from DB ──────────────────────────────────────
+    print(f"     Loading Duo credentials from DB for {POD_ID}...")
+    try:
+        db = _sql.connect(DB_PATH)
+        db.row_factory = _sql.Row
+        row = db.execute(
+            "SELECT duo_ikey, duo_skey, duo_host FROM pods WHERE pod_id=?",
+            (POD_ID,)
+        ).fetchone()
+        db.close()
+    except Exception as e:
+        return False, f"DB read failed: {e}"
+
+    if not row or not row["duo_ikey"]:
+        return False, (
+            "Duo credentials not configured for this POD — "
+            "enter ikey/skey/host in the dashboard Duo panel first"
+        )
+
+    ikey = row["duo_ikey"].strip()
+    skey = row["duo_skey"].strip()
+    host = row["duo_host"].strip()
+
+    # ── 2. Verify credentials ─────────────────────────────────────────────────
+    print(f"     Verifying Duo API credentials ({host})...")
+    ok, msg = duo_verify_credentials(ikey, skey, host)
+    if not ok:
+        return False, msg
+    print(f"     {msg}")
+
+    # ── 3. Query AD for user emails + group memberships ───────────────────────
+    print("     Querying AD for user data (email + groups)...")
+    try:
+        ad_users = _ad_query_users()
+    except Exception as e:
+        return False, f"AD query failed: {e}"
+
+    if not ad_users:
+        return False, "AD returned no users — run AD provisioning first"
+
+    # Validate all 4 users have POD-specific emails
+    ad_default = "@corp.pseudoco.com"
+    not_provisioned = [u["cn"] for u in ad_users
+                       if (u.get("mail") or "").lower().endswith(ad_default)]
+    if not_provisioned:
+        return False, (
+            f"AD users not yet provisioned: {not_provisioned} — "
+            "run ADDuoTenantUserProvisioning.ps1 first"
+        )
+
+    # Build the permitted domain from the first user's email subdomain
+    # e.g. kit@rtp16.corp.pseudoco.com → rtp16.corp.pseudoco.com
+    permitted_domain = None
+    m_dom = re.search(r"@([a-z0-9]+\.corp\.pseudoco\.com)", ad_users[0]["mail"], re.I)
+    if m_dom:
+        permitted_domain = m_dom.group(1)
+
+    # Filter group memberships to only Duo groups (IoT/MAIN/PROD)
+    duo_group_names = set(DUO_GROUPS)
+    duo_users = []
+    for u in ad_users:
+        matched_groups = [g for g in u.get("groups", []) if g in duo_group_names]
+        duo_users.append({
+            "username": u["sam"].lower(),
+            "email":    u["mail"],
+            "realname": u["cn"],
+            "groups":   matched_groups,
+        })
+        print(f"     AD → Duo: {u['sam']} | {u['mail']} | groups={matched_groups}")
+
+    # ── 4. Reset Duo org ──────────────────────────────────────────────────────
+    print("     Resetting Duo org (delete users, groups, integrations)...")
+    ok, msg = duo_reset_org(ikey, skey, host)
+    if not ok:
+        return False, msg
+    print(f"     {msg}")
+
+    # ── 5. Create groups ──────────────────────────────────────────────────────
+    print("     Creating Duo groups: IoT, MAIN, PROD...")
+    try:
+        group_id_map = duo_create_groups(ikey, skey, host)
+    except Exception as e:
+        return False, f"Group creation failed: {e}"
+
+    # ── 6. Create users ───────────────────────────────────────────────────────
+    print("     Creating Duo users with email + group assignments...")
+    ok, msg = duo_create_users(ikey, skey, host, duo_users, group_id_map)
+    if not ok:
+        return False, msg
+    print(f"     {msg}")
+
+    # ── 7. Set permitted domain ───────────────────────────────────────────────
+    if permitted_domain:
+        print(f"     Setting permitted domain: {permitted_domain}...")
+        ok, msg = duo_set_permitted_domain(ikey, skey, host, permitted_domain)
+        if not ok:
+            print(f"     WARN: {msg}")  # non-fatal
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    user_summary = " | ".join(
+        f"{u['username']}={u['email']}"
+        for u in duo_users
+    )
+    return True, (
+        f"Duo setup complete | {len(duo_users)} users created | "
+        f"domain={permitted_domain or 'n/a'} | {user_summary}"
+    )
 
 
 def phase_cdfmc_check():
