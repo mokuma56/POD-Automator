@@ -4109,9 +4109,11 @@ function renderFabricGrid(podId, steps) {
   html += '</div>';
 
   // Only update DOM if content changed — prevents scroll jump on re-render
+  // Also force re-render when podId changes so button handlers are re-attached
   const newHtml = html;
-  if (grid._lastHtml === newHtml) return;
+  if (grid._lastHtml === newHtml && grid._lastPodId === podId) return;
   grid._lastHtml = newHtml;
+  grid._lastPodId = podId;
   grid.innerHTML = newHtml;
 
   setTimeout(() => {
@@ -4321,8 +4323,9 @@ function renderSdaGrid(podId, data) {
   });
   html += '</div>';
 
-  if (grid._lastHtml === html) return;
+  if (grid._lastHtml === html && grid._lastPodId === podId) return;
   grid._lastHtml = html;
+  grid._lastPodId = podId;
   grid.innerHTML = html;
 
   // Wire buttons
@@ -4735,8 +4738,9 @@ function renderBaseConfigGrid(podId, statusData) {
   html += '<div id="baseconfig-log" style="margin-top:14px;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:10px;font-size:11px;font-family:monospace;color:#8899aa;max-height:160px;overflow-y:auto;display:none;"></div>';
 
   // Only rebuild DOM if content changed
-  if (grid._lastHtml === html) return;
+  if (grid._lastHtml === html && grid._lastPodId === podId) return;
   grid._lastHtml = html;
+  grid._lastPodId = podId;
   grid.innerHTML = html;
 
   // Rebuild the 1-second timer registry from the current status data
