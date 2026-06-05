@@ -365,7 +365,6 @@ interface GigabitEthernet1/0/2
  spanning-tree portfast trunk
  cts manual
   policy static sgt 2 trusted
-  propagate sgt
 !
 interface GigabitEthernet1/0/3
  description Client
@@ -388,6 +387,17 @@ interface GigabitEthernet1/0/3
 #  - Critical-auth service templates for ISE AAA-down survivability
 #
 DOT1X_SECURITY = """\
+radius server dnac-radius_198.18.5.101
+ address ipv4 198.18.5.101 auth-port 1812 acct-port 1813
+ key C1sco12345
+aaa group server radius dnac-client-radius-group
+ server name dnac-radius_198.18.5.101
+ ip radius source-interface Loopback0
+aaa authentication dot1x default group dnac-client-radius-group
+aaa authorization network default group dnac-client-radius-group
+aaa accounting identity default start-stop group dnac-client-radius-group
+aaa accounting update newinfo periodic 2880
+ip radius source-interface Loopback0
 service password-encryption
 no logging console
 no ip domain lookup

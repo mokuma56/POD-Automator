@@ -112,7 +112,7 @@ interface GigabitEthernet1/0/48
 !
 router ospf 1
  router-id 172.30.255.3
- default-information originate
+ default-information originate always
 !
 ip route vrf Mgmt-vrf 0.0.0.0 0.0.0.0 198.18.128.1
 ip ssh source-interface Loopback0
