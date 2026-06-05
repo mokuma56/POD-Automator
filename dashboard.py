@@ -105,6 +105,19 @@ def _migrate():
         conn.execute("ALTER TABLE pods ADD COLUMN scc_api_secret TEXT DEFAULT ''")
     except Exception:
         pass
+    # Migration: add Duo Admin API credentials columns
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN duo_ikey TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN duo_skey TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN duo_host TEXT DEFAULT ''")
+    except Exception:
+        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pipeline_steps (
             pod_id TEXT, step_name TEXT, status TEXT, started_at TEXT,
@@ -1787,10 +1800,10 @@ def upload_event():
                 if "C8231" in val or "ISR" in val or "C8000" in val:
                     router_serial = val
 
-        vpn_host = row.get(vpn_host_col, "") if vpn_host_col else ""
-        vpn_user = row.get(vpn_user_col, "") if vpn_user_col else ""
-        vpn_pass = row.get(vpn_pass_col, "") if vpn_pass_col else ""
-        session_id = row.get(session_col, "") if session_col else ""
+        vpn_host = row.get(vpn_host_col, "").strip() if vpn_host_col else ""
+        vpn_user = row.get(vpn_user_col, "").strip() if vpn_user_col else ""
+        vpn_pass = row.get(vpn_pass_col, "").strip() if vpn_pass_col else ""
+        session_id = row.get(session_col, "").strip() if session_col else ""
         assigned_to = (row.get(assigned_col, "").strip() if assigned_col else "")
 
         router_ip = row.get(router_ip_col, "") if router_ip_col else ""
@@ -2136,6 +2149,39 @@ def save_scc_keys(pod_id):
     conn.close()
     return jsonify({"status": "ok"})
 
+
+@app.route("/api/pod-duo-keys/<pod_id>", methods=["GET"])
+def get_duo_keys(pod_id):
+    """Return Duo Admin API credentials for a POD."""
+    conn = _db()
+    row = conn.execute(
+        "SELECT duo_ikey, duo_skey, duo_host FROM pods WHERE pod_id=?", (pod_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"duo_ikey": "", "duo_skey": "", "duo_host": ""})
+    return jsonify({
+        "duo_ikey": row["duo_ikey"] or "",
+        "duo_skey":  row["duo_skey"] or "",
+        "duo_host":  row["duo_host"] or "",
+    })
+
+
+@app.route("/api/pod-duo-keys/<pod_id>", methods=["POST"])
+def save_duo_keys(pod_id):
+    """Save Duo Admin API credentials for a POD."""
+    data = request.get_json(force=True)
+    ikey = data.get("duo_ikey", "").strip()
+    skey = data.get("duo_skey", "").strip()
+    host = data.get("duo_host", "").strip()
+    conn = _db()
+    conn.execute(
+        "UPDATE pods SET duo_ikey=?, duo_skey=?, duo_host=?, updated_at=datetime('now') WHERE pod_id=?",
+        (ikey, skey, host, pod_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/run-pod/<pod_id>", methods=["POST"])
@@ -2519,6 +2565,7 @@ DASHBOARD_HTML = """
       <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches</button>
       <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
       <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
+      <button class="tab-btn" onclick="switchTab(this, 'duo')">Duo Setup</button>
       <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
        <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
        <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
@@ -2552,11 +2599,16 @@ DASHBOARD_HTML = """
          <button id="ad-recheck-btn" class="btn-reconnect">⟳ Re-check</button>
          <button id="ad-rerun-btn" class="btn-reconnect" style="color:#ff4757;border-color:#ff4757;">⚠ Re-run AD Automation</button>
        </div>
-       <div id="ad-grid" style="padding:16px;">
-         <div style="color:#667788;font-size:13px;">Select a POD to load AD verification status</div>
-       </div>
-     </div>
-     <div class="tab-content" id="tab-scc">
+      <div id="ad-grid" style="padding:16px;">
+          <div style="color:#667788;font-size:13px;">Select a POD to load AD verification status</div>
+        </div>
+      </div>
+      <div class="tab-content" id="tab-duo">
+        <div id="duo-grid" style="padding:16px;min-height:260px;">
+          <div style="color:#667788;font-size:13px;">Select a POD to manage Duo setup</div>
+        </div>
+      </div>
+      <div class="tab-content" id="tab-scc">
        <div id="scc-actions" style="display:none;margin-bottom:10px;">
          <button id="scc-recheck-btn" class="btn-reconnect" onclick="sccRecheckCurrent()">&#x21bb; Re-check Auto</button>
        </div>
@@ -2616,6 +2668,7 @@ const PIPELINE_ORDER = [
   "connectivity_test",
   "cdfmc_check",
   "ad_verify",
+  "duo_setup",
   "scc_reset_check",
 ];
 
@@ -2662,6 +2715,7 @@ async function load() {
     else if (tabName === 'switches')  loadSwitches(detailId);
     else if (tabName === 'cdfmc')     loadCdfmc(detailId);
     else if (tabName === 'ad')        loadAd(detailId);
+    else if (tabName === 'duo')       loadDuoPanel(detailId);
     else if (tabName === 'upgrade')   loadUpgrade(detailId);
     else if (tabName === 'scc')       loadSccChecklist(detailId);
     else if (tabName === 'fabric')    loadFabricStatus(detailId);
@@ -2969,7 +3023,7 @@ async function loadSteps(podId) {
   const done    = steps.filter(s => s.status === 'completed' || s.status === 'skipped').length;
   const skipped = steps.filter(s => s.status === 'skipped').length;
   const running = steps.some(s => s.status === 'running');
-  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify','scc_reset_check']);
+  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify','duo_setup','scc_reset_check']);
   const hardFailed = steps.some(s => s.status === 'failed' && !SOFT_FAIL.has(s.step_name));
   const softFailed = steps.some(s => s.status === 'failed' && SOFT_FAIL.has(s.step_name));
   const allAccountedFor = steps.length > 0 && steps.every(s => s.status === 'completed' || s.status === 'skipped' || s.status === 'failed');
@@ -3577,6 +3631,112 @@ const SCC_MANUAL_ITEMS = [
     desc: 'Secure Access → Experience and Insights → Account Management. Delete ThousandEyes integration.' },
 ];
 
+// ── Duo Setup Panel ──────────────────────────────────────────────────────────
+async function loadDuoPanel(podId) {
+  const grid = document.getElementById('duo-grid');
+  if (!grid) return;
+
+  // Preserve inputs if user is typing
+  if (window._duoKeysDirty) {
+    const ik = document.getElementById('duo-ikey-input');
+    const sk = document.getElementById('duo-skey-input');
+    const hk = document.getElementById('duo-host-input');
+    var savedIkey = ik ? ik.value : '';
+    var savedSkey = sk ? sk.value : '';
+    var savedHost = hk ? hk.value : '';
+  }
+
+  // Fetch stored credentials + latest duo_setup step result
+  let keysD = {duo_ikey: '', duo_skey: '', duo_host: ''};
+  let stepResult = '';
+  let stepStatus = '';
+  try {
+    const kr = await fetch('/api/pod-duo-keys/' + podId);
+    keysD = await kr.json();
+  } catch(e) {}
+  try {
+    const sr = await fetch('/api/steps/' + podId);
+    const steps = await sr.json();
+    const s = (steps || []).find(x => x.step_name === 'duo_setup');
+    if (s) { stepResult = s.result || ''; stepStatus = s.status || ''; }
+  } catch(e) {}
+
+  if (window._duoKeysDirty) {
+    keysD.duo_ikey = savedIkey;
+    keysD.duo_skey = savedSkey;
+    keysD.duo_host = savedHost;
+  }
+
+  const statusColor = stepStatus === 'completed' ? '#00e68a' : stepStatus === 'failed' ? '#ff4757' : stepStatus === 'running' ? '#ffa502' : '#667788';
+  const statusIcon  = stepStatus === 'completed' ? '✓' : stepStatus === 'failed' ? '✗' : stepStatus === 'running' ? '⟳' : '○';
+
+  grid.innerHTML =
+    '<div class="switch-card" style="margin-bottom:12px;">'
+    + '<div class="switch-card-title"><span class="role-tag cc">KEYS</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Duo Admin API Credentials</span></div>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:center;margin-top:6px;">'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">Integration Key (ikey)</div>'
+    + '<input id="duo-ikey-input" type="text" value="' + escHtml(keysD.duo_ikey || '') + '" placeholder="DIRIBLQ..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">Secret Key (skey)</div>'
+    + '<input id="duo-skey-input" type="password" value="' + escHtml(keysD.duo_skey || '') + '" placeholder="Secret..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">API Hostname</div>'
+    + '<input id="duo-host-input" type="text" value="' + escHtml(keysD.duo_host || '') + '" placeholder="api-xxxxx.duosecurity.com" style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<button id="duo-keys-save-btn" class="btn-reconnect" style="margin-top:16px;white-space:nowrap;">Save</button>'
+    + '</div>'
+    + '<div id="duo-keys-status" style="font-size:11px;color:#667788;margin-top:4px;min-height:16px;"></div>'
+    + '</div>'
+    + '<div class="switch-card">'
+    + '<div class="switch-card-title"><span class="role-tag ' + (stepStatus === 'completed' ? 'pass' : 'cc') + '">' + stepStatus.toUpperCase() + '</span>'
+    + '<span style="color:#e0e6ed;font-size:13px;font-weight:600;">duo_setup — Last Run</span>'
+    + '<span style="margin-left:auto;font-size:18px;color:' + statusColor + ';">' + statusIcon + '</span></div>'
+    + (stepResult
+        ? '<div style="font-size:12px;font-family:monospace;color:#c0ccd8;background:#0a1628;border-radius:4px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;word-break:break-all;">'
+          + escHtml(stepResult.replace(/\s*\|\s*/g, '\n')) + '</div>'
+        : '<div style="color:#445566;font-size:12px;margin-top:6px;">No result yet — run the pipeline to execute this step.</div>')
+    + '</div>';
+
+  setTimeout(() => {
+    const saveBtn = document.getElementById('duo-keys-save-btn');
+    if (saveBtn) saveBtn.onclick = async () => {
+      const ikey = document.getElementById('duo-ikey-input').value.trim();
+      const skey = document.getElementById('duo-skey-input').value.trim();
+      const host = document.getElementById('duo-host-input').value.trim();
+      const statusEl = document.getElementById('duo-keys-status');
+      if (!ikey || !skey || !host) {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ ikey, skey, and host are all required';
+        return;
+      }
+      statusEl.style.color = '#ffa502';
+      statusEl.textContent = 'Saving...';
+      try {
+        const res = await fetch('/api/pod-duo-keys/' + podId, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({duo_ikey: ikey, duo_skey: skey, duo_host: host})
+        });
+        const d = await res.json();
+        if (d.status === 'ok') {
+          window._duoKeysDirty = false;
+          statusEl.style.color = '#00e68a';
+          statusEl.textContent = '✓ Saved — ready to run duo_setup step';
+        } else {
+          statusEl.style.color = '#ff4757';
+          statusEl.textContent = '✗ Save failed: ' + (d.message || 'unknown error');
+        }
+      } catch(e) {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ Save failed: ' + e;
+      }
+    };
+    const ikeyEl = document.getElementById('duo-ikey-input');
+    const skeyEl = document.getElementById('duo-skey-input');
+    const hostEl = document.getElementById('duo-host-input');
+    if (ikeyEl) ikeyEl.addEventListener('input', () => { window._duoKeysDirty = true; });
+    if (skeyEl) skeyEl.addEventListener('input', () => { window._duoKeysDirty = true; });
+    if (hostEl) hostEl.addEventListener('input', () => { window._duoKeysDirty = true; });
+  }, 0);
+}
+
 async function loadSccChecklist(podId) {
   const grid = document.getElementById('scc-grid');
   window._sccCurrentPodId = podId;
@@ -3783,6 +3943,10 @@ function switchTab(btn, name) {
   if (name === 'scc') {
     const podId = document.getElementById('detail-pod-id').dataset.podId;
     if (podId) loadSccChecklist(podId);
+  }
+  if (name === 'duo') {
+    const podId = document.getElementById('detail-pod-id').dataset.podId;
+    if (podId) loadDuoPanel(podId);
   }
   if (name === 'fabric') {
     const podId = document.getElementById('detail-pod-id').dataset.podId;
