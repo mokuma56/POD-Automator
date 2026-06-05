@@ -3240,6 +3240,19 @@ function formatDur(start, end) {
 }
 
 async function showPipeline(podId) {
+  // Kill any pollers that were running for a previously-open POD so their
+  // async callbacks cannot write stale data into this panel after the switch.
+  if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
+  if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
+  if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
+  if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
+  // Reset CatC tile so it re-initialises for the new POD
+  const _ct = document.getElementById('catc-tile-container');
+  if (_ct) { _ct._initialized = false; _ct._podId = null; }
+  // Clear the SDA grid so it doesn't flash old-POD data before loadSdaStatus fires
+  const _sg = document.getElementById('sda-grid');
+  if (_sg) { _sg.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>'; _sg._lastHtml = null; _sg._lastPodId = null; }
+
   const panel = document.getElementById('detail-panel');
   const podData = window._lastPods ? window._lastPods.find(p => p.pod_id === podId) : null;
   const podLabel = (podData && podData.pod_number)
@@ -4418,33 +4431,30 @@ async function sccRecheckCancel(podId) {
 }
 
 function switchTab(btn, name) {
+  // Kill pollers that belong to the tab we are leaving so they don't
+  // bleed data into a tab that is no longer visible.
+  if (name !== 'fabric') {
+    if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
+    if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
+  }
+  if (name !== 'sda') {
+    if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
+    if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
+  }
+
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
-  if (name === 'scc') {
-    const podId = document.getElementById('detail-pod-id').dataset.podId;
-    if (podId) loadSccChecklist(podId);
-  }
-  if (name === 'duo') {
-    const podId = document.getElementById('detail-pod-id').dataset.podId;
-    if (podId) loadDuoPanel(podId);
-  }
-  if (name === 'sa') {
-    const podId = document.getElementById('detail-pod-id').dataset.podId;
-    if (podId) loadSaPanel(podId);
-  }
-  if (name === 'fabric') {
-    const podId = document.getElementById('detail-pod-id').dataset.podId;
-    if (podId) loadFabricStatus(podId);
-  }
-  if (name === 'baseconfig') {
-    const podId = document.getElementById('detail-pod-id').dataset.podId;
-    if (podId) loadBaseConfig(podId);
-  }
-  if (name === 'kb') {
-    loadKbTab();
-  }
+
+  const podId = document.getElementById('detail-pod-id').dataset.podId;
+  if (name === 'scc')        { if (podId) loadSccChecklist(podId); }
+  if (name === 'duo')        { if (podId) loadDuoPanel(podId); }
+  if (name === 'sa')         { if (podId) loadSaPanel(podId); }
+  if (name === 'fabric')     { if (podId) loadFabricStatus(podId); }
+  if (name === 'sda')        { if (podId) loadSdaStatus(podId); }
+  if (name === 'baseconfig') { if (podId) loadBaseConfig(podId); }
+  if (name === 'kb')         { loadKbTab(); }
 }
 
 const FABRIC_STEPS = [
@@ -4491,14 +4501,35 @@ const FABRIC_STEP_COMMANDS = {
   verify_nve_peers: "show nve peers",
 };
 
-async function loadFabricStatus(podId) {
-  const grid = document.getElementById('fabric-grid');
-  if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
-  if (!grid._lastHtml) grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
-  const r = await fetch('/api/fabric/status/' + podId);
-  const data = await r.json();
-  renderFabricGrid(podId, data.steps || {});
-}
+ async function loadFabricStatus(podId) {
+   // Kill any stale poller before rendering (e.g. POD switch)
+   if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
+   const grid = document.getElementById('fabric-grid');
+   if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+   if (!grid._lastHtml) grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
+   const r = await fetch('/api/fabric/status/' + podId);
+   const data = await r.json();
+   renderFabricGrid(podId, data.steps || {});
+   // Start a poller if any step is currently running (mirrors _sdaPoller behaviour)
+   const anyRunning = Object.values(data.steps || {}).some(s => (s || {}).status === 'running');
+   if (anyRunning) _fabricStartPoller(podId);
+ }
+
+ function _fabricStartPoller(podId) {
+   if (window._fabricPoller) clearInterval(window._fabricPoller);
+   let polls = 0;
+   window._fabricPoller = setInterval(async () => {
+     polls++;
+     const r = await fetch('/api/fabric/status/' + podId);
+     const data = await r.json();
+     renderFabricGrid(podId, data.steps || {});
+     const anyRunning = Object.values(data.steps || {}).some(s => (s || {}).status === 'running');
+     if (!anyRunning || polls > 200) {
+       clearInterval(window._fabricPoller);
+       window._fabricPoller = null;
+     }
+   }, 3000);
+ }
 
 function renderFabricGrid(podId, steps) {
   const grid = document.getElementById('fabric-grid');
@@ -5503,9 +5534,10 @@ function closeDetail() {
   if (logPollId) clearInterval(logPollId);
   if (stepPollId) { clearInterval(stepPollId); stepPollId = null; }
   // Clear CatC tile polls and reset _initialized so buttons re-wire on next open
-  if (window._catcPoll) { clearInterval(window._catcPoll); window._catcPoll = null; }
-  if (window._sdaCatcPoll) { clearInterval(window._sdaCatcPoll); window._sdaCatcPoll = null; }
-  if (window._sdaPoller) { clearInterval(window._sdaPoller); window._sdaPoller = null; }
+  if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
+  if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
+  if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
+  if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
   const ct = document.getElementById('catc-tile-container');
   if (ct) { ct._initialized = false; ct._podId = null; }
   const sct = document.getElementById('sda-catc-tile-container');
