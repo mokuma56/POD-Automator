@@ -3690,7 +3690,7 @@ async function loadDuoPanel(podId) {
     + '<span style="margin-left:auto;font-size:18px;color:' + statusColor + ';">' + statusIcon + '</span></div>'
     + (stepResult
         ? '<div style="font-size:12px;font-family:monospace;color:#c0ccd8;background:#0a1628;border-radius:4px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;word-break:break-all;">'
-          + escHtml(stepResult.replace(/\s*\|\s*/g, '\n')) + '</div>'
+          + escHtml(stepResult.replace(/\s*\|\s*/g, '\\n')) + '</div>'
         : '<div style="color:#445566;font-size:12px;margin-top:6px;">No result yet — run the pipeline to execute this step.</div>')
     + '</div>';
 
