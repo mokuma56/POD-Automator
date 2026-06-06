@@ -808,15 +808,25 @@ def step_provision(log_fn=print):
         log_fn(f"  All devices already SDA-provisioned")
         return True, "provision already done"
 
-    log_fn(f"  SDA-provisioning {len(to_provision)} device(s)...")
-    for p in to_provision:
-        r = s.post(f"{CATC_BASE}/dna/intent/api/v1/sda/provisionDevices", json=[p])
-        if r.status_code not in (200, 201, 202):
-            raise RuntimeError(f"SDA provision failed: {r.status_code} {r.text[:200]}")
-        task_id = r.json().get("response", {}).get("taskId")
-        if task_id:
-            _wait_task(s, task_id, log_fn=log_fn, timeout=300)
-        log_fn(f"    Provisioned {p['networkDeviceId']}")
+    # Provision all devices in a single batch POST.
+    #
+    # Why batch instead of sequential:
+    # When CatC provisions the Control Plane / Border node it performs a
+    # site-wide AAA/RADIUS config push to every device it can reach in the
+    # fabric site.  If we POST each device one at a time, edge nodes receive
+    # that AAA push from the CP provision task before our loop gets to them,
+    # so CatC rejects their individual provision with
+    # "AAA CLI(s) are already present on the device".
+    # Sending all three in one call lets CatC handle the ordering internally
+    # and eliminates the race entirely.
+    log_fn(f"  SDA-provisioning {len(to_provision)} device(s) in a single batch...")
+    r = s.post(f"{CATC_BASE}/dna/intent/api/v1/sda/provisionDevices", json=to_provision)
+    if r.status_code not in (200, 201, 202):
+        raise RuntimeError(f"SDA provision failed: {r.status_code} {r.text[:200]}")
+    task_id = r.json().get("response", {}).get("taskId")
+    if task_id:
+        _wait_task(s, task_id, log_fn=log_fn, timeout=600)  # 10 min for 3 devices
+    log_fn(f"  All {len(to_provision)} device(s) provisioned")
 
     return True, "provision OK"
 
