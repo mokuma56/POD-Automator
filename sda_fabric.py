@@ -1386,12 +1386,40 @@ def step_deploy_anycast_gateways(log_fn=print):
 def step_fabric_devices(log_fn=print):
     """Add Border+CP node and 2 edge nodes to the fabric.
 
-    CatC handles all config (AAA, dot1x, TrustSec) when devices are POSTed.
-    If devices are already in fabric (re-run), remove them first so the POST
-    triggers a fresh CatC config push.  step_clean_fabric_vlans must run
-    before this step to strip conflicting VLANs/AAA from the switches.
+    Expects switches to be in clean base-config state (no SDA VLANs).
+    If conflicting VLANs are detected the step fails immediately with a
+    clear message — reset the switches and re-run.
+
+    CatC handles all config push (AAA, dot1x, TrustSec) on fabric POST.
     """
     s = _catc_session(log_fn)
+
+    # --- Pre-check: fail fast if conflicting VLANs exist on any switch ---
+    log_fn("  Checking for VLAN conflicts before fabric add...")
+    conflicts = {}
+    for key, info in SWITCH_IPS.items():
+        try:
+            client = __import__("paramiko").SSHClient()
+            client.set_missing_host_key_policy(__import__("paramiko").AutoAddPolicy())
+            client.connect(info["mgmt"], username=SWITCH_USER, password=SWITCH_PASS,
+                           timeout=10, allow_agent=False, look_for_keys=False)
+            _, stdout, _ = client.exec_command("show vlan brief")
+            vlan_out = stdout.read().decode(errors="ignore")
+            client.close()
+            found = [v for v in FABRIC_CONFLICT_VLANS if f"\n{v} " in vlan_out or f"\n{v}\t" in vlan_out]
+            if found:
+                conflicts[info["name"]] = found
+        except Exception as e:
+            log_fn(f"    WARNING: could not check VLANs on {info['name']} ({info['mgmt']}): {e}")
+
+    if conflicts:
+        lines = "\n".join(f"  {name}: VLANs {vlans}" for name, vlans in conflicts.items())
+        raise RuntimeError(
+            f"VLAN conflict — fabric VLANs already exist on switches. "
+            f"Reset the switches to base config and re-run.\n{lines}"
+        )
+    log_fn("  No VLAN conflicts — proceeding.")
+
     fabric_id = _get_fabric_id(s)
     if not fabric_id:
         raise RuntimeError("Fabric site not found")
@@ -2069,7 +2097,6 @@ DEPLOY_STEPS = [
     ("virtual_networks",             step_virtual_networks),
     ("anycast_gateways",             step_anycast_gateways),
     ("transit",                      step_transit),
-    ("clean_fabric_vlans",           step_clean_fabric_vlans),
     ("fabric_devices",               step_fabric_devices),
     ("ise_nads",                     step_ise_nads),
     ("l3_handoff",                   step_l3_handoff),
