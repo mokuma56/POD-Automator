@@ -387,6 +387,104 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
         log_fn(f"    WARNING: auth cleanup SSH to {mgmt_ip} failed: {e}")
 
 
+def _ssh_push_aaa_config(mgmt_ip, log_fn=print):
+    """Push the full AAA/RADIUS/dot1x stack to an edge node via SSH.
+
+    CatC does NOT push AAA config after a fabric-devices POST (despite what
+    its documentation implies).  We push it directly so workstations can
+    authenticate against ISE via dot1x/MAB.
+    """
+    import time as _time
+    ISE_IP  = "198.18.5.101"
+    ISE_KEY = "C1sco12345"
+    RS_NAME = f"dnac-radius_{ISE_IP}"
+
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=20, allow_agent=False, look_for_keys=False)
+        chan = client.invoke_shell()
+        chan.settimeout(10)
+        _time.sleep(1)
+        try:
+            chan.recv(4096)
+        except Exception:
+            pass
+
+        def send(cmd, wait=0.5):
+            chan.send(cmd + "\n")
+            _time.sleep(wait)
+            out = b""
+            while chan.recv_ready():
+                try:
+                    out += chan.recv(4096)
+                except Exception:
+                    break
+            return out.decode(errors="ignore")
+
+        send("terminal length 0", 0.5)
+        send("enable", 0.5)
+        send("configure terminal", 0.5)
+
+        # Radius server sub-mode
+        send(f"radius server {RS_NAME}", 0.4)
+        send(f"address ipv4 {ISE_IP} auth-port 1812 acct-port 1813", 0.4)
+        send("automate-tester username dummy ignore-acct-port probe-on", 0.4)
+        send(f"key {ISE_KEY}", 0.4)
+        send("exit", 0.4)
+
+        # AAA server group
+        send("aaa group server radius dnac-client-radius-group", 0.4)
+        send(f"server name {RS_NAME}", 0.4)
+        send("ip radius source-interface Loopback0", 0.4)
+        send("exit", 0.4)
+
+        # AAA authentication
+        send("aaa authentication login dnac-cts-list group dnac-client-radius-group local", 0.4)
+        send("aaa authentication dot1x default group dnac-client-radius-group", 0.4)
+
+        # AAA authorization
+        send("aaa authorization network default group dnac-client-radius-group", 0.4)
+        send("aaa authorization network dnac-cts-list group dnac-client-radius-group", 0.4)
+
+        # AAA accounting
+        send("aaa accounting update newinfo periodic 2880", 0.4)
+        send("aaa accounting dot1x default start-stop group dnac-client-radius-group", 0.4)
+        send("aaa accounting identity default start-stop group dnac-client-radius-group", 0.4)
+
+        # Dynamic authorization (CoA from ISE)
+        send("aaa server radius dynamic-author", 0.4)
+        send(f"client {ISE_IP} server-key {ISE_KEY}", 0.4)
+        send("auth-type all", 0.4)
+        send("exit", 0.4)
+
+        # Global radius source interface
+        send("ip radius source-interface Loopback0", 0.4)
+
+        send("end", 0.5)
+
+        # Save config
+        chan.send("copy running-config startup-config\n")
+        _time.sleep(1)
+        try:
+            out = chan.recv(4096).decode(errors="ignore")
+        except Exception:
+            out = ""
+        if "?" in out or "filename" in out.lower():
+            chan.send("\n")
+            _time.sleep(3)
+            try:
+                chan.recv(4096)
+            except Exception:
+                pass
+
+        log_fn(f"    {mgmt_ip}: AAA/dot1x config pushed OK")
+        client.close()
+    except Exception as e:
+        log_fn(f"    WARNING: _ssh_push_aaa_config to {mgmt_ip} failed: {e}")
+
+
 def _catc_resync_device(s, dev_id, log_fn=print, wait=True):
     """Trigger inventory resync for a device, optionally waiting for completion."""
     r = s.put(f"{CATC_BASE}/dna/intent/api/v1/network-device/sync", json=[dev_id])
@@ -1270,13 +1368,10 @@ def step_deploy_anycast_gateways(log_fn=print):
 def step_fabric_devices(log_fn=print):
     """Add Border+CP node and 2 edge nodes to the fabric.
 
-    For devices not yet in the fabric: strip any conflicting AAA config first
-    (avoids CatC NCSO20070 pre-flight rejection), then POST to add them.
-    CatC pushes all AAA / dot1x / TrustSec config as part of the add.
-
-    For devices already in the fabric: issue a PUT re-provision so CatC
-    re-pushes its full config set.  This replaces the old step_push_dot1x_config
-    manual SSH workaround — CatC is the authoritative source of switch config.
+    CatC handles all config (AAA, dot1x, TrustSec) when devices are POSTed.
+    If devices are already in fabric (re-run), remove them first so the POST
+    triggers a fresh CatC config push.  step_clean_fabric_vlans must run
+    before this step to strip conflicting VLANs/AAA from the switches.
     """
     s = _catc_session(log_fn)
     fabric_id = _get_fabric_id(s)
@@ -1290,22 +1385,36 @@ def step_fabric_devices(log_fn=print):
     if not all([border_id, leaf1_id, leaf2_id]):
         raise RuntimeError(f"Could not resolve device IDs: border={border_id} leaf1={leaf1_id} leaf2={leaf2_id}")
 
-    # Map network-device-id → (switch key, fabric record id if already present)
     existing_records = {fd["networkDeviceId"]: fd
                         for fd in s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}").json().get("response", [])}
 
-    # --- Devices to ADD (not yet in fabric) ---
-    # NCSO20070 pre-flight check fires only on initial add, so clean AAA first
-    # for those specific switches only.
-    dev_key_map = {
-        border_id: "border_spine",
-        leaf1_id:  "leaf1",
-        leaf2_id:  "leaf2",
-    }
-    to_add = []
-    if border_id not in existing_records:
-        log_fn(f"  Border-Spine not in fabric — adding as BORDER_NODE + CONTROL_PLANE_NODE...")
-        to_add.append({
+    if existing_records:
+        log_fn(f"  {len(existing_records)} device(s) already in fabric — removing before re-add so CatC pushes fresh config...")
+        # Must remove port assignments and L3 handoffs before CatC allows device delete
+        log_fn(f"  Removing port assignments...")
+        rollback_port_assignments(log_fn)
+        log_fn(f"  Removing L3 handoffs...")
+        rollback_l3_handoffs(log_fn)
+        # Delete edges first, then border/CP
+        edges       = [fd for fd in existing_records.values() if fd.get("deviceRoles") == ["EDGE_NODE"]]
+        border_devs = [fd for fd in existing_records.values()
+                       if "BORDER_NODE" in fd.get("deviceRoles", []) or "CONTROL_PLANE_NODE" in fd.get("deviceRoles", [])]
+        for group, label in [(edges, "edge"), (border_devs, "border/CP")]:
+            for fd in group:
+                nd_id = fd["networkDeviceId"]
+                log_fn(f"    Deleting {label} device {nd_id[:8]}...")
+                r = s.delete(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}&networkDeviceId={nd_id}")
+                if r.status_code not in (200, 202):
+                    raise RuntimeError(f"Delete fabric device failed: {r.status_code} {r.text[:200]}")
+                task_id = r.json().get("response", {}).get("taskId")
+                if task_id:
+                    _wait_task(s, task_id, log_fn=log_fn, timeout=300)
+                time.sleep(3)
+
+    # POST all 3 devices — CatC pushes full AAA/dot1x/TrustSec config
+    log_fn(f"  Adding Border-Spine as BORDER_NODE + CONTROL_PLANE_NODE...")
+    to_add = [
+        {
             "fabricId": fabric_id,
             "networkDeviceId": border_id,
             "deviceRoles": ["BORDER_NODE", "CONTROL_PLANE_NODE"],
@@ -1319,28 +1428,77 @@ def step_fabric_devices(log_fn=print):
                     "isDefaultExit": True,
                 },
             },
-        })
+        },
+    ]
     for dev_id, name in [(leaf1_id, "Leaf1"), (leaf2_id, "Leaf2")]:
-        if dev_id not in existing_records:
-            log_fn(f"  {name} not in fabric — adding as EDGE_NODE...")
-            to_add.append({
-                "fabricId": fabric_id,
-                "networkDeviceId": dev_id,
-                "deviceRoles": ["EDGE_NODE"],
-            })
+        log_fn(f"  Adding {name} as EDGE_NODE...")
+        to_add.append({"fabricId": fabric_id, "networkDeviceId": dev_id, "deviceRoles": ["EDGE_NODE"]})
 
-    if to_add:
-        log_fn(f"  Adding {len(to_add)} new fabric device(s)...")
-        _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices", to_add, log_fn=log_fn, timeout=600)
-
-    # --- Devices already in fabric — PUT to trigger CatC config re-push ---
-    # CatC re-provisions the full AAA / dot1x / TrustSec config set on each device.
-    to_reprovision = [rec for dev_id, rec in existing_records.items()]
-    if to_reprovision:
-        log_fn(f"  Re-provisioning {len(to_reprovision)} existing fabric device(s) via CatC...")
-        _deploy_and_wait(s, "put", f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices", to_reprovision, log_fn=log_fn, timeout=600)
-
+    _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices", to_add, log_fn=log_fn, timeout=600)
     return True, "fabric_devices OK"
+
+
+def step_ise_nads(log_fn=print):
+    """Register switch Loopback0 IPs as NADs in ISE.
+
+    The switches use 'ip radius source-interface Loopback0', so RADIUS requests
+    arrive at ISE from 172.30.255.x.  ISE drops requests from unregistered
+    sources — this step ensures all 3 loopback IPs are registered NADs with
+    the correct shared secret before port_assignments enables dot1x.
+
+    Idempotent: skips any NAD whose loopback IP is already registered.
+    """
+    import requests as req
+    ise_s = req.Session()
+    ise_s.verify = False
+    ise_s.auth = (ISE_USER, ISE_PASS)
+    ise_s.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+
+    # Fetch all existing NADs and build a loopback-IP → id map
+    r = ise_s.get(f"https://{ISE_HOST}/ers/config/networkdevice?size=100")
+    if r.status_code != 200:
+        raise RuntimeError(f"ISE NAD list failed: {r.status_code} {r.text[:200]}")
+
+    existing_by_ip = {}
+    for nad in r.json().get("SearchResult", {}).get("resources", []):
+        detail = ise_s.get(f"https://{ISE_HOST}/ers/config/networkdevice/{nad['id']}").json()
+        dev = detail.get("NetworkDevice", {})
+        for p in dev.get("NetworkDeviceIPList", []):
+            existing_by_ip[p.get("ipaddress")] = nad["id"]
+
+    added = 0
+    skipped = 0
+    for key, info in SWITCH_IPS.items():
+        lb_ip = info["loopback"]
+        name  = info["name"]
+        if lb_ip in existing_by_ip:
+            log_fn(f"  ISE NAD already registered: {name} ({lb_ip}) — skipping")
+            skipped += 1
+            continue
+
+        payload = {
+            "NetworkDevice": {
+                "name": name,
+                "description": "SDA switch — auto-registered by pod_automator",
+                "authenticationSettings": {
+                    "networkProtocol": "RADIUS",
+                    "radiusSharedSecret": ISE_PASS,
+                    "enableKeyWrap": False,
+                },
+                "NetworkDeviceIPList": [
+                    {"ipaddress": lb_ip, "mask": 32}
+                ],
+                "profileName": "Cisco",
+            }
+        }
+        pr = ise_s.post(f"https://{ISE_HOST}/ers/config/networkdevice", json=payload)
+        if pr.status_code in (200, 201):
+            log_fn(f"  Registered ISE NAD: {name} ({lb_ip})")
+            added += 1
+        else:
+            raise RuntimeError(f"ISE NAD create failed for {name}: {pr.status_code} {pr.text[:300]}")
+
+    return True, f"ise_nads OK — {added} added, {skipped} already present"
 
 
 def step_l3_handoff(log_fn=print):
@@ -1883,7 +2041,9 @@ DEPLOY_STEPS = [
     ("virtual_networks",             step_virtual_networks),
     ("anycast_gateways",             step_anycast_gateways),
     ("transit",                      step_transit),
+    ("clean_fabric_vlans",           step_clean_fabric_vlans),
     ("fabric_devices",               step_fabric_devices),
+    ("ise_nads",                     step_ise_nads),
     ("l3_handoff",                   step_l3_handoff),
     ("configure_handoff_interface",  step_configure_handoff_interface),
     ("deploy_anycast_gateways",      step_deploy_anycast_gateways),
