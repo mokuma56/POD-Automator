@@ -1677,40 +1677,60 @@ def rollback_fabric_site(log_fn=print):
 def rollback_delete_devices(log_fn=print):
     """Delete the 3 switches from CATC inventory one at a time via DELETE /network-device/{id}.
 
-    Retries up to 5 times with 60s backoff if CATC reports a provisioning lock.
+    Retries up to 10 times with 30s backoff on provisioning locks.
+    After each task completion, verifies the device is actually absent from
+    inventory — CatC tasks can return 'success' while the device stays present.
     """
     s = _catc_session(log_fn)
-    r = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
-    devs = [d for d in r.json().get("response", [])
-            if any(sw["name"] in (d.get("hostname") or "") for sw in SWITCH_IPS.values())]
+
+    def _fetch_switch_devices():
+        r = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
+        return {d["id"]: d for d in r.json().get("response", [])
+                if any(sw["name"] in (d.get("hostname") or "") for sw in SWITCH_IPS.values())}
+
+    devs = _fetch_switch_devices()
     if not devs:
         log_fn("  No switch devices found in inventory")
         return True, "skipped"
 
-    for d in devs:
-        d_id = d["id"]
+    deleted = 0
+    for d_id, d in list(devs.items()):
         hostname = d.get("hostname", d_id)
-        max_retries = 5
+        max_retries = 10
+        success = False
         for attempt in range(1, max_retries + 1):
-            log_fn(f"  Deleting {hostname} from inventory (attempt {attempt}/{max_retries})...")
-            r2 = s.delete(f"{CATC_BASE}/dna/intent/api/v1/network-device/{d_id}?cleanConfig=false")
-            if r2.status_code not in (200, 202):
-                raise RuntimeError(f"Delete device failed: {r2.status_code} {r2.text[:200]}")
-            task_id = r2.json().get("response", {}).get("taskId")
-            if task_id:
-                try:
+            try:
+                log_fn(f"  Deleting {hostname} from inventory (attempt {attempt}/{max_retries})...")
+                r2 = s.delete(f"{CATC_BASE}/dna/intent/api/v1/network-device/{d_id}?cleanConfig=false")
+                if r2.status_code == 404:
+                    log_fn(f"  {hostname} already gone (404) — skipping")
+                    success = True
+                    break
+                if r2.status_code not in (200, 202):
+                    raise RuntimeError(f"Delete device failed: {r2.status_code} {r2.text[:200]}")
+                task_id = r2.json().get("response", {}).get("taskId")
+                if task_id:
                     _wait_task(s, task_id, log_fn=log_fn, timeout=300)
-                    break  # success
-                except RuntimeError as e:
-                    if "being provisioned" in str(e) and attempt < max_retries:
-                        log_fn(f"  CATC provisioning lock — waiting 60s before retry...")
-                        time.sleep(60)
-                        continue
-                    raise
-            else:
-                break
+                # Verify the device is actually gone — CatC tasks can succeed silently
+                time.sleep(5)
+                still_there = _fetch_switch_devices()
+                if d_id not in still_there:
+                    log_fn(f"  {hostname} confirmed removed from inventory")
+                    success = True
+                    break
+                raise RuntimeError(f"{hostname} still present in inventory after delete task")
+            except Exception as e:
+                log_fn(f"  Attempt {attempt} failed ({type(e).__name__}): {e}")
+                if attempt >= max_retries:
+                    raise RuntimeError(f"{hostname}: all {max_retries} delete attempts failed — last error: {e}") from e
+                log_fn(f"  Waiting 30s before retry...")
+                time.sleep(30)
+
+        if success:
+            deleted += 1
         time.sleep(3)
-    return True, f"rollback_delete_devices OK — {len(devs)} deleted"
+
+    return True, f"rollback_delete_devices OK — {deleted}/{len(devs)} deleted"
 
 
 def rollback_delete_discovery(log_fn=print):
