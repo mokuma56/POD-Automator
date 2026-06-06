@@ -785,8 +785,71 @@ def step_discovery(log_fn=print):
     return True, "discovery OK"
 
 
+def _clean_sda_aaa(mgmt_ip, name, log_fn=print):
+    """SSH to a switch and remove SDA-specific AAA CLIs that CatC pushes
+    site-wide when provisioning the CP/Border node.
+
+    CatC rejects provisioning a device that already has these CLIs with
+    "AAA CLI(s) are already present on the device".  Running this before
+    provision makes the step idempotent regardless of what previous partial
+    runs pushed.  Base-config AAA (local auth/authz) is left untouched.
+    """
+    SDA_AAA_REMOVES = [
+        "no aaa group server radius dnac-client-radius-group",
+        "no aaa authentication dot1x default group dnac-client-radius-group",
+        "no aaa authentication login dnac-cts-list group dnac-client-radius-group local",
+        "no aaa authorization network dnac-cts-list group dnac-client-radius-group",
+        "no aaa accounting dot1x default start-stop group dnac-client-radius-group",
+        "no aaa accounting identity default start-stop group dnac-client-radius-group",
+        "no aaa accounting network default start-stop group dnac-client-radius-group",
+        "no aaa accounting update newinfo periodic 2880",
+        "no aaa server radius dynamic-author",
+        "no radius server dnac-radius_198.18.5.101",
+        "no ip radius source-interface Loopback0",
+    ]
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=10, allow_agent=False, look_for_keys=False)
+
+        # Check if any SDA AAA is actually present before touching anything
+        _, stdout, _ = client.exec_command("show run | section ^aaa|^radius")
+        current = stdout.read().decode(errors="ignore")
+        if "dnac" not in current and "dynamic-author" not in current:
+            log_fn(f"    {name}: no SDA AAA present — skipping clean")
+            client.close()
+            return
+
+        log_fn(f"    {name}: SDA AAA detected — cleaning before provision...")
+        chan = client.invoke_shell()
+        time.sleep(1)
+        chan.recv(2000)
+        chan.send("conf t\n")
+        time.sleep(0.5)
+        for cmd in SDA_AAA_REMOVES:
+            chan.send(cmd + "\n")
+            time.sleep(0.3)
+        chan.send("end\nwrite memory\n")
+        time.sleep(4)
+        out = chan.recv(8096).decode(errors="ignore")
+        if "[OK]" in out:
+            log_fn(f"    {name}: SDA AAA cleaned and saved")
+        else:
+            log_fn(f"    {name}: WARNING — write memory may not have completed")
+        client.close()
+    except Exception as e:
+        log_fn(f"    {name}: WARNING — could not clean SDA AAA ({e}), provision may fail")
+
+
 def step_provision(log_fn=print):
-    """Provision the 3 switches to MAIN site via SDA wired provisioning."""
+    """Provision the 3 switches to MAIN site via SDA wired provisioning.
+
+    Pre-cleans SDA-specific AAA CLIs from devices that need provisioning.
+    CatC pushes AAA site-wide when the CP/Border node is provisioned, so any
+    unprovision edge node may already have those CLIs before we get to it.
+    Cleaning them first makes this step fully idempotent.
+    """
     s = _catc_session(log_fn)
 
     # Check which devices are already SDA-provisioned
@@ -802,31 +865,32 @@ def step_provision(log_fn=print):
         if dev_id in already:
             log_fn(f"    Already SDA-provisioned, skipping")
         else:
-            to_provision.append({"networkDeviceId": dev_id, "siteId": SITE_ID})
+            to_provision.append({"networkDeviceId": dev_id, "siteId": SITE_ID,
+                                  "_mgmt": info["mgmt"], "_name": info["name"]})
 
     if not to_provision:
         log_fn(f"  All devices already SDA-provisioned")
         return True, "provision already done"
 
-    # Provision all devices in a single batch POST.
-    #
-    # Why batch instead of sequential:
-    # When CatC provisions the Control Plane / Border node it performs a
-    # site-wide AAA/RADIUS config push to every device it can reach in the
-    # fabric site.  If we POST each device one at a time, edge nodes receive
-    # that AAA push from the CP provision task before our loop gets to them,
-    # so CatC rejects their individual provision with
-    # "AAA CLI(s) are already present on the device".
-    # Sending all three in one call lets CatC handle the ordering internally
-    # and eliminates the race entirely.
-    log_fn(f"  SDA-provisioning {len(to_provision)} device(s) in a single batch...")
-    r = s.post(f"{CATC_BASE}/dna/intent/api/v1/sda/provisionDevices", json=to_provision)
+    # Pre-clean SDA AAA CLIs from each device before provisioning
+    log_fn(f"  Pre-cleaning SDA AAA from {len(to_provision)} device(s)...")
+    for p in to_provision:
+        _clean_sda_aaa(p["_mgmt"], p["_name"], log_fn)
+
+    # Strip internal keys before posting to CatC
+    payload = [{"networkDeviceId": p["networkDeviceId"], "siteId": p["siteId"]}
+               for p in to_provision]
+
+    # Provision all devices in a single batch POST so CatC handles
+    # CP-vs-edge ordering internally.
+    log_fn(f"  SDA-provisioning {len(payload)} device(s) in a single batch...")
+    r = s.post(f"{CATC_BASE}/dna/intent/api/v1/sda/provisionDevices", json=payload)
     if r.status_code not in (200, 201, 202):
         raise RuntimeError(f"SDA provision failed: {r.status_code} {r.text[:200]}")
     task_id = r.json().get("response", {}).get("taskId")
     if task_id:
-        _wait_task(s, task_id, log_fn=log_fn, timeout=600)  # 10 min for 3 devices
-    log_fn(f"  All {len(to_provision)} device(s) provisioned")
+        _wait_task(s, task_id, log_fn=log_fn, timeout=600)
+    log_fn(f"  All {len(payload)} device(s) provisioned")
 
     return True, "provision OK"
 
