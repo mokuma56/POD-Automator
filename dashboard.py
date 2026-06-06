@@ -199,10 +199,14 @@ _migrate()
 
 # ---- Log helpers ----
 def log(pod_id, msg):
-    conn = _db()
-    conn.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=5)
+        conn.row_factory = sqlite3.Row
+        conn.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # never crash the _run() thread over a log write
 
 def clear_logs(pod_id):
     conn = _db()
