@@ -915,8 +915,26 @@ def step_transit(log_fn=print):
 
 
 def step_clean_fabric_vlans(log_fn=print):
-    """Remove conflicting VLANs/SVIs and prior-run sub-interfaces from switches."""
+    """Remove conflicting VLANs/SVIs from switches before a fresh fabric add.
+
+    Only cleans VLANs when devices are NOT yet in the fabric.  If devices are
+    already in fabric, CatC owns those VLANs and will clean them during its
+    own device-delete task — running our clean first causes CatC's delete to
+    fail on 'no interface VlanXXX' (interface already gone).
+    """
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
+
+    # Check if devices are already in fabric — skip VLAN clean if so
+    try:
+        s = _catc_session(log_fn)
+        fabric_id = _get_fabric_id(s)
+        if fabric_id:
+            existing = s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}").json().get("response", [])
+            if existing:
+                log_fn(f"  Devices already in fabric — skipping VLAN clean (CatC will handle on delete)")
+                return True, "clean_fabric_vlans skipped (devices in fabric)"
+    except Exception as e:
+        log_fn(f"  WARNING: could not check fabric state, proceeding with VLAN clean: {e}")
 
     log_fn(f"  Cleaning VLANs {FABRIC_CONFLICT_VLANS} and Gi1/0/48 sub-interfaces from switches...")
     for key, info in SWITCH_IPS.items():
@@ -1408,7 +1426,17 @@ def step_fabric_devices(log_fn=print):
                     raise RuntimeError(f"Delete fabric device failed: {r.status_code} {r.text[:200]}")
                 task_id = r.json().get("response", {}).get("taskId")
                 if task_id:
-                    _wait_task(s, task_id, log_fn=log_fn, timeout=300)
+                    try:
+                        _wait_task(s, task_id, log_fn=log_fn, timeout=300)
+                    except RuntimeError as e:
+                        # CatC delete task can fail if switch state already clean
+                        # (e.g. VLANs pre-cleaned).  Check if device actually left fabric.
+                        still_in = {fd2["networkDeviceId"] for fd2 in
+                                    s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}").json().get("response", [])}
+                        if nd_id not in still_in:
+                            log_fn(f"    WARNING: delete task reported failure but device is gone — continuing ({e})")
+                        else:
+                            raise
                 time.sleep(3)
 
     # POST all 3 devices — CatC pushes full AAA/dot1x/TrustSec config
