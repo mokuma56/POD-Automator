@@ -1180,7 +1180,7 @@ def _clear_stuck_running(pod_id, table, mode=None):
 # ---------------------------------------------------------------------------
 
 SDA_DEPLOY_STEPS   = ["discovery", "provision", "fabric_site", "virtual_networks",
-                       "anycast_gateways", "transit", "fabric_devices",
+                       "anycast_gateways", "transit", "clean_fabric_vlans", "fabric_devices", "ise_nads",
                        "l3_handoff", "configure_handoff_interface", "deploy_anycast_gateways",
                        "port_assignments", "verify"]
 SDA_ROLLBACK_STEPS = ["remove_port_assignments", "remove_l3_handoffs", "restore_handoff_interface",
@@ -1190,7 +1190,7 @@ SDA_ROLLBACK_STEPS = ["remove_port_assignments", "remove_l3_handoffs", "restore_
                        "delete_ise_nads", "remove_network_profile"]
 
 
-SDA_DEPLOY_STEP_KEYS   = ["discovery","provision","fabric_site","virtual_networks","anycast_gateways","transit","fabric_devices","l3_handoff","configure_handoff_interface","deploy_anycast_gateways","port_assignments","verify"]
+SDA_DEPLOY_STEP_KEYS   = ["discovery","provision","fabric_site","virtual_networks","anycast_gateways","transit","clean_fabric_vlans","fabric_devices","ise_nads","l3_handoff","configure_handoff_interface","deploy_anycast_gateways","port_assignments","verify"]
 SDA_ROLLBACK_STEP_KEYS = ["remove_port_assignments","remove_l3_handoffs","restore_handoff_interface","remove_fabric_devices","remove_anycast_gateways","disable_gbac_policy","remove_transit","remove_vn_assignments","remove_virtual_networks","remove_fabric_site","delete_devices","delete_discovery","delete_ise_nads","remove_network_profile"]
 
 
@@ -4660,7 +4660,7 @@ const BASECONFIG_SWITCHES = {
 
 const SDA_DEPLOY_STEP_KEYS = [
   "discovery","provision","fabric_site","virtual_networks",
-  "anycast_gateways","transit","fabric_devices","l3_handoff",
+  "anycast_gateways","transit","clean_fabric_vlans","fabric_devices","ise_nads","l3_handoff",
   "configure_handoff_interface","deploy_anycast_gateways",
   "port_assignments","verify"
 ];
@@ -4671,7 +4671,9 @@ const SDA_DEPLOY_STEP_LABELS = {
   virtual_networks:             "Create L3 VNs",
   anycast_gateways:             "Anycast Gateways",
   transit:                      "XAR-Transit",
+  clean_fabric_vlans:           "Clean VLANs & AAA",
   fabric_devices:               "Fabric Devices",
+  ise_nads:                     "Register ISE NADs",
   l3_handoff:                   "L3 Handoff",
   configure_handoff_interface:  "Configure Handoff Interface",
   deploy_anycast_gateways:      "Deploy Anycast Gateways",
@@ -4685,7 +4687,9 @@ const SDA_DEPLOY_STEP_TARGETS = {
   virtual_networks:             "Main / PROD / IOT",
   anycast_gateways:             "VLAN 10 / 101 / 102",
   transit:                      "BGP ASN 65534",
+  clean_fabric_vlans:           "VLANs + AAA clean",
   fabric_devices:               "Border+CP + Leaf1+Leaf2",
+  ise_nads:                     "Loopback0 172.30.255.x",
   l3_handoff:                   "CatC API",
   configure_handoff_interface:  "Gi1/0/48 sub-ints",
   deploy_anycast_gateways:      "CatC → Leaf2 SVIs",
