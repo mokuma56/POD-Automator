@@ -70,30 +70,42 @@ def ensure_sda_table():
         print(f"Warning: could not create sda_steps table: {e}")
 
 
-def _set_step(mode, step_name, status, result=None):
-    """Upsert a step row. Sets started_at on first RUNNING, completed_at on OK/FAILED."""
-    try:
-        c = sqlite3.connect(DB_PATH, timeout=10)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        row = c.execute(
-            "SELECT started_at FROM sda_steps WHERE pod_id=? AND mode=? AND step_name=?",
-            (POD_ID, mode, step_name)
-        ).fetchone()
-        started = (row[0] if row else None) or (now if status == "running" else None)
-        completed = now if status in ("completed", "failed") else None
-        c.execute("""
-            INSERT INTO sda_steps (pod_id, mode, step_name, status, started_at, completed_at, result)
-            VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT(pod_id, mode, step_name) DO UPDATE SET
-                status=excluded.status,
-                started_at=COALESCE(excluded.started_at, started_at),
-                completed_at=excluded.completed_at,
-                result=excluded.result
-        """, (POD_ID, mode, step_name, status, started, completed, result))
-        c.commit()
-        c.close()
-    except Exception as e:
-        print(f"Warning: _set_step failed: {e}")
+def _set_step(mode, step_name, status, result=None, _retries=5, _retry_delay=2):
+    """Upsert a step row. Sets started_at on first RUNNING, completed_at on OK/FAILED.
+
+    Retries up to _retries times on transient SQLite errors (locked / disk I/O)
+    so that a momentary volume-mount hiccup cannot silently leave a step stuck
+    at 'running' forever.
+    """
+    last_err = None
+    for attempt in range(1, _retries + 1):
+        try:
+            c = sqlite3.connect(DB_PATH, timeout=10)
+            now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            row = c.execute(
+                "SELECT started_at FROM sda_steps WHERE pod_id=? AND mode=? AND step_name=?",
+                (POD_ID, mode, step_name)
+            ).fetchone()
+            started = (row[0] if row else None) or (now if status == "running" else None)
+            completed = now if status in ("completed", "failed") else None
+            c.execute("""
+                INSERT INTO sda_steps (pod_id, mode, step_name, status, started_at, completed_at, result)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(pod_id, mode, step_name) DO UPDATE SET
+                    status=excluded.status,
+                    started_at=COALESCE(excluded.started_at, started_at),
+                    completed_at=excluded.completed_at,
+                    result=excluded.result
+            """, (POD_ID, mode, step_name, status, started, completed, result))
+            c.commit()
+            c.close()
+            return  # success
+        except Exception as e:
+            last_err = e
+            if attempt < _retries:
+                print(f"Warning: _set_step attempt {attempt}/{_retries} failed ({e}), retrying in {_retry_delay}s...")
+                time.sleep(_retry_delay)
+    print(f"Warning: _set_step permanently failed after {_retries} attempts: {last_err}")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -2187,6 +2199,21 @@ def run_rollback(log_fn=print, pod_id=None, db_path=None, resume=True):
     if db_path:
         DB_PATH = db_path
     ensure_sda_table()
+
+    # Reset any stale 'running' rows from a previous crashed/interrupted run.
+    # This ensures a stuck step is never permanently frozen — the next invocation
+    # of run_rollback will re-run it rather than skip (completed) or loop (running).
+    try:
+        c = sqlite3.connect(DB_PATH, timeout=10)
+        c.execute(
+            "UPDATE sda_steps SET status='pending', completed_at=NULL "
+            "WHERE pod_id=? AND mode='rollback' AND status='running'",
+            (POD_ID,)
+        )
+        c.commit()
+        c.close()
+    except Exception as e:
+        log_fn(f"Warning: could not reset stale running steps: {e}")
 
     # Build set of already-completed step names from DB
     completed_in_db = set()
