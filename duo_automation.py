@@ -100,13 +100,16 @@ def _paginate(ikey: str, skey: str, host: str, path: str, params: dict = None) -
 # Org reset
 # ──────────────────────────────────────────────────────────────────────────────
 
-DUO_ADMIN_API_TYPE = "adminapi"  # integration type to keep
+DUO_ADMIN_API_TYPE = "adminapi"  # integration type to keep (never deleted)
 
 def duo_reset_org(ikey: str, skey: str, host: str,
                   log=None) -> tuple[bool, str]:
     """
-    Delete all non-Admin-API integrations, all users, all groups,
-    and all permitted domains from the Duo org.
+    Reset a Duo org for a new lab session:
+      - Deletes all users, groups, and permitted domains
+      - PRESERVES all integrations (applications) — the authproxy and any
+        SSO/SAML apps are org-level config that cannot be recreated via API;
+        they must survive across runs.
 
     Returns (ok, message).
     log: optional callable(str) for progress messages.
@@ -115,26 +118,7 @@ def duo_reset_org(ikey: str, skey: str, host: str,
     deleted = {"integrations": 0, "users": 0, "groups": 0, "domains": 0}
 
     try:
-        # 1. Delete non-Admin-API integrations (v3 endpoint for SSO + v1 for classic)
-        for api_path in ("/admin/v1/integrations", "/admin/v3/integrations"):
-            try:
-                integrations = _paginate(ikey, skey, host, api_path)
-            except Exception:
-                integrations = []
-            for integ in integrations:
-                itype = integ.get("type", "")
-                ikey_val = integ.get("integration_key", "")
-                if itype == DUO_ADMIN_API_TYPE or not ikey_val:
-                    continue
-                try:
-                    _duo_request(ikey, skey, host, "DELETE",
-                                 f"{api_path}/{ikey_val}")
-                    deleted["integrations"] += 1
-                    _log(f"Deleted integration {ikey_val} ({itype})")
-                except Exception as e:
-                    _log(f"WARN: could not delete integration {ikey_val}: {e}")
-
-        # 2. Delete all users
+        # 1. Users
         users = _paginate(ikey, skey, host, "/admin/v1/users")
         for user in users:
             uid = user.get("user_id")
@@ -283,6 +267,126 @@ def duo_set_permitted_domain(ikey: str, skey: str, host: str,
         return True, f"Permitted domain set: {domain}"
     except Exception as e:
         return False, f"Failed to set permitted domain '{domain}': {e}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth Proxy helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def duo_get_authproxy_creds(ikey: str, skey: str, host: str) -> dict | None:
+    """
+    Return credentials for the first non-adminapi integration in the org,
+    which is assumed to be the Authentication Proxy application.
+
+    Returns {"ikey": ..., "skey": ..., "host": host} or None if none found.
+    """
+    try:
+        integrations = _paginate(ikey, skey, host, "/admin/v1/integrations")
+    except Exception:
+        return None
+    for integ in integrations:
+        if integ.get("type") == DUO_ADMIN_API_TYPE:
+            continue
+        ap_ikey = integ.get("integration_key", "")
+        ap_skey = integ.get("secret_key", "")
+        if ap_ikey and ap_skey:
+            return {"ikey": ap_ikey, "skey": ap_skey, "host": host}
+    return None
+
+
+AUTHPROXY_CFG_PATH = (
+    r"C:\Program Files\Duo Security Authentication Proxy\conf\authproxy.cfg"
+)
+AD_WINRM_USER = "administrator"
+AD_WINRM_PASS = "C1sco12345"
+
+
+def duo_push_authproxy_cfg(
+    ap_ikey: str,
+    ap_skey: str,
+    ap_host: str,
+    ad_ip: str = "198.18.5.102",
+    winrm_user: str = AD_WINRM_USER,
+    winrm_pass: str = AD_WINRM_PASS,
+    log=None,
+) -> tuple[bool, str]:
+    """
+    Push authproxy.cfg to AD1 via WinRM, restart the DuoAuthProxy service,
+    and verify it reaches Running state.
+
+    Returns (ok, message).
+    """
+    _log = log or (lambda s: print(f"     [authproxy] {s}"))
+
+    cfg = (
+        "[cloud]\n"
+        f"ikey={ap_ikey}\n"
+        f"skey={ap_skey}\n"
+        f"api_host={ap_host}\n"
+        f"service_account_username={winrm_user}\n"
+        f"service_account_password={winrm_pass}\n"
+    )
+
+    try:
+        import winrm as _winrm
+    except ImportError:
+        return False, "pywinrm not installed — run: pip install pywinrm"
+
+    try:
+        s = _winrm.Session(
+            f"http://{ad_ip}:5985/wsman",
+            auth=(winrm_user, winrm_pass),
+            transport="ntlm",
+        )
+    except Exception as e:
+        return False, f"WinRM connect failed: {e}"
+
+    # 1. Write authproxy.cfg using base64 to avoid quoting issues
+    import base64 as _b64
+    cfg_b64 = _b64.b64encode(cfg.encode("utf-8")).decode()
+    write_ps = (
+        f"$bytes = [Convert]::FromBase64String('{cfg_b64}'); "
+        f"$text = [System.Text.Encoding]::UTF8.GetString($bytes); "
+        f"$dir = Split-Path -Parent '{AUTHPROXY_CFG_PATH}'; "
+        "if (!(Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }; "
+        f"Set-Content -Path '{AUTHPROXY_CFG_PATH}' -Value $text -Encoding UTF8; "
+        "Write-Output 'WRITE_OK'"
+    )
+    r = s.run_ps(write_ps)
+    out = r.std_out.decode(errors="replace").strip()
+    if "WRITE_OK" not in out:
+        err = r.std_err.decode(errors="replace")[:200]
+        return False, f"Failed to write authproxy.cfg: {out} | {err}"
+    _log("authproxy.cfg written")
+
+    # 2. Restart service
+    restart_ps = (
+        "try { Restart-Service DuoAuthProxy -Force -ErrorAction Stop } "
+        "catch { try { "
+        "Stop-Service DuoAuthProxy -Force -ErrorAction SilentlyContinue; "
+        "Start-Sleep 2; "
+        "Start-Service DuoAuthProxy -ErrorAction Stop "
+        "} catch { Write-Error $_.Exception.Message } }; "
+        "Start-Sleep 4; "
+        "$svc = Get-Service DuoAuthProxy -ErrorAction SilentlyContinue; "
+        "if ($svc) { Write-Output \"STATUS:$($svc.Status)\" } "
+        "else { Write-Output 'STATUS:NotFound' }"
+    )
+    r2 = s.run_ps(restart_ps)
+    out2 = r2.std_out.decode(errors="replace").strip()
+    _log(f"Service output: {out2[:120]}")
+
+    import re as _re
+    m = _re.search(r"STATUS:(\w+)", out2)
+    status = m.group(1) if m else "Unknown"
+    if status.lower() == "running":
+        _log(f"DuoAuthProxy service: Running ✓")
+        return True, f"authproxy.cfg pushed ({ap_host}) | service Running"
+    else:
+        err2 = r2.std_err.decode(errors="replace")[:200]
+        return False, (
+            f"authproxy.cfg written but service status={status} | {err2[:100]}"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

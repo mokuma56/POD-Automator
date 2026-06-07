@@ -134,19 +134,27 @@ def _migrate():
     # Org-level credentials (keyed by org number; pods link at runtime via scc_org)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS org_credentials (
-            org_number   TEXT PRIMARY KEY,
-            duo_ikey     TEXT DEFAULT '',
-            duo_skey     TEXT DEFAULT '',
-            duo_host     TEXT DEFAULT '',
-            scc_api_key  TEXT DEFAULT '',
-            scc_api_secret TEXT DEFAULT '',
-            scc_org_uuid TEXT DEFAULT '',
-            sa_org_id    TEXT DEFAULT '',
-            sa_api_key   TEXT DEFAULT '',
-            sa_api_secret TEXT DEFAULT '',
-            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            org_number      TEXT PRIMARY KEY,
+            duo_ikey        TEXT DEFAULT '',
+            duo_skey        TEXT DEFAULT '',
+            duo_host        TEXT DEFAULT '',
+            scc_api_key     TEXT DEFAULT '',
+            scc_api_secret  TEXT DEFAULT '',
+            scc_org_uuid    TEXT DEFAULT '',
+            sa_org_id       TEXT DEFAULT '',
+            sa_api_key      TEXT DEFAULT '',
+            sa_api_secret   TEXT DEFAULT '',
+            authproxy_ikey  TEXT DEFAULT '',
+            authproxy_skey  TEXT DEFAULT '',
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Migration: add authproxy columns if upgrading from older schema
+    for _col in ("authproxy_ikey", "authproxy_skey"):
+        try:
+            conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
+        except Exception:
+            pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pipeline_steps (
             pod_id TEXT, step_name TEXT, status TEXT, started_at TEXT,

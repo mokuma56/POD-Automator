@@ -2154,6 +2154,7 @@ def phase_duo_setup():
         duo_verify_credentials, duo_reset_org,
         duo_create_groups, duo_create_users,
         duo_set_permitted_domain, DUO_GROUPS,
+        duo_get_authproxy_creds, duo_push_authproxy_cfg,
     )
 
     DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
@@ -2222,8 +2223,8 @@ def phase_duo_setup():
         })
         print(f"     AD → Duo: {u['sam']} | {u['mail']} | groups={matched_groups}")
 
-    # ── 4. Reset Duo org ──────────────────────────────────────────────────────
-    print("     Resetting Duo org (delete users, groups, integrations)...")
+    # ── 4. Reset Duo org (users/groups/domains only — integrations preserved) ──
+    print("     Resetting Duo org (delete users, groups, domains — preserving integrations)...")
     ok, msg = duo_reset_org(ikey, skey, host)
     if not ok:
         return False, msg
@@ -2250,14 +2251,74 @@ def phase_duo_setup():
         if not ok:
             print(f"     WARN: {msg}")  # non-fatal
 
+    # ── 8. Auth Proxy setup on AD1 ────────────────────────────────────────────
+    print("     Setting up Duo Auth Proxy on AD1 (198.18.5.102)...")
+    ap_creds = duo_get_authproxy_creds(ikey, skey, host)
+    if ap_creds:
+        print(f"     Found authproxy integration: {ap_creds['ikey']}")
+        # Persist credentials to DB for future reference
+        try:
+            import sqlite3 as _sq
+            _c = _sq.connect(DB_PATH)
+            _c.execute(
+                "UPDATE org_credentials SET authproxy_ikey=?, authproxy_skey=? "
+                "WHERE org_number=?",
+                (ap_creds["ikey"], ap_creds["skey"],
+                 _extract_org_number(keys.get("_org_num", "") if isinstance(keys, dict) else ""))
+            )
+            _c.commit(); _c.close()
+        except Exception:
+            pass  # non-fatal DB write
+    else:
+        # Fall back to DB-stored authproxy credentials
+        try:
+            import sqlite3 as _sq
+            _c = _sq.connect(DB_PATH)
+            _c.row_factory = _sq.Row
+            _org_num = _extract_org_number(
+                _c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (POD_ID,))
+                 .fetchone()["scc_org"] or ""
+            )
+            _row = _c.execute(
+                "SELECT authproxy_ikey, authproxy_skey FROM org_credentials WHERE org_number=?",
+                (_org_num,)
+            ).fetchone()
+            _c.close()
+            if _row and _row["authproxy_ikey"] and _row["authproxy_skey"]:
+                ap_creds = {"ikey": _row["authproxy_ikey"], "skey": _row["authproxy_skey"], "host": host}
+                print(f"     Using DB-stored authproxy credentials: {ap_creds['ikey']}")
+        except Exception:
+            pass
+
+    if ap_creds:
+        ap_ok, ap_msg = duo_push_authproxy_cfg(
+            ap_ikey=ap_creds["ikey"],
+            ap_skey=ap_creds["skey"],
+            ap_host=ap_creds["host"],
+            ad_ip=AD_DC_IP,
+            winrm_user=AD_DC_USER,
+            winrm_pass=AD_DC_PASS,
+        )
+        if ap_ok:
+            print(f"     Auth proxy: {ap_msg}")
+        else:
+            print(f"     WARN: Auth proxy setup failed: {ap_msg}")  # non-fatal
+    else:
+        print(
+            "     WARN: No authproxy integration found and no stored credentials. "
+            "Create an Authentication Proxy application in the Duo admin console "
+            f"({host}) and enter ikey/skey in Org Credentials."
+        )
+
     # ── Summary ───────────────────────────────────────────────────────────────
     user_summary = " | ".join(
         f"{u['username']}={u['email']}"
         for u in duo_users
     )
+    ap_status = "authproxy=ok" if ap_creds else "authproxy=no-creds"
     return True, (
         f"Duo setup complete | {len(duo_users)} users created | "
-        f"domain={permitted_domain or 'n/a'} | {user_summary}"
+        f"domain={permitted_domain or 'n/a'} | {ap_status} | {user_summary}"
     )
 
 
@@ -2648,9 +2709,16 @@ def phase_scc_reset_check():
             _persist(k, "skipped", msg)
         return False, f"SCC keys missing for org {org_num} — generate keys first | {msg}"
 
-    key_id     = keys.get("scc_api_key") or keys.get("key_id", "")
-    key_secret = keys.get("scc_api_secret") or keys.get("key_secret", "")
-    org_id     = str(keys.get("scc_org_id", ""))
+    # SSE (Umbrella) API uses the Secure Access (sa_*) key pair, not the CDO
+    # machine-account JWT stored in scc_api_secret.  Load SA keys explicitly.
+    try:
+        sa_keys  = _sa_load_keys(pod_id=pod_id)
+        key_id     = sa_keys.get("sa_api_key", "")
+        key_secret = sa_keys.get("sa_api_secret", "")
+    except Exception:
+        # Fallback: try scc keys (old behaviour, may return 500)
+        key_id     = keys.get("scc_api_key") or keys.get("key_id", "")
+        key_secret = keys.get("scc_api_secret") or keys.get("key_secret", "")
 
     try:
         token = _scc_token(key_id, key_secret)
