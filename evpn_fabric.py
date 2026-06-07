@@ -721,20 +721,27 @@ def _send_raw(ip, commands, timeout=30):
 def _persist_fabric_step(step_name, status, result=""):
     if not POD_ID:
         return
-    try:
-        c = sqlite3.connect(DB_PATH)
-        c.execute("""
-            INSERT OR REPLACE INTO fabric_steps
-                (pod_id, step_name, status, started_at, completed_at, result)
-            VALUES (?, ?, ?,
-                COALESCE((SELECT started_at FROM fabric_steps WHERE pod_id=? AND step_name=?), datetime('now')),
-                CASE WHEN ? IN ('completed','failed','skipped') THEN datetime('now') ELSE NULL END,
-                ?)
-        """, (POD_ID, step_name, status, POD_ID, step_name, status, result))
-        c.commit()
-        c.close()
-    except Exception:
-        pass
+    # Retry up to 3 times — SQLite "database is locked" can silently drop
+    # the completed/failed write if the dashboard is writing simultaneously,
+    # leaving the step stuck in 'running' forever.
+    for attempt in range(3):
+        try:
+            c = sqlite3.connect(DB_PATH, timeout=15)
+            c.execute("""
+                INSERT OR REPLACE INTO fabric_steps
+                    (pod_id, step_name, status, started_at, completed_at, result)
+                VALUES (?, ?, ?,
+                    COALESCE((SELECT started_at FROM fabric_steps WHERE pod_id=? AND step_name=?), datetime('now')),
+                    CASE WHEN ? IN ('completed','failed','skipped') THEN datetime('now') ELSE NULL END,
+                    ?)
+            """, (POD_ID, step_name, status, POD_ID, step_name, status, result))
+            c.commit()
+            c.close()
+            return
+        except Exception as e:
+            print(f"[fabric] WARNING: _persist_fabric_step({step_name}, {status}) attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                import time; time.sleep(0.5)
 
 
 def _load_completed_fabric_steps():
