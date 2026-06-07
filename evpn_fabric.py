@@ -396,6 +396,8 @@ aaa group server radius dnac-client-radius-group
 aaa authentication dot1x default group dnac-client-radius-group
 aaa authorization network default group dnac-client-radius-group
 aaa accounting identity default start-stop group dnac-client-radius-group
+aaa authentication login dnac-cts-list group dnac-client-radius-group local
+aaa authorization network dnac-cts-list group dnac-client-radius-group
 aaa accounting update newinfo periodic 2880
 ip radius source-interface Loopback0
 service password-encryption
