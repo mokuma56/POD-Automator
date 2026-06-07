@@ -1100,16 +1100,88 @@ def phase_catc_discover(log_fn=print):
     else:
         log_fn(f"[catc:step] assign_wlc_site | failed | {wlc_name} not in inventory — skipping site assignment")
 
-    # ── Step 7: Provision switches (sync with site) ───────────────────────────
+    # ── Step 7: Provision switches ────────────────────────────────────────────
+    # Pre-provision: remove any stale AAA CLIs so CatC doesn't reject with NCSO20070.
+    # These are pushed by old pipeline runs; safe to no-op if already absent.
+    AAA_CLEANUP = [
+        "no aaa server radius dynamic-author",
+        "no aaa group server radius dnac-client-radius-group",
+        "no radius server dnac-radius_198.18.5.101",
+        "no aaa authentication dot1x default",
+        "no aaa authorization network default group dnac-client-radius-group",
+        "no aaa accounting dot1x default",
+        "no aaa accounting identity default",
+        "no aaa accounting update newinfo",
+        "no aaa authentication login dnac-cts-list",
+        "no aaa authorization network dnac-cts-list",
+        "no ip radius source-interface Loopback0",
+    ]
+    leaf_ips = [info["mgmt"] for key, info in SWITCHES.items() if "leaf" in key.lower()]
+    for leaf_ip in leaf_ips:
+        try:
+            import paramiko as _paramiko
+            _c = _paramiko.SSHClient()
+            _c.set_missing_host_key_policy(_paramiko.AutoAddPolicy())
+            _c.connect(leaf_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       look_for_keys=False, allow_agent=False, timeout=15)
+            _sh = _c.invoke_shell(width=200)
+            _time.sleep(1); _sh.recv(4096)
+            def _s(cmd, d=0.5):
+                _sh.send(cmd + "\n"); _time.sleep(d); return _sh.recv(4096).decode(errors="ignore")
+            _s("terminal length 0"); _s("configure terminal", 1)
+            for cmd in AAA_CLEANUP:
+                _s(cmd, 0.4)
+            _s("end", 1); _s("write memory", 3)
+            _c.close()
+            log_fn(f"[catc:step] provision | running | Pre-provision AAA cleanup done on {leaf_ip}")
+        except Exception as _e:
+            log_fn(f"[catc:step] provision | running | Pre-provision cleanup skipped for {leaf_ip}: {_e}")
+
+    # Trigger actual CatC provision action for all 3 switches
+    log_fn(f"[catc:step] provision | running | Triggering CatC provision for all switches")
+    r_inv2 = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
+                          headers=headers, verify=False, timeout=15)
+    inv2 = {d["managementIpAddress"]: d for d in r_inv2.json().get("response", [])}
+    device_ids = [inv2[ip]["id"] for ip in loopback_ips if ip in inv2 and "id" in inv2[ip]]
+    if not device_ids:
+        log_fn(f"[catc:step] provision | failed | No device IDs found for loopback IPs")
+        return False, "Provision failed — devices not found in inventory"
+
+    prov_payload = [{"networkDeviceId": dev_id, "siteId": CATC_MAIN_SITE_ID} for dev_id in device_ids]
+    r_prov = requests.post(f"{CATC_BASE}/dna/intent/api/v2/provision-device",
+                           headers=headers, json=prov_payload, verify=False, timeout=30)
+    if r_prov.status_code not in (200, 202):
+        log_fn(f"[catc:step] provision | failed | HTTP {r_prov.status_code}: {r_prov.text[:300]}")
+        return False, f"Provision trigger failed ({r_prov.status_code}): {r_prov.text[:300]}"
+
+    # Poll task to completion
+    task_id = (r_prov.json().get("response") or {}).get("taskId") or \
+              (r_prov.json().get("response") or [{}])[0].get("taskId") if isinstance(r_prov.json().get("response"), list) else None
+    if task_id:
+        log_fn(f"[catc:step] provision | running | Task {task_id} — waiting for completion")
+        deadline_prov = _time.time() + 300
+        while _time.time() < deadline_prov:
+            r_task = requests.get(f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
+                                  headers=headers, verify=False, timeout=15)
+            t = r_task.json().get("response", {})
+            if t.get("isError"):
+                log_fn(f"[catc:step] provision | failed | Task error: {t.get('failureReason','')[:200]}")
+                return False, f"Provision task failed: {t.get('failureReason','')}"
+            if t.get("endTime"):
+                log_fn(f"[catc:step] provision | running | Provision task completed — verifying managed state")
+                break
+            _time.sleep(10)
+
+    # Verify all devices reach Managed state
     log_fn(f"[catc:step] provision | running | Verifying devices are managed and syncing")
-    deadline = _time.time() + 120
+    deadline = _time.time() + 300
     all_managed = False
     while _time.time() < deadline:
         r_check = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
                                headers=headers, verify=False, timeout=15)
-        inv2 = {d["managementIpAddress"]: d for d in r_check.json().get("response", [])}
-        states = [(ip, inv2.get(ip, {}).get("managementState", "?"),
-                       inv2.get(ip, {}).get("collectionStatus", "?")) for ip in loopback_ips]
+        inv3 = {d["managementIpAddress"]: d for d in r_check.json().get("response", [])}
+        states = [(ip, inv3.get(ip, {}).get("managementState", "?"),
+                       inv3.get(ip, {}).get("collectionStatus", "?")) for ip in loopback_ips]
         managed = [ip for ip, ms, cs in states if ms == "Managed" and cs not in ("In Progress", "Not Synced")]
         log_fn(f"[catc:step] provision | running | Managed: {len(managed)}/3 — "
                + " | ".join(f"{ip}:{cs}" for ip, ms, cs in states))
@@ -1122,7 +1194,7 @@ def phase_catc_discover(log_fn=print):
         log_fn(f"[catc:step] provision | failed | Not all devices reached Managed state in time")
         return False, "Provision verification timed out — devices not all Managed"
 
-    log_fn(f"[catc:step] provision | completed | All 3 switches Managed and synced at MAIN site")
+    log_fn(f"[catc:step] provision | completed | All 3 switches provisioned and Managed")
     return True, f"All switches discovered, assigned to MAIN site, and provisioned: {summary}"
 
 
