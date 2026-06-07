@@ -657,8 +657,19 @@ def step_discovery(log_fn=print):
     s = _catc_session(log_fn)
     disc_id = _get_discovery_id(s)
     if disc_id:
-        log_fn(f"  Discovery '{DISCOVERY_NAME}' already exists (id={disc_id}), reusing...")
-    else:
+        log_fn(f"  Discovery '{DISCOVERY_NAME}' already exists (id={disc_id}), checking devices...")
+        # Quick check — if not all 3 switches are in inventory, delete and re-create
+        r_chk = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
+        found = [d for d in r_chk.json().get("response", [])
+                 if any(sw["name"] in (d.get("hostname") or "") for sw in SWITCH_IPS.values())]
+        if len(found) < 3:
+            log_fn(f"  Only {len(found)}/3 switches in inventory — deleting stale discovery and re-creating...")
+            s.delete(f"{CATC_BASE}/dna/intent/api/v1/discovery/{disc_id}")
+            time.sleep(3)
+            disc_id = None
+        else:
+            log_fn(f"  All 3 switches present — reusing discovery...")
+    if not disc_id:
         log_fn(f"  Creating discovery job '{DISCOVERY_NAME}'...")
         payload = {
             "name": DISCOVERY_NAME,
@@ -842,13 +853,172 @@ def _clean_sda_aaa(mgmt_ip, name, log_fn=print):
         log_fn(f"    {name}: WARNING — could not clean SDA AAA ({e}), provision may fail")
 
 
+def _clean_lisp(mgmt_ip, name, log_fn=print):
+    """SSH to a switch and remove any leftover LISP config.
+
+    CatC rejects adding a fabric device that already has 'router lisp' with
+    "The LISP configuration is already present on device … Remove the LISP
+    configuration from the device and retry."  Running this before
+    step_fabric_devices makes the step idempotent.
+    """
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=10, allow_agent=False, look_for_keys=False)
+
+        _, stdout, _ = client.exec_command("show run | include ^router lisp")
+        if "router lisp" not in stdout.read().decode(errors="ignore"):
+            log_fn(f"    {name}: no LISP config present — skipping clean")
+            client.close()
+            return
+
+        log_fn(f"    {name}: LISP config detected — cleaning before fabric add...")
+        chan = client.invoke_shell()
+        time.sleep(1)
+        chan.recv(2000)
+        chan.send("conf t\n")
+        time.sleep(0.5)
+        chan.send("no router lisp\n")
+        time.sleep(2)
+        chan.send("end\nwrite memory\n")
+        time.sleep(5)
+        out = chan.recv(8096).decode(errors="ignore")
+        if "[OK]" in out:
+            log_fn(f"    {name}: LISP cleaned and saved")
+        else:
+            log_fn(f"    {name}: WARNING — write memory may not have completed after LISP clean")
+        client.close()
+    except Exception as e:
+        log_fn(f"    {name}: WARNING — could not clean LISP ({e}), fabric_devices may fail")
+
+
+def _clean_fabric_remnants(mgmt_ip, name, log_fn=print):
+    """SSH to a switch and remove all SDA fabric-specific remnants.
+
+    CatC rejects fabric device add if any of these are present from a prior
+    fabric run (even after rollback, CatC only removes its own DB records — it
+    does NOT clean the switch config).  Covers:
+      - interface templates  (DefaultWiredDot1x*)
+      - policy-map type control subscriber  (PMAP_DefaultWiredDot1x* / BridgeVM)
+      - class-map type control subscriber   (DOT1X, MAB, IN_CRITICAL_AUTH, etc.)
+      - service-template  (DefaultCritical*_SRV_TEMPLATE)
+      - router lisp  (already handled by _clean_lisp but included for completeness)
+
+    Order matters:
+      1. Remove service-policy from inside each template body
+      2. Delete the template  (now unreferenced)
+      3. Delete the policy-maps
+      4. Delete the class-maps
+      5. Delete the service-templates
+      6. Remove LISP
+    """
+    SDA_TEMPLATES_PM = [
+        ("DefaultWiredDot1xClosedAuth",    "PMAP_DefaultWiredDot1xClosedAuth_1X_MAB"),
+        ("DefaultWiredDot1xLowImpactAuth", "PMAP_DefaultWiredDot1xLowImpactAuth_1X_MAB"),
+        ("DefaultWiredDot1xOpenAuth",      "PMAP_DefaultWiredDot1xOpenAuth_1X_MAB"),
+    ]
+    SDA_POLICY_MAPS = [
+        "PMAP_DefaultBridgeModeVM_MAB",
+        "PMAP_DefaultWiredDot1xClosedAuth_1X_MAB",
+        "PMAP_DefaultWiredDot1xClosedAuth_MAB_1X",
+        "PMAP_DefaultWiredDot1xLowImpactAuth_1X_MAB",
+        "PMAP_DefaultWiredDot1xLowImpactAuth_MAB_1X",
+        "PMAP_DefaultWiredDot1xOpenAuth_1X_MAB",
+        "PMAP_DefaultWiredDot1xOpenAuth_MAB_1X",
+    ]
+    SDA_CLASS_MAPS = [
+        "AAA_SVR_DOWN_AUTHD_HOST", "AAA_SVR_DOWN_UNAUTHD_HOST",
+        "AUTHC_SUCCESS-AUTHZ_FAIL", "DOT1X", "DOT1X_FAILED",
+        "DOT1X_MEDIUM_PRIO", "DOT1X_NO_RESP", "DOT1X_TIMEOUT",
+        "IN_CRITICAL_AUTH", "IN_CRITICAL_AUTH_CLOSED_MODE",
+        "IN_CRITICAL_BRIDGE_VM_MODE", "MAB", "MAB_FAILED",
+        "NOT_IN_CRITICAL_AUTH", "NOT_IN_CRITICAL_AUTH_CLOSED_MODE",
+        "NOT_IN_CRITICAL_BRIDGE_VM_MODE",
+    ]
+    SDA_SVC_TEMPLATES = [
+        "DefaultCriticalBridgeVM_SRV_TEMPLATE",
+        "DefaultCriticalAuthVlan_SRV_TEMPLATE",
+        "DefaultCriticalVoice_SRV_TEMPLATE",
+        "DefaultCriticalAccess_SRV_TEMPLATE",
+    ]
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=10, allow_agent=False, look_for_keys=False)
+
+        # Quick check — skip entirely if nothing SDA-fabric is present
+        _, stdout, _ = client.exec_command(
+            "show run | include ^template DefaultWiredDot1x|^router lisp|^policy-map type control subscriber PMAP_"
+        )
+        probe = stdout.read().decode(errors="ignore")
+        if "DefaultWiredDot1x" not in probe and "router lisp" not in probe and "PMAP_" not in probe:
+            log_fn(f"    {name}: no fabric remnants found — skipping clean")
+            client.close()
+            return
+
+        log_fn(f"    {name}: fabric remnants detected — cleaning...")
+        chan = client.invoke_shell()
+        time.sleep(1)
+        chan.recv(2000)
+
+        def send(cmd, wait=0.5):
+            chan.send(cmd + "\n")
+            time.sleep(wait)
+            buf = b""
+            end = time.time() + wait + 1.0
+            while time.time() < end:
+                if chan.recv_ready():
+                    buf += chan.recv(8192)
+                    end = time.time() + 0.4
+                else:
+                    time.sleep(0.1)
+            return buf.decode(errors="ignore")
+
+        send("conf t", wait=0.4)
+
+        # 1. Remove service-policy from inside each template, then delete template
+        for tmpl, pm in SDA_TEMPLATES_PM:
+            send(f"template {tmpl}", wait=0.3)
+            send(f" no service-policy type control subscriber {pm}", wait=0.3)
+            send("exit", wait=0.3)
+            send(f"no template {tmpl}", wait=0.5)
+
+        # 2. Delete policy-maps
+        for pm in SDA_POLICY_MAPS:
+            send(f"no policy-map type control subscriber {pm}", wait=0.4)
+
+        # 3. Delete class-maps
+        for cm in SDA_CLASS_MAPS:
+            send(f"no class-map type control subscriber {cm}", wait=0.3)
+
+        # 4. Delete service-templates
+        for st in SDA_SVC_TEMPLATES:
+            send(f"no service-template {st}", wait=0.3)
+
+        # 5. Remove LISP
+        send("no router lisp", wait=1.0)
+
+        send("end", wait=0.4)
+        out = send("write memory", wait=6)
+        if "[OK]" in out:
+            log_fn(f"    {name}: fabric remnants cleaned and saved")
+        else:
+            log_fn(f"    {name}: WARNING — write memory may not have completed")
+        client.close()
+    except Exception as e:
+        log_fn(f"    {name}: WARNING — could not clean fabric remnants ({e}), fabric_devices may fail")
+
+
 def step_provision(log_fn=print):
     """Provision the 3 switches to MAIN site via SDA wired provisioning.
 
-    Pre-cleans SDA-specific AAA CLIs from devices that need provisioning.
-    CatC pushes AAA site-wide when the CP/Border node is provisioned, so any
-    unprovision edge node may already have those CLIs before we get to it.
-    Cleaning them first makes this step fully idempotent.
+    Pre-cleans all SDA/fabric remnants from switches before provisioning so
+    CatC starts from a clean baseline.  Skips devices already provisioned in
+    CatC (idempotent).  Note: step_fabric_devices also pre-cleans remnants
+    immediately before the fabric add, which covers any re-push that occurs
+    between provision and fabric add (e.g. transit side-effects).
     """
     s = _catc_session(log_fn)
 
@@ -872,10 +1042,11 @@ def step_provision(log_fn=print):
         log_fn(f"  All devices already SDA-provisioned")
         return True, "provision already done"
 
-    # Pre-clean SDA AAA CLIs from each device before provisioning
-    log_fn(f"  Pre-cleaning SDA AAA from {len(to_provision)} device(s)...")
+    # Pre-clean SDA AAA CLIs and any fabric remnants from each device
+    log_fn(f"  Pre-cleaning SDA config from {len(to_provision)} device(s)...")
     for p in to_provision:
         _clean_sda_aaa(p["_mgmt"], p["_name"], log_fn)
+        _clean_fabric_remnants(p["_mgmt"], p["_name"], log_fn)
 
     # Strip internal keys before posting to CatC
     payload = [{"networkDeviceId": p["networkDeviceId"], "siteId": p["siteId"]}
@@ -1217,7 +1388,7 @@ def step_configure_handoff_interface(log_fn=print):
                        timeout=15, allow_agent=False, look_for_keys=False)
         _, out, _ = client.exec_command("show ip interface brief | include Vlan5")
         vlan5 = out.read().decode()
-        _, out2, _ = client.exec_command("show run | include GigabitEthernet1/0/48\.")
+        _, out2, _ = client.exec_command(r"show run | include GigabitEthernet1/0/48\.")
         sub_ifaces = out2.read().decode()
         client.close()
         has_vlan5_ip = "192.168.255.7" in vlan5 and "unassigned" not in vlan5
@@ -1505,6 +1676,14 @@ def step_fabric_devices(log_fn=print):
             f"Reset the switches to base config and re-run.\n{lines}"
         )
     log_fn("  No VLAN conflicts — proceeding.")
+
+    # Pre-clean all SDA fabric remnants (LISP, templates, policy-maps, class-maps).
+    # CatC rejects fabric add if any of these are present from a prior run.
+    # No CatC sync needed here — step_provision's fresh re-provision already
+    # refreshed CatC's device config cache with a clean baseline.
+    log_fn("  Pre-cleaning fabric remnants on all switches...")
+    for key, info in SWITCH_IPS.items():
+        _clean_fabric_remnants(info["mgmt"], info["name"], log_fn)
 
     fabric_id = _get_fabric_id(s)
     if not fabric_id:
