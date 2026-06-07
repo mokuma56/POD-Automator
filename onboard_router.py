@@ -1101,43 +1101,9 @@ def phase_catc_discover(log_fn=print):
         log_fn(f"[catc:step] assign_wlc_site | failed | {wlc_name} not in inventory — skipping site assignment")
 
     # ── Step 7: Provision switches ────────────────────────────────────────────
-    # Pre-provision: remove any stale AAA CLIs so CatC doesn't reject with NCSO20070.
-    # These are pushed by old pipeline runs; safe to no-op if already absent.
-    AAA_CLEANUP = [
-        "no aaa server radius dynamic-author",
-        "no aaa group server radius dnac-client-radius-group",
-        "no radius server dnac-radius_198.18.5.101",
-        "no aaa authentication dot1x default",
-        "no aaa authorization network default group dnac-client-radius-group",
-        "no aaa accounting dot1x default",
-        "no aaa accounting identity default",
-        "no aaa accounting update newinfo",
-        "no aaa authentication login dnac-cts-list",
-        "no aaa authorization network dnac-cts-list",
-        "no ip radius source-interface Loopback0",
-    ]
-    leaf_ips = [info["mgmt"] for key, info in SWITCHES.items() if "leaf" in key.lower()]
-    for leaf_ip in leaf_ips:
-        try:
-            import paramiko as _paramiko
-            _c = _paramiko.SSHClient()
-            _c.set_missing_host_key_policy(_paramiko.AutoAddPolicy())
-            _c.connect(leaf_ip, username=SWITCH_USER, password=SWITCH_PASS,
-                       look_for_keys=False, allow_agent=False, timeout=15)
-            _sh = _c.invoke_shell(width=200)
-            _time.sleep(1); _sh.recv(4096)
-            def _s(cmd, d=0.5):
-                _sh.send(cmd + "\n"); _time.sleep(d); return _sh.recv(4096).decode(errors="ignore")
-            _s("terminal length 0"); _s("configure terminal", 1)
-            for cmd in AAA_CLEANUP:
-                _s(cmd, 0.4)
-            _s("end", 1); _s("write memory", 3)
-            _c.close()
-            log_fn(f"[catc:step] provision | running | Pre-provision AAA cleanup done on {leaf_ip}")
-        except Exception as _e:
-            log_fn(f"[catc:step] provision | running | Pre-provision cleanup skipped for {leaf_ip}: {_e}")
-
-    # Trigger actual CatC provision action for all 3 switches
+    # Trigger actual CatC provision action for all 3 switches.
+    # NOTE: DOT1X_SECURITY no longer pushes any AAA/RADIUS CLIs so CatC will
+    # never hit NCSO20070 on a clean run. Do NOT add cleanup here.
     log_fn(f"[catc:step] provision | running | Triggering CatC provision for all switches")
     r_inv2 = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
                           headers=headers, verify=False, timeout=15)
