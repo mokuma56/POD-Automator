@@ -400,6 +400,9 @@ aaa accounting identity default start-stop group dnac-client-radius-group
 aaa authentication login dnac-cts-list group dnac-client-radius-group local
 aaa authorization network dnac-cts-list group dnac-client-radius-group
 aaa accounting update newinfo periodic 2880
+aaa server radius dynamic-author
+ client 198.18.5.101 server-key C1sco12345
+ auth-type all
 ip radius source-interface Loopback0
 service password-encryption
 no logging console
