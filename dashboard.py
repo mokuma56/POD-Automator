@@ -2391,6 +2391,8 @@ def import_org_credentials_csv():
         return jsonify({"error": str(e)}), 500
 
 
+# !! DO NOT REMOVE THE DECORATOR BELOW — this has been dropped 3 times by edits inserting new routes above this function !!
+@app.route("/api/run-pod/<pod_id>", methods=["POST"])
 def run_pod(pod_id):
     """Run the pipeline for a single POD (VPN must already be connected)."""
     import subprocess, os, tempfile
