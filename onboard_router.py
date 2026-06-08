@@ -2013,18 +2013,67 @@ def _ad_query_users():
 
 def phase_detect_pod_number():
     """
-    Query AD for Kit/Lee/Pat/Nik and extract the authoritative POD number
-    from their email subdomain (e.g. nik@rtp16.corp.pseudoco.com → POD# 16).
+    Detect the authoritative dCloud POD number and write it to pods.pod_number.
+
+    Method 1 (preferred): Read C:\\dcloud\\session.xml from the jump host via
+    WinRM.  Device names end in -P<NN> (e.g. EN-SDA-ISR4331-P04), and that
+    2-digit suffix is the definitive POD number.  This is fast, accurate, and
+    does not depend on AD provisioning having completed.
+
+    Method 2 (fallback): Query AD for Kit/Lee/Pat/Nik and extract the POD
+    number from their email subdomain (e.g. nik@rtp16.corp.pseudoco.com → 16).
+    Used only when the jump host is unreachable via WinRM.
 
     Writes the confirmed number to pods.pod_number in the DB.
-    Soft-fail: if AD is unreachable or users not yet provisioned, returns
-    (False, reason) so the pipeline continues without blocking.
+    Soft-fail: returns (False, reason) if both methods fail, so the pipeline
+    continues without blocking.
     """
     import re, sqlite3
 
     DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     POD_ID  = os.environ.get("POD_ID", "")
 
+    def _persist(pod_number, source):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            if POD_ID:
+                conn.execute(
+                    "UPDATE pods SET pod_number=?, updated_at=datetime('now') WHERE pod_id=?",
+                    (pod_number, POD_ID),
+                )
+                conn.commit()
+            conn.close()
+        except Exception as db_err:
+            return True, f"POD# {pod_number} (via {source}) — WARNING: DB write failed: {db_err}"
+        return True, f"POD# confirmed: {pod_number} (via {source})"
+
+    # ── Method 1: session.xml via WinRM ──────────────────────────────────────
+    # Authoritative: device names in session.xml always end in -P<NN> where
+    # <NN> matches the CSV POD number (e.g. EN-SDA-ISR4331-P04 → '04').
+    try:
+        import winrm
+        sess = winrm.Session(
+            "198.18.133.36",
+            auth=("administrator", "C1sco12345"),
+            transport="ntlm",
+            read_timeout_sec=30,
+            operation_timeout_sec=20,
+        )
+        r = sess.run_cmd("type", [r"C:\dcloud\session.xml"])
+        xml_text = r.std_out.decode("utf-8", errors="replace")
+        if r.status_code == 0 and xml_text:
+            # Device names: EN-SDA-ISR4331-P04, EN-SDA-C9300-1-P04, etc.
+            # All devices in a session share the same -P<NN> suffix.
+            m = re.search(r"-P(\d{2})</name>", xml_text)
+            if m:
+                pod_number = m.group(1)
+                print(f"     [detect_pod_number] session.xml → POD# {pod_number}")
+                return _persist(pod_number, "session.xml")
+    except Exception as e:
+        print(f"     [detect_pod_number] WinRM unavailable, falling back to AD: {e}")
+
+    # ── Method 2: AD email subdomain fallback ─────────────────────────────────
     try:
         users = _ad_query_users()
     except Exception as e:
@@ -2037,34 +2086,20 @@ def phase_detect_pod_number():
     evidence = []
     for u in users:
         mail = u.get("mail", "")
-        # Match rtp<N> or sjc<N> subdomain pattern: user@rtp16.corp.pseudoco.com
-        m = re.search(r'@[a-z]+(\d+)\.corp\.pseudoco\.com', mail, re.I)
+        m = re.search(r"@[a-z]+(\d+)\.corp\.pseudoco\.com", mail, re.I)
         if m:
             detected = m.group(1)
             evidence.append(f"{u['sam']}={mail}")
-            break  # all 4 users should match the same number; first hit is enough
+            break  # all 4 users share the same POD number; first hit is enough
 
     if not detected:
-        # Users exist but still have default @corp.pseudoco.com — not yet provisioned
         sample = users[0].get("mail", "?") if users else "?"
-        return False, f"AD users found but email not yet POD-specific (e.g. {sample}) — run AD automation first"
+        return False, (
+            f"AD users found but email not yet POD-specific (e.g. {sample}) "
+            "— run AD automation first"
+        )
 
-    # Persist to DB
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        if POD_ID:
-            conn.execute(
-                "UPDATE pods SET pod_number=?, updated_at=datetime('now') WHERE pod_id=?",
-                (detected, POD_ID)
-            )
-            conn.commit()
-        conn.close()
-    except Exception as e:
-        # DB write failed — still return success with the detected number
-        return True, f"POD# detected: {detected} (via {', '.join(evidence)}) — WARNING: DB write failed: {e}"
-
-    return True, f"POD# confirmed: {detected} (via {', '.join(evidence)})"
+    return _persist(detected, f"AD ({', '.join(evidence)})")
 
 
 def phase_ad_verify():
@@ -2154,7 +2189,8 @@ def phase_duo_setup():
         duo_verify_credentials, duo_reset_org,
         duo_create_groups, duo_create_users,
         duo_set_permitted_domain, DUO_GROUPS,
-        duo_get_authproxy_creds, duo_push_authproxy_cfg,
+        duo_get_authproxy_creds, duo_create_authproxy_integration,
+        duo_push_authproxy_cfg,
     )
 
     DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
@@ -2290,6 +2326,35 @@ def phase_duo_setup():
         except Exception:
             pass
 
+    if not ap_creds:
+        # Auto-create a radius-type integration for the auth proxy
+        print("     No authproxy integration found — creating radius-type integration...")
+        ap_creds = duo_create_authproxy_integration(ikey, skey, host)
+        if ap_creds:
+            print(f"     Created authproxy integration: {ap_creds['ikey']}")
+            try:
+                import sqlite3 as _sq
+                _c = _sq.connect(DB_PATH)
+                _c.row_factory = _sq.Row
+                _org_num = _extract_org_number(
+                    _c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (POD_ID,))
+                     .fetchone()["scc_org"] or ""
+                )
+                _c.execute(
+                    "UPDATE org_credentials SET authproxy_ikey=?, authproxy_skey=? "
+                    "WHERE org_number=?",
+                    (ap_creds["ikey"], ap_creds["skey"], _org_num)
+                )
+                _c.commit(); _c.close()
+            except Exception:
+                pass  # non-fatal DB write
+        else:
+            print(
+                "     WARN: Failed to create authproxy integration. "
+                "Create an Authentication Proxy application manually in the Duo admin console "
+                f"({host}) and enter ikey/skey in Org Credentials."
+            )
+
     if ap_creds:
         ap_ok, ap_msg = duo_push_authproxy_cfg(
             ap_ikey=ap_creds["ikey"],
@@ -2303,12 +2368,6 @@ def phase_duo_setup():
             print(f"     Auth proxy: {ap_msg}")
         else:
             print(f"     WARN: Auth proxy setup failed: {ap_msg}")  # non-fatal
-    else:
-        print(
-            "     WARN: No authproxy integration found and no stored credentials. "
-            "Create an Authentication Proxy application in the Duo admin console "
-            f"({host}) and enter ikey/skey in Org Credentials."
-        )
 
     # ── Summary ───────────────────────────────────────────────────────────────
     user_summary = " | ".join(
@@ -2633,6 +2692,56 @@ def _scc_org_number_from_pod() -> str:
     return ""
 
 
+def phase_duo_ext_dir_setup() -> tuple[bool, str]:
+    """
+    External Directory (AD sync) + SSO Auth Proxy setup for this POD's Duo org.
+
+    Runs after duo_setup.  Requires:
+      - Auth proxy installed on AD1 (handled by duo_setup)
+      - authproxy_ikey/skey in org_credentials (stored by duo_setup)
+      - idac_url configured in org_credentials
+
+    Calls duo_automation.duo_ext_dir_and_sso_setup() which:
+      Part 1 – External Directory:
+        Users → External Directories → Add AD, push clean [cloud] to AD1,
+        Test Connection, configure DC 198.18.5.102:389 / groups / attrs, Sync Now
+      Part 2 – SSO Auth Proxy:
+        Applications → SSO Settings → add AD source, capture [sso] config,
+        push to AD1, run enrollment command, verify Connected,
+        configure DC, add permitted domain corp.pseudoco.com, set routing rule
+
+    Returns (ok, result_string).
+
+    When running inside Docker (pipeline container), delegates to the dashboard
+    host process via http://host.docker.internal:5050/api/duo-ext-dir-setup-sync/{pod_id}
+    because Playwright (headless browser) needs the host network stack.
+    """
+    DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    POD_ID  = os.environ.get("POD_ID", "")
+
+    if not POD_ID:
+        return False, "POD_ID env var not set"
+
+    if os.path.exists("/.dockerenv"):
+        import urllib.request, json as _json
+        dashboard_url = os.environ.get("DASHBOARD_URL", "http://192.168.65.254:5050")
+        try:
+            req = urllib.request.Request(
+                f"{dashboard_url}/api/duo-ext-dir-setup-sync/{POD_ID}",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                data=b"{}",
+            )
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                data = _json.loads(resp.read())
+            return data.get("ok", False), data.get("result", "no result from host")
+        except Exception as e:
+            return False, f"Host delegation failed: {e}"
+
+    from duo_automation import duo_ext_dir_and_sso_setup
+    return duo_ext_dir_and_sso_setup(POD_ID, DB_PATH)
+
+
 def phase_scc_reset_check():
     """
     Automated SCC reset verification (6 of 13 checklist items).
@@ -2908,6 +3017,43 @@ def phase_scc_reset_check():
     summary = " | ".join(f"{k}: {'✓' if v[0] else '✗'} {v[1]}" for k, v in results.items())
     print(f"     SCC reset check ({'PASS' if all_ok else 'FAIL'}): {summary}")
     return all_ok, summary
+
+
+def phase_duo_saml_setup() -> tuple[bool, str]:
+    """
+    Automate full SA + Duo SAML/SCIM integration setup.
+
+    When running inside Docker (pipeline container), delegates to the dashboard
+    host process via http://host.docker.internal:5050/api/duo-saml-setup-sync/{pod_id}
+    because playwright (headless browser) needs the host network stack and
+    the management.api.umbrella.com JWT requires an Okta browser session.
+
+    When running on the host directly, calls duo_automation.duo_saml_full_setup().
+
+    Returns (ok, result_string).
+    """
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    pod_id  = os.environ.get("POD_ID", "")
+
+    if os.path.exists("/.dockerenv"):
+        import urllib.request, json as _json
+        dashboard_url = os.environ.get("DASHBOARD_URL", "http://192.168.65.254:5050")
+        try:
+            req = urllib.request.Request(
+                f"{dashboard_url}/api/duo-saml-setup-sync/{pod_id}",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                data=b"{}",
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                data = _json.loads(resp.read())
+            return data.get("ok", False), data.get("result", "no result from host")
+        except Exception as e:
+            return False, f"Host delegation failed: {e}"
+
+    # Running on host — call directly
+    from duo_automation import duo_saml_full_setup
+    return duo_saml_full_setup(pod_id, db_path)
 
 
 if __name__ == "__main__":
