@@ -59,6 +59,16 @@ def _db():
     conn.execute("PRAGMA synchronous=FULL")
     return conn
 
+def _get_global_config(conn, key, default=""):
+    row = conn.execute("SELECT value FROM global_config WHERE key=?", (key,)).fetchone()
+    return row["value"] if row and row["value"] else default
+
+def _set_global_config(conn, key, value):
+    conn.execute(
+        "INSERT INTO global_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
 def _migrate():
     conn = _db()
     conn.execute("""
@@ -149,12 +159,20 @@ def _migrate():
             updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Migration: add authproxy columns if upgrading from older schema
-    for _col in ("authproxy_ikey", "authproxy_skey"):
+    # Migration: add authproxy + SAML columns if upgrading from older schema
+    for _col in ("authproxy_ikey", "authproxy_skey",
+                 "idac_url", "duo_saml_app_ikey", "sa_saml_profile_id"):
         try:
             conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
         except Exception:
             pass
+    # Global key-value config (CCO credentials etc.)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS global_config (
+            key   TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pipeline_steps (
             pod_id TEXT, step_name TEXT, status TEXT, started_at TEXT,
@@ -340,16 +358,19 @@ SWITCH_CHECKS = {
         "VRF (expect Mgmt-vrf only)",
         "Version (expect 17.12.x)",
         "VLAN (expect default + VLAN 5)",
+        "AAA (base config only)",
     ]},
     "leaf1": {"name": "Leaf 1", "ip": "198.18.128.22", "checks": [
         "VRF (expect Mgmt-vrf only)",
         "Version (expect 17.12.x)",
         "VLAN (expect default only)",
+        "AAA (base config only)",
     ]},
     "leaf2": {"name": "Leaf 2", "ip": "198.18.128.23", "checks": [
         "VRF (expect Mgmt-vrf only)",
         "Version (expect 17.12.x)",
         "VLAN (expect default only)",
+        "AAA (base config only)",
     ]},
 }
 
@@ -384,7 +405,7 @@ def api_switches(pod_id):
 
         checks = []
         for i, label in enumerate(info["checks"]):
-            if step.get("status") == "completed" and i < len(check_parts):
+            if step.get("status") in ("completed", "failed") and i < len(check_parts):
                 part = check_parts[i]
                 if part.startswith("PASS"):
                     checks.append({"label": label, "status": "pass", "result": part.replace("PASS: ", "")})
@@ -392,6 +413,8 @@ def api_switches(pod_id):
                     checks.append({"label": label, "status": "fail", "result": part.replace("FAIL: ", "")})
                 else:
                     checks.append({"label": label, "status": "pass", "result": part})
+            elif step.get("status") in ("completed", "failed"):
+                checks.append({"label": label, "status": "na", "result": "no data"})
             elif step.get("status") == "running":
                 checks.append({"label": label, "status": "na", "result": "checking..."})
             elif step.get("status") == "failed":
@@ -420,7 +443,7 @@ def api_switches(pod_id):
     ct_checks = []
     switch_order = [("border_spine", "Border Spine"), ("leaf1", "Leaf 1"), ("leaf2", "Leaf 2")]
     for i, (_, label) in enumerate(switch_order):
-        if ct_status == "completed" and i < len(ct_parts):
+        if ct_status in ("completed", "failed") and i < len(ct_parts):
             part = ct_parts[i]
             if part.startswith("PASS"):
                 ct_checks.append({"label": label + " → 198.18.5.100", "status": "pass", "result": part.replace("PASS: ", "")})
@@ -428,6 +451,8 @@ def api_switches(pod_id):
                 ct_checks.append({"label": label + " → 198.18.5.100", "status": "fail", "result": part.replace("FAIL: ", "")})
             else:
                 ct_checks.append({"label": label + " → 198.18.5.100", "status": "pass", "result": part})
+        elif ct_status in ("completed", "failed"):
+            ct_checks.append({"label": label + " → 198.18.5.100", "status": "na", "result": "no data"})
         elif ct_status == "running":
             ct_checks.append({"label": label + " → 198.18.5.100", "status": "na", "result": "checking..."})
         elif ct_status == "failed":
@@ -541,7 +566,7 @@ def api_switches_recheck(pod_id):
                     "--network", f"container:vpn-{pod_id}",
                     "--entrypoint", "python3",
                     "pod-automator:latest", "-c", script
-                ], capture_output=True, text=True, timeout=120)
+                ], capture_output=True, text=True, timeout=240)
                 # Parse the printed repr (last line of stdout)
                 stdout = result.stdout.strip()
                 stderr = result.stderr.strip()
@@ -1004,6 +1029,94 @@ def api_scc_run_check_sync(pod_id):
         import importlib, onboard_router
         importlib.reload(onboard_router)
         ok, result = onboard_router.phase_scc_reset_check()
+        return jsonify({"ok": ok, "result": result})
+    except Exception as e:
+        return jsonify({"ok": False, "result": str(e)}), 500
+
+
+@app.route("/api/duo-saml-setup/<pod_id>", methods=["POST"])
+def api_duo_saml_setup(pod_id):
+    """Run duo_saml_full_setup in a background thread.
+    Called directly by the UI or delegated from the pipeline container."""
+    import threading, importlib, sys, os as _os
+
+    db_path = str(Path(__file__).parent / "data" / "pod_state.db")
+
+    # Mark as running
+    c = _db()
+    c.execute(
+        "INSERT OR REPLACE INTO pipeline_steps "
+        "(pod_id, step_name, status, started_at, result) VALUES (?,?,?,datetime('now'),?)",
+        (pod_id, "duo_saml_setup", "running", ""),
+    )
+    c.commit(); c.close()
+    log(pod_id, "[duo_saml_setup] Starting SA+Duo SAML/SCIM setup...")
+
+    def _run():
+        sys.path.insert(0, str(Path(__file__).parent))
+        _os.environ["POD_ID"] = pod_id
+        _os.environ["DB_PATH"] = db_path
+        try:
+            import importlib as _il
+            import duo_automation as _da
+            _il.reload(_da)
+
+            def _log_fn(msg):
+                log(pod_id, f"[duo_saml_setup] {msg}")
+
+            ok, result = _da.duo_saml_full_setup(pod_id, db_path, log=_log_fn)
+            log(pod_id, f"[duo_saml_setup] {'OK' if ok else 'FAILED'}: {result}")
+            c2 = _db()
+            c2.execute(
+                "INSERT OR REPLACE INTO pipeline_steps "
+                "(pod_id, step_name, status, result) VALUES (?,?,?,?)",
+                (pod_id, "duo_saml_setup", "completed" if ok else "failed", result),
+            )
+            c2.commit(); c2.close()
+        except Exception as e:
+            msg = f"ERROR: {e}"
+            log(pod_id, f"[duo_saml_setup] {msg}")
+            c3 = _db()
+            c3.execute(
+                "INSERT OR REPLACE INTO pipeline_steps "
+                "(pod_id, step_name, status, result) VALUES (?,?,?,?)",
+                (pod_id, "duo_saml_setup", "failed", msg),
+            )
+            c3.commit(); c3.close()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "ok", "message": f"Duo SAML setup started for {pod_id}"})
+
+
+@app.route("/api/duo-saml-setup-sync/<pod_id>", methods=["POST"])
+def api_duo_saml_setup_sync(pod_id):
+    """Synchronous variant — called by the pipeline container via host.docker.internal."""
+    import sys, os as _os
+    db_path = str(Path(__file__).parent / "data" / "pod_state.db")
+    sys.path.insert(0, str(Path(__file__).parent))
+    _os.environ["POD_ID"] = pod_id
+    _os.environ["DB_PATH"] = db_path
+    try:
+        import importlib, duo_automation
+        importlib.reload(duo_automation)
+        ok, result = duo_automation.duo_saml_full_setup(pod_id, db_path)
+        return jsonify({"ok": ok, "result": result})
+    except Exception as e:
+        return jsonify({"ok": False, "result": str(e)}), 500
+
+
+@app.route("/api/duo-ext-dir-setup-sync/<pod_id>", methods=["POST"])
+def api_duo_ext_dir_setup_sync(pod_id):
+    """Synchronous variant — called by the pipeline container via host.docker.internal."""
+    import sys, os as _os
+    db_path = str(Path(__file__).parent / "data" / "pod_state.db")
+    sys.path.insert(0, str(Path(__file__).parent))
+    _os.environ["POD_ID"] = pod_id
+    _os.environ["DB_PATH"] = db_path
+    try:
+        import importlib, duo_automation
+        importlib.reload(duo_automation)
+        ok, result = duo_automation.duo_ext_dir_and_sso_setup(pod_id, db_path)
         return jsonify({"ok": ok, "result": result})
     except Exception as e:
         return jsonify({"ok": False, "result": str(e)}), 500
@@ -2293,7 +2406,8 @@ def get_org_credentials(org_number):
     if not row:
         return jsonify({"org_number": org_number, "duo_ikey": "", "duo_skey": "", "duo_host": "",
                         "scc_api_key": "", "scc_api_secret": "", "scc_org_uuid": "",
-                        "sa_org_id": "", "sa_api_key": "", "sa_api_secret": ""})
+                        "sa_org_id": "", "sa_api_key": "", "sa_api_secret": "",
+                        "idac_url": "", "scc_email": ""})
     return jsonify(dict(row))
 
 
@@ -2306,18 +2420,22 @@ def save_org_credentials(org_number):
         INSERT INTO org_credentials
             (org_number, duo_ikey, duo_skey, duo_host,
              scc_api_key, scc_api_secret, scc_org_uuid,
-             sa_org_id, sa_api_key, sa_api_secret, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))
+             sa_org_id, sa_api_key, sa_api_secret, idac_url, scc_email, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
         ON CONFLICT(org_number) DO UPDATE SET
             duo_ikey=excluded.duo_ikey, duo_skey=excluded.duo_skey, duo_host=excluded.duo_host,
             scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret, scc_org_uuid=excluded.scc_org_uuid,
             sa_org_id=excluded.sa_org_id, sa_api_key=excluded.sa_api_key, sa_api_secret=excluded.sa_api_secret,
+            idac_url=excluded.idac_url,
+            scc_email=excluded.scc_email,
             updated_at=datetime('now')
     """, (
         org_number,
         data.get("duo_ikey", "").strip(), data.get("duo_skey", "").strip(), data.get("duo_host", "").strip(),
         data.get("scc_api_key", "").strip(), data.get("scc_api_secret", "").strip(), data.get("scc_org_uuid", "").strip(),
         data.get("sa_org_id", "").strip(), data.get("sa_api_key", "").strip(), data.get("sa_api_secret", "").strip(),
+        data.get("idac_url", "").strip(),
+        data.get("scc_email", "").strip(),
     ))
     conn.commit()
     conn.close()
@@ -2328,6 +2446,7 @@ ORG_CSV_COLS = [
     "org_number", "duo_ikey", "duo_skey", "duo_host",
     "scc_org_uuid", "scc_api_key", "scc_api_secret",
     "sa_org_id", "sa_api_key", "sa_api_secret",
+    "idac_url", "scc_email",
 ]
 
 
@@ -2397,6 +2516,92 @@ def import_org_credentials_csv():
         return jsonify({"status": "ok", "imported": imported, "skipped": skipped})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/global-config", methods=["GET"])
+def get_global_config():
+    """Return global key-value config (CCO credentials etc.)."""
+    conn = _db()
+    cco_user = _get_global_config(conn, "cco_username")
+    cco_pass = _get_global_config(conn, "cco_password")
+    conn.close()
+    return jsonify({"cco_username": cco_user, "cco_password": cco_pass})
+
+
+@app.route("/api/global-config", methods=["POST"])
+def save_global_config():
+    """Save global key-value config."""
+    data = request.get_json(force=True)
+    conn = _db()
+    for key in ("cco_username", "cco_password"):
+        if key in data:
+            _set_global_config(conn, key, (data[key] or "").strip())
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/fetch-idac-url/<org_number>", methods=["POST"])
+def fetch_idac_url_route(org_number):
+    """
+    Run fetch_idac_url_from_dcloud() inside a running VPN container so it can
+    reach the jump host (198.18.133.36 is only reachable via VPN).
+    Uses ?pod_id=POD-N if supplied, otherwise picks the first running vpn-POD-* container.
+    """
+    import subprocess
+
+    pod_id = request.args.get("pod_id", "").strip()
+    if not pod_id:
+        try:
+            out = subprocess.check_output(
+                ["docker", "ps", "--format", "{{.Names}}", "--filter", "name=vpn-POD"],
+                text=True,
+            ).strip()
+            names = [n.strip() for n in out.splitlines() if n.strip()]
+            if not names:
+                return jsonify({"status": "error", "message": "No running VPN container found — start a POD first"}), 500
+            pod_id = names[0].replace("vpn-", "", 1)
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"Docker lookup error: {e}"}), 500
+
+    py_cmd = (
+        "import sys; sys.path.insert(0,'/pipeline'); "
+        "from duo_automation import fetch_idac_url_from_dcloud; "
+        "print(fetch_idac_url_from_dcloud(), end='')"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "--network", f"container:vpn-{pod_id}",
+                "--entrypoint", "python3",
+                "pod-automator:latest", "-c", py_cmd,
+            ],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip()[-400:] or result.stdout.strip()[-200:])
+        idac_url = result.stdout.strip()
+        if not idac_url or "idac.cat-dcloud.com" not in idac_url:
+            raise RuntimeError(
+                f"Unexpected output from container — stdout: {result.stdout[:100]} | stderr: {result.stderr[:100]}"
+            )
+    except subprocess.TimeoutExpired:
+        return jsonify({"status": "error", "message": "Timeout (>600s) fetching iDAC URL — idac_sdk can take ~4min, try again"}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    conn = _db()
+    conn.execute(
+        "UPDATE org_credentials SET idac_url=?, updated_at=datetime('now') WHERE org_number=?",
+        (idac_url, org_number),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok", "idac_url": idac_url, "via_pod": pod_id})
+
+
+
 
 
 # !! DO NOT REMOVE THE DECORATOR BELOW — this has been dropped 3 times by edits inserting new routes above this function !!
@@ -2748,9 +2953,9 @@ DASHBOARD_HTML = """
        </div>
        <span style="font-size:11px;color:#445566;">click to expand</span>
      </div>
-     <!-- Expandable body -->
-     <div id="org-creds-body" style="display:none;padding:0 16px 16px 16px;border-top:1px solid #1a2d4a;">
-       <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:10px 0 8px 0;">
+      <!-- Expandable body -->
+      <div id="org-creds-body" style="display:none;padding:0 16px 16px 16px;border-top:1px solid #1a2d4a;">
+        <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:10px 0 8px 0;">
          <a href="/api/org-credentials/export.csv" download style="padding:5px 12px;background:#0d1e30;border:1px solid #00e68a;color:#00e68a;border-radius:4px;cursor:pointer;font-size:11px;text-decoration:none;">&#8595; Export CSV</a>
          <label style="padding:5px 12px;background:#0d1e30;border:1px solid #ffa502;color:#ffa502;border-radius:4px;cursor:pointer;font-size:11px;">
            &#8593; Import CSV
@@ -2861,6 +3066,9 @@ DASHBOARD_HTML = """
         </div>
       </div>
       <div class="tab-content" id="tab-duo">
+        <div id="duo-actions" style="display:none;margin-bottom:10px;padding:0 16px;gap:8px;">
+          <button id="duo-saml-btn" class="btn-reconnect" onclick="duoSamlSetupCurrent()">&#x21bb; Setup Duo SAML</button>
+        </div>
         <div id="duo-grid" style="padding:16px;min-height:260px;">
           <div style="color:#667788;font-size:13px;">Select a POD to manage Duo setup</div>
         </div>
@@ -2931,7 +3139,9 @@ const PIPELINE_ORDER = [
   "cdfmc_check",
   "ad_verify",
   "duo_setup",
+  "duo_ext_dir",
   "scc_reset_check",
+  "duo_saml_setup",
 ];
 
 async function handleFile(file) {
@@ -3920,23 +4130,6 @@ function toggleOrgCreds() {
   if (open && !document.querySelector('#org-creds-list .org-card')) initOrgCredsList();
 }
 
-function orgCredsNew() {
-  // Ensure panel is open first
-  const body = document.getElementById('org-creds-body');
-  if (body.style.display === 'none') toggleOrgCreds();
-  const row = document.getElementById('org-new-row');
-  row.style.display = 'flex';
-  const inp = document.getElementById('org-num-input');
-  inp.value = '';
-  inp.focus();
-}
-
-function closeOrgCredsForm() {
-  document.getElementById('org-creds-form').style.display = 'none';
-  document.getElementById('org-new-row').style.display = 'none';
-  document.querySelectorAll('.org-card.selected').forEach(el => el.classList.remove('selected'));
-}
-
 async function importOrgCsv(input) {
   const statusEl = document.getElementById('org-import-status');
   if (!input.files.length) return;
@@ -3972,7 +4165,7 @@ async function loadOrgCreds(orgNum) {
   formEl.style.display = 'block';
   formEl.innerHTML = '<div style="color:#667788;font-size:12px;">Loading...</div>';
 
-  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', scc_api_key:'', scc_api_secret:'', scc_org_uuid:'', sa_org_id:'', sa_api_key:'', sa_api_secret:''};
+  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', scc_api_key:'', scc_api_secret:'', scc_org_uuid:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', idac_url:'', scc_email:''};
   try {
     const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum));
     d = await r.json();
@@ -4002,6 +4195,20 @@ async function loadOrgCreds(orgNum) {
     + col('SA Org ID', 'sa_org_id', d.sa_org_id, '8381539', false)
     + col('API Key', 'sa_api_key', d.sa_api_key, '6671146f...', false)
     + col('API Secret', 'sa_api_secret', d.sa_api_secret, 'Secret...', true)
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">iDAC / SCC Auto-Login</div>'
+    + '<div style="grid-column:1/-1;">'
+    + lbl('SCC Admin Email')
+    + inp('scc_email', d.scc_email || '', 'maokuma@cisco.com', false)
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Cisco account email used to log into security.cisco.com (Mac browser mode). Varies per facilitator.</div>'
+    + '</div>'
+    + '<div style="grid-column:1/-1;">'
+    + lbl('iDAC Auto-Login URL')
+    + '<div style="display:flex;gap:6px;align-items:center;">'
+    + inp('idac_url', d.idac_url || '', 'https://idac.cat-dcloud.com/loaders/loader-cisco-wheel-autologin-saml.php?id=...', false)
+    + '<button id="oc-fetch-idac-btn" style="padding:4px 10px;background:#0d1e30;border:1px solid #ffa502;color:#ffa502;border-radius:4px;cursor:pointer;font-size:11px;white-space:nowrap;flex-shrink:0;">&#8635; Fetch</button>'
+    + '</div>'
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Used in Docker/pipeline mode. Click &#8635; Fetch to auto-retrieve from the lab jump host (VPN must be connected).</div>'
+    + '</div>'
     + '</div>'
     + '<div style="display:flex;gap:8px;align-items:center;margin-top:4px;">'
     + '<button id="oc-save-btn" style="padding:5px 14px;background:#0d4f6e;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:12px;">Save Org ' + escHtml(orgNum) + '</button>'
@@ -4026,6 +4233,8 @@ async function loadOrgCreds(orgNum) {
         sa_org_id:     document.getElementById('oc-sa_org_id').value.trim(),
         sa_api_key:    document.getElementById('oc-sa_api_key').value.trim(),
         sa_api_secret: document.getElementById('oc-sa_api_secret').value.trim(),
+        idac_url:      document.getElementById('oc-idac_url') ? document.getElementById('oc-idac_url').value.trim() : '',
+        scc_email:     document.getElementById('oc-scc_email') ? document.getElementById('oc-scc_email').value.trim() : '',
       };
       try {
         const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum),
@@ -4036,7 +4245,35 @@ async function loadOrgCreds(orgNum) {
         } else { status.style.color = '#ff4757'; status.textContent = '\u2717 Save failed'; }
       } catch(e) { status.style.color = '#ff4757'; status.textContent = '\u2717 ' + e.message; }
     };
+    // Fetch iDAC URL button
+    const fetchBtn = document.getElementById('oc-fetch-idac-btn');
+    if (fetchBtn) {
+      fetchBtn.onclick = () => fetchIdacUrl(orgNum);
+    }
   }, 0);
+}
+
+async function fetchIdacUrl(orgNum) {
+  const fetchBtn = document.getElementById('oc-fetch-idac-btn');
+  const status   = document.getElementById('oc-status');
+  const urlInput = document.getElementById('oc-idac_url');
+  if (fetchBtn) { fetchBtn.disabled = true; fetchBtn.textContent = 'Fetching...'; }
+  if (status)   { status.style.color = '#ffa502'; status.textContent = 'Fetching iDAC URL from dCloud...'; }
+  try {
+    const r = await fetch('/api/fetch-idac-url/' + encodeURIComponent(orgNum), {method:'POST'});
+    const d = await r.json();
+    if (d.status === 'ok' && d.idac_url) {
+      if (urlInput) urlInput.value = d.idac_url;
+      if (status) { status.style.color = '#00e68a'; status.textContent = '\u2713 iDAC URL fetched — click Save to persist'; }
+    } else {
+      const msg = d.message || 'Unknown error';
+      if (status) { status.style.color = '#ff4757'; status.textContent = '\u2717 ' + msg; }
+    }
+  } catch(e) {
+    if (status) { status.style.color = '#ff4757'; status.textContent = '\u2717 ' + e.message; }
+  } finally {
+    if (fetchBtn) { fetchBtn.disabled = false; fetchBtn.textContent = '\u21BB Fetch'; }
+  }
 }
 
 // ── SCC Reset Checklist ──────────────────────────────────────────
@@ -4086,10 +4323,12 @@ async function loadDuoPanel(podId) {
     var savedHost = hk ? hk.value : '';
   }
 
-  // Fetch stored credentials + latest duo_setup step result
+  // Fetch stored credentials + latest duo_setup + duo_saml_setup step results
   let keysD = {duo_ikey: '', duo_skey: '', duo_host: ''};
   let stepResult = '';
   let stepStatus = '';
+  let samlResult = '';
+  let samlStatus = '';
   try {
     const kr = await fetch('/api/pod-duo-keys/' + podId);
     keysD = await kr.json();
@@ -4099,6 +4338,8 @@ async function loadDuoPanel(podId) {
     const steps = await sr.json();
     const s = (steps || []).find(x => x.step_name === 'duo_setup');
     if (s) { stepResult = s.result || ''; stepStatus = s.status || ''; }
+    const ss = (steps || []).find(x => x.step_name === 'duo_saml_setup');
+    if (ss) { samlResult = ss.result || ''; samlStatus = ss.status || ''; }
   } catch(e) {}
 
   if (window._duoKeysDirty) {
@@ -4109,6 +4350,8 @@ async function loadDuoPanel(podId) {
 
   const statusColor = stepStatus === 'completed' ? '#00e68a' : stepStatus === 'failed' ? '#ff4757' : stepStatus === 'running' ? '#ffa502' : '#667788';
   const statusIcon  = stepStatus === 'completed' ? '✓' : stepStatus === 'failed' ? '✗' : stepStatus === 'running' ? '⟳' : '○';
+  const samlColor   = samlStatus === 'completed' ? '#00e68a' : samlStatus === 'failed' ? '#ff4757' : samlStatus === 'running' ? '#ffa502' : '#667788';
+  const samlIcon    = samlStatus === 'completed' ? '✓' : samlStatus === 'failed' ? '✗' : samlStatus === 'running' ? '⟳' : '○';
 
   grid.innerHTML =
     '<div class="switch-card" style="margin-bottom:12px;">'
@@ -4125,15 +4368,32 @@ async function loadDuoPanel(podId) {
     + '</div>'
     + '<div id="duo-keys-status" style="font-size:11px;color:#667788;margin-top:4px;min-height:16px;"></div>'
     + '</div>'
-    + '<div class="switch-card">'
+    + '<div class="switch-card" style="margin-bottom:12px;">'
     + '<div class="switch-card-title"><span class="role-tag ' + (stepStatus === 'completed' ? 'pass' : 'cc') + '">' + stepStatus.toUpperCase() + '</span>'
     + '<span style="color:#e0e6ed;font-size:13px;font-weight:600;">duo_setup — Last Run</span>'
     + '<span style="margin-left:auto;font-size:18px;color:' + statusColor + ';">' + statusIcon + '</span></div>'
     + (stepResult
         ? '<div style="font-size:12px;font-family:monospace;color:#c0ccd8;background:#0a1628;border-radius:4px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;word-break:break-all;">'
-          + escHtml(stepResult.replace(/\s*\|\s*/g, '\\n')) + '</div>'
-        : '<div style="color:#445566;font-size:12px;margin-top:6px;">No result yet — run the pipeline to execute this step.</div>')
+           + escHtml(stepResult.replace(/\s*\|\s*/g, '\\n')) + '</div>'
+         : '<div style="color:#445566;font-size:12px;margin-top:6px;">No result yet — run the pipeline to execute this step.</div>')
+     + '</div>'
+     + '<div class="switch-card">'
+     + '<div class="switch-card-title"><span class="role-tag ' + (samlStatus === 'completed' ? 'pass' : samlStatus === 'failed' ? 'fail' : 'cc') + '">' + (samlStatus || 'pending').toUpperCase() + '</span>'
+     + '<span style="color:#e0e6ed;font-size:13px;font-weight:600;">duo_saml_setup — SA+Duo SAML/SCIM</span>'
+     + '<span style="margin-left:auto;font-size:18px;color:' + samlColor + ';">' + samlIcon + '</span></div>'
+     + '<div style="font-size:11px;color:#667788;margin-top:4px;">Configures Duo as IdP for Secure Access SSO via SAML, and syncs users via SCIM. Requires iDAC URL in Org Credentials.</div>'
+     + (samlResult
+         ? '<div style="font-size:12px;font-family:monospace;color:#c0ccd8;background:#0a1628;border-radius:4px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;word-break:break-all;">'
+           + escHtml(samlResult.replace(/\s*\|\s*/g, '\\n')) + '</div>'
+        : '<div style="color:#445566;font-size:12px;margin-top:6px;">Not yet run — click "Setup Duo SAML" to execute.</div>')
     + '</div>';
+
+  // Show action buttons
+  const actionsEl = document.getElementById('duo-actions');
+  if (actionsEl) {
+    actionsEl.style.display = 'flex';
+    window._duoSamlCurrentPodId = podId;
+  }
 
   setTimeout(() => {
     const saveBtn = document.getElementById('duo-keys-save-btn');
@@ -4209,7 +4469,7 @@ async function loadSaPanel(podId) {
     + '</div>'
     + '<div class="switch-card">'
     + '<div class="switch-card-title"><span class="role-tag cc">INFO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automation Status</span></div>'
-    + '<div style="font-size:12px;color:#667788;margin-top:6px;">SA automation (SCIM token provisioning, SAML/SSO) is pending DevTools capture of internal API endpoints. Keys stored here will be used once automation is implemented.</div>'
+    + '<div style="font-size:12px;color:#667788;margin-top:6px;">SA SCIM token provisioning and Duo SAML/SCIM integration are automated via the <b>duo_saml_setup</b> pipeline step. Configure iDAC URL in Org Credentials then click "Setup Duo SAML" in the Duo tab.</div>'
     + '</div>';
 
   setTimeout(() => {
@@ -4399,6 +4659,43 @@ async function sccUnconfirm(podId, itemKey) {
 
 async function sccRecheckCurrent() {
   if (window._sccCurrentPodId) sccRecheck(window._sccCurrentPodId);
+}
+
+async function duoSamlSetupCurrent() {
+  const podId = window._duoSamlCurrentPodId;
+  if (!podId) return;
+  const grid = document.getElementById('duo-grid');
+  await fetch('/api/duo-saml-setup/' + podId, { method: 'POST' });
+
+  // Poll for completion
+  let polls = 0;
+  const MAX_POLLS = 120; // 10 min max (5s interval)
+  const notice = document.createElement('div');
+  notice.id = 'duo-saml-status-notice';
+  notice.style.cssText = 'padding:10px 0;color:#02c8ff;font-size:13px;';
+  notice.textContent = '⟳ Running SA+Duo SAML/SCIM setup (this may take ~60s)...';
+  if (grid) grid.prepend(notice);
+
+  const poller = setInterval(async () => {
+    polls++;
+    try {
+      const r = await fetch('/api/pipeline-steps/' + podId);
+      const steps = await r.json();
+      const s = (steps || []).find(x => x.step_name === 'duo_saml_setup');
+      if (s && s.status !== 'running') {
+        clearInterval(poller);
+        loadDuoPanel(podId);
+        return;
+      }
+      const n = document.getElementById('duo-saml-status-notice');
+      if (n) n.textContent = '⟳ Running SA+Duo SAML/SCIM setup (' + (polls * 5) + 's)...';
+      if (polls >= MAX_POLLS) {
+        clearInterval(poller);
+        loadDuoPanel(podId);
+      }
+    } catch(e) { /* keep polling */ }
+  }, 5000);
+  window._duoSamlPoller = poller;
 }
 
 async function sccRecheck(podId) {

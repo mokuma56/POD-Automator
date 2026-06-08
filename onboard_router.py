@@ -10,16 +10,25 @@ urllib3.disable_warnings()
 def _parse_vrfs(output: str):
     """Parse 'show vrf' output and return (has_mgmt, extra_vrfs).
     Filters purely in Python — no SSH pipes used.
-    VRF name lines start at column 0; interface continuation lines are indented.
+    On C9300/IOS XE, all VRF name lines are indented with 2 spaces; continuation
+    interface lines are deeply indented (only 1 token when split by 2+ spaces).
+    We use column splitting to distinguish VRF name lines (2+ columns) from
+    continuation lines (1 column = just an interface name).
     """
     SKIP = {"Mgmt-vrf", "Default", "Name", "show", "vrf"}
     has_mgmt = "Mgmt-vrf" in output
     extra_vrfs = []
     for line in output.splitlines():
-        # Indented lines = interface members, skip them
-        if not line or line[0] == " ":
+        stripped = line.strip()
+        if not stripped:
             continue
-        first = line.split()[0] if line.split() else ""
+        # Split on 2+ consecutive spaces to identify distinct columns.
+        # VRF name lines: "Main  65000:1  ipv4,ipv6  Gi1/0/47" → 4 tokens
+        # Continuation interface lines: "Lo103" → 1 token → skip
+        tokens = re.split(r'\s{2,}', stripped)
+        if len(tokens) < 2:
+            continue  # continuation interface line
+        first = tokens[0]
         # Skip command echo lines (e.g. "show vrf")
         if first.lower() in ("show", "vrf"):
             continue
@@ -1215,13 +1224,36 @@ def run_switch_checks(step_name):
         ver_ok, ver_str = _parse_version_str(out_ver)
         parts.append(f"{'PASS' if ver_ok else 'FAIL'}: Version {ver_str}")
 
-        # VLAN
+        # VLAN — only VLAN 1, VLAN 5 (DNAC), and internal VLANs 1002-1005 expected
         out = switch_cmd(shell, "show vlan brief")
-        has_vlan5 = any("5" in l and "DNAC" in l for l in out.splitlines())
-        parts.append(f"{'PASS' if has_vlan5 else 'FAIL'}: VLAN 5 {'present' if has_vlan5 else 'missing'}")
+        vlan_lines = [l for l in out.splitlines() if l.strip() and l[0].isdigit()]
+        non_default = []
+        for l in vlan_lines:
+            try:
+                vid = int(l.split()[0])
+            except ValueError:
+                continue
+            if vid in (1, 5) or 1002 <= vid <= 1005:
+                continue
+            non_default.append(l)
+        vlan_ok = len(non_default) == 0
+        parts.append(f"{'PASS' if vlan_ok else 'FAIL'}: VLAN check ({'only VLAN 1+5' if vlan_ok else f'extra: {[l.split()[0] for l in non_default]}'})")
+
+        # AAA — only the 3 base-config lines (plus aaa new-model) are allowed
+        out_aaa = switch_cmd(shell, "show run | include ^aaa")
+        ALLOWED_AAA = {
+            "aaa new-model",
+            "aaa authentication login default local",
+            "aaa authorization exec default local",
+            "aaa authorization network default local",
+        }
+        aaa_lines = [l.strip() for l in out_aaa.splitlines() if l.strip().startswith("aaa")]
+        extra_aaa = [l for l in aaa_lines if l not in ALLOWED_AAA]
+        aaa_ok = len(extra_aaa) == 0
+        parts.append(f"{'PASS' if aaa_ok else 'FAIL'}: AAA {'clean' if aaa_ok else f'extra: {extra_aaa[:3]}'}")
 
     else:
-        # Leaf switches — VRF, version, VLAN
+        # Leaf switches — VRF, version, VLAN, AAA
         out_vrf = switch_cmd(shell, "show vrf")
         has_mgmt, extra_vrfs = _parse_vrfs(out_vrf)
         parts.append(f"PASS: VRF OK (Mgmt-vrf only)" if (has_mgmt and not extra_vrfs) else f"FAIL: extra VRFs {extra_vrfs or 'Mgmt-vrf missing'}")
@@ -1230,17 +1262,39 @@ def run_switch_checks(step_name):
         ver_ok, ver_str = _parse_version_str(out_ver)
         parts.append(f"{'PASS' if ver_ok else 'FAIL'}: Version {ver_str}")
 
+        # VLAN — only VLAN 1 and internal VLANs 1002-1005 expected after base config
         out = switch_cmd(shell, "show vlan brief")
         vlan_lines = [l for l in out.splitlines() if l.strip() and l[0].isdigit()]
-        non_default = [l for l in vlan_lines if not l.startswith("1 ") and not l.startswith("1\t")
-                       and not l.startswith("100") and not l.startswith("999")]
+        non_default = []
+        for l in vlan_lines:
+            try:
+                vid = int(l.split()[0])
+            except ValueError:
+                continue
+            if vid == 1 or 1002 <= vid <= 1005:
+                continue
+            non_default.append(l)
         vlan_ok = len(non_default) == 0
         parts.append(f"{'PASS' if vlan_ok else 'FAIL'}: VLAN check ({'only default' if vlan_ok else f'extra: {[l.split()[0] for l in non_default]}'})")
+
+        # AAA — only the 3 base-config lines (plus aaa new-model) are allowed
+        out_aaa = switch_cmd(shell, "show run | include ^aaa")
+        ALLOWED_AAA = {
+            "aaa new-model",
+            "aaa authentication login default local",
+            "aaa authorization exec default local",
+            "aaa authorization network default local",
+        }
+        aaa_lines = [l.strip() for l in out_aaa.splitlines() if l.strip().startswith("aaa")]
+        extra_aaa = [l for l in aaa_lines if l not in ALLOWED_AAA]
+        aaa_ok = len(extra_aaa) == 0
+        parts.append(f"{'PASS' if aaa_ok else 'FAIL'}: AAA {'clean' if aaa_ok else f'extra: {extra_aaa[:3]}'}")
 
     client.close()
     result = " | ".join(parts)
     print(f"  {result}")
-    return True, result
+    overall_ok = "FAIL" not in result
+    return overall_ok, result
 
 
 def phase_connectivity_test():
