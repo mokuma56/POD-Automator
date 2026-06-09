@@ -1297,6 +1297,63 @@ def run_switch_checks(step_name):
     return overall_ok, result
 
 
+def phase_redeploy_config_group(s):
+    """Re-deploy PseudocoBranches config group after router is online.
+    Ensures vManage config group is in sync with the running device config.
+    Runs as a soft-fail step — will not block the pipeline on failure.
+    """
+    print("  Re-deploying config group to ensure sync...")
+    try:
+        r = s.post(
+            f"{VMANAGE}/dataservice/v1/config-group/{CG_ID}/device/deploy",
+            json={"devices": [{"id": UUID}]}, timeout=30
+        )
+        if r.status_code != 200:
+            return False, f"Deploy POST failed: {r.status_code} {r.text[:200]}"
+        try:
+            task_id = r.json().get("parentTaskId", r.json().get("id", ""))
+        except Exception:
+            task_id = ""
+        print(f"  Redeploy: task={task_id[:60]}")
+
+        # Poll up to 3 minutes for In Sync or task completion
+        for i in range(36):
+            time.sleep(5)
+            try:
+                devs = s.get(f"{VMANAGE}/dataservice/system/device/vedges", timeout=10).json().get("data", [])
+                dev = next((d for d in devs if UUID in d.get("uuid", "")), None)
+                if dev and dev.get("configStatusMessage", "") == "In Sync":
+                    print(f"  Redeploy: In Sync after {(i+1)*5}s")
+                    return True, f"Config group in sync after {(i+1)*5}s"
+            except Exception:
+                pass
+            if task_id:
+                try:
+                    tr = s.get(f"{VMANAGE}/dataservice/device/action/status/{task_id}", timeout=10)
+                    if tr.status_code == 200:
+                        status = tr.json().get("status", "") or \
+                                 (tr.json().get("data") or [{}])[0].get("status", "")
+                        if "done" in status.lower():
+                            return True, f"Deploy task done after {(i+1)*5}s"
+                        elif status.lower() in ("error", "fail", "failure"):
+                            detail = (tr.json().get("data") or [{}])[0].get("details", "")
+                            return False, f"Deploy task failed: {detail[:200]}"
+                except Exception:
+                    pass
+
+        # Final status check after timeout
+        try:
+            devs = s.get(f"{VMANAGE}/dataservice/system/device/vedges", timeout=10).json().get("data", [])
+            dev = next((d for d in devs if UUID in d.get("uuid", "")), None)
+            sync_status = dev.get("configStatusMessage", "unknown") if dev else "device not found"
+            return True, f"Deploy sent — final config status: {sync_status}"
+        except Exception:
+            return True, "Deploy sent (final status check failed)"
+
+    except Exception as e:
+        return False, f"Redeploy exception: {e}"
+
+
 def phase_connectivity_test():
     results = []
     for name, info in SWITCHES.items():
