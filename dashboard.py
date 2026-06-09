@@ -161,7 +161,8 @@ def _migrate():
     """)
     # Migration: add authproxy + SAML columns if upgrading from older schema
     for _col in ("authproxy_ikey", "authproxy_skey",
-                 "idac_url", "duo_saml_app_ikey", "sa_saml_profile_id"):
+                 "idac_url", "duo_saml_app_ikey", "sa_saml_profile_id",
+                 "scc_password"):
         try:
             conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
         except Exception:
@@ -1116,7 +1117,7 @@ def api_duo_ext_dir_setup_sync(pod_id):
     try:
         import importlib, duo_automation
         importlib.reload(duo_automation)
-        ok, result = duo_automation.duo_ext_dir_and_sso_setup(pod_id, db_path)
+        ok, result = duo_automation.duo_push_authproxy_config(pod_id, db_path)
         return jsonify({"ok": ok, "result": result})
     except Exception as e:
         return jsonify({"ok": False, "result": str(e)}), 500
@@ -2407,7 +2408,7 @@ def get_org_credentials(org_number):
         return jsonify({"org_number": org_number, "duo_ikey": "", "duo_skey": "", "duo_host": "",
                         "scc_api_key": "", "scc_api_secret": "", "scc_org_uuid": "",
                         "sa_org_id": "", "sa_api_key": "", "sa_api_secret": "",
-                        "idac_url": "", "scc_email": ""})
+                        "idac_url": "", "scc_email": "", "scc_password": ""})
     return jsonify(dict(row))
 
 
@@ -2420,14 +2421,15 @@ def save_org_credentials(org_number):
         INSERT INTO org_credentials
             (org_number, duo_ikey, duo_skey, duo_host,
              scc_api_key, scc_api_secret, scc_org_uuid,
-             sa_org_id, sa_api_key, sa_api_secret, idac_url, scc_email, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+             sa_org_id, sa_api_key, sa_api_secret, idac_url, scc_email, scc_password, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
         ON CONFLICT(org_number) DO UPDATE SET
             duo_ikey=excluded.duo_ikey, duo_skey=excluded.duo_skey, duo_host=excluded.duo_host,
             scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret, scc_org_uuid=excluded.scc_org_uuid,
             sa_org_id=excluded.sa_org_id, sa_api_key=excluded.sa_api_key, sa_api_secret=excluded.sa_api_secret,
             idac_url=excluded.idac_url,
             scc_email=excluded.scc_email,
+            scc_password=excluded.scc_password,
             updated_at=datetime('now')
     """, (
         org_number,
@@ -2436,6 +2438,7 @@ def save_org_credentials(org_number):
         data.get("sa_org_id", "").strip(), data.get("sa_api_key", "").strip(), data.get("sa_api_secret", "").strip(),
         data.get("idac_url", "").strip(),
         data.get("scc_email", "").strip(),
+        data.get("scc_password", "").strip(),
     ))
     conn.commit()
     conn.close()
@@ -2446,7 +2449,7 @@ ORG_CSV_COLS = [
     "org_number", "duo_ikey", "duo_skey", "duo_host",
     "scc_org_uuid", "scc_api_key", "scc_api_secret",
     "sa_org_id", "sa_api_key", "sa_api_secret",
-    "idac_url", "scc_email",
+    "idac_url", "scc_email", "scc_password",
 ]
 
 
@@ -4199,8 +4202,13 @@ async function loadOrgCreds(orgNum) {
     + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">iDAC / SCC Auto-Login</div>'
     + '<div style="grid-column:1/-1;">'
     + lbl('SCC Admin Email')
-    + inp('scc_email', d.scc_email || '', 'maokuma@cisco.com', false)
+    + inp('scc_email', d.scc_email || '', 'ciscoxar1@gmail.com', false)
     + '<div style="font-size:10px;color:#445566;margin-top:2px;">Cisco account email used to log into security.cisco.com (Mac browser mode). Varies per facilitator.</div>'
+    + '</div>'
+    + '<div style="grid-column:1/-1;">'
+    + lbl('SCC Admin Password')
+    + inp('scc_password', d.scc_password || '', 'C1sco12345!!', true)
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Password for SCC admin email. When set, fully automates Duo browser steps — no manual MFA needed.</div>'
     + '</div>'
     + '<div style="grid-column:1/-1;">'
     + lbl('iDAC Auto-Login URL')
@@ -4236,6 +4244,7 @@ async function loadOrgCreds(orgNum) {
         sa_api_secret: document.getElementById('oc-sa_api_secret').value.trim(),
         idac_url:      document.getElementById('oc-idac_url') ? document.getElementById('oc-idac_url').value.trim() : '',
         scc_email:     document.getElementById('oc-scc_email') ? document.getElementById('oc-scc_email').value.trim() : '',
+        scc_password:  document.getElementById('oc-scc_password') ? document.getElementById('oc-scc_password').value.trim() : '',
       };
       try {
         const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum),
