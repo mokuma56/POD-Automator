@@ -2805,27 +2805,23 @@ def _scc_org_number_from_pod() -> str:
 
 def phase_duo_ext_dir_setup() -> tuple[bool, str]:
     """
-    External Directory (AD sync) + SSO Auth Proxy setup for this POD's Duo org.
+    Push authproxy.cfg ([cloud] + [ad_client]) to AD1 via WinRM and restart
+    DuoAuthProxy.  No browser or Cisco Okta MFA required.
 
     Runs after duo_setup.  Requires:
-      - Auth proxy installed on AD1 (handled by duo_setup)
-      - authproxy_ikey/skey in org_credentials (stored by duo_setup)
-      - idac_url configured in org_credentials
+      - duo_ikey/skey/host in org_credentials (set by duo_setup)
+      - authproxy_ikey/skey in org_credentials OR fetchable via Duo Admin API
 
-    Calls duo_automation.duo_ext_dir_and_sso_setup() which:
-      Part 1 – External Directory:
-        Users → External Directories → Add AD, push clean [cloud] to AD1,
-        Test Connection, configure DC 198.18.5.102:389 / groups / attrs, Sync Now
-      Part 2 – SSO Auth Proxy:
-        Applications → SSO Settings → add AD source, capture [sso] config,
-        push to AD1, run enrollment command, verify Connected,
-        configure DC, add permitted domain corp.pseudoco.com, set routing rule
+    Uses duo_automation.duo_push_authproxy_config() which:
+      1. Loads/creates auth proxy integration credentials via Duo Admin API
+      2. Builds authproxy.cfg with [cloud] + [ad_client] (198.18.5.102:389)
+      3. Pushes cfg to AD1 via WinRM (DockerWinRMSession on Mac, direct in Docker)
+      4. Restarts DuoAuthProxy service and verifies Running state
+
+    The [sso] section + authproxyctl enrollment are handled later by
+    duo_saml_setup once duo_saml_app_ikey is available.
 
     Returns (ok, result_string).
-
-    When running inside Docker (pipeline container), delegates to the dashboard
-    host process via http://host.docker.internal:5050/api/duo-ext-dir-setup-sync/{pod_id}
-    because Playwright (headless browser) needs the host network stack.
     """
     DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     POD_ID  = os.environ.get("POD_ID", "")
@@ -2833,24 +2829,8 @@ def phase_duo_ext_dir_setup() -> tuple[bool, str]:
     if not POD_ID:
         return False, "POD_ID env var not set"
 
-    if os.path.exists("/.dockerenv"):
-        import urllib.request, json as _json
-        dashboard_url = os.environ.get("DASHBOARD_URL", "http://192.168.65.254:5050")
-        try:
-            req = urllib.request.Request(
-                f"{dashboard_url}/api/duo-ext-dir-setup-sync/{POD_ID}",
-                method="POST",
-                headers={"Content-Type": "application/json"},
-                data=b"{}",
-            )
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                data = _json.loads(resp.read())
-            return data.get("ok", False), data.get("result", "no result from host")
-        except Exception as e:
-            return False, f"Host delegation failed: {e}"
-
-    from duo_automation import duo_ext_dir_and_sso_setup
-    return duo_ext_dir_and_sso_setup(POD_ID, DB_PATH)
+    from duo_automation import duo_push_authproxy_config
+    return duo_push_authproxy_config(POD_ID, DB_PATH)
 
 
 def phase_scc_reset_check():
