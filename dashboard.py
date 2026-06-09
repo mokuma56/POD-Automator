@@ -3132,6 +3132,7 @@ const PIPELINE_ORDER = [
   "copy_bootstrap",
   "controller_mode_enable",
   "verify_online",
+  "redeploy_config_group",
   "verify_border_spine",
   "verify_leaf1",
   "verify_leaf2",
@@ -3509,7 +3510,7 @@ async function loadSteps(podId) {
   const done    = steps.filter(s => s.status === 'completed' || s.status === 'skipped').length;
   const skipped = steps.filter(s => s.status === 'skipped').length;
   const running = steps.some(s => s.status === 'running');
-  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify','duo_setup','scc_reset_check']);
+  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','redeploy_config_group','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify','duo_setup','scc_reset_check']);
   const hardFailed = steps.some(s => s.status === 'failed' && !SOFT_FAIL.has(s.step_name));
   const softFailed = steps.some(s => s.status === 'failed' && SOFT_FAIL.has(s.step_name));
   const allAccountedFor = steps.length > 0 && steps.every(s => s.status === 'completed' || s.status === 'skipped' || s.status === 'failed');
