@@ -12,7 +12,41 @@ import urllib.parse
 import email.utils
 import time
 import re
+import os
 import requests
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Persistent SCC browser session
+# Saved after every successful SCC login; loaded on subsequent runs to skip
+# Cisco Okta + Duo MFA entirely.  When the session expires the browser will
+# redirect back to sign-on.security.cisco.com and the login flow runs again
+# (one Duo push approval), after which the new session is saved.
+# ──────────────────────────────────────────────────────────────────────────────
+_SCC_SESSION_FILE = os.path.join(
+    "/pipeline/host-data" if os.path.exists("/.dockerenv")
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+    "scc_session.json",
+)
+
+
+def _scc_session_kwargs() -> dict:
+    """Return storage_state kwarg for Playwright new_context() when a saved
+    SCC session file exists.  Passing this skips Okta / Duo MFA on reuse."""
+    if os.path.exists(_SCC_SESSION_FILE):
+        return {"storage_state": _SCC_SESSION_FILE}
+    return {}
+
+
+def _save_scc_session(ctx, log=None) -> None:
+    """Persist the browser session state so future runs skip Okta MFA."""
+    try:
+        os.makedirs(os.path.dirname(_SCC_SESSION_FILE), exist_ok=True)
+        ctx.storage_state(path=_SCC_SESSION_FILE)
+        if log:
+            log(f"SCC session saved → {_SCC_SESSION_FILE}")
+    except Exception as exc:
+        if log:
+            log(f"WARNING: could not save SCC session: {exc}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1233,14 +1267,15 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
     except Exception as e:
         return False, f"DB read error: {e}"
 
-    duo_ikey   = oc.get("duo_ikey", "").strip()
-    duo_skey   = oc.get("duo_skey", "").strip()
-    duo_host   = oc.get("duo_host", "").strip()
-    sa_api_key = oc.get("sa_api_key", "").strip()
-    sa_api_sec = oc.get("sa_api_secret", "").strip()
-    sa_org_id  = oc.get("sa_org_id", "").strip()
-    idac_url   = oc.get("idac_url", "").strip()
-    scc_email  = oc.get("scc_email", "").strip()
+    duo_ikey      = oc.get("duo_ikey", "").strip()
+    duo_skey      = oc.get("duo_skey", "").strip()
+    duo_host      = oc.get("duo_host", "").strip()
+    sa_api_key    = oc.get("sa_api_key", "").strip()
+    sa_api_sec    = oc.get("sa_api_secret", "").strip()
+    sa_org_id     = oc.get("sa_org_id", "").strip()
+    idac_url      = oc.get("idac_url", "").strip()
+    scc_email     = oc.get("scc_email", "").strip()
+    scc_password  = oc.get("scc_password", "").strip()
 
     import os as _os
     _in_docker = _os.path.exists("/.dockerenv")
@@ -1251,24 +1286,30 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
         return False, "SA API credentials not configured for this org"
     if not sa_org_id:
         return False, "SA org ID not configured for this org"
-    if _in_docker and not idac_url:
-        return False, (
-            "iDAC auto-login URL not configured — "
-            "paste the SCC auto-login URL in Org Credentials → iDAC URL field"
-        )
-    if not _in_docker and not scc_email:
-        return False, (
-            "scc_email not configured — set it in Org Credentials for this org"
-        )
+    has_direct_creds = bool(scc_email and scc_password)
+    if not has_direct_creds:
+        if _in_docker and not idac_url:
+            return False, (
+                "iDAC auto-login URL not configured — "
+                "paste the SCC auto-login URL in Org Credentials → iDAC URL field"
+            )
+        if not _in_docker and not scc_email:
+            return False, (
+                "scc_email not configured — set it in Org Credentials for this org"
+            )
 
     # ── 2. Browser session: Okta token + Duo admin cookies ───────────────────
     _log("launching browser session (SCC + Duo admin authentication)...")
     try:
-        if _in_docker:
+        if _in_docker and not scc_password:
+            # Docker without direct creds: use iDAC auto-login
             sessions = get_browser_sessions(idac_url, duo_host, log=_log)
         else:
+            # Mac or Docker-with-password: use get_browser_sessions_mac
+            # (auto-detects headless when in Docker + scc_password set)
             sessions = get_browser_sessions_mac(
                 duo_host, scc_email, org_num, log=_log,
+                scc_password=scc_password,
             )
     except Exception as e:
         return False, f"Browser authentication failed: {e}"
@@ -1393,6 +1434,80 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
             )
     except Exception as e:
         _log(f"WARN: DB persist failed: {e}")
+
+    # ── 13. Push [sso] section to authproxy.cfg + run enrollment ──────────────
+    # Fetch the SAML app's secret key from the Duo Admin API, then build the
+    # [sso] section and append it to the existing authproxy.cfg on AD1.
+    # After writing, run 'authproxyctl enroll' which contacts Duo cloud and
+    # inserts 'rikey=' into the [sso] section; then restart to activate.
+    _log("fetching SAML app secret key from Duo Admin API ...")
+    try:
+        _integ_resp = _duo_request(
+            duo_ikey, duo_skey, duo_host,
+            "GET", f"/admin/v1/integrations/{app_ikey}",
+        )
+        app_skey = _integ_resp.get("response", {}).get("secret_key", "")
+        if not app_skey:
+            raise ValueError("secret_key empty in integration response")
+        _log(f"SAML app skey fetched ({len(app_skey)} chars)")
+    except Exception as e:
+        _log(f"WARN: could not fetch SAML app skey ({e}) — skipping [sso] push")
+        app_skey = ""
+
+    if app_skey:
+        try:
+            _log("connecting to AD1 via WinRM for [sso] push ...")
+            _sso_winrm = _winrm_connect_for_pod(pod_id, log=_log)
+
+            # Read current authproxy.cfg, strip any prior [sso] block
+            import re as _re_sso
+            _current = _winrm_read_file(_sso_winrm, AUTHPROXY_CFG_PATH)
+            _clean = _re_sso.sub(
+                r'\[sso\].*?(?=\[|\Z)', '', _current, flags=_re_sso.DOTALL
+            ).rstrip()
+
+            # Append new [sso] section (rikey will be added by authproxyctl enroll)
+            _sso_section = (
+                "\n\n[sso]\n"
+                f"ikey={app_ikey}\n"
+                f"skey={app_skey}\n"
+                f"api_host={duo_host}\n"
+            )
+            _new_cfg = _clean + _sso_section
+            _log("appending [sso] to authproxy.cfg and restarting ...")
+            _ok_sso, _msg_sso = _winrm_write_restart_cfg(_sso_winrm, _new_cfg, _log)
+            if not _ok_sso:
+                _log(f"WARN: [sso] write/restart failed: {_msg_sso}")
+            else:
+                _log(f"[sso] write: {_msg_sso}")
+                # Run authproxyctl enroll — inserts rikey= into [sso]
+                _log(f"running authproxyctl enroll on AD1 ...")
+                _enroll_args = (
+                    f"enroll --ikey {app_ikey} --skey {app_skey} "
+                    f"--api-host {duo_host}"
+                )
+                _ok_enroll, _out_enroll = _winrm_run_cmd(
+                    _sso_winrm,
+                    f"'{AUTHPROXY_ENROLL_EXE}' {_enroll_args}",
+                    _log,
+                )
+                _log(f"enroll output: {_out_enroll[:200]}")
+                # Restart once more to pick up the rikey written by enroll
+                _log("restarting DuoAuthProxy to activate rikey ...")
+                _sso_winrm.run_ps(
+                    "Restart-Service DuoAuthProxy -Force -ErrorAction SilentlyContinue; "
+                    "Start-Sleep 5; "
+                    "$s = Get-Service DuoAuthProxy -ErrorAction SilentlyContinue; "
+                    "if ($s) { Write-Output \"STATUS:$($s.Status)\" }"
+                )
+
+            if hasattr(_sso_winrm, "close"):
+                try:
+                    _sso_winrm.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            _log(f"WARN: [sso] push/enroll error (non-fatal): {e}")
 
     result = (
         f"SA+Duo SAML/SCIM setup complete | "
@@ -1608,18 +1723,26 @@ def get_browser_sessions_mac(
         scc_email: str,
         org_number: str,
         timeout_ms: int = 180_000,
-        log=None) -> dict:
+        log=None,
+        scc_password: str = "") -> dict:
     """
-    Obtain SCC Okta token + Duo admin session cookies using a visible Chrome
-    window on the Mac.  Skips iDAC entirely.
+    Obtain SCC Okta token + Duo admin session cookies.  Skips iDAC entirely.
+
+    If scc_password is provided the login is fully automated (email + password,
+    no MFA wait) and works both on Mac and headless in Docker.  Otherwise opens
+    a visible Chrome window and waits up to timeout_ms for manual SSO/MFA.
 
     Flow:
-      1. Launch Chrome (visible, channel="chrome").
+      1. Launch Chrome (headless when scc_password set and running in Docker,
+         otherwise visible channel="chrome" on Mac).
       2. Navigate to https://security.cisco.com.
-      3. If login page appears, auto-fill scc_email and wait for SSO/MFA.
-      4. Handle the org-selection modal — pick the tile for org_number.
+      3. Fill email; if scc_password provided fill password immediately,
+         otherwise wait up to timeout_ms for manual SSO/MFA completion.
+      4. Handle the org-selection page — pick tile for org_number.
       5. Extract Okta token from sessionStorage.
-      6. Navigate Products → Duo Security to open the Duo admin panel.
+      6. Navigate Products → Duo Security to open the Duo admin panel;
+         if the admin panel redirects to a login page and scc_password is
+         set, log in directly with email + password.
       7. Extract sid + _xsrf cookies from the Duo admin domain.
 
     Returns same dict as get_browser_sessions():
@@ -1634,14 +1757,17 @@ def get_browser_sessions_mac(
     expected_admin = f"admin-{m5.group(1)}.duosecurity.com" if m5 else None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            channel="chrome",
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        import os as _os5
+        _headless = scc_password and _os5.path.exists("/.dockerenv")
+        _launch_kw = {"headless": bool(_headless),
+                      "args": ["--disable-blink-features=AutomationControlled"]}
+        if not _headless:
+            _launch_kw["channel"] = "chrome"
+        browser = p.chromium.launch(**_launch_kw)
         ctx = browser.new_context(
             ignore_https_errors=True,
             viewport={"width": 1400, "height": 900},
+            **_scc_session_kwargs(),
         )
         page = ctx.new_page()
 
@@ -1651,36 +1777,101 @@ def get_browser_sessions_mac(
                   timeout=60_000, wait_until="domcontentloaded")
 
         # ── Step 2: handle login if redirected ──────────────────────────────
-        _log(f"current URL: {page.url[:80]}")
-        if "security.cisco.com" not in page.url:
-            _log(f"login redirect detected — filling email: {scc_email}")
+        # Wait for post-load redirect to settle before checking URL
+        page.wait_for_timeout(3000)
+        _log(f"URL after goto+3s: {page.url[:80]}")
+        _need_scc_login = ("security.cisco.com" not in page.url
+                           or "sign-on" in page.url
+                           or "login" in page.url)
+        if _need_scc_login:
+            # Wait for Okta SPA to render the login widget (async JS load)
+            _log(f"login redirect detected — waiting for email field (Okta SPA) ...")
+            _email_filled = False
             for sel in [
+                "input[name='identifier']",
+                "input[autocomplete='username']",
                 "input[type='email']",
                 "input[name='email']",
                 "input[id*='email' i]",
                 "input[placeholder*='email' i]",
-                "input[name='identifier']",
             ]:
                 try:
-                    lc = page.locator(sel)
-                    if lc.count() > 0:
-                        lc.first.fill(scc_email)
-                        lc.first.press("Enter")
-                        _log(f"email filled via {sel!r}")
-                        break
+                    lc = page.locator(sel).first
+                    lc.wait_for(state="visible", timeout=15_000)
+                    lc.fill(scc_email)
+                    lc.press("Enter")
+                    _log(f"email filled via {sel!r}")
+                    _email_filled = True
+                    break
                 except Exception:
                     continue
+            if not _email_filled:
+                _log(f"WARNING: no email field found — URL: {page.url[:80]}")
 
-            _log("waiting for SSO / MFA completion (up to 3 min) ...")
-            try:
-                page.wait_for_url("*security.cisco.com*", timeout=timeout_ms)
-            except Exception:
-                if "security.cisco.com" not in page.url:
-                    raise RuntimeError(
-                        f"Login did not reach SCC — stuck at: {page.url[:100]}"
+            if scc_password:
+                # Automated: wait for password field to appear after email submit
+                # (Okta SPA reveals it on the same page; 10s timeout)
+                _log("waiting for password field to appear ...")
+                _pw_lc = None
+                for sel in [
+                    "input[type='password']",
+                    "input[name='password']",
+                    "input[id*='password' i]",
+                    "input[placeholder*='password' i]",
+                ]:
+                    try:
+                        lc = page.locator(sel).first
+                        lc.wait_for(state="visible", timeout=10_000)
+                        _pw_lc = lc
+                        _log(f"password field visible via {sel!r}")
+                        break
+                    except Exception:
+                        continue
+                _log(f"URL before password fill: {page.url[:80]}")
+                if _pw_lc:
+                    _pw_lc.fill(scc_password)
+                    _pw_lc.press("Enter")
+                    _log("password submitted")
+                else:
+                    _log("WARNING: no password field found")
+                _log("waiting for post-password redirect (SCC or Duo MFA, up to 30s) ...")
+                try:
+                    page.wait_for_url(
+                        lambda url: (url.startswith("https://security.cisco.com/")
+                                     and "sign-on" not in url)
+                                    or "launchpad" in url
+                                    or "duosecurity.com/prompt" in url,
+                        timeout=30_000,
                     )
+                except Exception:
+                    pass
+                # Handle Duo MFA push — wait for approval (up to 3 min)
+                if "duosecurity.com/prompt" in page.url:
+                    _log("*** Duo MFA push sent — please approve on your device (waiting up to 3 min) ***")
+                    try:
+                        page.wait_for_url(
+                            lambda url: (url.startswith("https://security.cisco.com/")
+                                         and "sign-on" not in url)
+                                        or "launchpad" in url,
+                            timeout=180_000,
+                        )
+                    except Exception:
+                        pass
+            else:
+                _log("waiting for SSO / MFA completion (up to 3 min) ...")
+                try:
+                    page.wait_for_url("*security.cisco.com*", timeout=timeout_ms)
+                except Exception:
+                    pass
+
+            if ("security.cisco.com" not in page.url or "sign-on" in page.url) \
+                    and "launchpad" not in page.url:
+                raise RuntimeError(
+                    f"Login did not reach SCC — stuck at: {page.url[:100]}"
+                )
 
         _log(f"on SCC: {page.url[:80]}")
+        _save_scc_session(ctx, _log)
 
         # ── Step 3: org selection modal ──────────────────────────────────────
         # SCC shows an org picker when the account manages multiple orgs.
@@ -1802,10 +1993,14 @@ def get_browser_sessions_mac(
             raise RuntimeError("Could not open Duo admin panel via any method")
 
         if "login" in duo_page.url:
-            raise RuntimeError(
-                f"Duo admin landed on login page — SCC SSO did not carry "
-                f"over: {duo_page.url[:80]}"
-            )
+            if scc_password:
+                _log("Duo admin landed on login page — attempting direct login ...")
+                _duo_admin_direct_login(duo_page, scc_email, scc_password, _log)
+            else:
+                raise RuntimeError(
+                    f"Duo admin landed on login page — SCC SSO did not carry "
+                    f"over: {duo_page.url[:80]}"
+                )
 
         # ── Step 6: extract Duo admin session cookies ─────────────────────────
         admin_host_actual = duo_page.url.split("/")[2]
@@ -1874,6 +2069,60 @@ def _pw_fill_first(page, selectors: list, value: str, timeout: int = 8000) -> bo
     return False
 
 
+def _duo_admin_direct_login(page, email: str, password: str, log=None) -> None:
+    """
+    Fill the Duo admin login form with email + password.
+    page should already be on (or redirecting to) admin-xxx.duosecurity.com/login.
+    Raises RuntimeError if still on login page after submission.
+    """
+    _l = log or (lambda s: print(f"[duo-login] {s}"))
+    _l(f"filling Duo admin login form (email={email}) ...")
+
+    # Fill email
+    for sel in [
+        "input[name='email']",
+        "input[type='email']",
+        "input[id*='email' i]",
+        "input[placeholder*='email' i]",
+    ]:
+        try:
+            lc = page.locator(sel)
+            if lc.count() > 0:
+                lc.first.fill(email)
+                lc.first.press("Enter")
+                _l(f"email filled via {sel!r}")
+                break
+        except Exception:
+            continue
+
+    page.wait_for_timeout(2000)
+
+    # Fill password (appears on same page or after email submission)
+    for sel in [
+        "input[type='password']",
+        "input[name='password']",
+        "input[id*='password' i]",
+        "input[placeholder*='password' i]",
+    ]:
+        try:
+            lc = page.locator(sel)
+            if lc.count() > 0:
+                lc.first.fill(password)
+                lc.first.press("Enter")
+                _l(f"password filled via {sel!r}")
+                break
+        except Exception:
+            continue
+
+    # Wait for redirect away from login page
+    page.wait_for_timeout(3000)
+    if "/login" in page.url:
+        raise RuntimeError(
+            f"Duo admin login failed — still on login page after credentials: {page.url[:100]}"
+        )
+    _l(f"Duo admin login successful: {page.url[:80]}")
+
+
 def _pw_get_copy_content(page, hint: str, log=None) -> str:
     """
     Extract the text content that a 'Copy' button in a step is copying.
@@ -1932,7 +2181,8 @@ def _pw_get_copy_content(page, hint: str, log=None) -> str:
     return ""
 
 
-def _open_duo_admin_page(ctx, scc_page, admin_host: str, duo_host: str, log):
+def _open_duo_admin_page(ctx, scc_page, admin_host: str, duo_host: str, log,
+                          admin_email: str = "", admin_pass: str = ""):
     """
     Open Duo Admin panel from an already-authenticated SCC browser context.
     Returns the Duo admin Page object.
@@ -1977,9 +2227,12 @@ def _open_duo_admin_page(ctx, scc_page, admin_host: str, duo_host: str, log):
         duo_page = ctx.new_page()
         duo_page.goto(f"https://{admin_host}/", timeout=60_000, wait_until="networkidle")
         if "login" in duo_page.url.lower():
-            raise RuntimeError(
-                f"Direct Duo admin navigation landed on login page — {duo_page.url[:80]}"
-            )
+            if admin_email and admin_pass:
+                _duo_admin_direct_login(duo_page, admin_email, admin_pass, log)
+            else:
+                raise RuntimeError(
+                    f"Direct Duo admin navigation landed on login page — {duo_page.url[:80]}"
+                )
         log(f"Duo admin loaded directly: {duo_page.url[:80]}")
 
     if duo_page is None:
@@ -2557,6 +2810,137 @@ def _pw_sso_ext_auth_setup(
     return True, "SSO Auth Proxy: AD source enabled, permitted domain added, routing rule set"
 
 
+# ── Pure-API authproxy config push (no browser required) ─────────────────────
+
+AD_CLIENT_HOST    = "198.18.5.102"
+AD_CLIENT_PORT    = "389"
+AD_CLIENT_BASE_DN = "DC=corp,DC=pseudoco,DC=com"
+
+
+def duo_push_authproxy_config(
+    pod_id: str,
+    db_path: str,
+    log=None,
+) -> tuple[bool, str]:
+    """
+    Build and push authproxy.cfg to AD1 via WinRM, then restart DuoAuthProxy.
+
+    Sections written:
+      [cloud]    — auth proxy integration credentials (ikey/skey/api_host)
+      [ad_client] — static AD server config (host/port/service_account/base_dn)
+
+    Does NOT require a browser session or Cisco Okta MFA.  Replaces the browser-
+    automation path in duo_ext_dir_and_sso_setup() for the duo_ext_dir pipeline
+    step.
+
+    If authproxy_ikey/skey are missing from org_credentials, fetches or creates
+    a new Authentication Proxy integration via the Duo Admin API and saves it.
+
+    Returns (ok, message).
+    """
+    import sqlite3 as _sq4
+    import re as _re4
+
+    _log = log or (lambda s: print(f"     [authproxy-push] {s}"))
+
+    # ── 1. Load credentials from DB ──────────────────────────────────────────
+    _log("loading credentials from DB ...")
+    try:
+        with _sq4.connect(db_path) as conn:
+            conn.row_factory = _sq4.Row
+            pod_row = conn.execute(
+                "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
+            ).fetchone()
+            if not pod_row:
+                return False, f"POD {pod_id!r} not found in DB"
+            scc_org = pod_row["scc_org"] or ""
+            m = _re4.search(r"pseudoco-(\d+)", scc_org)
+            if not m:
+                return False, f"Cannot determine org number from scc_org={scc_org!r}"
+            org_num = m.group(1)
+            oc_row = conn.execute(
+                "SELECT * FROM org_credentials WHERE org_number=?", (org_num,)
+            ).fetchone()
+            if not oc_row:
+                return False, f"No org credentials for org {org_num}"
+            oc = dict(oc_row)
+    except Exception as e:
+        return False, f"DB read error: {e}"
+
+    duo_ikey  = oc.get("duo_ikey",  "").strip()
+    duo_skey  = oc.get("duo_skey",  "").strip()
+    duo_host  = oc.get("duo_host",  "").strip()
+    ap_ikey   = oc.get("authproxy_ikey", "").strip()
+    ap_skey   = oc.get("authproxy_skey", "").strip()
+
+    if not duo_host:
+        return False, "duo_host not configured for this org — run duo_setup first"
+    if not duo_ikey or not duo_skey:
+        return False, "Duo Admin API credentials not configured — run duo_setup first"
+
+    # ── 2. Ensure authproxy integration credentials exist ────────────────────
+    if not ap_ikey or not ap_skey:
+        _log("authproxy_ikey/skey missing — fetching from Duo API ...")
+        creds = duo_get_authproxy_creds(duo_ikey, duo_skey, duo_host)
+        if not creds:
+            _log("no existing auth proxy integration — creating new one ...")
+            creds = duo_create_authproxy_integration(duo_ikey, duo_skey, duo_host)
+        if not creds:
+            return False, "Could not find or create Auth Proxy integration in Duo"
+        ap_ikey = creds["ikey"]
+        ap_skey = creds["skey"]
+        _log(f"auth proxy ikey: {ap_ikey}")
+        # Save to DB
+        try:
+            with _sq4.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE org_credentials SET authproxy_ikey=?, authproxy_skey=? "
+                    "WHERE org_number=?",
+                    (ap_ikey, ap_skey, org_num),
+                )
+                conn.commit()
+            _log("saved authproxy_ikey/skey to DB")
+        except Exception as e:
+            _log(f"WARN: could not save authproxy creds to DB: {e}")
+
+    # ── 3. Build authproxy.cfg ────────────────────────────────────────────────
+    cfg = (
+        "[cloud]\n"
+        f"ikey={ap_ikey}\n"
+        f"skey={ap_skey}\n"
+        f"api_host={duo_host}\n"
+        "\n"
+        "[ad_client]\n"
+        f"host={AD_CLIENT_HOST}\n"
+        f"port={AD_CLIENT_PORT}\n"
+        f"service_account_username={AD_WINRM_USER}\n"
+        f"service_account_password={AD_WINRM_PASS}\n"
+        f"search_dn={AD_CLIENT_BASE_DN}\n"
+    )
+    _log(f"built authproxy.cfg ({len(cfg)} bytes): [cloud] + [ad_client]")
+
+    # ── 4. Connect to AD1 via WinRM ──────────────────────────────────────────
+    _log(f"connecting to AD1 ({AD_CLIENT_HOST}) via WinRM ...")
+    try:
+        winrm_sess = _winrm_connect_for_pod(pod_id, log=_log)
+    except Exception as e:
+        return False, f"WinRM connect failed: {e}"
+
+    # ── 5. Push cfg + restart service ────────────────────────────────────────
+    _log("pushing authproxy.cfg to AD1 and restarting DuoAuthProxy ...")
+    ok, msg = _winrm_write_restart_cfg(winrm_sess, cfg, _log)
+    if hasattr(winrm_sess, "close"):
+        try:
+            winrm_sess.close()
+        except Exception:
+            pass
+
+    if ok:
+        _log(f"authproxy push: {msg}")
+        return True, f"authproxy.cfg pushed ([cloud]+[ad_client]) | {msg}"
+    return False, f"authproxy push failed: {msg}"
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 def duo_ext_dir_and_sso_setup(
@@ -2613,21 +2997,24 @@ def duo_ext_dir_and_sso_setup(
     except Exception as e:
         return False, f"DB read error: {e}"
 
-    duo_host = oc.get("duo_host", "").strip()
-    idac_url = oc.get("idac_url", "").strip()
-    ap_ikey  = oc.get("authproxy_ikey", "").strip()
-    ap_skey  = oc.get("authproxy_skey", "").strip()
-    scc_email = oc.get("scc_email", "").strip()
+    duo_host     = oc.get("duo_host", "").strip()
+    idac_url     = oc.get("idac_url", "").strip()
+    ap_ikey      = oc.get("authproxy_ikey", "").strip()
+    ap_skey      = oc.get("authproxy_skey", "").strip()
+    scc_email    = oc.get("scc_email", "").strip()
+    scc_password = oc.get("scc_password", "").strip()
 
     import os as _os
     _in_docker = _os.path.exists("/.dockerenv")
 
     if not duo_host:
         return False, "Duo host not configured for this org"
-    if _in_docker and not idac_url:
-        return False, "iDAC URL not configured — set it in Org Credentials"
-    if not _in_docker and not scc_email:
-        return False, "scc_email not configured — set it in Org Credentials"
+    has_direct_creds = bool(scc_email and scc_password)
+    if not has_direct_creds:
+        if _in_docker and not idac_url:
+            return False, "iDAC URL not configured — set it in Org Credentials"
+        if not _in_docker and not scc_email:
+            return False, "scc_email not configured — set it in Org Credentials"
     if not ap_ikey or not ap_skey:
         return False, "Auth proxy credentials missing — run duo_setup step first"
 
@@ -2650,7 +3037,22 @@ def duo_ext_dir_and_sso_setup(
     browser_err = None
 
     with sync_playwright() as p:
-        if _in_docker:
+        if scc_password:
+            # Password mode: use fresh Playwright Chromium (NOT system Chrome) so
+            # there are no cached/expired SCC sessions to confuse the login flow.
+            # Headless in Docker, visible on Mac.
+            _headless_ext = _os.path.exists("/.dockerenv")
+            browser = p.chromium.launch(
+                headless=bool(_headless_ext),
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            ctx = browser.new_context(
+                ignore_https_errors=True,
+                viewport={"width": 1400, "height": 900},
+                accept_downloads=True,
+                **_scc_session_kwargs(),
+            )
+        elif _in_docker:
             browser = p.chromium.launch(
                 headless=True,
                 args=["--disable-blink-features=AutomationControlled"],
@@ -2664,6 +3066,7 @@ def duo_ext_dir_and_sso_setup(
                 ),
                 viewport={"width": 1400, "height": 900},
                 accept_downloads=True,
+                **_scc_session_kwargs(),
             )
         else:
             # Mac mode: visible Chrome, no iDAC needed
@@ -2676,40 +3079,108 @@ def duo_ext_dir_and_sso_setup(
                 ignore_https_errors=True,
                 viewport={"width": 1400, "height": 900},
                 accept_downloads=True,
+                **_scc_session_kwargs(),
             )
         scc_page = ctx.new_page()
         try:
-            # Authenticate to SCC
-            if _in_docker:
-                # Docker: use iDAC URL (handles direct autologin + adaptive card)
-                _log("authenticating via iDAC auto-login URL ...")
-                scc_page = _idac_navigate_to_scc(ctx, scc_page, idac_url, 90_000, _log)
-            else:
-                # Mac: navigate directly to security.cisco.com, fill email, select org
-                _log(f"navigating directly to SCC (email={scc_email}, org={org_num}) ...")
+            # Authenticate and open Duo Admin panel
+            if scc_password:
+                # Automated SCC login with email+password — no manual MFA wait
+                _log(f"SCC password login (email={scc_email}) ...")
                 scc_page.goto("https://security.cisco.com/",
                               timeout=60_000, wait_until="domcontentloaded")
-                if "security.cisco.com" not in scc_page.url:
-                    _log(f"login page detected — filling email: {scc_email}")
-                    for _esel in ["input[type='email']", "input[name='email']",
-                                  "input[name='identifier']",
-                                  "input[placeholder*='email' i]"]:
+                # Wait for any post-load redirect to settle (SCC may redirect to
+                # sign-on.security.cisco.com even if domcontentloaded fires early)
+                scc_page.wait_for_timeout(3000)
+                _log(f"URL after goto+3s: {scc_page.url[:80]}")
+                _need_login = ("security.cisco.com" not in scc_page.url
+                               or "sign-on" in scc_page.url
+                               or "login" in scc_page.url)
+                if _need_login:
+                    # Wait for Okta SPA to render the login widget (async JS load)
+                    _log(f"login page — waiting for email field (Okta SPA) ...")
+                    _email_filled = False
+                    for _esel in [
+                        "input[name='identifier']",
+                        "input[autocomplete='username']",
+                        "input[type='email']",
+                        "input[name='email']",
+                        "input[placeholder*='email' i]",
+                    ]:
                         try:
-                            _lc = scc_page.locator(_esel)
-                            if _lc.count() > 0:
-                                _lc.first.fill(scc_email)
-                                _lc.first.press("Enter")
-                                break
+                            _lc = scc_page.locator(_esel).first
+                            _lc.wait_for(state="visible", timeout=15_000)
+                            _lc.fill(scc_email)
+                            _lc.press("Enter")
+                            _log(f"email filled via {_esel!r}")
+                            _email_filled = True
+                            break
                         except Exception:
                             continue
-                    _log("waiting for SSO / MFA (up to 3 min) ...")
+                    if not _email_filled:
+                        _log(f"WARNING: no email field found — URL: {scc_page.url[:80]}")
+                    # After email submit wait for password field to appear (Okta SPA
+                    # reveals it on the same page) — up to 10s
+                    _log("waiting for password field to appear ...")
+                    _pw_lc = None
+                    for _psel in [
+                        "input[type='password']",
+                        "input[name='password']",
+                        "input[id*='password' i]",
+                        "input[placeholder*='password' i]",
+                    ]:
+                        try:
+                            _lc = scc_page.locator(_psel).first
+                            _lc.wait_for(state="visible", timeout=10_000)
+                            _pw_lc = _lc
+                            _log(f"password field visible via {_psel!r}")
+                            break
+                        except Exception:
+                            continue
+                    _log(f"URL before password fill: {scc_page.url[:80]}")
+                    if _pw_lc:
+                        _pw_lc.fill(scc_password)
+                        _pw_lc.press("Enter")
+                        _log("password submitted")
+                    else:
+                        _log("WARNING: no password field found")
+                    _log("waiting for post-password redirect (SCC or Duo MFA, up to 30s) ...")
                     try:
-                        scc_page.wait_for_url("*security.cisco.com*", timeout=180_000)
+                        scc_page.wait_for_url(
+                            lambda url: (url.startswith("https://security.cisco.com/")
+                                         and "sign-on" not in url)
+                                        or "launchpad" in url
+                                        or "duosecurity.com/prompt" in url,
+                            timeout=30_000,
+                        )
                     except Exception:
-                        if "security.cisco.com" not in scc_page.url:
-                            raise RuntimeError(
-                                f"Login did not reach SCC — stuck at: {scc_page.url[:100]}"
-                            )
+                        pass
+                    # Handle Duo MFA — poll URL every 10s so we can see what the
+                    # browser is doing after the push is approved (up to 5 min)
+                    if "duosecurity.com/prompt" in scc_page.url or "sign-on" in scc_page.url:
+                        _log("*** Duo MFA — LOOK AT THE CHROME BROWSER and approve the push (up to 5 min) ***")
+                        import time as _time_mfa
+                        _mfa_deadline = _time_mfa.time() + 300
+                        while _time_mfa.time() < _mfa_deadline:
+                            scc_page.wait_for_timeout(10_000)
+                            _cur = scc_page.url
+                            _log(f"  browser URL: {_cur[:80]}")
+                            if "security.cisco.com" in _cur and "sign-on" not in _cur:
+                                _log("  → SCC reached!")
+                                break
+                            if "launchpad" in _cur:
+                                _log("  → Launchpad reached!")
+                                break
+                        else:
+                            _log("  → 5-min timeout waiting for SCC")
+                    _log(f"URL after login: {scc_page.url[:80]}")
+                    # Guard: must be on SCC — not still on Duo MFA page
+                    if ("security.cisco.com" not in scc_page.url
+                            or "sign-on" in scc_page.url):
+                        raise RuntimeError(
+                            f"Did not reach SCC after Duo MFA (push not approved?) "
+                            f"— stuck at: {scc_page.url[:80]}"
+                        )
                 # Org selection
                 scc_page.wait_for_timeout(3000)
                 org_slug = f"pseudoco-{org_num}"
@@ -2720,6 +3191,7 @@ def duo_ext_dir_and_sso_setup(
                     f"div[role='button']:has-text('{org_slug}')",
                     f"li:has-text('{org_slug}')",
                     f"button:has-text('{org_num}')",
+                    f"a:has-text('{org_num}')",
                 ]:
                     try:
                         _lc = scc_page.locator(_osel).first
@@ -2730,11 +3202,70 @@ def duo_ext_dir_and_sso_setup(
                         break
                     except Exception:
                         continue
-            _log(f"SCC loaded: {scc_page.url[:60]}")
-
-            # Open Duo Admin panel
-            _log("opening Duo Admin panel ...")
-            duo_page = _open_duo_admin_page(ctx, scc_page, admin_host, duo_host, _log)
+                _log(f"SCC loaded: {scc_page.url[:60]}")
+                _save_scc_session(ctx, _log)
+                # Navigate to Duo admin via SCC SSO
+                _log("opening Duo Admin panel via SCC SSO ...")
+                duo_page = _open_duo_admin_page(ctx, scc_page, admin_host, duo_host, _log,
+                                                admin_email=scc_email, admin_pass=scc_password)
+            else:
+                # Fall back to SCC-based authentication
+                if _in_docker:
+                    # Docker: use iDAC URL (handles direct autologin + adaptive card)
+                    _log("authenticating via iDAC auto-login URL ...")
+                    scc_page = _idac_navigate_to_scc(ctx, scc_page, idac_url, 90_000, _log)
+                else:
+                    # Mac: navigate directly to security.cisco.com, fill email, select org
+                    _log(f"navigating directly to SCC (email={scc_email}, org={org_num}) ...")
+                    scc_page.goto("https://security.cisco.com/",
+                                  timeout=60_000, wait_until="domcontentloaded")
+                    if "security.cisco.com" not in scc_page.url:
+                        _log(f"login page detected — filling email: {scc_email}")
+                        for _esel in ["input[type='email']", "input[name='email']",
+                                      "input[name='identifier']",
+                                      "input[placeholder*='email' i]"]:
+                            try:
+                                _lc = scc_page.locator(_esel)
+                                if _lc.count() > 0:
+                                    _lc.first.fill(scc_email)
+                                    _lc.first.press("Enter")
+                                    break
+                            except Exception:
+                                continue
+                        _log("waiting for SSO / MFA (up to 3 min) ...")
+                        try:
+                            scc_page.wait_for_url("*security.cisco.com*", timeout=180_000)
+                        except Exception:
+                            if "security.cisco.com" not in scc_page.url:
+                                raise RuntimeError(
+                                    f"Login did not reach SCC — stuck at: {scc_page.url[:100]}"
+                                )
+                    # Org selection
+                    scc_page.wait_for_timeout(3000)
+                    org_slug = f"pseudoco-{org_num}"
+                    _log(f"selecting org tile '{org_slug}' ...")
+                    for _osel in [
+                        f"button:has-text('{org_slug}')",
+                        f"a:has-text('{org_slug}')",
+                        f"div[role='button']:has-text('{org_slug}')",
+                        f"li:has-text('{org_slug}')",
+                        f"button:has-text('{org_num}')",
+                    ]:
+                        try:
+                            _lc = scc_page.locator(_osel).first
+                            _lc.wait_for(state="visible", timeout=5_000)
+                            _lc.click(timeout=5_000)
+                            _log(f"org clicked via: {_osel!r}")
+                            scc_page.wait_for_timeout(3000)
+                            break
+                        except Exception:
+                            continue
+                _log(f"SCC loaded: {scc_page.url[:60]}")
+                _save_scc_session(ctx, _log)
+                # Open Duo Admin panel
+                _log("opening Duo Admin panel ...")
+                duo_page = _open_duo_admin_page(ctx, scc_page, admin_host, duo_host, _log,
+                                                admin_email=scc_email, admin_pass=scc_password)
 
             # Part 1: External Directory
             _log("=== Part 1: External Directory (AD sync) ===")
