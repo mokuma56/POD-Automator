@@ -748,7 +748,8 @@ CATC_HOST     = "198.18.5.100"
 CATC_USER     = "admin"
 CATC_PASS     = "Demo@C!sco"
 CATC_BASE     = f"https://{CATC_HOST}"
-CATC_MAIN_SITE_ID = "919ce2a1-39b7-4c1f-a7ec-c76e50170ab7"  # Global/NORTH CAROLINA/Durham/Site-105/MAIN
+CATC_MAIN_SITE_ID        = "919ce2a1-39b7-4c1f-a7ec-c76e50170ab7"  # Global/NORTH CAROLINA/Durham/Site-105/MAIN
+CATC_MAIN_SITE_HIERARCHY = "Global/NORTH CAROLINA/Durham/Site-105/MAIN"
 CATC_WLC_SITE_ID  = "ac7aeac8-fba7-4776-9b3e-feb20384bb44"  # Global/CALIFORNIA/San Jose/DC-Site-10/MAIN
 
 CATC_SWITCHES = {
@@ -1110,53 +1111,88 @@ def phase_catc_discover(log_fn=print):
         log_fn(f"[catc:step] assign_wlc_site | failed | {wlc_name} not in inventory — skipping site assignment")
 
     # ── Step 7: Provision switches ────────────────────────────────────────────
-    # Trigger actual CatC provision action for all 3 switches.
-    # NOTE: DOT1X_SECURITY no longer pushes any AAA/RADIUS CLIs so CatC will
-    # never hit NCSO20070 on a clean run. Do NOT add cleanup here.
-    log_fn(f"[catc:step] provision | running | Triggering CatC provision for all switches")
-    r_inv2 = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
-                          headers=headers, verify=False, timeout=15)
-    inv2 = {d["managementIpAddress"]: d for d in r_inv2.json().get("response", [])}
-    device_ids = [inv2[ip]["id"] for ip in loopback_ips if ip in inv2 and "id" in inv2[ip]]
-    if not device_ids:
-        log_fn(f"[catc:step] provision | failed | No device IDs found for loopback IPs")
-        return False, "Provision failed — devices not found in inventory"
+    # GUI equivalent: select each device → Actions → Provision.
+    # Per-device: POST first (creates record + pushes config for new devices).
+    # If POST returns "already provisioned" → PUT (re-deploys to existing record).
+    # PUT on a device with no provision record returns HTTP 400 — must POST first.
+    log_fn(f"[catc:step] provision | running | Provisioning switches via CatC (POST per device)")
 
-    prov_payload = [{"networkDeviceId": dev_id, "siteId": CATC_MAIN_SITE_ID} for dev_id in device_ids]
-    r_prov = requests.post(f"{CATC_BASE}/dna/intent/api/v2/provision-device",
-                           headers=headers, json=prov_payload, verify=False, timeout=30)
-    if r_prov.status_code not in (200, 202):
-        log_fn(f"[catc:step] provision | failed | HTTP {r_prov.status_code}: {r_prov.text[:300]}")
-        return False, f"Provision trigger failed ({r_prov.status_code}): {r_prov.text[:300]}"
+    for dev_key, dev_info in CATC_DISCOVERY_IPS.items():
+        dev_ip   = dev_info["loopback"]
+        dev_name = dev_info["name"]
+        dev_payload = [{"siteNameHierarchy": CATC_MAIN_SITE_HIERARCHY,
+                        "deviceManagementIpAddress": dev_ip}]
+        exec_id = None
 
-    # Poll task to completion
-    task_id = (r_prov.json().get("response") or {}).get("taskId") or \
-              (r_prov.json().get("response") or [{}])[0].get("taskId") if isinstance(r_prov.json().get("response"), list) else None
-    if task_id:
-        log_fn(f"[catc:step] provision | running | Task {task_id} — waiting for completion")
-        deadline_prov = _time.time() + 300
-        while _time.time() < deadline_prov:
-            r_task = requests.get(f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
-                                  headers=headers, verify=False, timeout=15)
-            t = r_task.json().get("response", {})
-            if t.get("isError"):
-                log_fn(f"[catc:step] provision | failed | Task error: {t.get('failureReason','')[:200]}")
-                return False, f"Provision task failed: {t.get('failureReason','')}"
-            if t.get("endTime"):
-                log_fn(f"[catc:step] provision | running | Provision task completed — verifying managed state")
-                break
-            _time.sleep(10)
+        # Try POST first — creates provision record and pushes config
+        r_post = requests.post(
+            f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
+            headers=headers, json=dev_payload, verify=False, timeout=30,
+        )
+        post_body = {}
+        try:
+            post_body = r_post.json()
+        except Exception:
+            pass
 
-    # Verify all devices reach Managed state
-    log_fn(f"[catc:step] provision | running | Verifying devices are managed and syncing")
-    deadline = _time.time() + 300
+        already_provisioned = "already provisioned" in post_body.get("description", "").lower()
+
+        if r_post.status_code in (200, 202) and not already_provisioned:
+            exec_id = post_body.get("executionId") or post_body.get("taskId")
+            log_fn(f"[catc:step] provision | running | {dev_name}: POST accepted (exec {exec_id})")
+        else:
+            # Device already has a provision record → PUT re-deploys full config
+            if already_provisioned:
+                log_fn(f"[catc:step] provision | running | {dev_name}: already provisioned — PUT to re-deploy")
+            else:
+                log_fn(f"[catc:step] provision | running | {dev_name}: POST {r_post.status_code} — trying PUT")
+
+            r_put = requests.put(
+                f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
+                headers=headers, json=dev_payload, verify=False, timeout=60,
+            )
+            put_body = {}
+            try:
+                put_body = r_put.json()
+            except Exception:
+                pass
+
+            if r_put.status_code not in (200, 202):
+                log_fn(f"[catc:step] provision | running | {dev_name}: PUT {r_put.status_code} — {put_body.get('description','')[:120]} — skipping")
+                continue
+
+            exec_id = put_body.get("executionId") or put_body.get("taskId")
+            log_fn(f"[catc:step] provision | running | {dev_name}: PUT accepted (exec {exec_id})")
+
+        # Poll execution-status for this device (up to 5 min)
+        if exec_id:
+            deadline_prov = _time.time() + 300
+            while _time.time() < deadline_prov:
+                r_exec = requests.get(
+                    f"{CATC_BASE}/dna/intent/api/v1/dnacaap/management/execution-status/{exec_id}",
+                    headers=headers, verify=False, timeout=15,
+                )
+                es = r_exec.json() if r_exec.ok else {}
+                status = es.get("status", "")
+                log_fn(f"[catc:step] provision | running | {dev_name}: exec {str(exec_id)[:8]}… status={status}")
+                if status.upper() == "SUCCESS":
+                    log_fn(f"[catc:step] provision | running | {dev_name}: provision SUCCESS")
+                    break
+                if status.upper() == "FAILURE":
+                    reason = es.get("bapiError") or es.get("description") or ""
+                    log_fn(f"[catc:step] provision | running | {dev_name}: provision FAILURE: {reason[:120]}")
+                    break
+                _time.sleep(10)
+
+
+    deadline = _time.time() + 120
     all_managed = False
     while _time.time() < deadline:
         r_check = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
                                headers=headers, verify=False, timeout=15)
-        inv3 = {d["managementIpAddress"]: d for d in r_check.json().get("response", [])}
-        states = [(ip, inv3.get(ip, {}).get("managementState", "?"),
-                       inv3.get(ip, {}).get("collectionStatus", "?")) for ip in loopback_ips]
+        inv2 = {d["managementIpAddress"]: d for d in r_check.json().get("response", [])}
+        states = [(ip, inv2.get(ip, {}).get("managementState", "?"),
+                       inv2.get(ip, {}).get("collectionStatus", "?")) for ip in loopback_ips]
         managed = [ip for ip, ms, cs in states if ms == "Managed" and cs not in ("In Progress", "Not Synced")]
         log_fn(f"[catc:step] provision | running | Managed: {len(managed)}/3 — "
                + " | ".join(f"{ip}:{cs}" for ip, ms, cs in states))
@@ -1169,7 +1205,7 @@ def phase_catc_discover(log_fn=print):
         log_fn(f"[catc:step] provision | failed | Not all devices reached Managed state in time")
         return False, "Provision verification timed out — devices not all Managed"
 
-    log_fn(f"[catc:step] provision | completed | All 3 switches provisioned and Managed")
+    log_fn(f"[catc:step] provision | completed | All 3 switches Managed and synced at MAIN site")
     return True, f"All switches discovered, assigned to MAIN site, and provisioned: {summary}"
 
 
@@ -1243,6 +1279,7 @@ def run_switch_checks(step_name):
         out_aaa = switch_cmd(shell, "show run | include ^aaa")
         ALLOWED_AAA = {
             "aaa new-model",
+            "aaa session-id common",
             "aaa authentication login default local",
             "aaa authorization exec default local",
             "aaa authorization network default local",
@@ -1281,6 +1318,7 @@ def run_switch_checks(step_name):
         out_aaa = switch_cmd(shell, "show run | include ^aaa")
         ALLOWED_AAA = {
             "aaa new-model",
+            "aaa session-id common",
             "aaa authentication login default local",
             "aaa authorization exec default local",
             "aaa authorization network default local",
@@ -3112,20 +3150,56 @@ def phase_scc_reset_check():
 
 def phase_duo_saml_setup() -> tuple[bool, str]:
     """
-    Automate full SA + Duo SAML/SCIM integration setup.
+    Full SA + Duo SAML/SCIM integration setup.
 
-    When running inside Docker (pipeline container), delegates to the dashboard
-    host process via http://host.docker.internal:5050/api/duo-saml-setup-sync/{pod_id}
-    because playwright (headless browser) needs the host network stack and
-    the management.api.umbrella.com JWT requires an Okta browser session.
+    If authproxy_cfg in DB already contains a [sso] section, push it verbatim
+    to AD1 (no browser needed — config is complete).
 
-    When running on the host directly, calls duo_automation.duo_saml_full_setup().
+    Otherwise run duo_saml_full_setup() which:
+      - authenticates via iDAC URL (preferred, no MFA) or email+password fallback
+      - creates/configures the Duo SAML SP app via browser
+      - obtains SA management JWT and configures SA SAML IdP profile
+      - appends [sso] section to authproxy.cfg on AD1 + runs authproxyctl enroll
 
+    When running inside Docker, delegates to the dashboard host process.
     Returns (ok, result_string).
     """
+    import sqlite3 as _sq4, re as _re4
     db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     pod_id  = os.environ.get("POD_ID", "")
 
+    # If DB-stored authproxy.cfg already has [sso] section, push verbatim — no browser
+    try:
+        with _sq4.connect(db_path) as conn:
+            conn.row_factory = _sq4.Row
+            pod_row = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+            if pod_row:
+                scc_org = pod_row["scc_org"] or ""
+                m = _re4.search(r"pseudoco-(\d+)", scc_org)
+                if m:
+                    oc_row = conn.execute(
+                        "SELECT * FROM org_credentials WHERE org_number=?",
+                        (m.group(1),)
+                    ).fetchone()
+                    if oc_row:
+                        oc_dict = dict(oc_row)
+                        stored = oc_dict.get("authproxy_cfg", "").strip()
+                        if stored and "[sso]" in stored:
+                            from duo_automation import duo_push_authproxy_config, duo_trigger_ad_sync
+                            ok, msg = duo_push_authproxy_config(pod_id, db_path)
+                            if not ok:
+                                return ok, msg
+                            # Trigger AD directory sync after [sso] cfg is live
+                            _sync_ok, sync_msg = duo_trigger_ad_sync(
+                                oc_dict.get("duo_ikey", "").strip(),
+                                oc_dict.get("duo_skey", "").strip(),
+                                oc_dict.get("duo_host", "").strip(),
+                            )
+                            return True, f"{msg} | {sync_msg}"
+    except Exception:
+        pass  # fall through to full setup
+
+    # Full SAML setup via browser (iDAC preferred)
     if os.path.exists("/.dockerenv"):
         import urllib.request, json as _json
         dashboard_url = os.environ.get("DASHBOARD_URL", "http://192.168.65.254:5050")
@@ -3142,7 +3216,6 @@ def phase_duo_saml_setup() -> tuple[bool, str]:
         except Exception as e:
             return False, f"Host delegation failed: {e}"
 
-    # Running on host — call directly
     from duo_automation import duo_saml_full_setup
     return duo_saml_full_setup(pod_id, db_path)
 
