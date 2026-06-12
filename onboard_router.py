@@ -3185,17 +3185,17 @@ def phase_duo_saml_setup() -> tuple[bool, str]:
                         oc_dict = dict(oc_row)
                         stored = oc_dict.get("authproxy_cfg", "").strip()
                         if stored and "[sso]" in stored:
-                            from duo_automation import duo_push_authproxy_config, duo_trigger_ad_sync
+                            from duo_automation import (
+                                duo_push_authproxy_config,
+                                duo_sa_configure_headless,
+                            )
+                            # Step A: push authproxy.cfg with [sso] to AD1 via WinRM
                             ok, msg = duo_push_authproxy_config(pod_id, db_path)
                             if not ok:
                                 return ok, msg
-                            # Trigger AD directory sync after [sso] cfg is live
-                            _sync_ok, sync_msg = duo_trigger_ad_sync(
-                                oc_dict.get("duo_ikey", "").strip(),
-                                oc_dict.get("duo_skey", "").strip(),
-                                oc_dict.get("duo_host", "").strip(),
-                            )
-                            return True, f"{msg} | {sync_msg}"
+                            # Step B: headless SA SAML IdP + Duo SCIM config + AD sync
+                            _sa_ok, sa_msg = duo_sa_configure_headless(pod_id, db_path)
+                            return True, f"{msg} | {sa_msg}"
     except Exception:
         pass  # fall through to full setup
 

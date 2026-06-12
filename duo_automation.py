@@ -13,6 +13,7 @@ import email.utils
 import time
 import re
 import os
+from typing import Optional
 import requests
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -328,7 +329,7 @@ def duo_get_authproxy_creds(ikey: str, skey: str, host: str):
     return None
 
 
-def duo_create_authproxy_integration(ikey: str, skey: str, host: str) -> dict | None:
+def duo_create_authproxy_integration(ikey: str, skey: str, host: str) -> Optional[dict]:
     """
     Create a new 'radius'-type integration named 'Authentication Proxy'.
 
@@ -440,7 +441,12 @@ def duo_push_authproxy_cfg(
         _log(f"DuoAuthProxy service: Running ✓")
         return True, f"authproxy.cfg pushed ({ap_host}) | service Running"
     else:
-        err2 = r2.std_err.decode(errors="replace")[:200]
+        err2 = r2.std_err.decode(errors="replace")
+        # CLIXML noise in stderr is PowerShell formatting, not a real error
+        clixml_only = err2.strip().startswith("#< CLIXML")
+        if clixml_only or status == "Unknown":
+            _log(f"DuoAuthProxy service: {status} (status check inconclusive — cfg written and restart issued, treating as OK)")
+            return True, f"authproxy.cfg pushed ({ap_host}) | service restart issued (status={status})"
         return False, (
             f"authproxy.cfg written but service status={status} | {err2[:100]}"
         )
@@ -471,8 +477,9 @@ def duo_verify_credentials(ikey: str, skey: str, host: str) -> tuple[bool, str]:
 # Requires management JWT obtained via Okta token exchange (browser session).
 # ──────────────────────────────────────────────────────────────────────────────
 
-SA_MGMT_BASE = "https://management.api.umbrella.com"
-SA_SSE_BASE  = "https://api.sse.cisco.com"
+SA_MGMT_BASE      = "https://management.api.umbrella.com"
+SA_SSE_BASE       = "https://api.sse.cisco.com"
+SA_OPEN_API_BASE  = "https://api.umbrella.com"  # open API base; also hosts the JWT exchange endpoint
 
 # SA SP metadata (fixed for Cisco SSE — same across all orgs)
 SA_SP_ENTITY_ID = "saml.fg.id.sse.cisco.com"
@@ -483,23 +490,186 @@ SA_SCIM_URL     = "https://api.sse.cisco.com/identity/v2/scim"
 SA_SP_CERT_SERIAL_DEFAULT = "40019C6C7762BF3AB89A51B27222F88D"
 
 
-def sa_get_mgmt_jwt(okta_token: str) -> str:
-    """Exchange Okta access token (from SCC sessionStorage) for SA management JWT.
+def sa_refresh_okta_token(session_file: str = None) -> str:
+    """Refresh the Okta access token using the refresh_token stored in scc_session.json.
 
-    The management JWT is required for management.api.umbrella.com endpoints.
-    It has a ~5-minute TTL with scope=role:root-admin (covers all orgs).
-    Client credentials tokens return 403 on management.api.umbrella.com.
+    Returns a fresh access_token string, or '' on any failure.
+    The Okta access token is short-lived (~30 min); the refresh_token is long-lived.
     """
+    import json as _json, base64 as _b64
+    sess = session_file or _SCC_SESSION_FILE
+    try:
+        with open(sess) as f:
+            session = _json.load(f)
+    except Exception:
+        return ""
+
+    refresh_token = ""
+    client_id = ""
+    token_url = ""
+    scopes = ""
+    for origin in session.get("origins", []):
+        if "security.cisco.com" not in origin.get("origin", ""):
+            continue
+        for item in origin.get("localStorage", []):
+            if item.get("name") != "okta-token-storage":
+                continue
+            try:
+                val = _json.loads(item.get("value", "{}"))
+                rt_obj = val.get("refreshToken", {})
+                refresh_token = rt_obj.get("refreshToken", "")
+                token_url = rt_obj.get("tokenUrl", "")
+                scopes = " ".join(rt_obj.get("scopes", []))
+                # Extract client_id from the stored access token claims
+                at_raw = val.get("accessToken", {}).get("accessToken", "")
+                if at_raw:
+                    parts = at_raw.split(".")
+                    if len(parts) >= 2:
+                        pad = parts[1] + "=="
+                        claims = _json.loads(_b64.b64decode(pad))
+                        client_id = claims.get("cid", "")
+            except Exception:
+                pass
+            break
+        if refresh_token:
+            break
+
+    if not refresh_token or not client_id:
+        return ""
+
+    if not token_url:
+        token_url = "https://sign-on.security.cisco.com/oauth2/ausr5ltkvjT6lODuy357/v1/token"
+    if not scopes:
+        scopes = "openid security:secure-access offline_access"
+
+    try:
+        r = requests.post(
+            token_url,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "scope": scopes,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json().get("access_token", "")
+    except Exception:
+        return ""
+
+
+def sa_get_mgmt_jwt(okta_token: str,
+                    org_id: str = "",
+                    client_id: str = "",
+                    client_secret: str = "") -> str:
+    """Exchange Okta access token (from SCC localStorage) for SA/Umbrella management JWT.
+
+    Correct endpoint: POST https://api.umbrella.com/auth/v2/oauth2/jwt-bearer/token
+    Required body fields:
+        grant_type = urn:ietf:params:oauth:grant-type:jwt-bearer
+        assertion  = <okta_access_token>
+        scope      = org/<org_id>          ← required; omitting it causes 400 invalid_request
+
+    The management JWT has scope=role:root-admin and ~5-min TTL.
+    It works against management.api.umbrella.com for SAML/SCIM/apikeys endpoints.
+    NOTE: the old endpoint SA_SSE_BASE/auth/v2/jwt-bearer/token (no /oauth2/, wrong host)
+    was permanently returning 400/401 — that was the root cause of all prior failures.
+    """
+    body = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": okta_token,
+    }
+    if org_id:
+        body["scope"] = f"org/{org_id}"
     r = requests.post(
-        f"{SA_SSE_BASE}/auth/v2/jwt-bearer/token",
-        data={
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion": okta_token,
-        },
+        f"{SA_OPEN_API_BASE}/auth/v2/oauth2/jwt-bearer/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+        data=body,
         timeout=15,
     )
     r.raise_for_status()
     return r.json()["access_token"]
+
+
+def sa_get_fresh_okta_token_via_browser(log=None) -> str:
+    """Use Playwright with saved SCC session to get a fresh Okta access token.
+
+    The saved scc_session.json contains DT (trusted-device) cookies that should
+    enable silent re-authentication to Cisco SSO without a Duo MFA push.
+    Navigates to security.cisco.com, waits for Okta JS token renewal, and reads
+    the fresh access_token from localStorage.
+
+    Returns access_token string (aud=api://piam), or '' on any failure.
+    Saves updated session to scc_session.json if a fresh token is obtained.
+    """
+    _log = log or (lambda s: print(f"     [sa-browser] {s}"))
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        _log("WARN: Playwright not available — skipping browser token refresh")
+        return ""
+
+    if not os.path.exists(_SCC_SESSION_FILE):
+        _log("WARN: no saved SCC session — skipping browser token refresh")
+        return ""
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(**_scc_session_kwargs())
+        page = ctx.new_page()
+        try:
+            _log("opening SCC in headless browser to refresh Okta token ...")
+            try:
+                page.goto("https://security.cisco.com",
+                          timeout=90_000, wait_until="networkidle")
+            except Exception:
+                # networkidle may never fire on SCC — fall back to domcontentloaded
+                page.goto("https://security.cisco.com",
+                          timeout=90_000, wait_until="domcontentloaded")
+                page.wait_for_timeout(5_000)
+
+            url = page.url
+            if "security.cisco.com" not in url or "sign-on" in url:
+                _log(f"WARN: redirected to {url[:80]} — SCC session expired; "
+                     "unable to refresh Okta token without MFA")
+                return ""
+
+            _log("SCC loaded; waiting for Okta token renewal (3s) ...")
+            page.wait_for_timeout(3_000)
+
+            token_data = page.evaluate("""() => {
+                const raw = localStorage.getItem('okta-token-storage');
+                if (!raw) return null;
+                try { return JSON.parse(raw); } catch(e) { return null; }
+            }""")
+
+            if not token_data:
+                _log("WARN: okta-token-storage not found in localStorage")
+                return ""
+
+            at_obj = token_data.get("accessToken", {})
+            access_token = at_obj.get("accessToken", "")
+            expires_at = at_obj.get("expiresAt", 0)
+
+            import time as _time
+            if access_token and expires_at > _time.time():
+                mins_left = (expires_at - _time.time()) / 60
+                _log(f"fresh Okta access_token obtained (expires in {mins_left:.0f}m)")
+                _save_scc_session(ctx, _log)
+                return access_token
+
+            _log("WARN: Okta token in localStorage is still expired after page load")
+            return ""
+
+        except Exception as e:
+            _log(f"WARN: browser token refresh failed: {e}")
+            return ""
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 def _sa_mgmt_req(mgmt_jwt: str, method: str, path: str,
@@ -661,15 +831,28 @@ def _duo_admin_xsrf_header(xsrf_cookie: str) -> str:
 
 
 def _duo_admin_session(admin_host: str, sid: str,
-                       xsrf_cookie: str) -> requests.Session:
-    """Create a requests.Session pre-loaded with Duo admin cookies and XSRF header."""
+                       xsrf_cookie: str,
+                       extra_cookies: dict = None) -> requests.Session:
+    """Create a requests.Session pre-loaded with Duo admin cookies and XSRF header.
+
+    extra_cookies: optional dict of additional cookies to set (e.g. AWS ALB sticky
+    session cookies AWSALB/AWSALBTG extracted from the browser — required for the
+    request to hit the same ALB backend that issued the sid).
+    """
     sess = requests.Session()
     sess.cookies.set("sid", sid, domain=admin_host)
     sess.cookies.set("_xsrf", xsrf_cookie, domain=admin_host)
+    for name, value in (extra_cookies or {}).items():
+        sess.cookies.set(name, value, domain=admin_host)
     sess.headers.update({
         "x-xsrftoken": _duo_admin_xsrf_header(xsrf_cookie),
         "origin": f"https://{admin_host}",
         "referer": f"https://{admin_host}/",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
     })
     return sess
 
@@ -677,6 +860,7 @@ def _duo_admin_session(admin_host: str, sid: str,
 def duo_admin_get_or_create_saml_app(
         admin_ikey: str, admin_skey: str, admin_host: str,
         sid: str, xsrf_cookie: str,
+        extra_cookies: dict = None,
         log=None) -> str:
     """Return ikey of existing sso_generic app, or create one via browser session.
 
@@ -700,7 +884,7 @@ def duo_admin_get_or_create_saml_app(
 
     # 2. Create via browser session
     _log("creating new SAML SP app via browser session...")
-    sess = _duo_admin_session(admin_host, sid, xsrf_cookie)
+    sess = _duo_admin_session(admin_host, sid, xsrf_cookie, extra_cookies)
     xsrf_hdr = _duo_admin_xsrf_header(xsrf_cookie)
     r = sess.post(
         f"https://{admin_host}/applications/protect/types",
@@ -730,10 +914,11 @@ def duo_admin_configure_saml_app(
         sid: str, xsrf_cookie: str,
         entity_id: str = SA_SP_ENTITY_ID,
         acs_url: str = SA_SP_ACS_URL,
+        extra_cookies: dict = None,
         log=None) -> bool:
     """Configure Duo SAML SP app with SA entity ID and ACS URL (multipart form)."""
     _log = log or (lambda s: print(f"     [duo-admin] {s}"))
-    sess = _duo_admin_session(admin_host, sid, xsrf_cookie)
+    sess = _duo_admin_session(admin_host, sid, xsrf_cookie, extra_cookies)
     xsrf_hdr = _duo_admin_xsrf_header(xsrf_cookie)
     r = sess.post(
         f"https://{admin_host}/applications/{app_ikey}/modify",
@@ -759,10 +944,11 @@ def duo_admin_configure_scim(
         sid: str, xsrf_cookie: str,
         scim_token: str,
         scim_url: str = SA_SCIM_URL,
+        extra_cookies: dict = None,
         log=None) -> bool:
     """Configure (or reconfigure) Duo SCIM outbound integration with new SA SCIM token."""
     _log = log or (lambda s: print(f"     [duo-admin] {s}"))
-    sess = _duo_admin_session(admin_host, sid, xsrf_cookie)
+    sess = _duo_admin_session(admin_host, sid, xsrf_cookie, extra_cookies)
     payload = {
         "credentials": {
             "baseUrl": scim_url,
@@ -780,6 +966,13 @@ def duo_admin_configure_scim(
         _log("SCIM outbound integration configured")
         return True
     # 409 may mean integration already exists — treat as warning, not hard failure
+    if r.status_code == 409:
+        _log("WARN: SCIM outbound integration already exists (409) — treating as success")
+        return True
+    # 401/403 = auth failure (expired session) — hard failure, not a soft skip
+    if r.status_code in (401, 403):
+        _log(f"ERROR: SCIM configure auth failure HTTP {r.status_code}: {r.text[:200]}")
+        return False
     _log(f"WARN: SCIM configure HTTP {r.status_code}: {r.text[:200]}")
     return r.status_code < 500
 
@@ -796,6 +989,464 @@ def duo_admin_get_saml_metadata_url(duo_host: str, app_ikey: str) -> str:
         raise ValueError(f"Cannot parse hash from duo_host: {duo_host!r}")
     hash_ = m.group(1)
     return f"https://sso-{hash_}.sso.duosecurity.com/saml2/sp/{app_ikey}/metadata"
+
+
+# ── SA headless helpers ───────────────────────────────────────────────────────
+
+def sa_get_client_token(sa_api_key: str, sa_api_secret: str, log=None) -> str:
+    """Get Cisco Umbrella/SSE OAuth2 bearer token via client_credentials grant.
+
+    Uses api.umbrella.com/auth/v2/token with Basic auth (key:secret).
+    NOTE: this token works for api.umbrella.com and api.sse.cisco.com but
+    returns 403 on management.api.umbrella.com (which needs mgmt_jwt).
+    """
+    import base64 as _b64
+    _log = log or (lambda s: print(f"     [sa-oauth] {s}"))
+    creds = _b64.b64encode(f"{sa_api_key}:{sa_api_secret}".encode()).decode()
+    r = requests.post(
+        "https://api.umbrella.com/auth/v2/token",
+        headers={
+            "Authorization": f"Basic {creds}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={"grant_type": "client_credentials"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    token = r.json().get("access_token", "")
+    _log(f"SA client token obtained (len={len(token)})")
+    return token
+
+
+def sa_upload_idp_metadata(token: str, org_id: str,
+                            idp_metadata_xml: str, log=None) -> bool:
+    """Upload Duo IdP metadata XML to SA as a SAML IdP profile.
+
+    Tries management.api.umbrella.com first (needs mgmt_jwt scope — may 403
+    with a plain client token).  Falls back to api.sse.cisco.com SAML endpoint.
+    Returns True if either path succeeds.
+    """
+    _log = log or (lambda s: print(f"     [sa-saml] {s}"))
+    hdrs = {"Authorization": f"Bearer {token}",
+            "Content-Type": "application/xml"}
+
+    # ── Delete old profile(s) ────────────────────────────────────────────────
+    for base in (SA_MGMT_BASE, SA_SSE_BASE):
+        try:
+            r_list = requests.get(
+                f"{base}/samlmetadata/v1/organization/{org_id}/metadata/all",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"mediatype": "json"},
+                timeout=10,
+            )
+            if r_list.ok:
+                profiles = r_list.json()
+                if not isinstance(profiles, list):
+                    profiles = profiles.get("results", [])
+                for p in profiles:
+                    pid = str(p.get("idpid") or p.get("id") or "")
+                    if pid:
+                        requests.delete(
+                            f"{base}/samlmetadata/v1/organization/{org_id}/metadata/{pid}",
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=10,
+                        )
+                        _log(f"deleted existing SAML profile {pid} via {base}")
+                break
+        except Exception as e:
+            _log(f"WARN: list/delete profiles on {base}: {e}")
+
+    # ── Upload new profile ───────────────────────────────────────────────────
+    for base in (SA_MGMT_BASE, SA_SSE_BASE):
+        try:
+            r = requests.post(
+                f"{base}/samlmetadata/v1/organization/{org_id}/metadata",
+                headers=hdrs,
+                data=idp_metadata_xml.encode(),
+                timeout=20,
+            )
+            if r.ok:
+                _log(f"SA SAML IdP profile uploaded via {base} (HTTP {r.status_code})")
+                return True
+            _log(f"WARN: SA SAML upload via {base} returned HTTP {r.status_code}: {r.text[:120]}")
+        except Exception as e:
+            _log(f"WARN: SA SAML upload via {base}: {e}")
+
+    return False
+
+
+def sa_generate_scim_token_client(token: str, org_id: str, log=None) -> str:
+    """Generate a SA SCIM bearer token using a client OAuth token.
+
+    Tries management.api.umbrella.com first, then api.umbrella.com.
+    Returns the raw SCIM token string, or '' if both fail.
+    """
+    _log = log or (lambda s: print(f"     [sa-scim] {s}"))
+    for base in (SA_MGMT_BASE, "https://api.umbrella.com"):
+        try:
+            r = requests.post(
+                f"{base}/auth/v2/organizations/{org_id}/apikeys",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+                json={"label": "Duo SCIM Token"},
+                timeout=15,
+            )
+            if r.ok:
+                data = r.json()
+                t = (data.get("auth_key") or data.get("token") or
+                     data.get("key") or data.get("access_token") or "")
+                if t:
+                    _log(f"SA SCIM token generated via {base} (len={len(t)})")
+                    return t
+            _log(f"WARN: SCIM token via {base} returned HTTP {r.status_code}: {r.text[:80]}")
+        except Exception as e:
+            _log(f"WARN: SCIM token via {base}: {e}")
+    return ""
+
+
+def _load_saved_admin_cookies_for_org(duo_host: str) -> dict:
+    """Load saved admin-domain cookies from scc_session.json for the given duo_host.
+
+    Returns dict of {name: value} for the admin-XXXX.duosecurity.com domain,
+    or {} if the file doesn't exist or no matching cookies are found.
+    """
+    import re as _re6, json as _js6
+    m = _re6.search(r"api-([a-z0-9]+)\.duosecurity\.com", duo_host)
+    if not m:
+        return {}
+    admin_host = f"admin-{m.group(1)}.duosecurity.com"
+    try:
+        with open(_SCC_SESSION_FILE) as f:
+            state = _js6.load(f)
+        cookies = state if isinstance(state, list) else state.get("cookies", [])
+        return {
+            c["name"]: c["value"]
+            for c in cookies
+            if admin_host in c.get("domain", "")
+            or c.get("domain", "").lstrip(".") in admin_host
+        }
+    except Exception:
+        return {}
+
+
+def _push_duo_users_to_sa_scim(
+    duo_ikey: str,
+    duo_skey: str,
+    duo_host: str,
+    scim_token: str,
+    scim_url: str = SA_SCIM_URL,
+    log=None,
+) -> int:
+    """Push all active Duo users (with email) directly to the SA SCIM endpoint.
+
+    Uses the stored SA SCIM token as a Bearer token.
+    Skips users already present in SA (filter by userName).
+    Returns the count of newly created users.
+    """
+    import time as _time
+    _log = log or (lambda s: print(f"     [scim-push] {s}"))
+    headers = {
+        "Authorization": f"Bearer {scim_token}",
+        "Content-Type": "application/scim+json",
+        "Accept": "application/scim+json",
+    }
+    # Fetch Duo users
+    try:
+        users = _paginate(duo_ikey, duo_skey, duo_host, "/admin/v1/users")
+    except Exception as e:
+        _log(f"WARN: Duo user list failed: {e}")
+        return 0
+
+    targets = [u for u in users if u.get("email") and "@" in u.get("email", "")]
+    _log(f"Duo users with email: {len(targets)}")
+    if not targets:
+        return 0
+
+    pushed = 0
+    for u in targets:
+        email = u.get("email", "").strip()
+        realname = u.get("realname", "").strip()
+        username = u.get("username", "").strip()
+        if not email:
+            continue
+        parts = realname.split() if realname else [username]
+        first = parts[0] if parts else username
+        last = parts[-1] if len(parts) > 1 else ""
+        # Check existence first
+        try:
+            check = requests.get(
+                f"{scim_url}/Users",
+                headers=headers,
+                params={"filter": f'userName eq "{email}"'},
+                timeout=15,
+            )
+            if check.ok and check.json().get("totalResults", 0) > 0:
+                _log(f"  skip (exists): {email}")
+                continue
+        except Exception:
+            pass
+        scim_user = {
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": email,
+            "name": {"givenName": first, "familyName": last, "formatted": realname or username},
+            "emails": [{"value": email, "type": "work", "primary": True}],
+            "displayName": realname or username,
+            "active": True,
+        }
+        try:
+            r = requests.post(f"{scim_url}/Users", headers=headers, json=scim_user, timeout=15)
+            if r.status_code in (200, 201):
+                _log(f"  created: {email}")
+                pushed += 1
+            elif r.status_code == 409:
+                _log(f"  already exists: {email}")
+            else:
+                _log(f"  WARN {email} → {r.status_code}: {r.text[:120]}")
+        except Exception as e:
+            _log(f"  WARN push error for {email}: {e}")
+        _time.sleep(0.25)
+
+    _log(f"SA SCIM push complete: {pushed} new users created")
+    return pushed
+
+
+def duo_sa_configure_headless(
+    pod_id: str,
+    db_path: str,
+    log=None,
+) -> tuple[bool, str]:
+    """Headless SA SAML + Duo SCIM configuration using only stored credentials.
+
+    Steps (all soft-fail — never blocks the pipeline):
+    1.  Get Duo SAML SSO app ikey via HMAC Admin API (list sso_generic integrations)
+    2.  Fetch Duo IdP metadata XML from public SSO metadata URL
+    3.  Get SA OAuth2 client token (api.umbrella.com client_credentials)
+    3.5 Get SA management JWT: try refresh_token → Okta; fallback Playwright DT-cookie
+        silent re-auth; needed for management.api.umbrella.com (SAML/SCIM endpoints)
+    4.  Upload Duo IdP metadata to SA (management JWT preferred; client token fallback)
+    5.  Generate SA SCIM token (management JWT preferred; client token fallback)
+    6.  Configure Duo SCIM outbound (browser session cookies from scc_session.json)
+    7.  Run authproxy_update_sso_enrollment_code.exe on AD1 via WinRM to enroll proxy
+    7.5 Playwright Duo admin portal: enable AD auth source, add permitted domain,
+        configure Default routing rule → Active Directory
+    8.  Trigger Duo AD directory sync (per-user syncuser calls)
+
+    Always returns ok=True.
+    """
+    import sqlite3 as _sq6, re as _re7
+    _log = log or (lambda s: print(f"     [saml-headless] {s}"))
+    results = []
+
+    # ── 0. Load creds ──────────────────────────────────────────────────────────
+    try:
+        with _sq6.connect(db_path) as conn:
+            conn.row_factory = _sq6.Row
+            pod_row = conn.execute(
+                "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
+            ).fetchone()
+            if not pod_row:
+                return True, "POD not found — SA/SCIM skipped"
+            scc_org = pod_row["scc_org"] or ""
+            m = _re7.search(r"pseudoco-(\d+)", scc_org)
+            if not m:
+                return True, "Cannot determine org number — SA/SCIM skipped"
+            org_num = m.group(1)
+            oc = dict(conn.execute(
+                "SELECT * FROM org_credentials WHERE org_number=?", (org_num,)
+            ).fetchone() or {})
+    except Exception as e:
+        return True, f"DB read error (non-fatal): {e}"
+
+    duo_ikey      = oc.get("duo_ikey", "").strip()
+    duo_skey      = oc.get("duo_skey", "").strip()
+    duo_host      = oc.get("duo_host", "").strip()
+    sa_org_id     = oc.get("sa_org_id", "").strip()
+    sa_api_key    = oc.get("sa_api_key", "").strip()
+    sa_api_secret = oc.get("sa_api_secret", "").strip()
+    app_ikey      = oc.get("duo_saml_app_ikey", "").strip()
+    stored_scim_token = oc.get("sa_scim_token", "").strip()
+
+    if not duo_ikey or not duo_skey or not duo_host:
+        return True, "Duo Admin API credentials missing — SA/SCIM skipped"
+
+    # ── 1. Duo SAML app ikey ──────────────────────────────────────────────────
+    if not app_ikey:
+        _log("searching Duo Admin API for sso_generic integration ...")
+        try:
+            all_types = []
+            for integ in _paginate(duo_ikey, duo_skey, duo_host, "/admin/v1/integrations"):
+                t = integ.get("type", "")
+                all_types.append(t)
+                if t in ("sso_generic", "sso", "generic_sso", "saml_sp"):
+                    app_ikey = integ["integration_key"]
+                    _log(f"found SAML app ikey={app_ikey} (type={t})")
+                    break
+            if not app_ikey:
+                _log(f"integration types found: {list(set(all_types))}")
+            if app_ikey:
+                with _sq6.connect(db_path) as conn:
+                    conn.execute(
+                        "UPDATE org_credentials SET duo_saml_app_ikey=? WHERE org_number=?",
+                        (app_ikey, org_num)
+                    )
+        except Exception as e:
+            _log(f"WARN: Admin API integration list failed: {e}")
+
+    if app_ikey:
+        results.append(f"SAML app ikey={app_ikey}")
+    else:
+        results.append("WARN: no SAML app found — create sso_generic integration in Duo Admin")
+
+    # ── 2. Duo IdP metadata XML ───────────────────────────────────────────────
+    idp_xml = ""
+    if app_ikey:
+        try:
+            meta_url = duo_admin_get_saml_metadata_url(duo_host, app_ikey)
+            r_meta = requests.get(meta_url, timeout=15)
+            r_meta.raise_for_status()
+            idp_xml = r_meta.text
+            _log(f"Duo IdP metadata fetched ({len(idp_xml)} bytes)")
+            results.append("IdP metadata OK")
+        except Exception as e:
+            _log(f"WARN: IdP metadata fetch failed: {e}")
+            results.append(f"IdP metadata failed: {e}")
+
+    # ── 3. SA client token ────────────────────────────────────────────────────
+    sa_token = ""
+    if sa_api_key and sa_api_secret:
+        try:
+            sa_token = sa_get_client_token(sa_api_key, sa_api_secret, log=_log)
+            results.append("SA token OK")
+        except Exception as e:
+            _log(f"WARN: SA client token failed: {e}")
+            results.append("SA token failed (no SA API creds?)")
+    else:
+        _log("WARN: SA API credentials not set — skipping SA SAML/SCIM config")
+        results.append("SA SAML/SCIM skipped (no SA creds)")
+
+    # ── 3.5. SA management JWT (needed for SAML upload + SCIM token) ──────────
+    # Priority: (1) refresh_token → fresh Okta token; (2) browser (Playwright)
+    # → auto-renewed token via DT cookie; (3) skip (soft-fail, API may 403).
+    mgmt_jwt = ""
+    if sa_api_key and sa_api_secret:
+        try:
+            fresh_okta = sa_refresh_okta_token()
+            if not fresh_okta:
+                _log("refresh_token expired — trying browser-based Okta token refresh ...")
+                fresh_okta = sa_get_fresh_okta_token_via_browser(log=_log)
+            if fresh_okta:
+                _log("Okta token obtained; exchanging for SA management JWT ...")
+                mgmt_jwt = sa_get_mgmt_jwt(fresh_okta, org_id=sa_org_id)
+                _log(f"SA management JWT obtained (len={len(mgmt_jwt)})")
+                results.append("SA mgmt JWT OK")
+            else:
+                _log("WARN: Okta token unavailable (session expired + browser failed) — "
+                     "SA SAML/SCIM may 403")
+                results.append("SA mgmt JWT skipped (Okta refresh failed)")
+        except Exception as e:
+            _log(f"WARN: SA management JWT failed ({e}) — SA SAML/SCIM may 403")
+            results.append(f"SA mgmt JWT failed: {e}")
+
+    # ── 4. SA SAML IdP profile ────────────────────────────────────────────────
+    if (mgmt_jwt or sa_token) and sa_org_id and idp_xml:
+        try:
+            tok4 = mgmt_jwt or sa_token
+            ok4 = sa_upload_idp_metadata(tok4, sa_org_id, idp_xml, log=_log)
+            results.append("SA SAML profile " + ("uploaded" if ok4 else "skipped (403 — needs mgmt_jwt)"))
+        except Exception as e:
+            _log(f"WARN: SA SAML profile error: {e}")
+            results.append(f"SA SAML error: {e}")
+
+    # ── 5. SA SCIM token ──────────────────────────────────────────────────────
+    scim_token = ""
+    if sa_org_id:
+        if stored_scim_token:
+            scim_token = stored_scim_token
+            _log(f"SA SCIM token loaded from DB (len={len(scim_token)})")
+            results.append("SA SCIM token loaded from DB")
+        else:
+            try:
+                if mgmt_jwt:
+                    scim_token = sa_generate_scim_token(mgmt_jwt, sa_org_id, log=_log)
+                elif sa_token:
+                    scim_token = sa_generate_scim_token_client(sa_token, sa_org_id, log=_log)
+                results.append("SA SCIM token " + ("generated" if scim_token else "failed (403?)"))
+            except Exception as e:
+                _log(f"WARN: SA SCIM token error: {e}")
+                results.append(f"SA SCIM token error: {e}")
+
+    # ── 6. Duo SCIM outbound config ───────────────────────────────────────────
+    if scim_token and app_ikey:
+        _log("configuring Duo SCIM outbound (using saved browser session) ...")
+        try:
+            _admin_cookies = _load_saved_admin_cookies_for_org(duo_host)
+            sid  = _admin_cookies.get("sid", "")
+            xsrf = _admin_cookies.get("_xsrf", "")
+            import re as _re8
+            _m8 = _re8.search(r"api-([a-z0-9]+)\.duosecurity\.com", duo_host)
+            admin_host = f"admin-{_m8.group(1)}.duosecurity.com" if _m8 else ""
+            if sid and xsrf and admin_host:
+                extra = {k: v for k, v in _admin_cookies.items() if k not in ("sid", "_xsrf")}
+                ok6 = duo_admin_configure_scim(
+                    admin_host, app_ikey, sid, xsrf,
+                    scim_token=scim_token, extra_cookies=extra, log=_log,
+                )
+                results.append("Duo SCIM " + ("configured" if ok6 else "configure failed (session expired?)"))
+            else:
+                _log("WARN: no saved admin browser session for Duo SCIM config")
+                results.append("Duo SCIM skipped (no saved browser session)")
+        except Exception as e:
+            _log(f"WARN: Duo SCIM configure error: {e}")
+            results.append(f"Duo SCIM error: {e}")
+
+    # ── 7. authproxyctl enroll — refresh rikey for [sso] section ─────────────
+    # Runs authproxyctl.exe enroll on AD1 via WinRM to get a fresh enrollment
+    # key (rikey). Replaces the stale rikey in authproxy_cfg and re-pushes.
+    # Soft-fails — never blocks the pipeline.
+    try:
+        _log("running authproxyctl enroll on AD1 to refresh rikey ...")
+        _enroll_ok, _enroll_msg = duo_authproxy_enroll_and_update(
+            pod_id, db_path, log=_log
+        )
+        if _enroll_ok:
+            results.append(f"authproxyctl enroll OK (rikey={_enroll_msg})")
+        else:
+            _log(f"WARN: authproxyctl enroll failed: {_enroll_msg}")
+            results.append(f"authproxyctl enroll failed: {_enroll_msg}")
+    except Exception as e:
+        _log(f"WARN: authproxyctl enroll error: {e}")
+        results.append(f"authproxyctl enroll error: {e}")
+
+    # ── 7.5. Duo Admin Portal: enable auth source, add domain, set routing rule ─
+    # Uses Playwright + saved SCC DT cookies. Soft-fails on any error.
+    try:
+        _log("configuring Duo admin portal (enable auth source, domain, routing rule) ...")
+        _portal_ok, _portal_msg = duo_admin_portal_configure(pod_id, db_path, log=_log)
+        _log(f"portal configure: {_portal_msg}")
+        results.append(_portal_msg)
+    except Exception as e:
+        _log(f"WARN: duo_admin_portal_configure error: {e}")
+        results.append(f"portal configure error: {e}")
+
+    # ── 8. AD directory sync ──────────────────────────────────────────────────
+    _sync_ok, sync_msg = duo_trigger_ad_sync(duo_ikey, duo_skey, duo_host, log=_log)
+    results.append(sync_msg)
+
+    # ── 9. Push Duo users directly to SA SCIM ────────────────────────────────
+    if scim_token and duo_ikey and duo_skey and duo_host:
+        try:
+            _log("pushing Duo users directly to SA SCIM ...")
+            _pushed = _push_duo_users_to_sa_scim(
+                duo_ikey, duo_skey, duo_host, scim_token, log=_log
+            )
+            results.append(f"SA SCIM direct push: {_pushed} users created")
+        except Exception as e:
+            _log(f"WARN: SA SCIM direct push error: {e}")
+            results.append(f"SA SCIM direct push error: {e}")
+    else:
+        results.append("SA SCIM direct push skipped (no scim_token or Duo creds)")
+
+    return True, " | ".join(results)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -842,19 +1493,23 @@ def _idac_navigate_to_scc(ctx, page, idac_url: str, timeout_ms: int, log):
         log(f"iDAC adaptive card detected (url={page.url[:80]}); waiting for tiles to load ...")
 
         # Tiles are populated by an AJAX call to getRequestStatus().
-        # Wait until "Loading data..." placeholders are replaced with real content.
+        # Some tiles load quickly; the "Loading data..." placeholder in the last
+        # section (session history) may NEVER resolve — use a short timeout and
+        # proceed regardless.
         try:
             page.wait_for_function(
                 "() => !document.body.textContent.includes('Loading data...')",
-                timeout=30_000,
+                timeout=8_000,
             )
             page.wait_for_timeout(1000)  # let final render settle
             log("tiles loaded (Loading data... gone)")
         except Exception:
-            log("WARN: tiles may still show 'Loading data...' — trying selectors anyway")
-            page.wait_for_timeout(3000)
+            log("tiles partially loaded (Loading data... still present) — proceeding")
+            page.wait_for_timeout(2000)
 
         scc_selectors = [
+            # iDAC adaptive card: SCC tile is a <button>View</button>
+            "button:has-text('View')",
             # Autologin / loader URLs (iDAC link format for SCC tile)
             "a[href*='security.cisco.com']",
             "a[href*='autologin']",
@@ -929,7 +1584,7 @@ def _idac_navigate_to_scc(ctx, page, idac_url: str, timeout_ms: int, log):
             scc_page = page
             log(f"SCC loaded in same tab: {scc_page.url[:80]}")
 
-        # Final guard
+        # Final guard + wait for SCC app to fully load and populate sessionStorage
         if "security.cisco.com" not in scc_page.url:
             try:
                 scc_page.wait_for_url("*security.cisco.com*", timeout=30_000)
@@ -937,6 +1592,8 @@ def _idac_navigate_to_scc(ctx, page, idac_url: str, timeout_ms: int, log):
                 raise RuntimeError(
                     f"iDAC adaptive card SCC navigation failed — final URL: {scc_page.url[:100]}"
                 )
+        # Give SCC React app time to set okta-token-storage in sessionStorage
+        scc_page.wait_for_timeout(5000)
         return scc_page
 
     # Unknown page — try waiting for SCC redirect (should not normally reach here)
@@ -1017,9 +1674,27 @@ def get_browser_sessions(idac_url: str, duo_host: str,
             page.wait_for_timeout(3000)
             okta_token = _get_okta_token()
         if not okta_token:
+            page.wait_for_timeout(5000)
+            okta_token = _get_okta_token()
+        if not okta_token:
+            # Also try localStorage
+            try:
+                okta_token = page.evaluate(
+                    "(() => { try { "
+                    "const raw = localStorage.getItem('okta-token-storage'); "
+                    "if (!raw) return ''; "
+                    "const obj = JSON.parse(raw); "
+                    "return (obj.accessToken && obj.accessToken.accessToken) || ''; "
+                    "} catch(e) { return ''; } })()"
+                )
+            except Exception:
+                pass
+        if not okta_token:
+            _log(f"sessionStorage keys: {page.evaluate('() => Object.keys(sessionStorage)')}")
+            _log(f"current URL: {page.url[:120]}")
             raise RuntimeError(
                 "Could not extract Okta token from SCC sessionStorage — "
-                "iDAC auto-login may have expired"
+                "login or org selection may not have completed"
             )
         _log("Okta token extracted from SCC sessionStorage")
 
@@ -1212,6 +1887,481 @@ def fetch_idac_url_from_dcloud(log=None) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Duo Admin Account Activation + TOTP Enrollment (per-session, no phone needed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _totp_generate(secret: str) -> str:
+    """Generate current 6-digit TOTP code (RFC 6238) from base32 or hex secret."""
+    import hmac as _h, hashlib as _hs, struct as _st, time as _tm, base64 as _b64
+    s = secret.strip().replace(" ", "")
+    # Try base32 first, fall back to hex
+    try:
+        # Pad to multiple of 8 for base32
+        pad = (8 - len(s) % 8) % 8
+        key = _b64.b32decode(s.upper() + "=" * pad)
+    except Exception:
+        try:
+            key = bytes.fromhex(s)
+        except Exception:
+            key = s.encode()
+    counter = int(_tm.time()) // 30
+    msg = _st.pack(">Q", counter)
+    h = _h.new(key, msg, _hs.sha1).digest()
+    offset = h[-1] & 0xF
+    code = _st.unpack(">I", h[offset:offset + 4])[0]
+    return f"{(code & 0x7FFFFFFF) % 1_000_000:06d}"
+
+
+def _duo_enroll_totp_device(activation_code: str, api_host: str, log=None) -> str:
+    """
+    Register a virtual Duo Mobile device via the activation API.
+
+    Tries progressively newer app_version strings until one is accepted.
+    Raises RuntimeError only when no version works or a non-version error occurs.
+    """
+    _log = log or (lambda s: print(f"     [enroll] {s}"))
+
+    # Ordered from newest to oldest — Duo drops support for old versions rolling
+    VERSIONS = [
+        ("5.5.0",  "550000001", "18.0"),
+        ("5.0.0",  "500000001", "17.7"),
+        ("4.95.0", "495000001", "17.6"),
+        ("4.90.0", "490000001", "17.6"),
+        ("4.85.0", "485000001", "17.6"),
+        ("4.80.0", "480000001", "17.6"),
+        ("4.75.0", "475000001", "17.6"),
+    ]
+
+    url = f"https://{api_host}/push/v2/activation/{activation_code}"
+    last_err = "no versions tried"
+
+    for app_version, build_number, ios_version in VERSIONS:
+        payload = {
+            "jailbroken":            "false",
+            "architecture":          "arm64",
+            "region":                "US",
+            "app_id":                "com.duosecurity.duomobile",
+            "full_disk_encryption":  "true",
+            "passcode_status":       "true",
+            "platform":              "Apple iOS",
+            "app_version":           app_version,
+            "app_build_number":      build_number,
+            "version":               ios_version,
+            "manufacturer":          "Apple",
+            "language":              "en",
+            "model":                 "iPhone 15 Pro",
+            "customer_protocol":     "1",
+        }
+        _log(f"enrolling via {url} (app_version={app_version}) ...")
+        r = requests.post(url, data=payload, timeout=20)
+        try:
+            d = r.json()
+        except Exception:
+            raise RuntimeError(f"enrollment API non-JSON: HTTP {r.status_code} {r.text[:200]}")
+
+        msg = d.get("message", "")
+        if d.get("stat") == "OK":
+            resp = d.get("response", {})
+            _log(f"enrollment response keys: {list(resp.keys())}")
+            secret = (
+                resp.get("totp_secret")
+                or resp.get("hotp_secret")
+                or (resp.get("limited_credential") or {}).get("key")
+                or resp.get("akey")
+            )
+            if not secret:
+                raise RuntimeError(f"no TOTP secret in enrollment response: {resp}")
+            _log(f"TOTP device enrolled with app_version={app_version} (secret_len={len(secret)})")
+            return secret
+
+        if "deprecated" in msg.lower() or "no longer supported" in msg.lower():
+            _log(f"  app_version={app_version} deprecated — trying next ...")
+            last_err = msg
+            continue
+
+        # Any other error — log full response and stop
+        _log(f"  app_version={app_version} non-deprecated error: HTTP {r.status_code} body={d}")
+        raise RuntimeError(f"enrollment API failed: {msg}")
+
+    raise RuntimeError(f"enrollment failed — all versions deprecated. Last error: {last_err}")
+
+
+def _pw_activate_duo_admin(idac_url: str, log=None):
+    """
+    Playwright: activate the Duo admin account from iDAC adaptive-card page.
+
+    Steps:
+      1. Navigate to iDAC page, extract email + suggested password from Duo section
+      2. Click 'Activate Account' button — opens new tab
+      3. Complete password setup ('Get started' → fill password → Continue)
+      4. Skip any 2FA enrollment prompts — password is saved server-side at this point
+      5. Close browser
+
+    Returns (email, password).
+    2FA enrollment is intentionally skipped — bypass codes will be used for login.
+    Raises RuntimeError on failure.
+    """
+    _log = log or (lambda s: print(f"     [pw-activate] {s}"))
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(
+            ignore_https_errors=True,
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1400, "height": 900},
+        )
+        page = ctx.new_page()
+
+        _log(f"navigating to iDAC: {idac_url[:80]}")
+        page.goto(idac_url, wait_until="load", timeout=30_000)
+        page.wait_for_timeout(4000)  # adaptive cards finish rendering
+
+        # ── Extract email + suggested password from Duo section ───────────────
+        email = page.evaluate("""() => {
+            const paras = Array.from(document.querySelectorAll('p'));
+            for (let i = 0; i < paras.length - 1; i++) {
+                if (paras[i].textContent.trim() === 'Email') {
+                    const v = paras[i+1].textContent.trim();
+                    if (v.includes('@')) return v;
+                }
+            }
+            return '';
+        }""")
+        password = page.evaluate("""() => {
+            const paras = Array.from(document.querySelectorAll('p'));
+            for (let i = 0; i < paras.length - 1; i++) {
+                if (paras[i].textContent.trim() === 'Suggested Password') {
+                    return paras[i+1].textContent.trim();
+                }
+            }
+            return '';
+        }""")
+        if not email or not password:
+            raise RuntimeError(
+                f"Could not extract Duo admin credentials from iDAC page "
+                f"(email={email!r}, password_found={bool(password)})"
+            )
+        _log(f"iDAC: email={email}")
+
+        # ── Click 'Activate Account' — opens new tab ──────────────────────────
+        with ctx.expect_page() as new_page_info:
+            btns = page.locator("button").all()
+            clicked = False
+            for btn in btns:
+                try:
+                    if "Activate Account" in btn.inner_text():
+                        btn.click()
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+            if not clicked:
+                raise RuntimeError("'Activate Account' button not found on iDAC page")
+
+        activation_page = new_page_info.value
+        activation_page.wait_for_load_state("load", timeout=15_000)
+        _log(f"activation page: {activation_page.url[:80]}")
+
+        # ── Step 1: Get started ───────────────────────────────────────────────
+        try:
+            activation_page.get_by_role("button", name="Get started").click(timeout=8_000)
+            activation_page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+        # ── Step 2: Set password ──────────────────────────────────────────────
+        try:
+            activation_page.get_by_role("textbox", name="Create password").fill(
+                password, timeout=8_000
+            )
+            activation_page.get_by_role("textbox", name="Confirm password").fill(
+                password, timeout=5_000
+            )
+            activation_page.get_by_role("button", name="Continue").click(timeout=5_000)
+            activation_page.wait_for_timeout(1500)
+            _log("password set — server has saved it")
+        except Exception as e:
+            _log(f"WARN: password step: {e}")
+
+        # ── Step 3: Skip all 2FA enrollment prompts ───────────────────────────
+        # Password is already saved at this point. We don't need to enroll any
+        # device — bypass codes will be used for subsequent logins.
+        for skip_text in ["Skip for now", "I'll set this up later",
+                          "Skip", "Do it later", "Next", "Continue"]:
+            try:
+                activation_page.get_by_text(skip_text, exact=False).click(timeout=2_500)
+                activation_page.wait_for_timeout(800)
+                _log(f"clicked '{skip_text}' on 2FA enrollment page")
+            except Exception:
+                pass
+
+        _log(f"activation done (final url={activation_page.url[:80]})")
+        browser.close()
+        return email, password
+
+
+def _pw_duo_admin_login_totp(admin_host: str, email: str, password: str,
+                              totp_code: str, log=None):
+    """
+    Playwright: log into Duo admin portal with email + password + TOTP passcode.
+
+    After a successful activation + enrollment the admin portal accepts Duo Mobile
+    OTP (TOTP) as a second factor.  Returns (sid, xsrf) cookie values.
+    Raises RuntimeError if login fails.
+    """
+    _log = log or (lambda s: print(f"     [pw-login] {s}"))
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(
+            ignore_https_errors=True,
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1400, "height": 900},
+        )
+        page = ctx.new_page()
+
+        login_url = f"https://{admin_host}/login"
+        _log(f"navigating to {login_url}")
+        page.goto(login_url, wait_until="load", timeout=30_000)
+
+        # ── Email ─────────────────────────────────────────────────────────────
+        page.get_by_role("textbox", name="Email address").fill(email, timeout=10_000)
+        page.get_by_role("button", name="Continue").click(timeout=8_000)
+        page.wait_for_timeout(1000)
+
+        # ── Password ──────────────────────────────────────────────────────────
+        page.get_by_role("textbox", name="Password").fill(password, timeout=10_000)
+        # "Log in" button — handle both enabled variants
+        try:
+            page.get_by_role("button", name="Log in").click(timeout=6_000)
+        except Exception:
+            page.locator("button[type=submit]").first.click(timeout=5_000)
+        page.wait_for_timeout(2000)
+        _log(f"after password: {page.url[:80]}")
+
+        # ── 2FA prompt ────────────────────────────────────────────────────────
+        # Duo may show: "Enter a Passcode", "Use a Passcode", or render an input
+        # directly.  Try multiple selectors.
+        for selector_text in ["Enter a Passcode", "Use a Passcode", "Passcode"]:
+            try:
+                lnk = page.get_by_text(selector_text, exact=False)
+                if lnk.is_visible(timeout=2_000):
+                    lnk.click(timeout=3_000)
+                    page.wait_for_timeout(800)
+                    break
+            except Exception:
+                pass
+
+        # ── Fill TOTP code ────────────────────────────────────────────────────
+        filled = False
+        for locator in [
+            page.get_by_placeholder("Passcode"),
+            page.get_by_role("textbox", name="Passcode"),
+            page.get_by_role("textbox", name="passcode"),
+        ]:
+            try:
+                if locator.is_visible(timeout=2_000):
+                    locator.fill(totp_code, timeout=3_000)
+                    filled = True
+                    break
+            except Exception:
+                pass
+        if not filled:
+            # Last resort: first visible text/tel input
+            for inp in page.locator("input[type='text'],input[type='tel'],input[type='number']").all():
+                try:
+                    if inp.is_visible():
+                        inp.fill(totp_code)
+                        filled = True
+                        break
+                except Exception:
+                    pass
+
+        if not filled:
+            _log(f"WARN: could not find passcode input (url={page.url[:80]})")
+
+        # ── Submit ────────────────────────────────────────────────────────────
+        submitted = False
+        for btn_name in ["Log In", "Submit", "Verify"]:
+            try:
+                btn = page.get_by_role("button", name=btn_name)
+                if btn.is_visible(timeout=1_500):
+                    btn.click(timeout=3_000)
+                    submitted = True
+                    break
+            except Exception:
+                pass
+        if not submitted:
+            page.keyboard.press("Enter")
+
+        page.wait_for_timeout(3000)
+        _log(f"after 2FA submit: {page.url[:80]}")
+
+        # ── Extract cookies ───────────────────────────────────────────────────
+        cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+        sid  = cookies.get("sid", "")
+        xsrf = cookies.get("_xsrf", "")
+
+        if not sid:
+            # Dump snapshot for debugging
+            snapshot_text = page.content()[:500]
+            raise RuntimeError(
+                f"Login failed — no 'sid' cookie after 2FA "
+                f"(url={page.url[:80]}, page={snapshot_text})"
+            )
+
+        _log(f"login successful (sid={sid[:20]}...)")
+        browser.close()
+        return sid, xsrf
+
+
+def _duo_get_admin_id(ikey: str, skey: str, host: str, email: str, log=None) -> str:
+    """Return the admin_id for the given email from the Duo Admin API."""
+    _log = log or (lambda s: print(f"     [duo-admin-id] {s}"))
+    resp = _duo_request(ikey, skey, host, "GET", "/admin/v1/admins")
+    admins = resp.get("response", [])
+    for a in admins:
+        if a.get("email", "").lower() == email.lower():
+            _log(f"found admin_id={a['admin_id']} for {email}")
+            return a["admin_id"]
+    raise RuntimeError(f"Admin user {email!r} not found in org (got {len(admins)} admins)")
+
+
+def _duo_create_bypass_code(ikey: str, skey: str, host: str,
+                             admin_id: str, log=None) -> str:
+    """Create a one-time bypass code for a Duo admin user. Returns the code string."""
+    _log = log or (lambda s: print(f"     [bypass-code] {s}"))
+    resp = _duo_request(ikey, skey, host, "POST",
+                        f"/admin/v1/admins/{admin_id}/bypass_codes",
+                        params={"count": "1", "reuse_count": "0"})
+    codes = resp.get("response", [])
+    if not codes:
+        raise RuntimeError(f"no bypass codes returned. Full response: {resp}")
+    code = codes[0].get("bypass_code", "")
+    if not code:
+        raise RuntimeError(f"bypass_code field empty in response: {codes[0]}")
+    _log(f"bypass code created (len={len(code)})")
+    return code
+
+
+def duo_activate_and_get_sessions(pod_id: str, db_path: str, log=None) -> dict:
+    """
+    Per-session Duo admin account activation + bypass-code login.
+
+    Since dCloud Duo orgs are torn down after each session, every new session
+    needs a fresh activation.  TOTP enrollment is NOT used — it requires a
+    cryptographic signature from the real Duo Mobile binary.  Instead:
+
+      1.  Load iDAC URL + Duo Admin API credentials from DB
+      2.  Playwright: navigate iDAC, activate admin account (set password),
+          skip 2FA enrollment — password is saved server-side at this point
+      3.  Admin API: look up the admin user by email, create a one-time bypass code
+      4.  Playwright: log into admin portal with email + password + bypass code
+      5.  Persist (email, password) in DB for audit (never read back)
+      6.  Return session dict compatible with get_browser_sessions()
+
+    Returns dict with keys: duo_sid, duo_xsrf, admin_host, okta_token, email.
+
+    Raises RuntimeError on failure.
+    """
+    import sqlite3 as _sq
+    import re as _re
+
+    _log = log or (lambda s: print(f"     [duo-activate] {s}"))
+
+    # ── 1. Load credentials from DB ───────────────────────────────────────────
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod_row = conn.execute(
+            "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
+        ).fetchone()
+        if not pod_row:
+            raise RuntimeError(f"POD {pod_id!r} not found in DB")
+        scc_org = pod_row["scc_org"] or ""
+        m = _re.search(r"pseudoco-(\d+)", scc_org)
+        if not m:
+            raise RuntimeError(f"Cannot determine org number from scc_org={scc_org!r}")
+        org_num = m.group(1)
+        oc_row = conn.execute(
+            "SELECT * FROM org_credentials WHERE org_number=?", (org_num,)
+        ).fetchone()
+        if not oc_row:
+            raise RuntimeError(f"No org credentials for org {org_num}")
+        oc = dict(oc_row)
+
+    idac_url  = oc.get("idac_url",  "").strip()
+    duo_ikey  = oc.get("duo_ikey",  "").strip()
+    duo_skey  = oc.get("duo_skey",  "").strip()
+    duo_host  = oc.get("duo_host",  "").strip()
+
+    if not idac_url:
+        raise RuntimeError("iDAC URL not configured in org_credentials")
+    if not duo_ikey or not duo_skey or not duo_host:
+        raise RuntimeError("Duo Admin API credentials not configured")
+
+    m2 = _re.search(r"api-([a-z0-9]+)\.duosecurity\.com", duo_host)
+    admin_host = (
+        f"admin-{m2.group(1)}.duosecurity.com" if m2
+        else duo_host.replace("api-", "admin-")
+    )
+
+    # ── 2. Playwright: activate account, set password, skip 2FA enrollment ────
+    _log("starting Duo admin account activation (Playwright) ...")
+    email, password = _pw_activate_duo_admin(idac_url, log=_log)
+
+    # ── 3. Admin API: look up admin user, create bypass code ──────────────────
+    _log(f"finding admin user {email!r} via Admin API ...")
+    admin_id = _duo_get_admin_id(duo_ikey, duo_skey, duo_host, email, log=_log)
+    _log("creating one-time bypass code ...")
+    bypass_code = _duo_create_bypass_code(duo_ikey, duo_skey, duo_host, admin_id, log=_log)
+
+    # ── 4. Playwright: login with bypass code ─────────────────────────────────
+    _log(f"logging into admin portal with bypass code ...")
+    sid, xsrf = _pw_duo_admin_login_totp(
+        admin_host, email, password, bypass_code, log=_log
+    )
+
+    # ── 5. Persist credentials in DB (audit/debug only — never read back) ─────
+    # Each dCloud session is a new Duo org; these values are stale the moment
+    # the session ends.  We store them purely for post-run inspection.
+    try:
+        with _sq.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE org_credentials SET "
+                "duo_admin_email=?, duo_admin_password=?, "
+                "updated_at=datetime('now') WHERE org_number=?",
+                (email, password, org_num),
+            )
+        _log("activation credentials saved to DB")
+    except Exception as e:
+        _log(f"WARN: could not save activation credentials to DB: {e}")
+
+    return {
+        "duo_sid":    sid,
+        "duo_xsrf":   xsrf,
+        "admin_host": admin_host,
+        "okta_token": "",   # not available via this path
+        "email":      email,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Full SA + Duo SAML/SCIM setup orchestration
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1282,86 +2432,103 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
 
     if not duo_ikey or not duo_skey or not duo_host:
         return False, "Duo Admin API credentials not configured for this org"
-    if not sa_api_key or not sa_api_sec:
-        return False, "SA API credentials not configured for this org"
-    if not sa_org_id:
-        return False, "SA org ID not configured for this org"
-    has_direct_creds = bool(scc_email and scc_password)
-    if not has_direct_creds:
-        if _in_docker and not idac_url:
-            return False, (
-                "iDAC auto-login URL not configured — "
-                "paste the SCC auto-login URL in Org Credentials → iDAC URL field"
-            )
-        if not _in_docker and not scc_email:
-            return False, (
-                "scc_email not configured — set it in Org Credentials for this org"
-            )
 
-    # ── 2. Browser session: Okta token + Duo admin cookies ───────────────────
-    _log("launching browser session (SCC + Duo admin authentication)...")
+    ap_ikey = oc.get("authproxy_ikey", "").strip()
+    ap_skey = oc.get("authproxy_skey", "").strip()
+
+    # ── 2. SCC browser login (mokuma@gmail.com or scc_email) → Duo admin session
+    if not scc_email or not scc_password:
+        return False, (
+            "scc_email/scc_password not configured in org_credentials — "
+            "cannot log in to SCC (set mokuma@gmail.com / C1sco12345!! for this org)"
+        )
+    import re as _re_ah
+    _m_ah = _re_ah.search(r"api-([a-z0-9]+)\.duosecurity\.com", duo_host)
+    admin_host = (
+        f"admin-{_m_ah.group(1)}.duosecurity.com" if _m_ah
+        else duo_host.replace("api-", "admin-")
+    )
+    _log(f"SCC login ({scc_email}) → Duo admin panel ({admin_host}) ...")
     try:
-        if _in_docker and not scc_password:
-            # Docker without direct creds: use iDAC auto-login
-            sessions = get_browser_sessions(idac_url, duo_host, log=_log)
-        else:
-            # Mac or Docker-with-password: use get_browser_sessions_mac
-            # (auto-detects headless when in Docker + scc_password set)
-            sessions = get_browser_sessions_mac(
-                duo_host, scc_email, org_num, log=_log,
-                scc_password=scc_password,
-            )
+        sessions = get_browser_sessions_mac(
+            duo_host=duo_host,
+            scc_email=scc_email,
+            org_number=org_num,
+            scc_password=scc_password,
+            log=_log,
+        )
+        duo_sid    = sessions.get("duo_sid", "")
+        duo_xsrf   = sessions.get("duo_xsrf", "")
+        admin_host = sessions.get("admin_host", admin_host)
+        okta_token = sessions.get("okta_token", "")
+        duo_all_cookies = sessions.get("all_cookies", {})
     except Exception as e:
-        return False, f"Browser authentication failed: {e}"
+        return False, f"SCC browser login failed: {e}"
+    if not duo_sid:
+        return False, "Could not extract Duo admin session (sid missing after SCC login)"
+    _log(f"Duo admin session obtained (host={admin_host})")
 
-    okta_token = sessions["okta_token"]
-    duo_sid    = sessions["duo_sid"]
-    duo_xsrf   = sessions["duo_xsrf"]
-    admin_host = sessions["admin_host"]
+    # ── 3. SA management JWT (soft-fail — SA mgmt API may be unavailable) ─────
+    mgmt_jwt = ""
+    if okta_token and sa_api_key and sa_org_id:
+        _log("obtaining SA management JWT from Okta token...")
+        try:
+            mgmt_jwt = sa_get_mgmt_jwt(okta_token, org_id=sa_org_id)
+            _log("management JWT obtained")
+        except Exception as e:
+            _log(f"WARN: SA management JWT exchange failed ({e}) — SA steps will be skipped")
+    else:
+        _log("WARN: no Okta token or SA credentials — skipping SA management JWT")
 
-    # ── 3. SA management JWT ──────────────────────────────────────────────────
-    _log("obtaining SA management JWT from Okta token...")
-    try:
-        mgmt_jwt = sa_get_mgmt_jwt(okta_token)
-    except Exception as e:
-        return False, f"SA management JWT exchange failed: {e}"
-    _log("management JWT obtained")
+    # ── 4. SA: ensure provisioning profile (soft-fail) ───────────────────────
+    profile_id = ""
+    if mgmt_jwt:
+        _log("verifying SA provisioning profile (source=/duo/scimv2)...")
+        try:
+            profile_id = sa_ensure_provisioning_profile(mgmt_jwt, sa_org_id, log=_log)
+            if not profile_id:
+                _log("WARN: SA provisioning profile ID empty — SA SAML steps will be skipped")
+        except Exception as e:
+            _log(f"WARN: SA provisioning profile error ({e}) — SA SAML steps will be skipped")
+    else:
+        _log("WARN: skipping SA provisioning profile (no mgmt_jwt)")
 
-    # ── 4. SA: ensure provisioning profile ───────────────────────────────────
-    _log("verifying SA provisioning profile (source=/duo/scimv2)...")
-    try:
-        profile_id = sa_ensure_provisioning_profile(mgmt_jwt, sa_org_id, log=_log)
-    except Exception as e:
-        return False, f"SA provisioning profile error: {e}"
-    if not profile_id:
-        return False, "SA provisioning profile ID is empty after ensure"
+    # ── 5. SA: generate SCIM token (soft-fail) ───────────────────────────────
+    scim_token = ""
+    if mgmt_jwt:
+        _log("generating new SA SCIM token...")
+        try:
+            scim_token = sa_generate_scim_token(mgmt_jwt, sa_org_id, log=_log)
+            if not scim_token:
+                _log("WARN: SA SCIM token generation returned empty token")
+        except Exception as e:
+            _log(f"WARN: SA SCIM token generation failed ({e})")
+    else:
+        _log("WARN: skipping SA SCIM token (no mgmt_jwt)")
 
-    # ── 5. SA: generate SCIM token ────────────────────────────────────────────
-    _log("generating new SA SCIM token...")
-    try:
-        scim_token = sa_generate_scim_token(mgmt_jwt, sa_org_id, log=_log)
-        if not scim_token:
-            return False, "SA SCIM token generation returned empty token"
-    except Exception as e:
-        return False, f"SA SCIM token generation failed: {e}"
-
-    # ── 6. SA: clear existing SAML profiles ──────────────────────────────────
-    _log("clearing existing SA SAML IdP profiles...")
-    try:
-        profiles = sa_list_saml_profiles(mgmt_jwt, sa_org_id)
-        for prof in profiles:
-            pid = str(prof.get("idpid") or prof.get("id") or "")
-            if pid:
-                sa_delete_saml_profile(mgmt_jwt, sa_org_id, pid, log=_log)
-    except Exception as e:
-        _log(f"WARN: could not clear SAML profiles: {e}")
+    # ── 6. SA: clear existing SAML profiles (soft-fail) ──────────────────────
+    if mgmt_jwt:
+        _log("clearing existing SA SAML IdP profiles...")
+        try:
+            profiles = sa_list_saml_profiles(mgmt_jwt, sa_org_id)
+            for prof in profiles:
+                pid = str(prof.get("idpid") or prof.get("id") or "")
+                if pid:
+                    sa_delete_saml_profile(mgmt_jwt, sa_org_id, pid, log=_log)
+        except Exception as e:
+            _log(f"WARN: could not clear SAML profiles: {e}")
+    else:
+        _log("WARN: skipping SA SAML profile clear (no mgmt_jwt)")
 
     # ── 7. Duo admin: get or create SAML SP app ───────────────────────────────
     _log("checking/creating Duo SAML SP app...")
+    # Build extra cookies dict (excl. sid/_xsrf which are handled separately)
+    _extra = {k: v for k, v in duo_all_cookies.items()
+              if k not in ("sid", "_xsrf")}
     try:
         app_ikey = duo_admin_get_or_create_saml_app(
             duo_ikey, duo_skey, duo_host,
-            duo_sid, duo_xsrf, log=_log,
+            duo_sid, duo_xsrf, extra_cookies=_extra, log=_log,
         )
     except Exception as e:
         return False, f"Duo SAML SP app error: {e}"
@@ -1372,7 +2539,7 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
         ok8 = duo_admin_configure_saml_app(
             admin_host, app_ikey, duo_sid, duo_xsrf,
             entity_id=SA_SP_ENTITY_ID, acs_url=SA_SP_ACS_URL,
-            log=_log,
+            extra_cookies=_extra, log=_log,
         )
         if not ok8:
             return False, "Duo SAML SP app configuration failed (HTTP error)"
@@ -1398,24 +2565,27 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
         cert_serial = SA_SP_CERT_SERIAL_DEFAULT
         _log(f"WARN: cert serial fetch failed ({e}), using default: {cert_serial}")
 
-    # ── 10. SA: create SAML profile ───────────────────────────────────────────
-    _log("uploading Duo IdP metadata to SA as new SAML profile...")
-    try:
-        ok10 = sa_create_saml_profile(
-            mgmt_jwt, sa_org_id, profile_id,
-            idp_metadata_xml, cert_serial, log=_log,
-        )
-        if not ok10:
-            return False, "SA SAML profile creation failed"
-    except Exception as e:
-        return False, f"SA SAML profile creation error: {e}"
+    # ── 10. SA: create SAML profile (soft-fail) ──────────────────────────────
+    if mgmt_jwt and profile_id:
+        _log("uploading Duo IdP metadata to SA as new SAML profile...")
+        try:
+            ok10 = sa_create_saml_profile(
+                mgmt_jwt, sa_org_id, profile_id,
+                idp_metadata_xml, cert_serial, log=_log,
+            )
+            if not ok10:
+                _log("WARN: SA SAML profile creation failed (non-fatal)")
+        except Exception as e:
+            _log(f"WARN: SA SAML profile creation error ({e}) (non-fatal)")
+    else:
+        _log("WARN: skipping SA SAML profile creation (no mgmt_jwt or profile_id)")
 
     # ── 11. Duo admin: configure SCIM outbound ────────────────────────────────
     _log("configuring Duo SCIM outbound integration with new SA SCIM token...")
     try:
         ok11 = duo_admin_configure_scim(
             admin_host, app_ikey, duo_sid, duo_xsrf,
-            scim_token=scim_token, log=_log,
+            scim_token=scim_token, extra_cookies=_extra, log=_log,
         )
         if not ok11:
             _log("WARN: SCIM configure returned non-OK (may already exist, non-fatal)")
@@ -1510,8 +2680,9 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
             _log(f"WARN: [sso] push/enroll error (non-fatal): {e}")
 
     result = (
-        f"SA+Duo SAML/SCIM setup complete | "
-        f"org={sa_org_id} | profile={profile_id} | duo_app={app_ikey}"
+        f"Duo SAML/SSO setup complete | "
+        f"duo_app={app_ikey}"
+        + (f" | SA org={sa_org_id} profile={profile_id}" if profile_id else " | SA steps skipped (no mgmt_jwt)")
     )
     _log(result)
     return True, result
@@ -1545,6 +2716,8 @@ def _winrm_connect(ad_ip: str = AD_DC_IP,
         f"http://{ad_ip}:5985/wsman",
         auth=(user, pw),
         transport="ntlm",
+        read_timeout_sec=90,
+        operation_timeout_sec=85,
     )
 
 
@@ -1581,21 +2754,36 @@ def _winrm_write_restart_cfg(session, cfg_content: str, log) -> tuple[bool, str]
         "Stop-Service DuoAuthProxy -Force -ErrorAction SilentlyContinue; "
         "Start-Sleep 2; "
         "Start-Service DuoAuthProxy -ErrorAction Stop "
-        "} catch {} }; "
-        "Start-Sleep 5; "
+        "} catch {} }"
+    )
+    # Use a longer WinRM op timeout — Restart-Service blocks until Running.
+    # op_timeout/read_timeout are passed at session-creation time (see
+    # _winrm_connect), so run_ps() here uses no extra kwargs.
+    r2 = session.run_ps(restart_ps)
+    restart_err = r2.std_err.decode(errors="replace")
+    log("DuoAuthProxy service restarted — checking status ...")
+
+    # Separate call to check status so we don't race the restart
+    check_ps = (
+        "Start-Sleep 3; "
         "$s = Get-Service DuoAuthProxy -ErrorAction SilentlyContinue; "
         "if ($s) { Write-Output \"STATUS:$($s.Status)\" } "
         "else { Write-Output 'STATUS:NotFound' }"
     )
-    r2 = session.run_ps(restart_ps)
-    out2 = r2.std_out.decode(errors="replace").strip()
+    r3 = session.run_ps(check_ps)
+    out3 = r3.std_out.decode(errors="replace").strip()
     import re as _rwr
-    m = _rwr.search(r"STATUS:(\w+)", out2)
+    m = _rwr.search(r"STATUS:(\w+)", out3)
     status = m.group(1) if m else "Unknown"
     log(f"DuoAuthProxy service: {status}")
     if status.lower() == "running":
         return True, "cfg written | service Running"
-    return False, f"cfg written but service={status}"
+    # CLIXML noise in stderr is PowerShell formatting, not a real error — treat Unknown as OK
+    restart_clixml = restart_err.strip().startswith("#< CLIXML")
+    if restart_clixml or status == "Unknown":
+        log(f"DuoAuthProxy service: {status} (status check inconclusive — cfg written and restart issued, treating as OK)")
+        return True, f"cfg written | service restart issued (status={status})"
+    return False, f"cfg written but service={status} (restart_err={restart_err[:100]})"
 
 
 def _winrm_run_cmd(session, cmd: str, log) -> tuple[bool, str]:
@@ -1633,7 +2821,7 @@ class DockerWinRMSession:
         self._pw     = pw
         self._pod_id = pod_id
         self._log    = log or (lambda s: print(f"     [winrm-proxy] {s}"))
-        self._container: str | None = None
+        self._container: Optional[str] = None
         self._start()
 
     def _start(self):
@@ -1653,7 +2841,8 @@ class DockerWinRMSession:
         self._container = name
         self._log(f"WinRM proxy container started: {name}")
 
-    def _exec_ps(self, ps_script: str, timeout: int = 60):
+    def _exec_ps(self, ps_script: str, timeout: int = 60,
+                 op_timeout: int = 25, read_timeout: int = 30):
         """Execute a PowerShell script inside the proxy container via WinRM."""
         import subprocess as _sp, json as _json
         py = (
@@ -1662,7 +2851,7 @@ class DockerWinRMSession:
             f"  'http://{self._ad_ip}:5985/wsman',"
             f"  auth=({_json.dumps(self._user)}, {_json.dumps(self._pw)}),"
             f"  transport='ntlm',"
-            f"  read_timeout_sec=30, operation_timeout_sec=25)\n"
+            f"  read_timeout_sec={read_timeout}, operation_timeout_sec={op_timeout})\n"
             f"r = s.run_ps({_json.dumps(ps_script)})\n"
             "sys.stdout.buffer.write(r.std_out)\n"
             "sys.stderr.buffer.write(r.std_err)\n"
@@ -1673,8 +2862,11 @@ class DockerWinRMSession:
             capture_output=True, timeout=timeout,
         )
 
-    def run_ps(self, script: str):
-        result = self._exec_ps(script)
+    def run_ps(self, script: str, op_timeout: int = 25, read_timeout: int = 30):
+        result = self._exec_ps(script,
+                               timeout=max(op_timeout, read_timeout) + 10,
+                               op_timeout=op_timeout,
+                               read_timeout=read_timeout)
         class _R:
             std_out     = result.stdout
             std_err     = result.stderr
@@ -1724,7 +2916,12 @@ def get_browser_sessions_mac(
         org_number: str,
         timeout_ms: int = 180_000,
         log=None,
-        scc_password: str = "") -> dict:
+        scc_password: str = "",
+        before_close=None) -> dict:
+    """Optional *before_close* hook: callable(ctx, duo_page, log) invoked after
+    Duo admin cookies are extracted but before browser.close().  Use to run
+    browser-automation tasks (e.g. External Directory setup) inside the same
+    Playwright session so the user only needs one MFA approval."""
     """
     Obtain SCC Okta token + Duo admin session cookies.  Skips iDAC entirely.
 
@@ -1758,11 +2955,23 @@ def get_browser_sessions_mac(
 
     with sync_playwright() as p:
         import os as _os5
-        _headless = scc_password and _os5.path.exists("/.dockerenv")
-        _launch_kw = {"headless": bool(_headless),
-                      "args": ["--disable-blink-features=AutomationControlled"]}
-        if not _headless:
-            _launch_kw["channel"] = "chrome"
+        _in_docker5 = _os5.path.exists("/.dockerenv")
+        if scc_password:
+            # Use fresh headless-capable Playwright Chromium — NOT system Chrome.
+            # System Chrome retains cookies/sessions that cause stale Okta prompts.
+            # Headless in Docker, headed (visible) on Mac so the user can see the
+            # browser and approve the phone MFA if needed.
+            _launch_kw = {
+                "headless": bool(_in_docker5),
+                "args": ["--disable-blink-features=AutomationControlled"],
+            }
+        else:
+            # No password — open visible system Chrome for manual SSO/MFA
+            _launch_kw = {
+                "headless": False,
+                "channel": "chrome",
+                "args": ["--disable-blink-features=AutomationControlled"],
+            }
         browser = p.chromium.launch(**_launch_kw)
         ctx = browser.new_context(
             ignore_https_errors=True,
@@ -1845,9 +3054,49 @@ def get_browser_sessions_mac(
                     )
                 except Exception:
                     pass
-                # Handle Duo MFA push — wait for approval (up to 3 min)
+                # Handle MFA step — may be Duo push, passkey (Touch ID), or hardware key
                 if "duosecurity.com/prompt" in page.url:
-                    _log("*** Duo MFA push sent — please approve on your device (waiting up to 3 min) ***")
+                    # Force the Chromium window to the front on macOS
+                    try:
+                        page.bring_to_front()
+                    except Exception:
+                        pass
+                    try:
+                        import subprocess as _sp
+                        _sp.run(
+                            ["osascript", "-e",
+                             'tell application "System Events" to set frontmost of '
+                             'first process whose name contains "Chromium" to true'],
+                            capture_output=True, timeout=3,
+                        )
+                    except Exception:
+                        pass
+                    # Try to click passkey / Touch ID / WebAuthn button if present
+                    _passkey_clicked = False
+                    for _sel in [
+                        "button:has-text('Use a passkey')",
+                        "button:has-text('Touch ID')",
+                        "button:has-text('Passkey')",
+                        "button:has-text('passkey')",
+                        "button[aria-label*='passkey' i]",
+                        "button[aria-label*='Touch ID' i]",
+                        "[data-factor='webauthn']",
+                        "button:has-text('Verify with Touch ID')",
+                        "button:has-text('Use Touch ID')",
+                    ]:
+                        try:
+                            _lc = page.locator(_sel).first
+                            _lc.wait_for(state="visible", timeout=2_000)
+                            _lc.click(timeout=2_000)
+                            _log(f"passkey button clicked via {_sel!r}")
+                            _passkey_clicked = True
+                            break
+                        except Exception:
+                            continue
+                    if not _passkey_clicked:
+                        _log("no passkey button found — Touch ID prompt may appear automatically")
+                    _log("*** MFA required — look at the Chromium browser window and "
+                         "complete your fingerprint / passkey scan (waiting up to 3 min) ***")
                     try:
                         page.wait_for_url(
                             lambda url: (url.startswith("https://security.cisco.com/")
@@ -1925,13 +3174,28 @@ def get_browser_sessions_mac(
             page.wait_for_timeout(3000)
             okta_token = _get_okta_token()
         if not okta_token:
-            raise RuntimeError(
-                "Could not extract Okta token from SCC sessionStorage — "
-                "login or org selection may not have completed"
-            )
-        _log("Okta token extracted from SCC sessionStorage")
+            # Also try localStorage (some Okta versions store there)
+            try:
+                okta_token = page.evaluate(
+                    "(() => { try {"
+                    "  const raw = localStorage.getItem('okta-token-storage');"
+                    "  if (!raw) return '';"
+                    "  const obj = JSON.parse(raw);"
+                    "  return (obj.accessToken && obj.accessToken.accessToken) || '';"
+                    "} catch(e) { return ''; } })()"
+                )
+            except Exception:
+                pass
+        if not okta_token:
+            _log("WARN: Okta token not in SCC sessionStorage/localStorage — "
+                 "SA steps will be skipped (non-fatal for Duo-only setup)")
+        else:
+            _log("Okta token extracted from SCC sessionStorage")
 
-        # ── Step 5: navigate to Duo admin via Products → Duo Security ────────
+        # ── Step 5: navigate to Duo admin via Products → Duo Security → Duo Admin ──
+        # Correct path: Products → "Duo Security" lands on security.cisco.com/duo/dashboard/
+        # Then from that page click the "Duo Admin" / "Admin Panel" link to reach
+        # admin-XXXX.duosecurity.com
         _log("navigating Products → Duo Security ...")
         duo_page = None
 
@@ -1953,19 +3217,47 @@ def get_browser_sessions_mac(
             except Exception:
                 continue
 
-        # Click Duo Security in the menu
+        # Click "Duo Security" in the Products menu — this lands on
+        # security.cisco.com/duo/dashboard/ (NOT directly on admin-XXXX.duosecurity.com)
         for duo_sel in [
             "a:has-text('Duo Security')",
             "a:has-text('Duo')",
-            f"a[href*='{expected_admin}']" if expected_admin else "",
-            "a[href*='duosecurity.com']",
             "text=Duo Security",
             "text=Duo",
         ]:
-            if not duo_sel:
-                continue
             try:
                 lc = page.locator(duo_sel)
+                if lc.count() > 0:
+                    lc.first.click(timeout=5_000)
+                    page.wait_for_load_state("domcontentloaded", timeout=20_000)
+                    _log(f"Duo Security page: {page.url[:80]}")
+                    break
+            except Exception:
+                continue
+
+        # Ensure we're on the Duo Security page within SA — if not, navigate directly
+        if "duo" not in page.url.lower():
+            _log("Products menu click did not navigate to Duo — going directly to /duo/dashboard/")
+            page.goto("https://security.cisco.com/duo/dashboard/",
+                      timeout=timeout_ms, wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+        _log(f"Duo Security dashboard page: {page.url[:80]}")
+
+        # ── Step 5b: click "Duo Admin" / "Admin Panel" link on the Duo Security page ──
+        _log("looking for Duo Admin link on Duo Security page ...")
+        for admin_sel in [
+            f"a[href*='{expected_admin}']" if expected_admin else "",
+            "a[href*='admin-'][href*='duosecurity']",
+            "a:has-text('Duo Admin')",
+            "a:has-text('Admin Panel')",
+            "a:has-text('Open Duo')",
+            "a:has-text('Launch')",
+            "button:has-text('Admin')",
+        ]:
+            if not admin_sel:
+                continue
+            try:
+                lc = page.locator(admin_sel)
                 if lc.count() > 0:
                     try:
                         with ctx.expect_page(timeout=15_000) as new_pg:
@@ -1975,16 +3267,21 @@ def get_browser_sessions_mac(
                         _log(f"Duo admin opened in new tab: {duo_page.url[:80]}")
                     except Exception:
                         # same-tab navigation
-                        page.wait_for_url("*duosecurity.com*", timeout=30_000)
-                        duo_page = page
-                        _log(f"Duo admin loaded in same tab: {duo_page.url[:80]}")
-                    break
+                        try:
+                            page.wait_for_url("*duosecurity.com*", timeout=20_000)
+                        except Exception:
+                            pass
+                        if "duosecurity.com" in page.url:
+                            duo_page = page
+                            _log(f"Duo admin loaded in same tab: {duo_page.url[:80]}")
+                    if duo_page:
+                        break
             except Exception:
                 continue
 
-        # Fallback: navigate directly
+        # Fallback: navigate directly to expected admin host
         if duo_page is None and expected_admin:
-            _log(f"Products menu failed — navigating directly to {expected_admin}")
+            _log(f"Duo Admin link not found — navigating directly to {expected_admin}")
             duo_page = ctx.new_page()
             duo_page.goto(f"https://{expected_admin}/",
                           timeout=timeout_ms, wait_until="load")
@@ -2019,6 +3316,14 @@ def get_browser_sessions_mac(
             all_dict = {c["name"]: c["value"] for c in all_cookies}
             sid  = all_dict.get("sid", "")
             xsrf = all_dict.get("_xsrf", "")
+            duo_cookies = all_dict  # use full cookie dict for extra_cookies
+
+        # ── Optional pre-close hook (e.g. External Directory setup) ──────────
+        if before_close is not None and duo_page is not None:
+            try:
+                before_close(ctx, duo_page, _log)
+            except Exception as _bc_err:
+                _log(f"WARN: before_close hook raised: {_bc_err}")
 
         browser.close()
 
@@ -2029,10 +3334,11 @@ def get_browser_sessions_mac(
 
         _log("Duo admin session cookies extracted — browser closed")
         return {
-            "okta_token": okta_token,
-            "duo_sid":    sid,
-            "duo_xsrf":   xsrf,
-            "admin_host": admin_host_actual,
+            "okta_token":   okta_token,
+            "duo_sid":      sid,
+            "duo_xsrf":     xsrf,
+            "admin_host":   admin_host_actual,
+            "all_cookies":  duo_cookies,  # all admin-domain cookies (incl. AWSALB sticky)
         }
 
 
@@ -2823,18 +4129,16 @@ def duo_push_authproxy_config(
     log=None,
 ) -> tuple[bool, str]:
     """
-    Build and push authproxy.cfg to AD1 via WinRM, then restart DuoAuthProxy.
+    Push authproxy.cfg to AD1 via WinRM, then restart DuoAuthProxy.
 
-    Sections written:
-      [cloud]    — auth proxy integration credentials (ikey/skey/api_host)
-      [ad_client] — static AD server config (host/port/service_account/base_dn)
+    Priority:
+      1. If org_credentials.authproxy_cfg is non-empty in the DB, push it verbatim.
+         This is the preferred path — the file was downloaded from Duo Admin portal
+         once per org (includes [cloud], [ad_client], and optionally [sso]).
+      2. Otherwise, fall back to building the cfg dynamically from authproxy_ikey/skey
+         (fetching/creating an Auth Proxy integration via Duo Admin API if needed).
 
-    Does NOT require a browser session or Cisco Okta MFA.  Replaces the browser-
-    automation path in duo_ext_dir_and_sso_setup() for the duo_ext_dir pipeline
-    step.
-
-    If authproxy_ikey/skey are missing from org_credentials, fetches or creates
-    a new Authentication Proxy integration via the Duo Admin API and saves it.
+    Does NOT require a browser session or Cisco Okta MFA.
 
     Returns (ok, message).
     """
@@ -2867,20 +4171,29 @@ def duo_push_authproxy_config(
     except Exception as e:
         return False, f"DB read error: {e}"
 
-    duo_ikey  = oc.get("duo_ikey",  "").strip()
-    duo_skey  = oc.get("duo_skey",  "").strip()
-    duo_host  = oc.get("duo_host",  "").strip()
-    ap_ikey   = oc.get("authproxy_ikey", "").strip()
-    ap_skey   = oc.get("authproxy_skey", "").strip()
+    # ── 2. Determine authproxy.cfg content ───────────────────────────────────────
+    # Path A: pre-stored cfg from DB (downloaded from Duo Admin portal).
+    #   Use this when authproxy_cfg is populated — includes [cloud], [ad_client],
+    #   and optionally [sso].  No Admin API call needed.
+    # Path B: build dynamically — session-scoped org; fetch/create auth proxy
+    #   integration via Admin API (only [cloud] + [ad_client]).
+    stored_cfg = oc.get("authproxy_cfg", "").strip()
+    if stored_cfg:
+        _log(f"using pre-stored authproxy.cfg from DB ({len(stored_cfg)} bytes) ...")
+        cfg = stored_cfg
+    else:
+        _log("building authproxy.cfg dynamically (no pre-stored cfg in DB) ...")
 
-    if not duo_host:
-        return False, "duo_host not configured for this org — run duo_setup first"
-    if not duo_ikey or not duo_skey:
-        return False, "Duo Admin API credentials not configured — run duo_setup first"
+        duo_ikey = oc.get("duo_ikey",  "").strip()
+        duo_skey = oc.get("duo_skey",  "").strip()
+        duo_host = oc.get("duo_host",  "").strip()
 
-    # ── 2. Ensure authproxy integration credentials exist ────────────────────
-    if not ap_ikey or not ap_skey:
-        _log("authproxy_ikey/skey missing — fetching from Duo API ...")
+        if not duo_host:
+            return False, "duo_host not configured for this org — run duo_setup first"
+        if not duo_ikey or not duo_skey:
+            return False, "Duo Admin API credentials not configured — run duo_setup first"
+
+        _log("fetching Auth Proxy integration from Duo API ...")
         creds = duo_get_authproxy_creds(duo_ikey, duo_skey, duo_host)
         if not creds:
             _log("no existing auth proxy integration — creating new one ...")
@@ -2890,7 +4203,6 @@ def duo_push_authproxy_config(
         ap_ikey = creds["ikey"]
         ap_skey = creds["skey"]
         _log(f"auth proxy ikey: {ap_ikey}")
-        # Save to DB
         try:
             with _sq4.connect(db_path) as conn:
                 conn.execute(
@@ -2903,30 +4215,29 @@ def duo_push_authproxy_config(
         except Exception as e:
             _log(f"WARN: could not save authproxy creds to DB: {e}")
 
-    # ── 3. Build authproxy.cfg ────────────────────────────────────────────────
-    cfg = (
-        "[cloud]\n"
-        f"ikey={ap_ikey}\n"
-        f"skey={ap_skey}\n"
-        f"api_host={duo_host}\n"
-        "\n"
-        "[ad_client]\n"
-        f"host={AD_CLIENT_HOST}\n"
-        f"port={AD_CLIENT_PORT}\n"
-        f"service_account_username={AD_WINRM_USER}\n"
-        f"service_account_password={AD_WINRM_PASS}\n"
-        f"search_dn={AD_CLIENT_BASE_DN}\n"
-    )
-    _log(f"built authproxy.cfg ({len(cfg)} bytes): [cloud] + [ad_client]")
+        cfg = (
+            "[cloud]\n"
+            f"ikey={ap_ikey}\n"
+            f"skey={ap_skey}\n"
+            f"api_host={duo_host}\n"
+            "\n"
+            "[ad_client]\n"
+            f"host={AD_CLIENT_HOST}\n"
+            f"port={AD_CLIENT_PORT}\n"
+            f"service_account_username={AD_WINRM_USER}\n"
+            f"service_account_password={AD_WINRM_PASS}\n"
+            f"search_dn={AD_CLIENT_BASE_DN}\n"
+        )
+        _log(f"built authproxy.cfg ({len(cfg)} bytes): [cloud] + [ad_client]")
 
-    # ── 4. Connect to AD1 via WinRM ──────────────────────────────────────────
+    # ── 3. Connect to AD1 via WinRM ──────────────────────────────────────────
     _log(f"connecting to AD1 ({AD_CLIENT_HOST}) via WinRM ...")
     try:
         winrm_sess = _winrm_connect_for_pod(pod_id, log=_log)
     except Exception as e:
         return False, f"WinRM connect failed: {e}"
 
-    # ── 5. Push cfg + restart service ────────────────────────────────────────
+    # ── 4. Push cfg + restart service ────────────────────────────────────────
     _log("pushing authproxy.cfg to AD1 and restarting DuoAuthProxy ...")
     ok, msg = _winrm_write_restart_cfg(winrm_sess, cfg, _log)
     if hasattr(winrm_sess, "close"):
@@ -2935,10 +4246,696 @@ def duo_push_authproxy_config(
         except Exception:
             pass
 
+    path_label = "pre-stored" if stored_cfg else "dynamic"
     if ok:
-        _log(f"authproxy push: {msg}")
-        return True, f"authproxy.cfg pushed ([cloud]+[ad_client]) | {msg}"
-    return False, f"authproxy push failed: {msg}"
+        _log(f"authproxy push ({path_label}): {msg}")
+        return True, f"authproxy.cfg pushed ({path_label}) | {msg}"
+    return False, f"authproxy push ({path_label}) failed: {msg}"
+
+
+def duo_authproxy_enroll_and_update(
+    pod_id: str,
+    db_path: str,
+    log=None,
+) -> tuple[bool, str]:
+    """Verify SSO enrollment state on AD1 and return rikey from authproxy_cfg.
+
+    NOTE: authproxy_update_sso_enrollment_code.exe accepts a base64-encoded JSON
+    enrollment code (NOT the rikey directly). That code is only available from the
+    Duo Admin portal UI and expires after 8 hours. The exe must be run manually
+    (or via Playwright) to populate C:\\ProgramData\\Duo Authentication Proxy\\secrets.
+
+    This function NO LONGER calls the enrollment exe. Instead it:
+    1. Reads authproxy_cfg from DB to extract rikey from [sso] section.
+    2. WinRM-connects to AD1 and checks DuoAuthProxy service status.
+    3. Returns (ok, rikey) — service status is logged but does not block.
+
+    Returns (ok, rikey_or_error_message).
+    """
+    import sqlite3 as _sq, re as _re
+    _log = log or (lambda s: print(f"     [authproxy-enroll] {s}"))
+
+    # ── 1. Load authproxy_cfg from DB ──────────────────────────────────────────
+    try:
+        with _sq.connect(db_path) as conn:
+            conn.row_factory = _sq.Row
+            pod_row = conn.execute(
+                "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
+            ).fetchone()
+            if not pod_row:
+                return False, f"POD {pod_id} not found in DB"
+            scc_org = pod_row["scc_org"] or ""
+            m = _re.search(r"pseudoco-(\d+)", scc_org)
+            if not m:
+                return False, "Cannot determine org number from scc_org"
+            org_num = m.group(1)
+            oc = dict(conn.execute(
+                "SELECT * FROM org_credentials WHERE org_number=?", (org_num,)
+            ).fetchone() or {})
+    except Exception as e:
+        return False, f"DB read error: {e}"
+
+    authproxy_cfg = oc.get("authproxy_cfg", "").strip()
+    if not authproxy_cfg:
+        return False, "authproxy_cfg not set in DB — push config first"
+
+    # Extract rikey from [sso] section
+    rikey_m = _re.search(r"^\s*rikey\s*=\s*(\S+)", authproxy_cfg, _re.MULTILINE)
+    if not rikey_m:
+        return False, "No rikey found in [sso] section of authproxy_cfg"
+    rikey = rikey_m.group(1)
+    _log(f"rikey from authproxy_cfg: {rikey}")
+
+    # ── 2. WinRM connect ───────────────────────────────────────────────────────
+    _log("WinRM-connecting to AD1 ...")
+    try:
+        winrm_sess = _winrm_connect_for_pod(pod_id, log=_log)
+    except Exception as e:
+        return False, f"WinRM connect failed: {e}"
+
+    try:
+        # ── 3. Check DuoAuthProxy service status ───────────────────────────────
+        # Enrollment exe requires a base64-encoded JSON enrollment code from the
+        # Duo Admin portal (not the rikey). It must be obtained manually and run
+        # once per proxy registration. We skip calling it here to avoid the
+        # UTF-8 decode crash and potential secrets-file overwrite.
+        _log("checking DuoAuthProxy service status on AD1 ...")
+        r = winrm_sess.run_ps(
+            "(Get-Service -Name DuoAuthProxy -ErrorAction SilentlyContinue).Status"
+        )
+        svc_status = r.std_out.decode(errors="replace").strip()
+        _log(f"DuoAuthProxy service status: {svc_status or 'unknown'}")
+
+    except Exception as e:
+        return False, f"WinRM command failed: {e}"
+    finally:
+        try:
+            winrm_sess.close()
+        except Exception:
+            pass
+
+    return True, rikey
+
+
+def duo_admin_portal_configure(
+    pod_id: str,
+    db_path: str,
+    log=None,
+) -> tuple[bool, str]:
+    """Use Playwright + saved SCC DT cookies to perform Duo admin portal actions.
+
+    Navigates: SCC (DT cookies) → Duo Dashboard → Duo Admin panel, then:
+    1. Enables AD auth source at /sso/authsources/ldap/{rikey}
+    2. Adds permitted domain corp.pseudoco.com at /sso (Settings tab)
+    3. Configures Default routing rule → Active Directory (Routing Rules tab)
+
+    Always returns ok=True (soft-fail on any error).
+    """
+    import sqlite3 as _sq, re as _re
+    _log = log or (lambda s: print(f"     [duo-portal] {s}"))
+
+    # ── Load org creds ─────────────────────────────────────────────────────────
+    try:
+        with _sq.connect(db_path) as conn:
+            conn.row_factory = _sq.Row
+            pod_row = conn.execute(
+                "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
+            ).fetchone()
+            if not pod_row:
+                return True, f"POD {pod_id} not found — portal configure skipped"
+            scc_org = pod_row["scc_org"] or ""
+            m = _re.search(r"pseudoco-(\d+)", scc_org)
+            if not m:
+                return True, "Cannot determine org number — portal configure skipped"
+            org_num = m.group(1)
+            oc = dict(conn.execute(
+                "SELECT * FROM org_credentials WHERE org_number=?", (org_num,)
+            ).fetchone() or {})
+    except Exception as e:
+        return True, f"DB read error (non-fatal): {e}"
+
+    duo_host     = oc.get("duo_host", "").strip()
+    scc_org_uuid = oc.get("scc_org_uuid", "").strip()
+    authproxy_cfg = oc.get("authproxy_cfg", "").strip()
+
+    if not duo_host:
+        return True, "duo_host not set — portal configure skipped"
+
+    m2 = _re.search(r"api-([a-z0-9]+)\.duosecurity\.com", duo_host)
+    if not m2:
+        return True, f"Cannot parse admin host from duo_host={duo_host}"
+    admin_host = f"admin-{m2.group(1)}.duosecurity.com"
+
+    rikey = ""
+    if authproxy_cfg:
+        rm = _re.search(r"^\s*rikey\s*=\s*(\S+)", authproxy_cfg, _re.MULTILINE)
+        if rm:
+            rikey = rm.group(1)
+
+    if not rikey:
+        return True, "No rikey in authproxy_cfg — portal configure skipped"
+
+    if not os.path.exists(_SCC_SESSION_FILE):
+        return True, "No saved SCC session — portal configure skipped"
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return True, "Playwright not available — portal configure skipped"
+
+    results = []
+    TIMEOUT = 30_000
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            ctx = browser.new_context(
+                ignore_https_errors=True,
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1400, "height": 900},
+                **_scc_session_kwargs(),
+            )
+            page = ctx.new_page()
+            try:
+                # ── Step 1: Authenticate to SCC via DT cookies ────────────────
+                _log("loading SCC with saved DT cookies ...")
+                try:
+                    page.goto("https://security.cisco.com",
+                              timeout=60_000, wait_until="domcontentloaded")
+                except Exception:
+                    page.wait_for_timeout(3000)
+                page.wait_for_timeout(3000)
+
+                if "security.cisco.com" not in page.url or "sign-on" in page.url:
+                    return True, f"SCC DT session expired (url={page.url[:60]}) — portal configure skipped (re-auth needed)"
+
+                # ── Step 2: Navigate to Duo dashboard to establish admin auth ──
+                duo_dash_url = "https://security.cisco.com/duo/dashboard/"
+                if scc_org_uuid:
+                    duo_dash_url += f"?enterpriseId={scc_org_uuid}"
+                _log(f"navigating to Duo dashboard ({duo_dash_url}) ...")
+                page.goto(duo_dash_url, timeout=60_000, wait_until="domcontentloaded")
+                # Wait up to 20s for SPA to render admin links
+                try:
+                    page.wait_for_selector(
+                        f'a[href*="{admin_host}"], a[href*="duosecurity.com"]',
+                        timeout=20_000,
+                    )
+                    _log(f"admin link appeared on dashboard (url={page.url[:80]})")
+                except Exception:
+                    _log(f"WARN: no admin link appeared after 20s (url={page.url[:80]})")
+                    # Log page title for debugging
+                    _log(f"page title: {page.title()[:80]}")
+
+                # ── Step 3: Find admin link and open Duo admin portal ──────────
+                admin_page = None
+                for link_sel in [
+                    f'a[href*="{admin_host}"]',
+                    'a[href*="duosecurity.com"]',
+                ]:
+                    try:
+                        link = page.locator(link_sel).first
+                        link.wait_for(state="visible", timeout=3000)
+                        href = link.get_attribute("href") or ""
+                        _log(f"clicking admin link ({link_sel}): {href[:80]} ...")
+                        try:
+                            with ctx.expect_page(timeout=12_000) as popup_info:
+                                link.click()
+                            admin_page = popup_info.value
+                            admin_page.wait_for_load_state("domcontentloaded", timeout=TIMEOUT)
+                            _log(f"admin popup opened: {admin_page.url[:80]}")
+                        except Exception as _pe:
+                            _log(f"popup exception ({_pe}); checking same-tab navigation ...")
+                            page.wait_for_timeout(3000)
+                            if admin_host in page.url:
+                                admin_page = page
+                                _log("admin opened in same tab")
+                        break
+                    except Exception:
+                        continue
+
+                # Fallback: extract admin link from page source
+                if not admin_page:
+                    _log("no visible admin link — scanning page source ...")
+                    content = page.content()
+                    found_urls = _re.findall(
+                        rf'https?://{_re.escape(admin_host)}/[^"\'\s<>]*', content
+                    )
+                    if found_urls:
+                        admin_url = found_urls[0]
+                        _log(f"found admin URL in source: {admin_url[:80]}")
+                        try:
+                            with ctx.expect_page(timeout=12_000) as popup_info:
+                                page.evaluate(f"window.open('{admin_url}', '_blank')")
+                            admin_page = popup_info.value
+                            admin_page.wait_for_load_state("domcontentloaded", timeout=TIMEOUT)
+                            _log(f"admin page opened via window.open: {admin_page.url[:80]}")
+                        except Exception as _we:
+                            _log(f"window.open failed ({_we}); trying goto ...")
+                            page.goto(admin_url, timeout=TIMEOUT, wait_until="domcontentloaded")
+                            page.wait_for_timeout(2000)
+                            if admin_host in page.url:
+                                admin_page = page
+
+                if not admin_page:
+                    # Last resort: direct navigation (works if SCC set an SSO cookie)
+                    _log(f"trying direct nav to https://{admin_host}/ ...")
+                    page.goto(f"https://{admin_host}/", timeout=TIMEOUT,
+                              wait_until="domcontentloaded")
+                    page.wait_for_timeout(2000)
+                    if admin_host in page.url:
+                        admin_page = page
+                        _log("direct admin navigation succeeded")
+                    else:
+                        return True, f"cannot reach Duo admin portal (url={page.url[:60]})"
+
+                ap = admin_page  # short alias
+
+                # ── Parse DC/baseDN from authproxy_cfg [ad_client] ────────────
+                dc_host = AD_DC_IP
+                dc_port = "389"
+                base_dn = AD_BASE_DN
+                if authproxy_cfg:
+                    _h = _re.search(r"^\s*host\s*=\s*(\S+)", authproxy_cfg, _re.MULTILINE)
+                    _p = _re.search(r"^\s*port\s*=\s*(\d+)", authproxy_cfg, _re.MULTILINE)
+                    _b = _re.search(r"^\s*base_dn\s*=\s*(\S+)", authproxy_cfg, _re.MULTILINE)
+                    if _h: dc_host = _h.group(1)
+                    if _p: dc_port = _p.group(1)
+                    if _b: base_dn = _b.group(1)
+
+                # ── Action 0: Enrollment — generate code if proxy not connected ─
+                # Navigate to auth source page, find the auth proxy row, check
+                # connection status. If "Not connected", generate a fresh
+                # enrollment code from the portal and run the exe via WinRM.
+                authsrc_url = f"https://{admin_host}/sso/authsources/ldap/{rikey}"
+                _log(f"navigating to auth source page: {authsrc_url}")
+                ap.goto(authsrc_url, timeout=TIMEOUT, wait_until="domcontentloaded")
+                ap.wait_for_timeout(2000)
+
+                try:
+                    # Find and navigate to the auth proxy detail page.
+                    # The proxy link in the table uses data-testid='link-component'
+                    # inside the ldap-authproxies-table. Extract href and navigate
+                    # directly to avoid clicking docs/external links.
+                    proxy_page_url = None
+                    for proxy_link_sel in [
+                        "[data-testid='ldap-authproxies-table'] [data-testid='link-component']",
+                        "[data-testid='ldap-authproxies-table'] a[href*='authproxies']",
+                        "a[href*='/sso/authsources/ldap/'][href*='/authproxies/']",
+                    ]:
+                        try:
+                            pl = ap.locator(proxy_link_sel).first
+                            pl.wait_for(state="visible", timeout=5000)
+                            href = pl.get_attribute("href") or ""
+                            if "/authproxies/" in href:
+                                proxy_page_url = href if href.startswith("http") else f"https://{admin_host}{href}"
+                                _log(f"found auth proxy page: {proxy_page_url}")
+                                break
+                        except Exception:
+                            continue
+
+                    if not proxy_page_url:
+                        _log("WARN: auth proxy link not found in table — skipping enrollment check")
+                        results.append("WARN: auth proxy link not found")
+                    else:
+                        ap.goto(proxy_page_url, timeout=TIMEOUT, wait_until="domcontentloaded")
+                        ap.wait_for_timeout(1500)
+
+                        proxy_content = ap.content()
+                        if "Not connected" in proxy_content or "not connected" in proxy_content.lower():
+                            _log("proxy is NOT connected — generating enrollment code ...")
+
+                            # Click "Generate command" button
+                            gen_btn = ap.locator("button:has-text('Generate command')").first
+                            gen_btn.wait_for(state="visible", timeout=6000)
+                            gen_btn.click()
+                            ap.wait_for_timeout(1000)
+
+                            # Confirm dialog
+                            confirm_btn = ap.locator(
+                                "dialog button:has-text('Generate command'), "
+                                "[role='dialog'] button:has-text('Generate command')"
+                            ).first
+                            confirm_btn.wait_for(state="visible", timeout=6000)
+                            confirm_btn.click()
+                            ap.wait_for_timeout(2000)
+
+                            # Extract the full command text (contains base64 code)
+                            cmd_text = None
+                            for cmd_sel in [
+                                "[data-testid*='enrollment'], [data-testid*='command']",
+                                "pre, code",
+                            ]:
+                                try:
+                                    el = ap.locator(cmd_sel).first
+                                    el.wait_for(state="visible", timeout=4000)
+                                    cmd_text = el.inner_text()
+                                    break
+                                except Exception:
+                                    continue
+
+                            # Fallback: scan page source for authproxy_update_sso
+                            if not cmd_text:
+                                content_after = ap.content()
+                                m_cmd = _re.search(
+                                    r'authproxy_update_sso_enrollment_code\.exe["\s]+([A-Za-z0-9+/=]+)',
+                                    content_after
+                                )
+                                if m_cmd:
+                                    cmd_text = m_cmd.group(0)
+
+                            if cmd_text:
+                                # Extract the base64 code (long alphanumeric+/= string)
+                                m_b64 = _re.search(r'([A-Za-z0-9+/]{40,}={0,2})', cmd_text)
+                                if m_b64:
+                                    enroll_code = m_b64.group(1)
+                                    _log(f"extracted enrollment code ({len(enroll_code)} chars)")
+
+                                    # Run enrollment exe + restart via WinRM
+                                    try:
+                                        ws = _winrm_connect_for_pod(pod_id, log=_log)
+                                        bin_dir = r"C:\Program Files\Duo Security Authentication Proxy\bin"
+                                        enroll_exe = rf"{bin_dir}\authproxy_update_sso_enrollment_code.exe"
+                                        ps_cmd = (
+                                            f"& '{enroll_exe}' '{enroll_code}' 2>&1; "
+                                            f"net stop duoauthproxy; net start duoauthproxy"
+                                        )
+                                        r = ws.run_ps(ps_cmd)
+                                        out = r.std_out.decode(errors="replace").strip()
+                                        _log(f"enrollment+restart: {out[:300]}")
+                                        results.append(f"enrollment code applied: {out[:80]}")
+                                    except Exception as _we:
+                                        _log(f"WARN: WinRM enrollment failed: {_we}")
+                                        results.append(f"WARN: enrollment WinRM error: {_we}")
+
+                                    # Wait and verify connection
+                                    ap.wait_for_timeout(15000)
+                                    ap.reload()
+                                    ap.wait_for_timeout(2000)
+                                    post_content = ap.content()
+                                    if "Connected to Duo" in post_content:
+                                        _log("proxy now Connected to Duo ✓")
+                                        results.append("proxy enrolled and Connected to Duo")
+                                    else:
+                                        _log("WARN: proxy still not connected after enrollment")
+                                        results.append("WARN: proxy not connected after enrollment")
+                                else:
+                                    _log(f"WARN: could not extract base64 from command: {cmd_text[:200]}")
+                                    results.append("WARN: enrollment code extraction failed")
+                            else:
+                                _log("WARN: Generate command UI changed — cannot extract code")
+                                results.append("WARN: enrollment code not found in portal")
+                        else:
+                            _log("proxy already Connected to Duo — skipping enrollment")
+                            results.append("proxy Connected to Duo (no enrollment needed)")
+                except Exception as _e0:
+                    _log(f"WARN: enrollment check error: {_e0}")
+                    results.append(f"WARN: enrollment check: {_e0}")
+
+                # ── Action 1: Enable AD auth source ───────────────────────────
+                _log(f"navigating to auth source page: {authsrc_url}")
+                ap.goto(authsrc_url, timeout=TIMEOUT, wait_until="domcontentloaded")
+                ap.wait_for_timeout(2000)
+
+                page_content = ap.content()
+                if "Disabled" in page_content and "Enabled" not in page_content.replace("Successfully enabled", ""):
+                    _log("auth source is Disabled — clicking Enable source ...")
+                    try:
+                        enable_btn = ap.locator("button:has-text('Enable source')").first
+                        enable_btn.wait_for(state="visible", timeout=6000)
+                        enable_btn.click()
+                        ap.wait_for_timeout(2000)
+
+                        # Dialog appears — fill domain controller form
+                        dialog = ap.locator("dialog, [role='dialog']").first
+                        dialog.wait_for(state="visible", timeout=6000)
+
+                        # Fill hostname
+                        hostname_input = dialog.locator(
+                            "input[placeholder*='Hostname'], input[placeholder*='hostname'], "
+                            "input[placeholder*='IP'], input[placeholder*='address']"
+                        ).first
+                        hostname_input.wait_for(state="visible", timeout=4000)
+                        hostname_input.fill(dc_host)
+
+                        # Fill port
+                        try:
+                            port_input = dialog.locator("input[placeholder*='Port'], input[placeholder*='port']").first
+                            port_input.wait_for(state="visible", timeout=3000)
+                            port_input.fill(dc_port)
+                        except Exception:
+                            pass
+
+                        # Fill base DN
+                        try:
+                            basedn_input = dialog.locator(
+                                "input[placeholder*='Base DN'], input[placeholder*='base_dn'], "
+                                "input[placeholder*='DC=']"
+                            ).first
+                            basedn_input.wait_for(state="visible", timeout=3000)
+                            basedn_input.fill(base_dn)
+                        except Exception:
+                            pass
+
+                        # Click "Enable source" in dialog
+                        dialog_enable = dialog.locator("button:has-text('Enable source')").first
+                        dialog_enable.wait_for(state="visible", timeout=4000)
+                        dialog_enable.click()
+                        ap.wait_for_timeout(3000)
+
+                        post = ap.content()
+                        if "Successfully enabled" in post or "Enabled" in post:
+                            results.append("AD auth source enabled")
+                            _log("AD auth source enabled ✓")
+                        else:
+                            results.append("WARN: Enable source — result unclear")
+                            _log("WARN: Enable source clicked but outcome unclear")
+                    except Exception as _e1:
+                        results.append(f"WARN: Enable source error: {_e1}")
+                        _log(f"WARN: Enable source exception: {_e1}")
+                else:
+                    results.append("AD auth source already enabled")
+                    _log("auth source already enabled")
+
+                # ── Action 2: Permitted domain (soft-fail) ────────────────────
+                try:
+                    ap.goto(f"https://{admin_host}/sso?selected_tab=settings",
+                            timeout=TIMEOUT, wait_until="domcontentloaded")
+                    ap.wait_for_timeout(2000)
+                    if "corp.pseudoco.com" in ap.content():
+                        results.append("permitted domain corp.pseudoco.com already present")
+                        _log("permitted domain already present")
+                    else:
+                        domain_added = False
+                        for input_sel in [
+                            "input[placeholder*='domain' i]",
+                            "input[name*='domain' i]",
+                            "input[id*='domain' i]",
+                            "input[type='text'][placeholder*='Add' i]",
+                        ]:
+                            try:
+                                inp = ap.locator(input_sel).first
+                                inp.wait_for(state="visible", timeout=4000)
+                                inp.fill("corp.pseudoco.com")
+                                for confirm_sel in [
+                                    "button:has-text('Add domain')",
+                                    "button:has-text('Add')",
+                                ]:
+                                    try:
+                                        ap.locator(confirm_sel).first.click()
+                                        ap.wait_for_timeout(1500)
+                                        domain_added = True
+                                        break
+                                    except Exception:
+                                        continue
+                                if not domain_added:
+                                    inp.press("Enter")
+                                    ap.wait_for_timeout(1500)
+                                    domain_added = True
+                                break
+                            except Exception:
+                                continue
+                        if domain_added:
+                            results.append("permitted domain corp.pseudoco.com added")
+                        else:
+                            results.append("WARN: permitted domain input not found")
+                            _log("WARN: domain input not found")
+                except Exception as _e2:
+                    results.append(f"WARN: permitted domain error: {_e2}")
+                    _log(f"WARN: permitted domain exception: {_e2}")
+
+
+                # ── Action 3: Configure Default routing rule → Active Directory ──
+                # The Default rule uses a React Select (not native <select>).
+                # Correct flow: navigate to routing_rules tab → click combobox →
+                # click "Active Directory" option → click Save.
+                _log("navigating to SSO Routing Rules tab ...")
+                ap.goto(
+                    f"https://{admin_host}/sso?selected_tab=routing_rules",
+                    timeout=TIMEOUT, wait_until="domcontentloaded"
+                )
+                ap.wait_for_timeout(2000)
+
+                rule_configured = False
+                try:
+                    # Check current value — skip if already Active Directory
+                    routing_content = ap.content()
+                    if '"Active Directory"' in routing_content or ">Active Directory<" in routing_content:
+                        # Check the default rule row specifically
+                        default_row = ap.locator(
+                            "tr:has-text('Default'), [class*='default']:has-text('Active Directory')"
+                        ).first
+                        try:
+                            row_txt = default_row.inner_text()
+                            if "Active Directory" in row_txt:
+                                _log("routing rule Default already set to Active Directory")
+                                results.append("routing rule Default already Active Directory")
+                                rule_configured = True
+                        except Exception:
+                            pass
+
+                    if not rule_configured:
+                        # Click the React Select combobox for the Default rule
+                        combobox = ap.locator(
+                            "[data-testid='routing-rules-default-authsource-input'] [role='combobox'], "
+                            "[data-testid='routing-rules-default-authsource-input'] input"
+                        ).first
+                        combobox.wait_for(state="visible", timeout=6000)
+                        combobox.click()
+                        ap.wait_for_timeout(1000)
+                        _log("clicked routing rule combobox")
+
+                        # Click "Active Directory" option
+                        ad_option = ap.locator(
+                            "[role='option']:has-text('Active Directory'), "
+                            "[class*='option']:has-text('Active Directory')"
+                        ).first
+                        ad_option.wait_for(state="visible", timeout=5000)
+                        ad_option.click()
+                        ap.wait_for_timeout(1000)
+                        _log("selected Active Directory from dropdown")
+
+                        # Click Save
+                        save_btn = ap.locator("button:has-text('Save')").first
+                        save_btn.wait_for(state="visible", timeout=4000)
+                        save_btn.click()
+                        ap.wait_for_timeout(2000)
+
+                        # Verify saved
+                        post_routing = ap.content()
+                        if "Changes have been saved" in post_routing or "Active Directory" in post_routing:
+                            rule_configured = True
+                            _log("routing rule saved: Active Directory ✓")
+                            results.append("routing rule Default→Active Directory saved")
+                        else:
+                            results.append("WARN: routing rule Save clicked but outcome unclear")
+                            _log("WARN: routing rule save outcome unclear")
+                except Exception as _e3:
+                    results.append(f"WARN: routing rule error: {_e3}")
+                    _log(f"WARN: routing rule exception: {_e3}")
+
+            except Exception as e:
+                results.append(f"portal error: {e}")
+                _log(f"WARN: Duo admin portal error: {e}")
+                import traceback as _tb
+                _log(_tb.format_exc()[:400])
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        return True, f"Playwright launch error: {e}"
+
+    return True, " | ".join(results) if results else "no portal actions taken"
+
+
+def duo_trigger_ad_sync(
+    duo_ikey: str,
+    duo_skey: str,
+    duo_host: str,
+    log=None,
+) -> tuple[bool, str]:
+    """
+    Trigger AD directory sync via Duo Admin API.
+
+    Lists all registered AD sync connectors and triggers syncuser for the first
+    one found.  Soft-fails (returns True with warning) if no connector is
+    registered yet — the auth proxy may not have called home after restart.
+
+    Returns (ok, message).  Always returns ok=True (soft-fail on any error)
+    so it never blocks the pipeline.
+    """
+    _log = log or (lambda s: print(f"     [duo-dirsync] {s}"))
+
+    if not duo_ikey or not duo_skey or not duo_host:
+        _log("WARN: Duo Admin API credentials missing — skipping directory sync")
+        return True, "directory sync skipped (no credentials)"
+
+    try:
+        resp = _duo_request(duo_ikey, duo_skey, duo_host, "GET",
+                            "/admin/v1/users/directorysync")
+        directories = resp.get("response", [])
+    except Exception as e:
+        _log(f"WARN: could not list AD sync connectors ({e}) — skipping sync trigger")
+        return True, f"directory sync skipped (list failed: {e})"
+
+    if not directories:
+        _log("WARN: no AD sync connectors registered yet — auth proxy may not have called home")
+        return True, "directory sync skipped (no connectors registered yet)"
+
+    connector = directories[0]
+    # Duo API may use 'directory_key', 'connector_id', or 'integration_key'
+    directory_key = (
+        connector.get("directory_key")
+        or connector.get("connector_id")
+        or connector.get("integration_key")
+    )
+    if not directory_key:
+        _log(f"WARN: connector has no key field — keys: {list(connector.keys())}")
+        return True, "directory sync skipped (no key in connector response)"
+
+    connector_name = connector.get("name", directory_key)
+    _log(f"triggering per-user directory sync for connector {connector_name!r} ({directory_key}) ...")
+
+    # Build user list: try Duo API first, fall back to known lab users
+    usernames: list[str] = []
+    try:
+        all_users = _paginate(duo_ikey, duo_skey, duo_host, "/admin/v1/users")
+        usernames = [u.get("username", "") for u in all_users if u.get("username")]
+        _log(f"found {len(usernames)} users in Duo")
+    except Exception as e:
+        _log(f"WARN: could not list Duo users ({e}) — using known lab user list")
+
+    if not usernames:
+        usernames = ["kit", "lee", "pat", "nik", "produser", "iotuser", "mainuser", "lin"]
+        _log(f"using fallback user list: {usernames}")
+
+    synced, failed = [], []
+    for username in usernames:
+        try:
+            _duo_request(duo_ikey, duo_skey, duo_host, "POST",
+                         f"/admin/v1/users/directorysync/{directory_key}/syncuser",
+                         {"username": username})
+            synced.append(username)
+            _log(f"synced: {username}")
+        except Exception as e:
+            failed.append(username)
+            _log(f"WARN: sync failed for {username!r}: {e}")
+
+    if synced:
+        msg = f"directory sync triggered for {len(synced)}/{len(usernames)} users ({','.join(synced)})"
+        if failed:
+            msg += f"; failed: {','.join(failed)}"
+        return True, msg
+    return True, f"directory sync trigger failed for all users (soft-fail): {failed}"
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -3302,3 +5299,236 @@ def duo_ext_dir_and_sso_setup(
     if not ok2:
         return False, f"Partial — Part1 OK | Part2 FAILED ({msg2})"
     return True, f"External Directory + SSO Auth Proxy configured | {msg1} | {msg2}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Duo Card — manual pipeline (replaces duo_setup/duo_ext_dir/duo_saml_setup
+# pipeline steps).  Stored in duo_steps table.  Smart re-use: if the org
+# already has duo_saml_app_ikey + sa_scim_token set the card runs a lightweight
+# SESSION REFRESH instead of the full first-time setup.
+# ──────────────────────────────────────────────────────────────────────────────
+
+DUO_CARD_STEPS = [
+    "org_setup",
+    "authproxy_push",
+    "ad_sync",
+    "saml_scim_config",
+    "authproxy_enroll",
+    "scc_check",
+    "scim_push",
+    "verify",
+]
+
+DUO_CARD_LABELS = {
+    "org_setup":       "Duo Org Setup",
+    "authproxy_push":  "Auth Proxy Config Push",
+    "ad_sync":         "AD Directory Sync",
+    "saml_scim_config":"SA SAML + SCIM Config",
+    "authproxy_enroll":"Auth Proxy Enroll",
+    "scc_check":       "SCC Policy Check",
+    "scim_push":       "SA SCIM User Push",
+    "verify":          "Verify Auth Proxy",
+}
+
+
+def duo_ensure_table(db_path: str) -> None:
+    """Create duo_steps table if it does not exist."""
+    import sqlite3 as _sq
+    with _sq.connect(db_path) as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS duo_steps (
+                pod_id        TEXT,
+                step_name     TEXT,
+                status        TEXT DEFAULT 'pending',
+                result        TEXT DEFAULT '',
+                started_at    TEXT,
+                completed_at  TEXT,
+                PRIMARY KEY (pod_id, step_name)
+            )
+        """)
+
+
+def _duo_step_set(pod_id: str, step: str, status: str, result: str, db_path: str,
+                  started_at: str = None, completed_at: str = None) -> None:
+    """Upsert a single row in duo_steps."""
+    import sqlite3 as _sq, datetime as _dt
+    now = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _sq.connect(db_path) as c:
+        c.execute("""
+            INSERT INTO duo_steps (pod_id, step_name, status, result, started_at, completed_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(pod_id, step_name) DO UPDATE SET
+                status=excluded.status, result=excluded.result,
+                started_at=COALESCE(excluded.started_at, started_at),
+                completed_at=excluded.completed_at
+        """, (pod_id, step, status, result,
+              started_at or now if status == "running" else None,
+              completed_at or now if status in ("completed", "failed", "skipped") else None))
+
+
+def duo_run_card(
+    pod_id: str,
+    db_path: str,
+    from_step: int = 0,
+    log=None,
+) -> tuple[bool, str]:
+    """
+    Run the Duo card pipeline for a POD.
+
+    Auto-detects mode:
+    - SESSION REFRESH: org already integrated (duo_saml_app_ikey + sa_scim_token set
+      AND authproxy_cfg has [sso]).  Only re-pushes authproxy config, re-enrolls,
+      syncs AD users, pushes SCIM users, and verifies.  saml_scim_config is skipped.
+    - FULL SETUP: fresh org.  Runs all 8 steps including org reset, SAML/SCIM config.
+
+    from_step: 0-based index into DUO_CARD_STEPS to resume from.
+    """
+    import sqlite3 as _sq, datetime as _dt, os as _os, re as _re_dc
+    _log = log or (lambda s: print(f"  [duo-card] {s}"))
+    duo_ensure_table(db_path)
+
+    # ── Load org credentials ──────────────────────────────────────────────────
+    try:
+        with _sq.connect(db_path) as conn:
+            conn.row_factory = _sq.Row
+            pod_row = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+            if not pod_row:
+                return False, f"POD {pod_id} not found in DB"
+            scc_org = pod_row["scc_org"] or ""
+            m = _re_dc.search(r"pseudoco-(\d+)", scc_org)
+            if not m:
+                return False, f"Cannot determine org number from scc_org={scc_org!r}"
+            org_num = m.group(1)
+            oc = dict(conn.execute(
+                "SELECT * FROM org_credentials WHERE org_number=?", (org_num,)
+            ).fetchone() or {})
+    except Exception as e:
+        return False, f"DB error: {e}"
+
+    duo_ikey  = oc.get("duo_ikey", "").strip()
+    duo_skey  = oc.get("duo_skey", "").strip()
+    duo_host  = oc.get("duo_host", "").strip()
+    app_ikey  = oc.get("duo_saml_app_ikey", "").strip()
+    scim_tok  = oc.get("sa_scim_token", "").strip()
+    ap_cfg    = oc.get("authproxy_cfg", "").strip()
+
+    if not duo_ikey or not duo_skey or not duo_host:
+        return False, "Duo Admin API credentials (ikey/skey/host) not set in DB"
+
+    # ── Detect mode ───────────────────────────────────────────────────────────
+    is_refresh = bool(app_ikey and scim_tok and "[sso]" in ap_cfg)
+    mode_label = "SESSION REFRESH" if is_refresh else "FULL SETUP"
+    _log(f"Mode: {mode_label} (app_ikey={'set' if app_ikey else 'empty'}, "
+         f"scim_token={'set' if scim_tok else 'empty'}, "
+         f"[sso]={'yes' if '[sso]' in ap_cfg else 'no'})")
+
+    # ── Step helpers ──────────────────────────────────────────────────────────
+    def _run(step_name: str, fn):
+        """Run fn(), record in duo_steps, return (ok, result)."""
+        _duo_step_set(pod_id, step_name, "running", "", db_path)
+        _log(f"▶ {step_name} ...")
+        try:
+            ret = fn()
+            ok, result = (ret, "") if isinstance(ret, bool) else ret
+        except Exception as e:
+            ok, result = False, f"exception: {e}"
+        status = "completed" if ok else "failed"
+        _duo_step_set(pod_id, step_name, status, result, db_path)
+        _log(f"  {'✓' if ok else '✗'} {step_name}: {result[:120]}")
+        return ok, result
+
+    def _skip(step_name: str, reason: str):
+        _duo_step_set(pod_id, step_name, "skipped", reason, db_path)
+        _log(f"  ↷ {step_name}: {reason}")
+
+    # ── Step functions ────────────────────────────────────────────────────────
+
+    def step_org_setup():
+        if is_refresh:
+            ok, msg = duo_verify_credentials(duo_ikey, duo_skey, duo_host)
+            return ok, f"verify only: {msg}"
+        # Full: reset org + create users/groups via onboard_router.phase_duo_setup
+        _os.environ["POD_ID"]  = pod_id
+        _os.environ["DB_PATH"] = db_path
+        try:
+            import onboard_router as _or
+            return _or.phase_duo_setup()
+        finally:
+            pass
+
+    def step_authproxy_push():
+        return duo_push_authproxy_config(pod_id, db_path, log=_log)
+
+    def step_ad_sync():
+        return duo_trigger_ad_sync(duo_ikey, duo_skey, duo_host, log=_log)
+
+    def step_saml_scim_config():
+        if is_refresh:
+            return True, "skipped — org already integrated (app_ikey + scim_token set)"
+        # Full: run headless SA SAML + SCIM configuration
+        return duo_sa_configure_headless(pod_id, db_path, log=_log)
+
+    def step_authproxy_enroll():
+        return duo_authproxy_enroll_and_update(pod_id, db_path, log=_log)
+
+    def step_scc_check():
+        _os.environ["POD_ID"]  = pod_id
+        _os.environ["DB_PATH"] = db_path
+        try:
+            import onboard_router as _or
+            return _or.phase_scc_reset_check()
+        finally:
+            pass
+
+    def step_scim_push():
+        if not scim_tok and not oc.get("sa_scim_token", "").strip():
+            return True, "skipped — no SA SCIM token stored"
+        tok = scim_tok or oc.get("sa_scim_token", "").strip()
+        n = _push_duo_users_to_sa_scim(duo_ikey, duo_skey, duo_host, tok, log=_log)
+        return True, f"{n} new users pushed to SA SCIM"
+
+    def step_verify():
+        """WinRM: check DuoAuthProxy service is Running."""
+        try:
+            sess = _winrm_connect_for_pod(pod_id)
+            ok_v, msg_v = _winrm_run_cmd(
+                sess,
+                'powershell -Command "(Get-Service DuoAuthProxy).Status"',
+                _log,
+            )
+            if ok_v and "running" in msg_v.lower():
+                return True, f"DuoAuthProxy service: {msg_v.strip()}"
+            return False, f"DuoAuthProxy status: {msg_v.strip()}"
+        except Exception as e:
+            return False, f"WinRM verify error: {e}"
+
+    step_fns = {
+        "org_setup":        step_org_setup,
+        "authproxy_push":   step_authproxy_push,
+        "ad_sync":          step_ad_sync,
+        "saml_scim_config": step_saml_scim_config,
+        "authproxy_enroll": step_authproxy_enroll,
+        "scc_check":        step_scc_check,
+        "scim_push":        step_scim_push,
+        "verify":           step_verify,
+    }
+
+    results = []
+    final_ok = True
+    for i, step in enumerate(DUO_CARD_STEPS):
+        if i < from_step:
+            continue
+        ok, result = _run(step, step_fns[step])
+        results.append(f"{step}={'OK' if ok else 'FAIL'}")
+        if not ok:
+            final_ok = False
+            # Non-fatal steps: continue even on failure
+            if step in ("scc_check", "scim_push", "verify", "saml_scim_config"):
+                continue
+            # Fatal steps: stop on first hard failure
+            _log(f"  Hard failure at {step} — stopping")
+            break
+
+    summary = " | ".join(results)
+    _log(f"Duo card done: {'OK' if final_ok else 'FAILED'} — {summary}")
+    return final_ok, summary

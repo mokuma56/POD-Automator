@@ -200,10 +200,6 @@ steps = [
      ("connectivity_test",  onboard_router.phase_connectivity_test),
      ("cdfmc_check",        onboard_router.phase_cdfmc_check),
      ("ad_verify",          onboard_router.phase_ad_verify),
-     ("duo_setup",          onboard_router.phase_duo_setup),
-      ("duo_ext_dir",         onboard_router.phase_duo_ext_dir_setup),
-      ("scc_reset_check",    onboard_router.phase_scc_reset_check),
-     ("duo_saml_setup",     onboard_router.phase_duo_saml_setup),
 ]
 
 SOFT_FAIL_STEPS = {
@@ -217,10 +213,6 @@ SOFT_FAIL_STEPS = {
     "connectivity_test",
     "cdfmc_check",
     "ad_verify",
-    "duo_setup",
-    "duo_ext_dir",
-    "scc_reset_check",
-    "duo_saml_setup",
 }
 
 for step_name, func in steps:
