@@ -63,6 +63,29 @@ for each POD:
 - Re-check and Reset & Redeploy buttons available from the cdFMC tab
 - All Terraform commands run on the Ubuntu automation PC via SSH
 
+### Duo Integration (🔒 Duo Tab)
+A manual card in the dashboard that handles the full Duo ↔ AD ↔ Secure Access
+integration. Auto-detects mode based on DB state:
+
+**SESSION REFRESH** (new dCloud session, org previously integrated):
+Runs when `duo_saml_app_ikey` + `sa_scim_token` + `[sso]` in `authproxy_cfg` are all set.
+Re-links AD→Duo and re-syncs users into SA automatically — no manual steps needed.
+
+**FULL SETUP** (brand-new org, never integrated):
+Runs all 7 steps including org reset, SAML/SCIM config. The SA SAML IdP upload
+requires a one-time manual step in the SA portal (management JWT is blocked for
+this Okta client).
+
+| Step | Description |
+|------|-------------|
+| 1. Duo Org Setup | Verify creds (refresh) or full org reset + user/group create (full) |
+| 2. Auth Proxy Config Push | Push `authproxy.cfg` from DB → AD1 via WinRM, restart service |
+| 3. AD Directory Sync | Trigger AD sync via Duo Admin API |
+| 4. SA SAML + SCIM Config | Configure SA SAML IdP + SCIM outbound (skipped in refresh) |
+| 5. Auth Proxy Enroll | Run `authproxyctl enroll`, update rikey in DB and on AD1 |
+| 6. SA SCIM User Push | Push Duo users to SA SCIM idempotently |
+| 7. Verify Auth Proxy | WinRM confirm DuoAuthProxy service is Running |
+
 ### Active Directory Verification
 Verifies that the AD users (Kit, Lee, Pat, Nik) in the POD's domain
 (`corp.pseudoco.com`) do not have `@corp.pseudoco.com` email addresses —
@@ -79,12 +102,18 @@ Single-page Flask dashboard at `http://localhost:5050`:
 - **Connect / Reconnect / Disconnect VPN** per POD
 - **Run Automation** per POD (or Run All)
 - **Detail panel** — per-POD tabbed view:
-  - **Pipeline Steps** — all 16 steps with status badges and results
+  - **Pipeline Steps** — all 20 steps with status badges and results
   - **Live Logs** — streaming pipeline output
   - **Switches** — per-switch cards with model, VRF, VLAN, version, OSPF, connectivity
   - **cdFMC** — deployment status, re-check, reset & redeploy
   - **AD Verify** — user email status, re-run automation
+  - **EVPN Fabric** — EVPN fabric deploy status and controls
+  - **SDA Fabric** — SDA fabric deploy status and controls
+  - **SCC Reset** — 6-item SCC org policy checklist; auto-reset via pipeline step 20
+  - **🔒 Duo** — Duo integration card (SESSION REFRESH or FULL SETUP mode, 7 steps)
+  - **Base Config Reset** — push baseline config to switches via Telnet
   - **Upgrade** — per-device version status and upgrade trigger
+  - **Knowledge Base** — semantic search + AI-assisted answers
 - **Software Upgrade Images card** — configure golden versions, upload firmware `.bin` files
 - **Clickable SSH** — click any switch name to open macOS Terminal.app with SSH
   connected through the Docker VPN (password automated via `sshpass`)
@@ -173,25 +202,29 @@ Mac (develop) ──git push──► GitHub (mokuma56/POD-Automator)
 
 | # | Step | Description |
 |---|------|-------------|
-| 1 | **verify_router** | SSH reachability check on router mgmt IP |
-| 2 | **reset_device** | Pushes base router config (credentials, SSH, HTTP) |
-| 3 | **quick_connect** | Sets system-ip, site-id, host-name via vManage Quick Connect API |
-| 4 | **config_group_associate** | Associates device to PseudocoBranches config group |
-| 5 | **assign_license** | Assigns WAN Advantage license (C8K_MEDIUM_WAN_A) |
-| 6 | **set_variables** | Pushes 34 config group variables from CSV template |
-| 7 | **deploy_config_group** | Deploys config group, polls until In Sync |
-| 8 | **generate_bootstrap** | Generates ciscosdwan.cfg via vManage bootstrap API |
-| 9 | **copy_bootstrap** | HTTP server on tun0 IP → router copies file to bootflash |
-| 10 | **controller_mode_enable** | SSH command to reboot router into SD-WAN controller mode |
-| 11 | **verify_online** | Polls vManage for 3 control tunnels (vBond/vManage/vSmart) |
-| 12 | **verify_border_spine** | C9300-48UB — model, VRF, VLAN, version, OSPF, connectivity |
-| 13 | **verify_leaf1** | C9300-48P — model, VRF, VLAN, version, connectivity |
-| 14 | **verify_leaf2** | C9300-48U — model, VRF, VLAN, version, connectivity |
-| 15 | **connectivity_test** | Each switch pings Catalyst Center (198.18.5.100) |
-| 16 | **cdfmc_check** | cdFMC/Terraform deployment and FTD connection verification |
+| 1 | **detect_pod_number** | Derives POD number from VPN credentials |
+| 2 | **verify_router** | SSH reachability check on router mgmt IP |
+| 3 | **reset_device** | Pushes base router config (credentials, SSH, HTTP) |
+| 4 | **quick_connect** | Sets system-ip, site-id, host-name via vManage Quick Connect API |
+| 5 | **config_group_associate** | Associates device to PseudocoBranches config group |
+| 6 | **assign_license** | Assigns WAN Advantage license (C8K_MEDIUM_WAN_A) |
+| 7 | **set_variables** | Pushes 34 config group variables from CSV template |
+| 8 | **deploy_config_group** | Deploys config group, polls until In Sync |
+| 9 | **generate_bootstrap** | Generates ciscosdwan.cfg via vManage bootstrap API |
+| 10 | **copy_bootstrap** | HTTP server on tun0 IP → router copies file to bootflash |
+| 11 | **controller_mode_enable** | SSH command to reboot router into SD-WAN controller mode |
+| 12 | **verify_online** | Polls vManage for 3 control tunnels (vBond/vManage/vSmart) |
+| 13 | **redeploy_config_group** | Re-deploys config group post-controller-mode (soft-fail) |
+| 14 | **verify_border_spine** | C9300-48UB — model, VRF, VLAN, version, OSPF, connectivity |
+| 15 | **verify_leaf1** | C9300-48P — model, VRF, VLAN, version, connectivity |
+| 16 | **verify_leaf2** | C9300-48U — model, VRF, VLAN, version, connectivity |
+| 17 | **connectivity_test** | Each switch pings Catalyst Center (198.18.5.100) |
+| 18 | **cdfmc_check** | cdFMC/Terraform deployment and FTD connection verification |
+| 19 | **ad_verify** | Verifies AD users have POD-specific emails (not @corp.pseudoco.com) |
+| 20 | **scc_reset_check** | Verifies SCC org is clean: no custom rules, NTGs, ZTA profiles, etc. |
 
-Steps 10–16 are **soft-fail** — on failure the pipeline records a WARN and continues
-so switch checks always run even if the router or cdFMC step fails.
+Steps 11–20 are **soft-fail** — on failure the pipeline records a WARN and continues
+so all checks always run even if an earlier step fails.
 
 ---
 
