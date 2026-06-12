@@ -5314,7 +5314,7 @@ DUO_CARD_STEPS = [
     "ad_sync",
     "saml_scim_config",
     "authproxy_enroll",
-    "scc_check",
+
     "scim_push",
     "verify",
 ]
@@ -5325,7 +5325,7 @@ DUO_CARD_LABELS = {
     "ad_sync":         "AD Directory Sync",
     "saml_scim_config":"SA SAML + SCIM Config",
     "authproxy_enroll":"Auth Proxy Enroll",
-    "scc_check":       "SCC Policy Check",
+
     "scim_push":       "SA SCIM User Push",
     "verify":          "Verify Auth Proxy",
 }
@@ -5471,15 +5471,6 @@ def duo_run_card(
     def step_authproxy_enroll():
         return duo_authproxy_enroll_and_update(pod_id, db_path, log=_log)
 
-    def step_scc_check():
-        _os.environ["POD_ID"]  = pod_id
-        _os.environ["DB_PATH"] = db_path
-        try:
-            import onboard_router as _or
-            return _or.phase_scc_reset_check()
-        finally:
-            pass
-
     def step_scim_push():
         if not scim_tok and not oc.get("sa_scim_token", "").strip():
             return True, "skipped — no SA SCIM token stored"
@@ -5508,7 +5499,6 @@ def duo_run_card(
         "ad_sync":          step_ad_sync,
         "saml_scim_config": step_saml_scim_config,
         "authproxy_enroll": step_authproxy_enroll,
-        "scc_check":        step_scc_check,
         "scim_push":        step_scim_push,
         "verify":           step_verify,
     }
@@ -5523,7 +5513,7 @@ def duo_run_card(
         if not ok:
             final_ok = False
             # Non-fatal steps: continue even on failure
-            if step in ("scc_check", "scim_push", "verify", "saml_scim_config"):
+            if step in ("scim_push", "verify", "saml_scim_config"):
                 continue
             # Fatal steps: stop on first hard failure
             _log(f"  Hard failure at {step} — stopping")

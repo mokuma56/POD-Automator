@@ -3240,6 +3240,7 @@ const PIPELINE_ORDER = [
   "connectivity_test",
   "cdfmc_check",
   "ad_verify",
+  "scc_reset_check",
 ];
 
 async function handleFile(file) {
