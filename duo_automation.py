@@ -5720,6 +5720,16 @@ def duo_create_cisco_sa_app_playwright(pod_id: str, db_path: str, log=None,
     admin_host = duo_host.replace("api-", "admin-")
     admin_url  = f"https://{admin_host}"
 
+    # derive SCC CDO URL for login entry point
+    try:
+        with _sq.connect(db_path) as _c2:
+            _c2.row_factory = _sq.Row
+            _pod_row = _c2.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+            scc_org = (_pod_row["scc_org"] or "") if _pod_row else ""
+    except Exception:
+        scc_org = ""
+    scc_url = f"https://{scc_org}" if scc_org else ""
+
     # ── Check if app already exists via Admin API ────────────────────────────────
     if duo_ikey and duo_skey:
         try:
@@ -5745,61 +5755,98 @@ def duo_create_cisco_sa_app_playwright(pod_id: str, db_path: str, log=None,
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=False, slow_mo=400)
             ctx = browser.new_context(viewport={"width": 1280, "height": 900})
-
-            # Inject saved cookies to try to skip login
-            saved = _load_saved_admin_cookies_for_org(duo_host)
-            if saved:
-                _log(f"injecting {len(saved)} saved cookies ...")
-                ctx.add_cookies([
-                    {"name": k, "value": v, "domain": f".{admin_host}",
-                     "path": "/", "secure": True, "httpOnly": False}
-                    for k, v in saved.items()
-                ])
-
             page = ctx.new_page()
-            page.goto(admin_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
 
-            # ── Login if needed ──────────────────────────────────────────────────
-            if "/login" in page.url or "signin" in page.url.lower() or "accounts.google" in page.url:
-                _log("not logged in — filling credentials ...")
-                # Fill email
-                for sel in ["input[name='email']", "input[type='email']",
-                            "input[id*='email' i]"]:
+            # ── Entry point: SCC CDO portal → Duo tile → SSO into Duo Admin ─────
+            # Duo Admin can only be reached via SSO from within the SCC org portal.
+            # Going directly to admin-xxx.duosecurity.com requires Okta Touch ID MFA.
+            if scc_url:
+                _log(f"opening SCC portal: {scc_url}")
+                page.goto(scc_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+
+                # Login to SCC if redirected to login page
+                if "login" in page.url.lower() or "id.cisco" in page.url or "accounts.google" in page.url:
+                    _log("SCC login page — filling credentials ...")
+                    for sel in ["input[name='email']", "input[type='email']", "input[id*='email' i]"]:
+                        try:
+                            loc = page.locator(sel)
+                            if loc.count() > 0:
+                                loc.first.fill(login_email)
+                                loc.first.press("Enter")
+                                _log(f"email filled ({sel})")
+                                break
+                        except Exception:
+                            continue
+                    page.wait_for_timeout(2000)
+                    for sel in ["input[type='password']", "input[name='password']"]:
+                        try:
+                            loc = page.locator(sel)
+                            if loc.count() > 0:
+                                loc.first.fill(login_pass)
+                                loc.first.press("Enter")
+                                _log(f"password filled ({sel})")
+                                break
+                        except Exception:
+                            continue
+                    _log("waiting for SCC dashboard (60s) ...")
+                    deadline = _time.time() + 60
+                    while _time.time() < deadline:
+                        page.wait_for_timeout(3000)
+                        if scc_org in page.url or "cdo.cisco" in page.url:
+                            _log("SCC login successful")
+                            break
+
+                # Navigate to Duo Admin via the SCC org portal tile/link
+                _log("looking for Duo Admin tile/link in SCC portal ...")
+                page.wait_for_timeout(2000)
+                for sel in [
+                    "a:has-text('Duo Admin')",
+                    "button:has-text('Duo Admin')",
+                    "[aria-label*='Duo' i]",
+                    "a[href*='duosecurity.com']",
+                    ":text('Duo')",
+                ]:
                     try:
                         loc = page.locator(sel)
                         if loc.count() > 0:
-                            loc.first.fill(login_email)
-                            loc.first.press("Enter")
-                            _log(f"email filled ({sel})")
+                            _log(f"found Duo link via {sel} — clicking ...")
+                            with ctx.expect_page() as new_page_info:
+                                loc.first.click()
+                            duo_page = new_page_info.value
+                            duo_page.wait_for_load_state("domcontentloaded", timeout=20000)
+                            page = duo_page
+                            _log(f"navigated to: {page.url}")
                             break
                     except Exception:
                         continue
                 page.wait_for_timeout(2000)
 
-                # Fill password
-                for sel in ["input[type='password']", "input[name='password']",
-                            "input[id*='pass' i]"]:
-                    try:
-                        loc = page.locator(sel)
-                        if loc.count() > 0:
-                            loc.first.fill(login_pass)
-                            loc.first.press("Enter")
-                            _log(f"password filled ({sel})")
+                # If still not on Duo Admin, wait — user may need to click
+                if admin_host not in page.url:
+                    _log(f"⚠ Not on Duo Admin yet ({page.url}) — waiting 60s for navigation ...")
+                    deadline = _time.time() + 60
+                    while _time.time() < deadline:
+                        page.wait_for_timeout(3000)
+                        if admin_host in page.url:
+                            _log("arrived at Duo Admin portal")
                             break
-                    except Exception:
-                        continue
-
-                # Wait for MFA (Touch ID) — user must act in the browser window
-                _log("⚠ MFA required — please complete Touch ID in the browser window (3 min timeout) ...")
-                deadline = _time.time() + 180
-                while _time.time() < deadline:
-                    page.wait_for_timeout(3000)
-                    if admin_host in page.url and "/login" not in page.url:
-                        _log("login successful")
-                        break
-                else:
-                    return False, "Login timed out — Touch ID not completed within 3 minutes"
+                    else:
+                        _log("WARN: still not on Duo Admin after 60s — proceeding anyway")
+            else:
+                _log("WARN: scc_url not set — opening Duo Admin directly (may require Touch ID MFA)")
+                page.goto(admin_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+                if "/login" in page.url or "signin" in page.url.lower():
+                    _log("⚠ MFA required — please complete Touch ID in the browser window (3 min) ...")
+                    deadline = _time.time() + 180
+                    while _time.time() < deadline:
+                        page.wait_for_timeout(3000)
+                        if admin_host in page.url and "/login" not in page.url:
+                            _log("login successful")
+                            break
+                    else:
+                        return False, "Login timed out — Touch ID not completed within 3 minutes"
 
             # ── Navigate to Applications → Protect an Application ───────────────
             _log("navigating to Applications ...")
