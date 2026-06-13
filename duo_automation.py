@@ -5800,6 +5800,7 @@ def duo_create_cisco_sa_app_playwright(pod_id: str, db_path: str, log=None,
                 # Navigate to Duo Admin via the SCC org portal tile/link
                 _log("looking for Duo Admin tile/link in SCC portal ...")
                 page.wait_for_timeout(2000)
+                clicked = False
                 for sel in [
                     "a:has-text('Duo Admin')",
                     "button:has-text('Duo Admin')",
@@ -5811,25 +5812,42 @@ def duo_create_cisco_sa_app_playwright(pod_id: str, db_path: str, log=None,
                         loc = page.locator(sel)
                         if loc.count() > 0:
                             _log(f"found Duo link via {sel} — clicking ...")
-                            with ctx.expect_page() as new_page_info:
-                                loc.first.click()
-                            duo_page = new_page_info.value
-                            duo_page.wait_for_load_state("domcontentloaded", timeout=20000)
-                            page = duo_page
-                            _log(f"navigated to: {page.url}")
+                            loc.first.click()
+                            clicked = True
                             break
                     except Exception:
                         continue
-                page.wait_for_timeout(2000)
 
-                # If still not on Duo Admin, wait — user may need to click
+                if clicked:
+                    # Wait up to 10s to see if a new tab opened in this context
+                    page.wait_for_timeout(3000)
+                    pages = ctx.pages
+                    # Pick whichever page is now on duosecurity.com
+                    for p in pages:
+                        try:
+                            if admin_host in p.url:
+                                page = p
+                                _log(f"new tab on Duo Admin: {page.url}")
+                                break
+                        except Exception:
+                            continue
+
+                # If still not on Duo Admin, poll up to 60s for any navigation
                 if admin_host not in page.url:
                     _log(f"⚠ Not on Duo Admin yet ({page.url}) — waiting 60s for navigation ...")
                     deadline = _time.time() + 60
                     while _time.time() < deadline:
                         page.wait_for_timeout(3000)
+                        # Also re-check all open pages
+                        for p in ctx.pages:
+                            try:
+                                if admin_host in p.url:
+                                    page = p
+                                    break
+                            except Exception:
+                                continue
                         if admin_host in page.url:
-                            _log("arrived at Duo Admin portal")
+                            _log(f"arrived at Duo Admin: {page.url}")
                             break
                     else:
                         _log("WARN: still not on Duo Admin after 60s — proceeding anyway")
