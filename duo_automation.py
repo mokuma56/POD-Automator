@@ -6138,7 +6138,10 @@ def duo_run_card(
         return False, "Duo Admin API credentials (ikey/skey/host) not set in DB"
 
     # ── Detect mode ───────────────────────────────────────────────────────────
-    is_refresh = bool(app_ikey and scim_tok and "[sso]" in ap_cfg)
+    # SESSION REFRESH = org was previously fully set up.
+    # app_ikey is intentionally excluded: it may have been cleared to force
+    # re-creation of the Duo SAML app without re-running the full org setup.
+    is_refresh = bool(scim_tok and "[sso]" in ap_cfg)
     mode_label = "SESSION REFRESH" if is_refresh else "FULL SETUP"
     _log(f"Mode: {mode_label} (app_ikey={'set' if app_ikey else 'empty'}, "
          f"scim_token={'set' if scim_tok else 'empty'}, "
