@@ -5331,7 +5331,334 @@ DUO_CARD_LABELS = {
 }
 
 
-def duo_create_cisco_sa_app_playwright(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+def sa_generate_scim_token_playwright(pod_id: str, db_path: str, log=None) -> tuple[str, str]:
+    """
+    Open a headed Chromium browser, login to SCC → Secure Access, then:
+      1. Connect → User, Groups, and Endpoint Devices
+      2. Configuration management (top-right)
+      3. Integrate directories → Identity provider (IdP)
+      4. Directory name = 'Duo', Identity Provider = 'Duo' → Next
+      5. Generate Token → extract Token and Provisioning URL → Done
+
+    Saves sa_scim_token to org_credentials in DB.
+    Returns (scim_token, provisioning_url) or ("", "") on failure.
+    """
+    import sqlite3 as _sq
+    import time as _time
+    import re as _re
+
+    _log = log or (lambda s: print(f"     [sa-scim-pw] {s}"))
+
+    # ── Load creds ───────────────────────────────────────────────────────────────
+    try:
+        with _sq.connect(db_path) as _c:
+            _c.row_factory = _sq.Row
+            pod_row = dict(_c.execute(
+                "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
+            ).fetchone() or {})
+            scc_org = pod_row.get("scc_org", "")
+            # Derive org number from scc_org field
+            m = _re.search(r"cisco-pseudoco-(\d+)", scc_org)
+            org_num = int(m.group(1)) if m else None
+            if org_num:
+                oc = dict(_c.execute(
+                    "SELECT * FROM org_credentials WHERE org_number=?", (org_num,)
+                ).fetchone() or {})
+            else:
+                oc = {}
+    except Exception as e:
+        _log(f"DB load failed: {e}")
+        return "", ""
+
+    scc_email  = oc.get("scc_email", "").strip()
+    scc_pass   = oc.get("scc_password", "").strip()
+    scc_url    = f"https://{scc_org}" if scc_org else ""
+
+    if not scc_url:
+        _log("scc_org not set in DB — cannot navigate to SA portal")
+        return "", ""
+    if not scc_email:
+        _log("scc_email not set in DB")
+        return "", ""
+
+    _log(f"opening SCC: {scc_url}")
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        _log("playwright not installed")
+        return "", ""
+
+    scim_token = ""
+    provisioning_url = SA_SCIM_URL  # static fallback
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=False, slow_mo=400)
+            ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+            page = ctx.new_page()
+
+            # ── SCC login ────────────────────────────────────────────────────────
+            page.goto(scc_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            # Handle Cisco SSO login if redirected
+            if scc_org not in page.url and "scc_org" not in page.url:
+                if "login" in page.url.lower() or "id.cisco" in page.url or "accounts.google" in page.url:
+                    _log("SCC login page — filling credentials ...")
+                    for sel in ["input[name='email']", "input[type='email']",
+                                "input[id*='email' i]", "input[id*='username' i]"]:
+                        try:
+                            loc = page.locator(sel)
+                            if loc.count() > 0:
+                                loc.first.fill(scc_email)
+                                loc.first.press("Enter")
+                                _log(f"email filled ({sel})")
+                                break
+                        except Exception:
+                            continue
+                    page.wait_for_timeout(2000)
+
+                    for sel in ["input[type='password']", "input[name='password']"]:
+                        try:
+                            loc = page.locator(sel)
+                            if loc.count() > 0:
+                                loc.first.fill(scc_pass)
+                                loc.first.press("Enter")
+                                _log(f"password filled ({sel})")
+                                break
+                        except Exception:
+                            continue
+
+                    _log("waiting for SCC dashboard (60s) — complete any MFA if prompted ...")
+                    deadline = _time.time() + 60
+                    while _time.time() < deadline:
+                        page.wait_for_timeout(3000)
+                        if scc_org in page.url or "cdo.cisco" in page.url:
+                            _log("SCC login successful")
+                            break
+                    else:
+                        _log("WARN: SCC login may not have completed — proceeding anyway")
+
+            page.wait_for_timeout(2000)
+
+            # ── Click on Secure Access tile ───────────────────────────────────────
+            _log("looking for Secure Access tile ...")
+            for sel in ["a:has-text('Secure Access')", "button:has-text('Secure Access')",
+                        ":text('Secure Access')", "[aria-label*='Secure Access' i]"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        _log(f"clicked Secure Access via {sel}")
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(3000)
+
+            # ── Navigate to Connect → User, Groups, and Endpoint Devices ─────────
+            _log("navigating to Connect → User, Groups, and Endpoint Devices ...")
+            for sel in ["a:has-text('Connect')", "button:has-text('Connect')",
+                        "nav a:has-text('Connect')"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        _log(f"clicked Connect via {sel}")
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(1500)
+
+            for sel in ["a:has-text('User, Groups')", "a:has-text('Users, Groups')",
+                        "a:has-text('User, Groups, and Endpoint')",
+                        ":text('User, Groups')", ":text('Users and Groups')"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        _log(f"clicked User Groups via {sel}")
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(2000)
+
+            # ── Configuration management ─────────────────────────────────────────
+            _log("clicking Configuration management ...")
+            for sel in ["button:has-text('Configuration management')",
+                        "a:has-text('Configuration management')",
+                        ":text('Configuration management')"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        _log("Configuration management clicked")
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(1500)
+
+            # ── Integrate directories ─────────────────────────────────────────────
+            _log("clicking Integrate directories ...")
+            for sel in ["button:has-text('Integrate directories')",
+                        "a:has-text('Integrate directories')",
+                        ":text('Integrate directories')"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        _log("Integrate directories clicked")
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(1500)
+
+            # ── Select Identity provider (IdP) ───────────────────────────────────
+            _log("selecting Identity provider (IdP) ...")
+            for sel in ["input[value='idp']", "label:has-text('Identity provider') input",
+                        "*:has-text('Identity provider') input[type='radio']",
+                        "input[type='radio']:near(:text('Identity provider'))"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        _log("IdP radio selected")
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(800)
+
+            # ── Fill Directory name = "Duo" ───────────────────────────────────────
+            _log("filling IdP directory name = 'Duo' ...")
+            for sel in ["input[placeholder*='name' i]", "input[label*='name' i]",
+                        "input[id*='name' i]", "input[type='text']:first-of-type"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.fill("Duo")
+                        _log(f"directory name filled via {sel}")
+                        break
+                except Exception:
+                    continue
+
+            # ── Select Identity Provider = "Duo" from dropdown ───────────────────
+            _log("selecting Identity Provider = 'Duo' ...")
+            for sel in ["select:near(:text('Identity Provider'))", "select[name*='provider' i]",
+                        "select[id*='provider' i]"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.select_option(label="Duo")
+                        _log("Identity Provider set to Duo")
+                        break
+                except Exception:
+                    continue
+
+            # Click Next
+            for sel in ["button:has-text('Next')", "button:has-text('Continue')"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        _log("Next clicked")
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(1500)
+
+            # ── Generate Token ────────────────────────────────────────────────────
+            _log("clicking Generate Token ...")
+            for sel in ["button:has-text('Generate Token')", "button:has-text('Generate')",
+                        ":text('Generate Token')"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        _log("Generate Token clicked")
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(2000)
+
+            # ── Extract Token and Provisioning URL ────────────────────────────────
+            _log("extracting Token and Provisioning URL ...")
+
+            # Try reading pre/code/input fields near "Token" and "URL" labels
+            for hint, targets in [
+                ("Token",            ["scim_token", "token"]),
+                ("Provisioning URL", ["scim_url", "url"]),
+            ]:
+                for field_sel in [
+                    f"*:has-text('{hint}') input",
+                    f"*:has-text('{hint}') code",
+                    f"*:has-text('{hint}') pre",
+                    f"*:has-text('{hint}') textarea",
+                    f"[aria-label*='{hint}' i]",
+                ]:
+                    try:
+                        loc = page.locator(field_sel).first
+                        if loc.count() > 0:
+                            val = (loc.get_attribute("value") or loc.inner_text()).strip()
+                            if val and len(val) > 10:
+                                if "Token" in hint:
+                                    scim_token = val
+                                    _log(f"Token extracted (len={len(val)})")
+                                else:
+                                    provisioning_url = val
+                                    _log(f"Provisioning URL extracted: {val[:60]}")
+                                break
+                    except Exception:
+                        continue
+
+            # Click "Copy token" and "Copy URL" buttons to confirm extraction
+            for btn_text in ["Copy token", "Copy URL", "Copy"]:
+                try:
+                    loc = page.locator(f"button:has-text('{btn_text}')")
+                    if loc.count() > 0:
+                        loc.first.click()
+                        page.wait_for_timeout(300)
+                        _log(f"clicked '{btn_text}'")
+                except Exception:
+                    pass
+
+            # ── Click Done ────────────────────────────────────────────────────────
+            _log("clicking Done ...")
+            for sel in ["button:has-text('Done')", "button:has-text('Finish')"]:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        _log("Done clicked")
+                        break
+                except Exception:
+                    continue
+
+            browser.close()
+
+    except Exception as e:
+        _log(f"Playwright error: {e}")
+        return "", ""
+
+    if not scim_token:
+        _log("WARN: could not extract SCIM token from SA portal")
+        return "", provisioning_url
+
+    # ── Save token to DB ─────────────────────────────────────────────────────────
+    try:
+        with _sq.connect(db_path) as _c:
+            _c.execute(
+                "UPDATE org_credentials SET sa_scim_token=?, updated_at=datetime('now') "
+                "WHERE org_number=?",
+                (scim_token, oc.get("org_number"))
+            )
+        _log(f"sa_scim_token saved to DB (len={len(scim_token)})")
+    except Exception as e:
+        _log(f"WARN: could not save token to DB: {e}")
+
+    return scim_token, provisioning_url
+
+
+def duo_create_cisco_sa_app_playwright(pod_id: str, db_path: str, log=None,
+                                        scim_token: str = "", scim_url: str = "") -> tuple[bool, str]:
     """
     Open a headed Chromium browser to create the 'Cisco Secure Access' app in the
     Duo Admin portal, following the lab guide exactly:
@@ -5377,7 +5704,10 @@ def duo_create_cisco_sa_app_playwright(pod_id: str, db_path: str, log=None) -> t
     duo_ikey  = oc.get("duo_ikey", "").strip()
     duo_skey  = oc.get("duo_skey", "").strip()
     duo_host  = oc.get("duo_host", "").strip()
-    scim_tok  = oc.get("sa_scim_token", "").strip()
+    # Use passed-in token/url if provided (freshly generated from SA portal),
+    # otherwise fall back to stored value
+    scim_tok  = scim_token or oc.get("sa_scim_token", "").strip()
+    scim_base = scim_url or SA_SCIM_URL
     login_email = oc.get("scc_email", "").strip()
     login_pass  = oc.get("scc_password", "").strip()
 
@@ -5855,10 +6185,10 @@ def duo_run_card(
         return duo_trigger_ad_sync(duo_ikey, duo_skey, duo_host, log=_log)
 
     def step_saml_scim_config():
-        # Always verify the stored app_ikey still exists in the Duo org.
-        # After a new dCloud session the Duo org resets — the ikey is stale even
-        # though it is set in DB, which would cause SESSION REFRESH to skip this
-        # step and leave SA without a working SAML app.
+        # ── 1. Verify stored Duo SAML app ikey still exists ──────────────────────
+        # After a new dCloud session the Duo org resets — the ikey becomes stale
+        # even though it is set in DB.  SESSION REFRESH must confirm the app is
+        # really there before skipping re-creation.
         if app_ikey:
             try:
                 _duo_request(duo_ikey, duo_skey, duo_host, "GET",
@@ -5869,8 +6199,42 @@ def duo_run_card(
                 # Full setup but app already exists — still run to ensure SCIM/groups configured
             except Exception:
                 _log(f"stored app_ikey={app_ikey} not found in Duo (session reset?) — re-creating")
-        # Create/configure the Cisco Secure Access app via headed Playwright browser
-        return duo_create_cisco_sa_app_playwright(pod_id, db_path, log=_log)
+
+        # ── 2. Validate stored SA SCIM token ─────────────────────────────────────
+        import urllib.request as _ur, json as _js
+        fresh_token = scim_tok
+        fresh_url   = SA_SCIM_URL
+
+        def _validate_scim_token(tok: str) -> bool:
+            if not tok:
+                return False
+            try:
+                req = _ur.Request(
+                    f"{SA_SCIM_URL}/Users?count=1",
+                    headers={"Authorization": f"Bearer {tok}",
+                             "Content-Type": "application/scim+json"},
+                )
+                with _ur.urlopen(req, timeout=10) as r:
+                    return r.status == 200
+            except Exception:
+                return False
+
+        if _validate_scim_token(fresh_token):
+            _log(f"existing SA SCIM token valid (len={len(fresh_token)})")
+        else:
+            _log("SA SCIM token missing or invalid — generating via SA portal (Playwright) ...")
+            fresh_token, fresh_url = sa_generate_scim_token_playwright(pod_id, db_path, log=_log)
+            if fresh_token:
+                _log(f"SA SCIM token generated (len={len(fresh_token)})")
+            else:
+                _log("WARN: could not generate SA SCIM token — Duo app will use stored/empty token")
+
+        # ── 3. Create / configure the Cisco Secure Access app in Duo ─────────────
+        return duo_create_cisco_sa_app_playwright(
+            pod_id, db_path, log=_log,
+            scim_token=fresh_token,
+            scim_url=fresh_url,
+        )
 
     def step_authproxy_enroll():
         return duo_authproxy_enroll_and_update(pod_id, db_path, log=_log)
