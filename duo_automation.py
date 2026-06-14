@@ -6284,9 +6284,13 @@ def duo_run_card(
         fresh_url   = SA_SCIM_URL
 
         def _validate_scim_token(tok: str) -> bool:
+            """Return True if token is non-empty AND the API doesn't reject it.
+            Network errors / timeouts are treated as 'assume valid' — only a
+            real HTTP 401/403 response means the token is genuinely bad."""
             if not tok:
                 return False
             try:
+                import urllib.error as _ue
                 req = _ur.Request(
                     f"{SA_SCIM_URL}/Users?count=1",
                     headers={"Authorization": f"Bearer {tok}",
@@ -6294,8 +6298,12 @@ def duo_run_card(
                 )
                 with _ur.urlopen(req, timeout=10) as r:
                     return r.status == 200
+            except _ue.HTTPError as e:
+                if e.code in (401, 403):
+                    return False          # definitely invalid
+                return True               # other HTTP error — assume OK
             except Exception:
-                return False
+                return True               # network unreachable (VPN blocks) — assume OK
 
         if _validate_scim_token(fresh_token):
             _log(f"existing SA SCIM token valid (len={len(fresh_token)})")
