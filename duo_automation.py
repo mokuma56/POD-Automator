@@ -4258,24 +4258,24 @@ def duo_authproxy_enroll_and_update(
     db_path: str,
     log=None,
 ) -> tuple[bool, str]:
-    """Verify SSO enrollment state on AD1 and return rikey from authproxy_cfg.
+    """
+    On fresh AD1 (session reset), run authproxyctl.exe enroll to register
+    this proxy instance with Duo and get a fresh rikey.
 
-    NOTE: authproxy_update_sso_enrollment_code.exe accepts a base64-encoded JSON
-    enrollment code (NOT the rikey directly). That code is only available from the
-    Duo Admin portal UI and expires after 8 hours. The exe must be run manually
-    (or via Playwright) to populate C:\\ProgramData\\Duo Authentication Proxy\\secrets.
+    Steps:
+    1. Load duo_saml_app_ikey from DB
+    2. Fetch SAML app secret_key from Duo Admin API
+    3. Strip old [sso] from authproxy.cfg on AD1; append new [sso] with ikey/skey/api_host
+    4. Run authproxyctl.exe enroll --ikey --skey --api-host → get rikey
+    5. Update authproxy.cfg in DB with new rikey
+    6. Restart DuoAuthProxy
 
-    This function NO LONGER calls the enrollment exe. Instead it:
-    1. Reads authproxy_cfg from DB to extract rikey from [sso] section.
-    2. WinRM-connects to AD1 and checks DuoAuthProxy service status.
-    3. Returns (ok, rikey) — service status is logged but does not block.
-
-    Returns (ok, rikey_or_error_message).
+    Returns (ok, rikey_or_message).
     """
     import sqlite3 as _sq, re as _re
     _log = log or (lambda s: print(f"     [authproxy-enroll] {s}"))
 
-    # ── 1. Load authproxy_cfg from DB ──────────────────────────────────────────
+    # ── 1. Load creds from DB ──────────────────────────────────────────────────
     try:
         with _sq.connect(db_path) as conn:
             conn.row_factory = _sq.Row
@@ -4295,18 +4295,30 @@ def duo_authproxy_enroll_and_update(
     except Exception as e:
         return False, f"DB read error: {e}"
 
+    duo_ikey      = oc.get("duo_ikey", "").strip()
+    duo_skey      = oc.get("duo_skey", "").strip()
+    duo_host      = oc.get("duo_host", "").strip()
+    app_ikey      = oc.get("duo_saml_app_ikey", "").strip()
     authproxy_cfg = oc.get("authproxy_cfg", "").strip()
+
+    if not app_ikey:
+        return False, "duo_saml_app_ikey not set in DB — complete step 4 first"
     if not authproxy_cfg:
-        return False, "authproxy_cfg not set in DB — push config first"
+        return False, "authproxy_cfg not set in DB — complete step 2 first"
 
-    # Extract rikey from [sso] section
-    rikey_m = _re.search(r"^\s*rikey\s*=\s*(\S+)", authproxy_cfg, _re.MULTILINE)
-    if not rikey_m:
-        return False, "No rikey found in [sso] section of authproxy_cfg"
-    rikey = rikey_m.group(1)
-    _log(f"rikey from authproxy_cfg: {rikey}")
+    # ── 2. Fetch SAML app secret_key from Duo Admin API ───────────────────────
+    _log(f"fetching SAML app secret_key from Duo Admin API (ikey={app_ikey}) ...")
+    try:
+        resp = _duo_request(duo_ikey, duo_skey, duo_host,
+                            "GET", f"/admin/v1/integrations/{app_ikey}")
+        app_skey = resp.get("response", {}).get("secret_key", "")
+        if not app_skey:
+            raise ValueError("secret_key empty in API response")
+        _log(f"secret_key fetched ({len(app_skey)} chars)")
+    except Exception as e:
+        return False, f"Could not fetch SAML app secret_key: {e}"
 
-    # ── 2. WinRM connect ───────────────────────────────────────────────────────
+    # ── 3. WinRM connect to AD1 ────────────────────────────────────────────────
     _log("WinRM-connecting to AD1 ...")
     try:
         winrm_sess = _winrm_connect_for_pod(pod_id, log=_log)
@@ -4314,27 +4326,82 @@ def duo_authproxy_enroll_and_update(
         return False, f"WinRM connect failed: {e}"
 
     try:
-        # ── 3. Check DuoAuthProxy service status ───────────────────────────────
-        # Enrollment exe requires a base64-encoded JSON enrollment code from the
-        # Duo Admin portal (not the rikey). It must be obtained manually and run
-        # once per proxy registration. We skip calling it here to avoid the
-        # UTF-8 decode crash and potential secrets-file overwrite.
-        _log("checking DuoAuthProxy service status on AD1 ...")
-        r = winrm_sess.run_ps(
-            "(Get-Service -Name DuoAuthProxy -ErrorAction SilentlyContinue).Status"
+        # Read current authproxy.cfg from AD1, strip any stale [sso] block
+        _log("reading current authproxy.cfg from AD1 ...")
+        current_cfg = _winrm_read_file(winrm_sess, AUTHPROXY_CFG_PATH)
+        clean_cfg = _re.sub(
+            r'\[sso\].*?(?=\[|\Z)', '', current_cfg, flags=_re.DOTALL
+        ).rstrip()
+
+        # Append fresh [sso] section (rikey will be written by authproxyctl enroll)
+        new_cfg = (
+            clean_cfg
+            + "\n\n[sso]\n"
+            + f"ikey={app_ikey}\n"
+            + f"skey={app_skey}\n"
+            + f"api_host={duo_host}\n"
         )
-        svc_status = r.std_out.decode(errors="replace").strip()
-        _log(f"DuoAuthProxy service status: {svc_status or 'unknown'}")
+        _log("writing updated authproxy.cfg with [sso] section ...")
+        ok_write, msg_write = _winrm_write_restart_cfg(winrm_sess, new_cfg, _log)
+        if not ok_write:
+            return False, f"authproxy.cfg write failed: {msg_write}"
+        _log(f"cfg write: {msg_write}")
+
+        # ── 4. Run authproxyctl enroll ─────────────────────────────────────────
+        _log("running authproxyctl enroll on AD1 ...")
+        enroll_cmd = (
+            f"& '{AUTHPROXY_ENROLL_EXE}' enroll "
+            f"--ikey {app_ikey} --skey {app_skey} --api-host {duo_host}"
+        )
+        ok_enroll, enroll_out = _winrm_run_cmd(winrm_sess, enroll_cmd, _log)
+        _log(f"enroll output: {enroll_out[:300]}")
+
+        # ── 5. Extract rikey from output and update DB ─────────────────────────
+        rikey_m = _re.search(r'rikey[=\s:]+([A-Z0-9]{20,})', enroll_out, _re.IGNORECASE)
+        if rikey_m:
+            rikey = rikey_m.group(1)
+            _log(f"rikey extracted: {rikey}")
+            # Update authproxy_cfg in DB with the new rikey
+            updated_cfg = _re.sub(
+                r'(^\[sso\][^\[]*)',
+                lambda mo: mo.group(0).rstrip() + f"\nrikey={rikey}\n",
+                new_cfg, flags=_re.MULTILINE | _re.DOTALL,
+            )
+            try:
+                with _sq.connect(db_path) as conn:
+                    conn.execute(
+                        "UPDATE org_credentials SET authproxy_cfg=?, updated_at=datetime('now') "
+                        "WHERE org_number=?",
+                        (updated_cfg, org_num)
+                    )
+                _log("authproxy_cfg updated in DB with new rikey")
+            except Exception as e:
+                _log(f"WARN: could not update DB: {e}")
+        else:
+            rikey = ""
+            _log("WARN: rikey not found in enroll output — proxy may not be enrolled")
+
+        # ── 6. Restart DuoAuthProxy to activate ───────────────────────────────
+        _log("restarting DuoAuthProxy to activate enrollment ...")
+        winrm_sess.run_ps(
+            "Restart-Service DuoAuthProxy -Force -ErrorAction SilentlyContinue; "
+            "Start-Sleep 5; "
+            "$s = Get-Service DuoAuthProxy -ErrorAction SilentlyContinue; "
+            "if ($s) { Write-Output \"STATUS:$($s.Status)\" }"
+        )
+        _log("DuoAuthProxy restarted")
 
     except Exception as e:
-        return False, f"WinRM command failed: {e}"
+        return False, f"Enrollment error: {e}"
     finally:
         try:
             winrm_sess.close()
         except Exception:
             pass
 
-    return True, rikey
+    if rikey:
+        return True, f"enrolled OK — rikey={rikey}"
+    return False, "enrollment ran but no rikey in output — check AD1 manually"
 
 
 def duo_admin_portal_configure(
