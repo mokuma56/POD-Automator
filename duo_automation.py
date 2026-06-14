@@ -6278,42 +6278,21 @@ def duo_run_card(
             except Exception:
                 _log(f"stored app_ikey={app_ikey} not found in Duo (session reset?) — re-creating")
 
-        # ── 2. Validate stored SA SCIM token ─────────────────────────────────────
-        import urllib.request as _ur, json as _js
+        # ── 2. Use stored SA SCIM token ───────────────────────────────────────────
+        # If a token is stored, use it as-is. sa_generate_scim_token_playwright
+        # is only called when no token exists at all.
         fresh_token = scim_tok
         fresh_url   = SA_SCIM_URL
 
-        def _validate_scim_token(tok: str) -> bool:
-            """Return True if token is non-empty AND the API doesn't reject it.
-            Network errors / timeouts are treated as 'assume valid' — only a
-            real HTTP 401/403 response means the token is genuinely bad."""
-            if not tok:
-                return False
-            try:
-                import urllib.error as _ue
-                req = _ur.Request(
-                    f"{SA_SCIM_URL}/Users?count=1",
-                    headers={"Authorization": f"Bearer {tok}",
-                             "Content-Type": "application/scim+json"},
-                )
-                with _ur.urlopen(req, timeout=10) as r:
-                    return r.status == 200
-            except _ue.HTTPError as e:
-                if e.code in (401, 403):
-                    return False          # definitely invalid
-                return True               # other HTTP error — assume OK
-            except Exception:
-                return True               # network unreachable (VPN blocks) — assume OK
-
-        if _validate_scim_token(fresh_token):
-            _log(f"existing SA SCIM token valid (len={len(fresh_token)})")
-        else:
-            _log("SA SCIM token missing or invalid — generating via SA portal (Playwright) ...")
+        if not fresh_token:
+            _log("no SA SCIM token stored — generating via SA portal (Playwright) ...")
             fresh_token, fresh_url = sa_generate_scim_token_playwright(pod_id, db_path, log=_log)
             if fresh_token:
                 _log(f"SA SCIM token generated (len={len(fresh_token)})")
             else:
-                _log("WARN: could not generate SA SCIM token — Duo app will use stored/empty token")
+                _log("WARN: could not generate SA SCIM token — proceeding without it")
+        else:
+            _log(f"using stored SA SCIM token (len={len(fresh_token)})")
 
         # ── 3. Create / configure the Cisco Secure Access app in Duo ─────────────
         return duo_create_cisco_sa_app_playwright(
