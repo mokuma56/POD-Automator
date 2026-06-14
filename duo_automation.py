@@ -6213,11 +6213,11 @@ def duo_run_card(
         return False, "Duo Admin API credentials (ikey/skey/host) not set in DB"
 
     # ── Detect mode ───────────────────────────────────────────────────────────
-    # SESSION REFRESH = org was previously fully set up.
-    # app_ikey is intentionally excluded: it may have been cleared to force
-    # re-creation of the Duo SAML app without re-running the full org setup.
-    is_refresh = bool(scim_tok and "[sso]" in ap_cfg)
-    mode_label = "SESSION REFRESH" if is_refresh else "FULL SETUP"
+    # SCC / SA / Duo orgs are permanently coupled — never torn down.
+    # Every run is effectively a session re-integration: push authproxy,
+    # sync AD users, verify app.  No "full setup vs refresh" distinction needed.
+    is_refresh = True
+    mode_label = "SESSION RE-INTEGRATION"
     _log(f"Mode: {mode_label} (app_ikey={'set' if app_ikey else 'empty'}, "
          f"scim_token={'set' if scim_tok else 'empty'}, "
          f"[sso]={'yes' if '[sso]' in ap_cfg else 'no'})")
@@ -6263,43 +6263,34 @@ def duo_run_card(
         return duo_trigger_ad_sync(duo_ikey, duo_skey, duo_host, log=_log)
 
     def step_saml_scim_config():
-        # ── 1. Verify stored Duo SAML app ikey still exists ──────────────────────
-        # After a new dCloud session the Duo org resets — the ikey becomes stale
-        # even though it is set in DB.  SESSION REFRESH must confirm the app is
-        # really there before skipping re-creation.
-        if app_ikey:
-            try:
-                _duo_request(duo_ikey, duo_skey, duo_host, "GET",
-                             f"/admin/v1/integrations/{app_ikey}")
-                if is_refresh:
-                    _log(f"SAML app verified in Duo (ikey={app_ikey}) — skipping re-create")
-                    return True, f"app verified (ikey={app_ikey})"
-                # Full setup but app already exists — still run to ensure SCIM/groups configured
-            except Exception:
-                _log(f"stored app_ikey={app_ikey} not found in Duo (session reset?) — re-creating")
+        """
+        SCC / SA / Duo orgs are permanently coupled and never torn down.
+        The SAML app ('Cisco Secure Access'), SCIM connector, and SA IdP config
+        are configured once manually and persist indefinitely.
 
-        # ── 2. Use stored SA SCIM token ───────────────────────────────────────────
-        # If a token is stored, use it as-is. sa_generate_scim_token_playwright
-        # is only called when no token exists at all.
-        fresh_token = scim_tok
-        fresh_url   = SA_SCIM_URL
+        This step simply verifies the stored duo_saml_app_ikey still exists in
+        the Duo org.  If it does → done.  If it's missing from DB → instruct
+        user to create the app manually and enter the ikey in the dashboard.
+        """
+        if not app_ikey:
+            return False, (
+                "duo_saml_app_ikey not set in DB — create the 'Cisco Secure Access' "
+                "app in Duo Admin portal (Applications → Protect an Application → "
+                "Cisco Secure Access) and paste the Integration Key into the "
+                "org credentials card on the dashboard, then re-run this step."
+            )
 
-        if not fresh_token:
-            _log("no SA SCIM token stored — generating via SA portal (Playwright) ...")
-            fresh_token, fresh_url = sa_generate_scim_token_playwright(pod_id, db_path, log=_log)
-            if fresh_token:
-                _log(f"SA SCIM token generated (len={len(fresh_token)})")
-            else:
-                _log("WARN: could not generate SA SCIM token — proceeding without it")
-        else:
-            _log(f"using stored SA SCIM token (len={len(fresh_token)})")
-
-        # ── 3. Create / configure the Cisco Secure Access app in Duo ─────────────
-        return duo_create_cisco_sa_app_playwright(
-            pod_id, db_path, log=_log,
-            scim_token=fresh_token,
-            scim_url=fresh_url,
-        )
+        try:
+            _duo_request(duo_ikey, duo_skey, duo_host, "GET",
+                         f"/admin/v1/integrations/{app_ikey}")
+            _log(f"SAML app verified in Duo org (ikey={app_ikey})")
+            return True, f"SAML app present (ikey={app_ikey})"
+        except Exception as e:
+            return False, (
+                f"SAML app ikey={app_ikey} not found in Duo org: {e} — "
+                "the app may have been deleted; re-create it in Duo Admin portal "
+                "and update duo_saml_app_ikey in the dashboard."
+            )
 
     def step_authproxy_enroll():
         return duo_authproxy_enroll_and_update(pod_id, db_path, log=_log)
