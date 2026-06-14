@@ -5528,17 +5528,27 @@ def sa_generate_scim_token_playwright(pod_id: str, db_path: str, log=None) -> tu
             page.wait_for_timeout(800)
 
             # ── Fill Directory name = "Duo" ───────────────────────────────────────
-            _log("filling IdP directory name = 'Duo' ...")
-            for sel in ["input[placeholder*='name' i]", "input[label*='name' i]",
-                        "input[id*='name' i]", "input[type='text']:first-of-type"]:
-                try:
-                    loc = page.locator(sel)
-                    if loc.count() > 0:
-                        loc.first.fill("Duo")
-                        _log(f"directory name filled via {sel}")
-                        break
-                except Exception:
-                    continue
+            # Guard: only fill if we're actually on the IdP setup form, not login
+            if "login" in page.url.lower() or "accounts.google" in page.url:
+                _log("WARN: still on login page — skipping IdP name fill")
+            else:
+                _log("filling IdP directory name = 'Duo' ...")
+                for sel in [
+                    "input[placeholder*='name' i]",
+                    "input[label*='name' i]",
+                    "input[id*='name' i]",
+                    "input[aria-label*='name' i]",
+                    "label:has-text('Name') + input",
+                    "label:has-text('Directory name') + input",
+                ]:
+                    try:
+                        loc = page.locator(sel)
+                        if loc.count() > 0:
+                            loc.first.fill("Duo")
+                            _log(f"directory name filled via {sel}")
+                            break
+                    except Exception:
+                        continue
 
             # ── Select Identity Provider = "Duo" from dropdown ───────────────────
             _log("selecting Identity Provider = 'Duo' ...")
