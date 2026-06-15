@@ -2518,39 +2518,40 @@ def get_org_credentials(org_number):
 
 @app.route("/api/org-credentials/<org_number>", methods=["POST"])
 def save_org_credentials(org_number):
-    """Create or update credentials for a given org number."""
+    """Create or update credentials for a given org number.
+    Empty string values are ignored — existing DB values are preserved.
+    This prevents accidental wipes when password fields aren't visible in the form.
+    """
     data = request.get_json(force=True)
     conn = _db()
+    # For new orgs: insert with whatever values were provided (empty is fine as placeholder)
     conn.execute("""
-        INSERT INTO org_credentials
-            (org_number, duo_ikey, duo_skey, duo_host,
-             duo_saml_app_ikey,
-             scc_api_key, scc_api_secret,
-             sa_org_id, sa_api_key, sa_api_secret,
-             scc_email, scc_password,
-             authproxy_cfg, sa_scim_token, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
-        ON CONFLICT(org_number) DO UPDATE SET
-            duo_ikey=excluded.duo_ikey, duo_skey=excluded.duo_skey, duo_host=excluded.duo_host,
-            duo_saml_app_ikey=excluded.duo_saml_app_ikey,
-            scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret,
-            sa_org_id=excluded.sa_org_id, sa_api_key=excluded.sa_api_key, sa_api_secret=excluded.sa_api_secret,
-            scc_email=excluded.scc_email,
-            scc_password=excluded.scc_password,
-            authproxy_cfg=excluded.authproxy_cfg,
-            sa_scim_token=excluded.sa_scim_token,
-            updated_at=datetime('now')
-    """, (
-        org_number,
-        data.get("duo_ikey", "").strip(), data.get("duo_skey", "").strip(), data.get("duo_host", "").strip(),
-        data.get("duo_saml_app_ikey", "").strip(),
-        data.get("scc_api_key", "").strip(), data.get("scc_api_secret", "").strip(),
-        data.get("sa_org_id", "").strip(), data.get("sa_api_key", "").strip(), data.get("sa_api_secret", "").strip(),
-        data.get("scc_email", "").strip(),
-        data.get("scc_password", "").strip(),
-        data.get("authproxy_cfg", "").strip(),
-        data.get("sa_scim_token", "").strip(),
-    ))
+        INSERT OR IGNORE INTO org_credentials (org_number, updated_at)
+        VALUES (?, datetime('now'))
+    """, (org_number,))
+    # For each field: only update if the submitted value is non-empty
+    fields = {
+        "duo_ikey":          data.get("duo_ikey", "").strip(),
+        "duo_skey":          data.get("duo_skey", "").strip(),
+        "duo_host":          data.get("duo_host", "").strip(),
+        "duo_saml_app_ikey": data.get("duo_saml_app_ikey", "").strip(),
+        "scc_api_key":       data.get("scc_api_key", "").strip(),
+        "scc_api_secret":    data.get("scc_api_secret", "").strip(),
+        "sa_org_id":         data.get("sa_org_id", "").strip(),
+        "sa_api_key":        data.get("sa_api_key", "").strip(),
+        "sa_api_secret":     data.get("sa_api_secret", "").strip(),
+        "scc_email":         data.get("scc_email", "").strip(),
+        "scc_password":      data.get("scc_password", "").strip(),
+        "authproxy_cfg":     data.get("authproxy_cfg", ""),  # preserve whitespace
+        "sa_scim_token":     data.get("sa_scim_token", "").strip(),
+    }
+    updates = {k: v for k, v in fields.items() if v != ""}
+    if updates:
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        conn.execute(
+            f"UPDATE org_credentials SET {set_clause}, updated_at=datetime('now') WHERE org_number=?",
+            list(updates.values()) + [org_number]
+        )
     conn.commit()
     conn.close()
     return jsonify({"status": "ok"})
