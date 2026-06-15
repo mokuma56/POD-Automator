@@ -6403,12 +6403,16 @@ def duo_run_card(
 
         try:
             # Run the enrollment EXE with the blob
+            # Note: use run_ps directly (not _winrm_run_cmd) to avoid
+            # double-& issue — _winrm_run_cmd prepends "& " to the cmd
             _log(f"running authproxy_update_sso_enrollment_code.exe ...")
-            _winrm_run_cmd(
-                winrm_sess,
-                f"& '{SSO_ENROLL_EXE}' '{enroll_blob}'",
-                _log,
+            _r = winrm_sess.run_ps(
+                f"& '{SSO_ENROLL_EXE}' '{enroll_blob}'; Write-Output 'ENROLL_DONE'"
             )
+            _out = _r.std_out.decode(errors="replace").strip()
+            _err = _r.std_err.decode(errors="replace").strip()
+            if _out: _log(f"enroll stdout: {_out[:300]}")
+            if _err: _log(f"enroll stderr: {_err[:200]}")
 
             # Stop and start DuoAuthProxy
             _log("restarting DuoAuthProxy ...")
