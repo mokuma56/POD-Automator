@@ -6225,6 +6225,8 @@ def duo_ensure_table(db_path: str) -> None:
         cols = [r[1] for r in c.execute("PRAGMA table_info(org_credentials)").fetchall()]
         if "authproxy_enroll_blob" not in cols:
             c.execute("ALTER TABLE org_credentials ADD COLUMN authproxy_enroll_blob TEXT DEFAULT ''")
+        if "authproxy_blob_saved_at" not in cols:
+            c.execute("ALTER TABLE org_credentials ADD COLUMN authproxy_blob_saved_at TIMESTAMP DEFAULT NULL")
 
 
 def _duo_step_set(pod_id: str, step: str, status: str, result: str, db_path: str,
@@ -6291,6 +6293,7 @@ def duo_run_card(
     scim_tok      = oc.get("sa_scim_token", "").strip()
     ap_cfg        = oc.get("authproxy_cfg", "").strip()
     enroll_blob   = oc.get("authproxy_enroll_blob", "").strip()
+    blob_saved_at = oc.get("authproxy_blob_saved_at", "") or ""
 
     if not duo_ikey or not duo_skey or not duo_host:
         return False, "Duo Admin API credentials (ikey/skey/host) not set in DB"
@@ -6406,6 +6409,27 @@ def duo_run_card(
                 "dashboard org credentials card under 'authproxy_enroll_blob'."
             )
 
+        # Warn if blob is stale — enrollment blobs are one-time codes.
+        # A blob used in a previous session will cause 401 on the SSO DRPC
+        # connection even though the EXE reports "All secrets stored successfully".
+        blob_age_warn = ""
+        if blob_saved_at:
+            import datetime as _dtb
+            try:
+                saved = _dtb.datetime.strptime(blob_saved_at[:19], "%Y-%m-%d %H:%M:%S")
+                age_h = ((_dtb.datetime.utcnow() - saved).total_seconds()) / 3600
+                if age_h > 24:
+                    blob_age_warn = (
+                        f" ⚠ BLOB IS {age_h:.0f}h OLD — one-time codes expire after first use. "
+                        "If the proxy fails to connect to Duo SSO (401 Invalid signature), "
+                        "generate a new command from Duo Admin portal → SSO Settings → "
+                        "External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command, "
+                        "paste into org credentials, then re-run this step."
+                    )
+                    _log(blob_age_warn)
+            except Exception:
+                pass
+
         _log("WinRM-connecting to AD1 for SSO enrollment ...")
         try:
             winrm_sess = _winrm_connect_for_pod(pod_id, log=_log)
@@ -6438,9 +6462,9 @@ def duo_run_card(
             # they are NOT written to authproxy.cfg.  No read-back needed.
             success = "ENROLL_DONE" in _out or "secrets stored" in _out.lower()
             if success:
-                return True, "enrollment OK (secrets stored internally by EXE)"
+                return True, "enrollment OK (secrets stored internally by EXE)" + blob_age_warn
             # EXE ran but no explicit success marker — treat as soft-success
-            return True, "enrollment ran (verify DuoAuthProxy is Running in step 7)"
+            return True, "enrollment ran (verify DuoAuthProxy is Running in step 7)" + blob_age_warn
 
         except Exception as e:
             return False, f"authproxy enrollment failed: {e}"

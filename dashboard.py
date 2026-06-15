@@ -162,7 +162,8 @@ def _migrate():
     for _col in ("authproxy_ikey", "authproxy_skey",
                  "duo_saml_app_ikey", "sa_saml_profile_id",
                  "scc_password", "scc_email", "authproxy_cfg",
-                 "sa_scim_token", "authproxy_enroll_blob"):
+                 "sa_scim_token", "authproxy_enroll_blob",
+                 "authproxy_blob_saved_at"):
         try:
             conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
         except Exception:
@@ -2512,7 +2513,8 @@ def get_org_credentials(org_number):
                         "scc_api_key": "", "scc_api_secret": "",
                         "sa_org_id": "", "sa_api_key": "", "sa_api_secret": "",
                         "scc_email": "", "scc_password": "", "authproxy_cfg": "",
-                        "sa_scim_token": "", "authproxy_enroll_blob": ""})
+                        "sa_scim_token": "", "authproxy_enroll_blob": "",
+                        "authproxy_blob_saved_at": ""})
     return jsonify(dict(row))
 
 
@@ -2552,6 +2554,12 @@ def save_org_credentials(org_number):
         conn.execute(
             f"UPDATE org_credentials SET {set_clause}, updated_at=datetime('now') WHERE org_number=?",
             list(updates.values()) + [org_number]
+        )
+    # If a new blob was submitted, stamp its individual save time so UI can warn when stale
+    if data.get("authproxy_enroll_blob", "").strip():
+        conn.execute(
+            "UPDATE org_credentials SET authproxy_blob_saved_at=datetime('now') WHERE org_number=?",
+            (org_number,)
         )
     conn.commit()
     conn.close()
@@ -4148,6 +4156,23 @@ function escHtml(s) {
 }
 
 // ── Org Credentials Management ───────────────────────────────────────────────
+
+// Returns an inline warning banner if the enrollment blob is stale (>24h).
+// savedAt is a SQLite datetime string 'YYYY-MM-DD HH:MM:SS' (UTC) or empty.
+function blobAgeWarning(savedAt) {
+  if (!savedAt) return '<div style="font-size:11px;color:#f59e0b;background:#2a1a00;border:1px solid #f59e0b;border-radius:4px;padding:5px 9px;margin-bottom:5px;">&#9888; No save timestamp \u2014 paste a fresh blob from Duo Admin portal before running step 5.</div>';
+  const saved = new Date(savedAt.replace(' ', 'T') + 'Z');
+  if (isNaN(saved.getTime())) return '';
+  const ageH = (Date.now() - saved.getTime()) / 3600000;
+  if (ageH > 24) {
+    const d = Math.floor(ageH / 24), h = Math.round(ageH % 24);
+    return '<div style="font-size:11px;color:#f59e0b;background:#2a1a00;border:1px solid #f59e0b;border-radius:4px;padding:5px 9px;margin-bottom:5px;">'
+      + '&#9888; Blob is <b>' + d + 'd ' + h + 'h old</b> \u2014 one-time codes expire after first use. '
+      + 'Generate a new command: Duo Admin \u2192 SSO Settings \u2192 External Auth Sources \u2192 AD \u2192 Auth Proxy \u2192 Step 2 \u2192 Generate Command, paste here and Save before re-running step 5.'
+      + '</div>';
+  }
+  return '<div style="font-size:11px;color:#22c55e;margin-bottom:4px;">&#10003; Blob saved ' + Math.round(ageH) + 'h ago</div>';
+}
 async function initOrgCredsList() {
   const listEl   = document.getElementById('org-creds-list');
   const countEl  = document.getElementById('org-creds-count');
@@ -4250,11 +4275,12 @@ async function loadOrgCreds(orgNum) {
     + col('Integration Key (ikey)', 'duo_ikey', d.duo_ikey, 'DIRIBLQ...', false)
     + col('Secret Key (skey)', 'duo_skey', d.duo_skey, 'Secret...', true)
     + col('API Hostname', 'duo_host', d.duo_host, 'api-xxxxx.duosecurity.com', false)
-    + '<div style="grid-column:1/-1;">'
-    + lbl('SSO Enrollment Blob (authproxy_enroll_blob)')
-    + inp('authproxy_enroll_blob', d.authproxy_enroll_blob || '', 'base64 blob from Duo SSO Settings → External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command', false)
-    + '<div style="font-size:10px;color:#445566;margin-top:2px;">In Duo Admin portal: Applications \u2192 SSO Settings \u2192 External Authentication Sources \u2192 Active Directory \u2192 Auth Proxy \u2192 Step 2 \u2192 click \u201cGenerate Command\u201d. Copy the base64 argument (after the .exe path). Required for step 5 (authproxy_enroll) each session \u2014 fresh AD1 needs re-enrollment.</div>'
-    + '</div>'
+     + '<div style="grid-column:1/-1;">'
+     + lbl('SSO Enrollment Blob (authproxy_enroll_blob)')
+     + blobAgeWarning(d.authproxy_blob_saved_at)
+     + inp('authproxy_enroll_blob', d.authproxy_enroll_blob || '', 'base64 blob from Duo SSO Settings → External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command', false)
+     + '<div style="font-size:10px;color:#445566;margin-top:2px;">In Duo Admin portal: Applications \u2192 SSO Settings \u2192 External Authentication Sources \u2192 Active Directory \u2192 Auth Proxy \u2192 Step 2 \u2192 click \u201cGenerate Command\u201d. Copy the base64 argument (after the .exe path). <b>One-time code \u2014 must be regenerated for each new dCloud session.</b></div>'
+     + '</div>'
     + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Secure Access (SA)</div>'
     + '<div style="grid-column:1/-1;">'
     + lbl('SA SCIM Provisioning Token')
