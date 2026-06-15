@@ -6356,7 +6356,8 @@ def duo_run_card(
                 return False, f"SA SCIM: HTTP {resp.status_code} — {resp.text[:200]}"
             total = resp.json().get("totalResults", 0)
             if total == 0:
-                return False, "SA SCIM: 0 users — SCIM sync not configured or users not pushed yet"
+                _log("SA SCIM: token valid — 0 users (step 6 will push)")
+                return True, "SA SCIM token valid (0 users — step 6 will push)"
             _log(f"SA SCIM: {total} users present ✓")
             return True, f"SA SCIM OK — {total} users synced"
         except Exception as e:
