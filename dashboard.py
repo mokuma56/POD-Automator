@@ -162,7 +162,7 @@ def _migrate():
     for _col in ("authproxy_ikey", "authproxy_skey",
                  "duo_saml_app_ikey", "sa_saml_profile_id",
                  "scc_password", "scc_email", "authproxy_cfg",
-                 "sa_scim_token"):
+                 "sa_scim_token", "authproxy_enroll_blob"):
         try:
             conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
         except Exception:
@@ -2512,7 +2512,7 @@ def get_org_credentials(org_number):
                         "scc_api_key": "", "scc_api_secret": "",
                         "sa_org_id": "", "sa_api_key": "", "sa_api_secret": "",
                         "scc_email": "", "scc_password": "", "authproxy_cfg": "",
-                        "sa_scim_token": ""})
+                        "sa_scim_token": "", "authproxy_enroll_blob": ""})
     return jsonify(dict(row))
 
 
@@ -2542,8 +2542,9 @@ def save_org_credentials(org_number):
         "sa_api_secret":     data.get("sa_api_secret", "").strip(),
         "scc_email":         data.get("scc_email", "").strip(),
         "scc_password":      data.get("scc_password", "").strip(),
-        "authproxy_cfg":     data.get("authproxy_cfg", ""),  # preserve whitespace
-        "sa_scim_token":     data.get("sa_scim_token", "").strip(),
+        "authproxy_cfg":          data.get("authproxy_cfg", ""),  # preserve whitespace
+        "sa_scim_token":          data.get("sa_scim_token", "").strip(),
+        "authproxy_enroll_blob":  data.get("authproxy_enroll_blob", "").strip(),
     }
     updates = {k: v for k, v in fields.items() if v != ""}
     if updates:
@@ -2563,7 +2564,7 @@ ORG_CSV_COLS = [
     "scc_api_key", "scc_api_secret",
     "sa_org_id", "sa_api_key", "sa_api_secret",
     "scc_email", "scc_password", "authproxy_cfg",
-    "sa_scim_token",
+    "sa_scim_token", "authproxy_enroll_blob",
 ]
 
 
@@ -4227,7 +4228,7 @@ async function loadOrgCreds(orgNum) {
   formEl.style.display = 'block';
   formEl.innerHTML = '<div style="color:#667788;font-size:12px;">Loading...</div>';
 
-  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', duo_saml_app_ikey:'', scc_api_key:'', scc_api_secret:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', scc_email:'', scc_password:'', authproxy_cfg:'', sa_scim_token:''};
+  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', duo_saml_app_ikey:'', scc_api_key:'', scc_api_secret:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', scc_email:'', scc_password:'', authproxy_cfg:'', sa_scim_token:'', authproxy_enroll_blob:''};
   try {
     const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum));
     d = await r.json();
@@ -4250,9 +4251,9 @@ async function loadOrgCreds(orgNum) {
     + col('Secret Key (skey)', 'duo_skey', d.duo_skey, 'Secret...', true)
     + col('API Hostname', 'duo_host', d.duo_host, 'api-xxxxx.duosecurity.com', false)
     + '<div style="grid-column:1/-1;">'
-    + lbl('SAML App Integration Key (duo_saml_app_ikey)')
-    + inp('duo_saml_app_ikey', d.duo_saml_app_ikey || '', 'ikey of the Cisco Secure Access SAML app in Duo', false)
-    + '<div style="font-size:10px;color:#445566;margin-top:2px;">In Duo Admin portal: Applications \u2192 Protect an Application \u2192 Cisco Secure Access \u2192 copy the Integration Key. Required for step 4 (verify) and step 5 (enroll).</div>'
+    + lbl('SSO Enrollment Blob (authproxy_enroll_blob)')
+    + inp('authproxy_enroll_blob', d.authproxy_enroll_blob || '', 'base64 blob from Duo SSO Settings → External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command', false)
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">In Duo Admin portal: Applications \u2192 SSO Settings \u2192 External Authentication Sources \u2192 Active Directory \u2192 Auth Proxy \u2192 Step 2 \u2192 click \u201cGenerate Command\u201d. Copy the base64 argument (after the .exe path). Required for step 5 (authproxy_enroll) each session \u2014 fresh AD1 needs re-enrollment.</div>'
     + '</div>'
     + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Secure Access (SA)</div>'
     + '<div style="grid-column:1/-1;">'
@@ -4298,19 +4299,20 @@ async function loadOrgCreds(orgNum) {
     // Browsers block HTML value= attribute on type="password" inputs (security feature).
     // Programmatically setting .value bypasses this — values are visible in the field.
     const _setVal = (id, val) => { const el = document.getElementById(id); if (el) el.value = val || ''; };
-    _setVal('oc-duo_ikey',          d.duo_ikey);
-    _setVal('oc-duo_skey',          d.duo_skey);
-    _setVal('oc-duo_host',          d.duo_host);
-    _setVal('oc-duo_saml_app_ikey', d.duo_saml_app_ikey);
-    _setVal('oc-sa_scim_token',     d.sa_scim_token);
-    _setVal('oc-scc_api_key',       d.scc_api_key);
-    _setVal('oc-scc_api_secret',    d.scc_api_secret);
-    _setVal('oc-sa_org_id',         d.sa_org_id);
-    _setVal('oc-sa_api_key',        d.sa_api_key);
-    _setVal('oc-sa_api_secret',     d.sa_api_secret);
-    _setVal('oc-scc_email',         d.scc_email);
-    _setVal('oc-scc_password',      d.scc_password);
-    _setVal('oc-authproxy_cfg',     d.authproxy_cfg);
+    _setVal('oc-duo_ikey',               d.duo_ikey);
+    _setVal('oc-duo_skey',               d.duo_skey);
+    _setVal('oc-duo_host',               d.duo_host);
+    _setVal('oc-duo_saml_app_ikey',      d.duo_saml_app_ikey);
+    _setVal('oc-sa_scim_token',          d.sa_scim_token);
+    _setVal('oc-authproxy_enroll_blob',  d.authproxy_enroll_blob);
+    _setVal('oc-scc_api_key',            d.scc_api_key);
+    _setVal('oc-scc_api_secret',         d.scc_api_secret);
+    _setVal('oc-sa_org_id',              d.sa_org_id);
+    _setVal('oc-sa_api_key',             d.sa_api_key);
+    _setVal('oc-sa_api_secret',          d.sa_api_secret);
+    _setVal('oc-scc_email',              d.scc_email);
+    _setVal('oc-scc_password',           d.scc_password);
+    _setVal('oc-authproxy_cfg',          d.authproxy_cfg);
   }, 0);
 }
 
@@ -4321,19 +4323,20 @@ async function saveOrgCreds(orgNum) {
   if (banner) banner.style.display = 'none';
   const _g = id => { const el = document.getElementById(id); return el ? el.value : ''; };
   const payload = {
-    duo_ikey:          _g('oc-duo_ikey').trim(),
-    duo_skey:          _g('oc-duo_skey').trim(),
-    duo_host:          _g('oc-duo_host').trim(),
-    duo_saml_app_ikey: _g('oc-duo_saml_app_ikey').trim(),
-    sa_scim_token:     _g('oc-sa_scim_token').trim(),
-    scc_api_key:       _g('oc-scc_api_key').trim(),
-    scc_api_secret:    _g('oc-scc_api_secret').trim(),
-    sa_org_id:         _g('oc-sa_org_id').trim(),
-    sa_api_key:        _g('oc-sa_api_key').trim(),
-    sa_api_secret:     _g('oc-sa_api_secret').trim(),
-    scc_email:         _g('oc-scc_email').trim(),
-    scc_password:      _g('oc-scc_password').trim(),
-    authproxy_cfg:     _g('oc-authproxy_cfg'),
+    duo_ikey:               _g('oc-duo_ikey').trim(),
+    duo_skey:               _g('oc-duo_skey').trim(),
+    duo_host:               _g('oc-duo_host').trim(),
+    duo_saml_app_ikey:      _g('oc-duo_saml_app_ikey').trim(),
+    sa_scim_token:          _g('oc-sa_scim_token').trim(),
+    authproxy_enroll_blob:  _g('oc-authproxy_enroll_blob').trim(),
+    scc_api_key:            _g('oc-scc_api_key').trim(),
+    scc_api_secret:         _g('oc-scc_api_secret').trim(),
+    sa_org_id:              _g('oc-sa_org_id').trim(),
+    sa_api_key:             _g('oc-sa_api_key').trim(),
+    sa_api_secret:          _g('oc-sa_api_secret').trim(),
+    scc_email:              _g('oc-scc_email').trim(),
+    scc_password:           _g('oc-scc_password').trim(),
+    authproxy_cfg:          _g('oc-authproxy_cfg'),
   };
   const _showBanner = (ok, msg) => {
     if (!banner) return;

@@ -6196,7 +6196,7 @@ def _save_saml_app_ikey(db_path: str, oc: dict, app_ikey: str) -> None:
 
 
 def duo_ensure_table(db_path: str) -> None:
-    """Create duo_steps table if it does not exist."""
+    """Create duo_steps table and ensure org_credentials has all required columns."""
     import sqlite3 as _sq
     with _sq.connect(db_path) as c:
         c.execute("""
@@ -6210,6 +6210,10 @@ def duo_ensure_table(db_path: str) -> None:
                 PRIMARY KEY (pod_id, step_name)
             )
         """)
+        # Ensure authproxy_enroll_blob column exists (migration for existing DBs)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(org_credentials)").fetchall()]
+        if "authproxy_enroll_blob" not in cols:
+            c.execute("ALTER TABLE org_credentials ADD COLUMN authproxy_enroll_blob TEXT DEFAULT ''")
 
 
 def _duo_step_set(pod_id: str, step: str, status: str, result: str, db_path: str,
@@ -6269,12 +6273,13 @@ def duo_run_card(
     except Exception as e:
         return False, f"DB error: {e}"
 
-    duo_ikey  = oc.get("duo_ikey", "").strip()
-    duo_skey  = oc.get("duo_skey", "").strip()
-    duo_host  = oc.get("duo_host", "").strip()
-    app_ikey  = oc.get("duo_saml_app_ikey", "").strip()
-    scim_tok  = oc.get("sa_scim_token", "").strip()
-    ap_cfg    = oc.get("authproxy_cfg", "").strip()
+    duo_ikey      = oc.get("duo_ikey", "").strip()
+    duo_skey      = oc.get("duo_skey", "").strip()
+    duo_host      = oc.get("duo_host", "").strip()
+    app_ikey      = oc.get("duo_saml_app_ikey", "").strip()
+    scim_tok      = oc.get("sa_scim_token", "").strip()
+    ap_cfg        = oc.get("authproxy_cfg", "").strip()
+    enroll_blob   = oc.get("authproxy_enroll_blob", "").strip()
 
     if not duo_ikey or not duo_skey or not duo_host:
         return False, "Duo Admin API credentials (ikey/skey/host) not set in DB"
@@ -6331,36 +6336,118 @@ def duo_run_card(
 
     def step_saml_scim_config():
         """
-        SCC / SA / Duo orgs are permanently coupled and never torn down.
-        The SAML app ('Cisco Secure Access'), SCIM connector, and SA IdP config
-        are configured once manually and persist indefinitely.
-
-        This step simply verifies the stored duo_saml_app_ikey still exists in
-        the Duo org.  If it does → done.  If it's missing from DB → instruct
-        user to create the app manually and enter the ikey in the dashboard.
+        Verify SA SCIM is live by querying the SA SCIM /Users endpoint.
+        The Cisco Secure Access app + SCIM connector are configured once
+        manually per org and persist forever (permanent org model).
+        This step confirms users are present — if 0, SCIM isn't synced yet.
         """
-        if not app_ikey:
-            return False, (
-                "duo_saml_app_ikey not set in DB — create the 'Cisco Secure Access' "
-                "app in Duo Admin portal (Applications → Protect an Application → "
-                "Cisco Secure Access) and paste the Integration Key into the "
-                "org credentials card on the dashboard, then re-run this step."
-            )
-
+        if not scim_tok:
+            return False, "sa_scim_token not set in DB — cannot verify SCIM"
         try:
-            _duo_request(duo_ikey, duo_skey, duo_host, "GET",
-                         f"/admin/v1/integrations/{app_ikey}")
-            _log(f"SAML app verified in Duo org (ikey={app_ikey})")
-            return True, f"SAML app present (ikey={app_ikey})"
-        except Exception as e:
-            return False, (
-                f"SAML app ikey={app_ikey} not found in Duo org: {e} — "
-                "the app may have been deleted; re-create it in Duo Admin portal "
-                "and update duo_saml_app_ikey in the dashboard."
+            import requests as _req
+            resp = _req.get(
+                "https://api.sse.cisco.com/identity/v2/scim/Users",
+                headers={"Authorization": f"Bearer {scim_tok}"},
+                timeout=15,
             )
+            if resp.status_code == 401:
+                return False, "SA SCIM: 401 Unauthorized — sa_scim_token may be expired"
+            if resp.status_code != 200:
+                return False, f"SA SCIM: HTTP {resp.status_code} — {resp.text[:200]}"
+            total = resp.json().get("totalResults", 0)
+            if total == 0:
+                return False, "SA SCIM: 0 users — SCIM sync not configured or users not pushed yet"
+            _log(f"SA SCIM: {total} users present ✓")
+            return True, f"SA SCIM OK — {total} users synced"
+        except Exception as e:
+            return False, f"SA SCIM check failed: {e}"
 
     def step_authproxy_enroll():
-        return duo_authproxy_enroll_and_update(pod_id, db_path, log=_log)
+        """
+        Re-enroll the Authentication Proxy on fresh AD1 each session.
+
+        Runs authproxy_update_sso_enrollment_code.exe with the stored blob,
+        stops/starts DuoAuthProxy, reads the new rikey from authproxy.cfg
+        on AD1, then updates authproxy_cfg in the DB so the next session's
+        authproxy_push carries the current rikey.
+
+        The blob comes from Duo Admin portal:
+          Applications → SSO Settings → External Authentication Sources
+          → Active Directory → Auth Proxy → Step 2 → Generate Command
+        Copy the base64 argument (not the full EXE path) and store it in
+        the dashboard org credentials card under 'authproxy_enroll_blob'.
+        """
+        import re as _re_e, time as _te
+        import sqlite3 as _sq_e
+
+        SSO_ENROLL_EXE = (
+            r"C:\Program Files\Duo Security Authentication Proxy\bin"
+            r"\authproxy_update_sso_enrollment_code.exe"
+        )
+
+        if not enroll_blob:
+            return False, (
+                "authproxy_enroll_blob not set in DB — "
+                "go to Duo Admin portal → Applications → SSO Settings → "
+                "External Authentication Sources → Active Directory → "
+                "Auth Proxy → Step 2 → click 'Generate Command', "
+                "copy the base64 argument, and paste it into the "
+                "dashboard org credentials card under 'authproxy_enroll_blob'."
+            )
+
+        _log("WinRM-connecting to AD1 for SSO enrollment ...")
+        try:
+            winrm_sess = _winrm_connect_for_pod(pod_id, log=_log)
+        except Exception as e:
+            return False, f"WinRM connect failed: {e}"
+
+        try:
+            # Run the enrollment EXE with the blob
+            _log(f"running authproxy_update_sso_enrollment_code.exe ...")
+            _winrm_run_cmd(
+                winrm_sess,
+                f"& '{SSO_ENROLL_EXE}' '{enroll_blob}'",
+                _log,
+            )
+
+            # Stop and start DuoAuthProxy
+            _log("restarting DuoAuthProxy ...")
+            winrm_sess.run_ps(
+                "Stop-Service -Name DuoAuthProxy -Force -ErrorAction SilentlyContinue"
+            )
+            _te.sleep(3)
+            winrm_sess.run_ps("Start-Service -Name DuoAuthProxy")
+            _te.sleep(3)
+
+            # Read authproxy.cfg from AD1 to capture new rikey
+            _log("reading authproxy.cfg from AD1 to extract rikey ...")
+            updated_cfg = _winrm_read_file(winrm_sess, AUTHPROXY_CFG_PATH)
+            m = _re_e.search(r'^rikey\s*=\s*(\S+)', updated_cfg, _re_e.MULTILINE)
+            new_rikey = m.group(1) if m else ""
+
+            if new_rikey:
+                _log(f"rikey={new_rikey}")
+                # Update stored authproxy_cfg in DB with new rikey
+                stored = ap_cfg or ""
+                updated_stored = _re_e.sub(
+                    r'rikey\s*=\s*\S+', f'rikey={new_rikey}', stored
+                )
+                if "rikey=" not in updated_stored:
+                    updated_stored = updated_stored.rstrip() + f"\n\n[sso]\nrikey={new_rikey}\n"
+                with _sq_e.connect(db_path) as _c:
+                    _c.execute(
+                        "UPDATE org_credentials SET authproxy_cfg=?, "
+                        "updated_at=datetime('now') WHERE org_number=?",
+                        (updated_stored, org_num),
+                    )
+                _log("authproxy_cfg updated in DB with new rikey ✓")
+                return True, f"enrollment OK — rikey={new_rikey}"
+            else:
+                _log("WARN: rikey not found in authproxy.cfg after enrollment")
+                return True, "enrollment ran — rikey not found in cfg (verify manually)"
+
+        except Exception as e:
+            return False, f"authproxy enrollment failed: {e}"
 
     def step_scim_push():
         if not scim_tok and not oc.get("sa_scim_token", "").strip():
