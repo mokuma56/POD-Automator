@@ -58,10 +58,6 @@ SWITCHES = {
 SWITCH_USER = "netadmin"
 SWITCH_PASS = "C1sco12345"
 
-# ISE RADIUS shared secret — must match what CatC/ISE have configured
-ISE_RADIUS_KEY = "C1sco12345"
-ISE_IP         = "198.18.5.101"
-
 DB_PATH = os.environ.get("DB_PATH", "data/pod_state.db")
 POD_ID  = os.environ.get("POD_ID", "")
 
@@ -367,9 +363,9 @@ interface GigabitEthernet1/0/2
  switchport trunk allowed vlan 10,101,102
  switchport mode trunk
  spanning-tree portfast trunk
- cts manual
-  policy static sgt 2 trusted
-  propagate sgt
+  cts manual
+   policy static sgt 2 trusted
+   propagate sgt
 !
 interface GigabitEthernet1/0/3
  description Client
@@ -391,52 +387,13 @@ interface GigabitEthernet1/0/3
 #  - CTS role-based enforcement on data VLANs
 #  - Critical-auth service templates for ISE AAA-down survivability
 #
-DOT1X_SECURITY = f"""\
+DOT1X_SECURITY = """\
 service password-encryption
 no logging console
 no ip domain lookup
+netconf-yang
+no ip dhcp snooping information option
 no ip tftp blocksize
-ip tftp source-interface GigabitEthernet0/0
-ip ssh version 2
-!
-cdp run
-lldp run
-!
-radius server ISE
- address ipv4 {ISE_IP} auth-port 1812 acct-port 1813
- key {ISE_RADIUS_KEY}
-!
-aaa group server radius dnac-client-radius-group
- server name ISE
-!
-aaa authentication dot1x default group dnac-client-radius-group
-aaa authorization network default group dnac-client-radius-group
-aaa accounting dot1x default start-stop group dnac-client-radius-group
-!
-device-tracking policy IPDT_POLICY
- no protocol udp
- tracking enable
-!
-device sensor filter-list dhcp list DHCP-SENSOR-LIST
- option name host-name
- option name requested-address
- option name parameter-request-list
- option name class-identifier
- option name client-identifier
-device sensor filter-list cdp list CDP-SENSOR-LIST
- tlv name device-name
- tlv name address-type
- tlv name capabilities-type
- tlv name platform-type
-device sensor filter-list lldp list LLDP-SENSOR-LIST
- tlv name system-name
- tlv name system-description
- tlv name system-capabilities
-device sensor filter-spec dhcp include list DHCP-SENSOR-LIST
-device sensor filter-spec cdp include list CDP-SENSOR-LIST
-device sensor filter-spec lldp include list LLDP-SENSOR-LIST
-device sensor notify all-changes
-!
 access-session attributes filter-list list ISE-DS-list
  vlan-id
  cdp
@@ -445,22 +402,12 @@ access-session attributes filter-list list ISE-DS-list
  http
 access-session authentication attributes filter-spec include list ISE-DS-list
 access-session accounting attributes filter-spec include list ISE-DS-list
-!
-dot1x system-auth-control
-no ip dhcp snooping information option
-!
 service-template CRITICAL_DATA_ACCESS
  access-group PERMIT-ISE
 service-template CRITICAL_VOICE_ACCESS
  access-group PERMIT-ISE
  voice vlan
-!
-ip access-list extended PERMIT-ISE
- 10 permit ip any any
-!
-cts role-based enforcement
-cts role-based enforcement vlan-list 10,101-102
-!
+dot1x system-auth-control
 class-map type control subscriber match-all AAA_SVR_DOWN_AUTHD_HOST
  match result-type aaa-timeout
  match authorization-status authorized
@@ -646,6 +593,13 @@ template WIRED_MAB_OPEN
  authentication periodic
  authentication timer reauthenticate server
  service-policy type control subscriber MAB_DOT1X_POLICY
+!
+ip tftp source-interface GigabitEthernet0/0
+ip ssh version 2
+ip access-list extended PERMIT-ISE
+ 10 permit ip any any
+cts role-based enforcement
+cts role-based enforcement vlan-list 10,101-102
 """
 
 # ── SSH helpers ───────────────────────────────────────────────────────────────
@@ -753,20 +707,27 @@ def _send_raw(ip, commands, timeout=30):
 def _persist_fabric_step(step_name, status, result=""):
     if not POD_ID:
         return
-    try:
-        c = sqlite3.connect(DB_PATH)
-        c.execute("""
-            INSERT OR REPLACE INTO fabric_steps
-                (pod_id, step_name, status, started_at, completed_at, result)
-            VALUES (?, ?, ?,
-                COALESCE((SELECT started_at FROM fabric_steps WHERE pod_id=? AND step_name=?), datetime('now')),
-                CASE WHEN ? IN ('completed','failed','skipped') THEN datetime('now') ELSE NULL END,
-                ?)
-        """, (POD_ID, step_name, status, POD_ID, step_name, status, result))
-        c.commit()
-        c.close()
-    except Exception:
-        pass
+    # Retry up to 3 times — SQLite "database is locked" can silently drop
+    # the completed/failed write if the dashboard is writing simultaneously,
+    # leaving the step stuck in 'running' forever.
+    for attempt in range(3):
+        try:
+            c = sqlite3.connect(DB_PATH, timeout=15)
+            c.execute("""
+                INSERT OR REPLACE INTO fabric_steps
+                    (pod_id, step_name, status, started_at, completed_at, result)
+                VALUES (?, ?, ?,
+                    COALESCE((SELECT started_at FROM fabric_steps WHERE pod_id=? AND step_name=?), datetime('now')),
+                    CASE WHEN ? IN ('completed','failed','skipped') THEN datetime('now') ELSE NULL END,
+                    ?)
+            """, (POD_ID, step_name, status, POD_ID, step_name, status, result))
+            c.commit()
+            c.close()
+            return
+        except Exception as e:
+            print(f"[fabric] WARNING: _persist_fabric_step({step_name}, {status}) attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                import time; time.sleep(0.5)
 
 
 def _load_completed_fabric_steps():

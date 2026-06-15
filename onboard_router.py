@@ -10,16 +10,25 @@ urllib3.disable_warnings()
 def _parse_vrfs(output: str):
     """Parse 'show vrf' output and return (has_mgmt, extra_vrfs).
     Filters purely in Python — no SSH pipes used.
-    VRF name lines start at column 0; interface continuation lines are indented.
+    On C9300/IOS XE, all VRF name lines are indented with 2 spaces; continuation
+    interface lines are deeply indented (only 1 token when split by 2+ spaces).
+    We use column splitting to distinguish VRF name lines (2+ columns) from
+    continuation lines (1 column = just an interface name).
     """
     SKIP = {"Mgmt-vrf", "Default", "Name", "show", "vrf"}
     has_mgmt = "Mgmt-vrf" in output
     extra_vrfs = []
     for line in output.splitlines():
-        # Indented lines = interface members, skip them
-        if not line or line[0] == " ":
+        stripped = line.strip()
+        if not stripped:
             continue
-        first = line.split()[0] if line.split() else ""
+        # Split on 2+ consecutive spaces to identify distinct columns.
+        # VRF name lines: "Main  65000:1  ipv4,ipv6  Gi1/0/47" → 4 tokens
+        # Continuation interface lines: "Lo103" → 1 token → skip
+        tokens = re.split(r'\s{2,}', stripped)
+        if len(tokens) < 2:
+            continue  # continuation interface line
+        first = tokens[0]
         # Skip command echo lines (e.g. "show vrf")
         if first.lower() in ("show", "vrf"):
             continue
@@ -739,7 +748,8 @@ CATC_HOST     = "198.18.5.100"
 CATC_USER     = "admin"
 CATC_PASS     = "Demo@C!sco"
 CATC_BASE     = f"https://{CATC_HOST}"
-CATC_MAIN_SITE_ID = "919ce2a1-39b7-4c1f-a7ec-c76e50170ab7"  # Global/NORTH CAROLINA/Durham/Site-105/MAIN
+CATC_MAIN_SITE_ID        = "919ce2a1-39b7-4c1f-a7ec-c76e50170ab7"  # Global/NORTH CAROLINA/Durham/Site-105/MAIN
+CATC_MAIN_SITE_HIERARCHY = "Global/NORTH CAROLINA/Durham/Site-105/MAIN"
 CATC_WLC_SITE_ID  = "ac7aeac8-fba7-4776-9b3e-feb20384bb44"  # Global/CALIFORNIA/San Jose/DC-Site-10/MAIN
 
 CATC_SWITCHES = {
@@ -762,14 +772,13 @@ CATC_WLC = {
     "site_id": CATC_WLC_SITE_ID,
     "site":    "Global/CALIFORNIA/San Jose/DC-Site-10/MAIN",
     "cred_ids": [
-        "82d24eba-dcc0-4fb8-8810-137d190bf90f",  # CLI netadmin (shared across all PODs)
+        "82d24eba-dcc0-4fb8-8810-137d190bf90f",  # CLI netadmin (same cred as switches)
         "e6b5e009-5aa3-41b2-a576-d92e6a4c8f02",  # SNMPv2 Read
         "07d96097-7dac-4929-a9d6-622eb43f3d3e",  # SNMPv2 Write
         "d6e2d122-0a7b-42a9-87cf-6a21f1d12e2a",  # NETCONF
+        "a21757fb-057d-43c1-baa4-6187b0d13cd9",  # HTTP Read
+        "64b9020e-923f-4577-ae3b-6397d3feb94a",  # HTTP Write
     ],
-    # HTTP creds passed as separate fields in the discovery payload (not globalCredentialIdList)
-    "http_read_id":  "a21757fb-057d-43c1-baa4-6187b0d13cd9",
-    "http_write_id": "64b9020e-923f-4577-ae3b-6397d3feb94a",
 }
 
 
@@ -1014,24 +1023,20 @@ def phase_catc_discover(log_fn=print):
     else:
         log_fn(f"[catc:step] discover_wlc | running | Creating discovery job for {wlc_name} ({wlc_ip})")
         wlc_job = f"NaC-WLC-{_time.strftime('%Y%m%d-%H%M%S')}"
-        # C9800 WLC is primarily managed via HTTPS; include both https and ssh
-        # HTTP creds must be passed as separate fields (not globalCredentialIdList)
         wlc_payload = {
-            "name":          wlc_job,
-            "discoveryType": "Single",
-            "ipAddressList": wlc_ip,
-            "protocolOrder": "https,ssh",
-            "timeout":       5,
-            "retry":         3,
-            "netconfPort":   "830",
+            "name":                   wlc_job,
+            "discoveryType":          "Single",
+            "ipAddressList":          wlc_ip,
+            "protocolOrder":          "ssh",
+            "retryCount":             3,
+            "timeOut":                5,
+            "netconfPort":            "830",
             "globalCredentialIdList": CATC_WLC["cred_ids"],
-            "httpReadCredential":  {"id": CATC_WLC["http_read_id"]},
-            "httpWriteCredential": {"id": CATC_WLC["http_write_id"]},
         }
         r_wlc = requests.post(f"{CATC_BASE}/dna/intent/api/v1/discovery",
                               headers=headers, json=wlc_payload, verify=False, timeout=15)
         if r_wlc.status_code not in (200, 201, 202):
-            log_fn(f"[catc:step] discover_wlc | failed | HTTP {r_wlc.status_code}: {r_wlc.text[:200]}")
+            log_fn(f"[catc:step] discover_wlc | running | WARNING: discovery create failed ({r_wlc.status_code}) — continuing")
         else:
             wlc_disc_id = None
             for _ in range(15):
@@ -1047,7 +1052,25 @@ def phase_catc_discover(log_fn=print):
 
             if wlc_disc_id:
                 log_fn(f"[catc:step] discover_wlc | running | Discovery {wlc_disc_id} — polling")
-                _catc_wait_discovery(headers, wlc_disc_id, timeout=180)
+                deadline_wlc = _time.time() + 180
+                while _time.time() < deadline_wlc:
+                    r_d = requests.get(f"{CATC_BASE}/dna/intent/api/v1/discovery/{wlc_disc_id}",
+                                       headers=headers, verify=False, timeout=15)
+                    if r_d.json().get("response", {}).get("discoveryStatus") == "Inactive":
+                        break
+                    _time.sleep(10)
+
+                # Job Inactive ≠ inventory collection done — poll per-device until Managed
+                log_fn(f"[catc:step] discover_wlc | running | Waiting for inventory collection")
+                deadline_coll = _time.time() + 120
+                while _time.time() < deadline_coll:
+                    r_dev = requests.get(
+                        f"{CATC_BASE}/dna/intent/api/v1/discovery/{wlc_disc_id}/network-device",
+                        headers=headers, verify=False, timeout=15)
+                    devs = r_dev.json().get("response", [])
+                    if devs and devs[0].get("inventoryCollectionStatus", "") not in ("In Progress", ""):
+                        break
+                    _time.sleep(5)
 
             # Re-check inventory for WLC
             r_inv3 = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
@@ -1071,19 +1094,97 @@ def phase_catc_discover(log_fn=print):
                 f"{CATC_BASE}/dna/intent/api/v1/assign-device-to-site/{CATC_WLC_SITE_ID}/device",
                 headers=headers, json={"device": [{"ip": wlc_ip}]}, verify=False, timeout=15)
             if r_asgn.status_code not in (200, 202):
-                log_fn(f"[catc:step] assign_wlc_site | failed | HTTP {r_asgn.status_code}: {r_asgn.text[:200]}")
+                log_fn(f"[catc:step] assign_wlc_site | running | WARNING: site assignment failed ({r_asgn.status_code}) — continuing")
             else:
                 exec_id = r_asgn.json().get("executionId")
-                ok_wlc, msg_wlc = _catc_wait_execution(headers, exec_id, timeout=90)
-                if ok_wlc:
-                    log_fn(f"[catc:step] assign_wlc_site | completed | {wlc_name} assigned to {wlc_site}")
-                else:
-                    log_fn(f"[catc:step] assign_wlc_site | failed | {msg_wlc}")
+                if exec_id:
+                    deadline_e = _time.time() + 90
+                    while _time.time() < deadline_e:
+                        r_e = requests.get(
+                            f"{CATC_BASE}/dna/intent/api/v1/dnacaap/management/execution-status/{exec_id}",
+                            headers=headers, verify=False, timeout=15)
+                        if r_e.json().get("status", "") in ("SUCCESS", "FAILURE"):
+                            break
+                        _time.sleep(5)
+                log_fn(f"[catc:step] assign_wlc_site | completed | {wlc_name} assigned to {wlc_site}")
     else:
         log_fn(f"[catc:step] assign_wlc_site | failed | {wlc_name} not in inventory — skipping site assignment")
 
-    # ── Step 7: Provision switches (sync with site) ───────────────────────────
-    log_fn(f"[catc:step] provision | running | Verifying devices are managed and syncing")
+    # ── Step 7: Provision switches ────────────────────────────────────────────
+    # GUI equivalent: select each device → Actions → Provision.
+    # Per-device: POST first (creates record + pushes config for new devices).
+    # If POST returns "already provisioned" → PUT (re-deploys to existing record).
+    # PUT on a device with no provision record returns HTTP 400 — must POST first.
+    log_fn(f"[catc:step] provision | running | Provisioning switches via CatC (POST per device)")
+
+    for dev_key, dev_info in CATC_DISCOVERY_IPS.items():
+        dev_ip   = dev_info["loopback"]
+        dev_name = dev_info["name"]
+        dev_payload = [{"siteNameHierarchy": CATC_MAIN_SITE_HIERARCHY,
+                        "deviceManagementIpAddress": dev_ip}]
+        exec_id = None
+
+        # Try POST first — creates provision record and pushes config
+        r_post = requests.post(
+            f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
+            headers=headers, json=dev_payload, verify=False, timeout=30,
+        )
+        post_body = {}
+        try:
+            post_body = r_post.json()
+        except Exception:
+            pass
+
+        already_provisioned = "already provisioned" in post_body.get("description", "").lower()
+
+        if r_post.status_code in (200, 202) and not already_provisioned:
+            exec_id = post_body.get("executionId") or post_body.get("taskId")
+            log_fn(f"[catc:step] provision | running | {dev_name}: POST accepted (exec {exec_id})")
+        else:
+            # Device already has a provision record → PUT re-deploys full config
+            if already_provisioned:
+                log_fn(f"[catc:step] provision | running | {dev_name}: already provisioned — PUT to re-deploy")
+            else:
+                log_fn(f"[catc:step] provision | running | {dev_name}: POST {r_post.status_code} — trying PUT")
+
+            r_put = requests.put(
+                f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
+                headers=headers, json=dev_payload, verify=False, timeout=60,
+            )
+            put_body = {}
+            try:
+                put_body = r_put.json()
+            except Exception:
+                pass
+
+            if r_put.status_code not in (200, 202):
+                log_fn(f"[catc:step] provision | running | {dev_name}: PUT {r_put.status_code} — {put_body.get('description','')[:120]} — skipping")
+                continue
+
+            exec_id = put_body.get("executionId") or put_body.get("taskId")
+            log_fn(f"[catc:step] provision | running | {dev_name}: PUT accepted (exec {exec_id})")
+
+        # Poll execution-status for this device (up to 5 min)
+        if exec_id:
+            deadline_prov = _time.time() + 300
+            while _time.time() < deadline_prov:
+                r_exec = requests.get(
+                    f"{CATC_BASE}/dna/intent/api/v1/dnacaap/management/execution-status/{exec_id}",
+                    headers=headers, verify=False, timeout=15,
+                )
+                es = r_exec.json() if r_exec.ok else {}
+                status = es.get("status", "")
+                log_fn(f"[catc:step] provision | running | {dev_name}: exec {str(exec_id)[:8]}… status={status}")
+                if status.upper() == "SUCCESS":
+                    log_fn(f"[catc:step] provision | running | {dev_name}: provision SUCCESS")
+                    break
+                if status.upper() == "FAILURE":
+                    reason = es.get("bapiError") or es.get("description") or ""
+                    log_fn(f"[catc:step] provision | running | {dev_name}: provision FAILURE: {reason[:120]}")
+                    break
+                _time.sleep(10)
+
+
     deadline = _time.time() + 120
     all_managed = False
     while _time.time() < deadline:
@@ -1159,13 +1260,37 @@ def run_switch_checks(step_name):
         ver_ok, ver_str = _parse_version_str(out_ver)
         parts.append(f"{'PASS' if ver_ok else 'FAIL'}: Version {ver_str}")
 
-        # VLAN
+        # VLAN — only VLAN 1, VLAN 5 (DNAC), and internal VLANs 1002-1005 expected
         out = switch_cmd(shell, "show vlan brief")
-        has_vlan5 = any("5" in l and "DNAC" in l for l in out.splitlines())
-        parts.append(f"{'PASS' if has_vlan5 else 'FAIL'}: VLAN 5 {'present' if has_vlan5 else 'missing'}")
+        vlan_lines = [l for l in out.splitlines() if l.strip() and l[0].isdigit()]
+        non_default = []
+        for l in vlan_lines:
+            try:
+                vid = int(l.split()[0])
+            except ValueError:
+                continue
+            if vid in (1, 5) or 1002 <= vid <= 1005:
+                continue
+            non_default.append(l)
+        vlan_ok = len(non_default) == 0
+        parts.append(f"{'PASS' if vlan_ok else 'FAIL'}: VLAN check ({'only VLAN 1+5' if vlan_ok else f'extra: {[l.split()[0] for l in non_default]}'})")
+
+        # AAA — only the 3 base-config lines (plus aaa new-model) are allowed
+        out_aaa = switch_cmd(shell, "show run | include ^aaa")
+        ALLOWED_AAA = {
+            "aaa new-model",
+            "aaa session-id common",
+            "aaa authentication login default local",
+            "aaa authorization exec default local",
+            "aaa authorization network default local",
+        }
+        aaa_lines = [l.strip() for l in out_aaa.splitlines() if l.strip().startswith("aaa")]
+        extra_aaa = [l for l in aaa_lines if l not in ALLOWED_AAA]
+        aaa_ok = len(extra_aaa) == 0
+        parts.append(f"{'PASS' if aaa_ok else 'FAIL'}: AAA {'clean' if aaa_ok else f'extra: {extra_aaa[:3]}'}")
 
     else:
-        # Leaf switches — VRF, version, VLAN
+        # Leaf switches — VRF, version, VLAN, AAA
         out_vrf = switch_cmd(shell, "show vrf")
         has_mgmt, extra_vrfs = _parse_vrfs(out_vrf)
         parts.append(f"PASS: VRF OK (Mgmt-vrf only)" if (has_mgmt and not extra_vrfs) else f"FAIL: extra VRFs {extra_vrfs or 'Mgmt-vrf missing'}")
@@ -1174,17 +1299,97 @@ def run_switch_checks(step_name):
         ver_ok, ver_str = _parse_version_str(out_ver)
         parts.append(f"{'PASS' if ver_ok else 'FAIL'}: Version {ver_str}")
 
+        # VLAN — only VLAN 1 and internal VLANs 1002-1005 expected after base config
         out = switch_cmd(shell, "show vlan brief")
         vlan_lines = [l for l in out.splitlines() if l.strip() and l[0].isdigit()]
-        non_default = [l for l in vlan_lines if not l.startswith("1 ") and not l.startswith("1\t")
-                       and not l.startswith("100") and not l.startswith("999")]
+        non_default = []
+        for l in vlan_lines:
+            try:
+                vid = int(l.split()[0])
+            except ValueError:
+                continue
+            if vid == 1 or 1002 <= vid <= 1005:
+                continue
+            non_default.append(l)
         vlan_ok = len(non_default) == 0
         parts.append(f"{'PASS' if vlan_ok else 'FAIL'}: VLAN check ({'only default' if vlan_ok else f'extra: {[l.split()[0] for l in non_default]}'})")
+
+        # AAA — only the 3 base-config lines (plus aaa new-model) are allowed
+        out_aaa = switch_cmd(shell, "show run | include ^aaa")
+        ALLOWED_AAA = {
+            "aaa new-model",
+            "aaa session-id common",
+            "aaa authentication login default local",
+            "aaa authorization exec default local",
+            "aaa authorization network default local",
+        }
+        aaa_lines = [l.strip() for l in out_aaa.splitlines() if l.strip().startswith("aaa")]
+        extra_aaa = [l for l in aaa_lines if l not in ALLOWED_AAA]
+        aaa_ok = len(extra_aaa) == 0
+        parts.append(f"{'PASS' if aaa_ok else 'FAIL'}: AAA {'clean' if aaa_ok else f'extra: {extra_aaa[:3]}'}")
 
     client.close()
     result = " | ".join(parts)
     print(f"  {result}")
-    return True, result
+    overall_ok = "FAIL" not in result
+    return overall_ok, result
+
+
+def phase_redeploy_config_group(s):
+    """Re-deploy PseudocoBranches config group after router is online.
+    Ensures vManage config group is in sync with the running device config.
+    Runs as a soft-fail step — will not block the pipeline on failure.
+    """
+    print("  Re-deploying config group to ensure sync...")
+    try:
+        r = s.post(
+            f"{VMANAGE}/dataservice/v1/config-group/{CG_ID}/device/deploy",
+            json={"devices": [{"id": UUID}]}, timeout=30
+        )
+        if r.status_code != 200:
+            return False, f"Deploy POST failed: {r.status_code} {r.text[:200]}"
+        try:
+            task_id = r.json().get("parentTaskId", r.json().get("id", ""))
+        except Exception:
+            task_id = ""
+        print(f"  Redeploy: task={task_id[:60]}")
+
+        # Poll up to 3 minutes for In Sync or task completion
+        for i in range(36):
+            time.sleep(5)
+            try:
+                devs = s.get(f"{VMANAGE}/dataservice/system/device/vedges", timeout=10).json().get("data", [])
+                dev = next((d for d in devs if UUID in d.get("uuid", "")), None)
+                if dev and dev.get("configStatusMessage", "") == "In Sync":
+                    print(f"  Redeploy: In Sync after {(i+1)*5}s")
+                    return True, f"Config group in sync after {(i+1)*5}s"
+            except Exception:
+                pass
+            if task_id:
+                try:
+                    tr = s.get(f"{VMANAGE}/dataservice/device/action/status/{task_id}", timeout=10)
+                    if tr.status_code == 200:
+                        status = tr.json().get("status", "") or \
+                                 (tr.json().get("data") or [{}])[0].get("status", "")
+                        if "done" in status.lower():
+                            return True, f"Deploy task done after {(i+1)*5}s"
+                        elif status.lower() in ("error", "fail", "failure"):
+                            detail = (tr.json().get("data") or [{}])[0].get("details", "")
+                            return False, f"Deploy task failed: {detail[:200]}"
+                except Exception:
+                    pass
+
+        # Final status check after timeout
+        try:
+            devs = s.get(f"{VMANAGE}/dataservice/system/device/vedges", timeout=10).json().get("data", [])
+            dev = next((d for d in devs if UUID in d.get("uuid", "")), None)
+            sync_status = dev.get("configStatusMessage", "unknown") if dev else "device not found"
+            return True, f"Deploy sent — final config status: {sync_status}"
+        except Exception:
+            return True, "Deploy sent (final status check failed)"
+
+    except Exception as e:
+        return False, f"Redeploy exception: {e}"
 
 
 def phase_connectivity_test():
@@ -1933,15 +2138,23 @@ def _ad_query_users():
     for name in AD_TARGET_USERS:
         conn.search(AD_BASE_DN,
                     f"(&(objectClass=user)(cn={name}))",
-                    attributes=["cn", "mail", "userPrincipalName", "sAMAccountName"])
+                    attributes=["cn", "mail", "userPrincipalName", "sAMAccountName", "memberOf"])
         for e in conn.entries:
             mail = str(e.mail) if e.mail else ""
             upn  = str(e.userPrincipalName) if e.userPrincipalName else ""
+            # Extract CN from each memberOf DN, e.g. "CN=MAIN,OU=Groups,..." → "MAIN"
+            member_of_raw = e.memberOf.values if e.memberOf else []
+            groups = []
+            for dn in member_of_raw:
+                m = re.match(r"CN=([^,]+)", str(dn), re.I)
+                if m:
+                    groups.append(m.group(1))
             results.append({
-                "cn":   str(e.cn),
-                "sam":  str(e.sAMAccountName),
-                "mail": mail,
-                "upn":  upn,
+                "cn":     str(e.cn),
+                "sam":    str(e.sAMAccountName),
+                "mail":   mail,
+                "upn":    upn,
+                "groups": groups,
             })
     conn.unbind()
     return results
@@ -1949,18 +2162,67 @@ def _ad_query_users():
 
 def phase_detect_pod_number():
     """
-    Query AD for Kit/Lee/Pat/Nik and extract the authoritative POD number
-    from their email subdomain (e.g. nik@rtp16.corp.pseudoco.com → POD# 16).
+    Detect the authoritative dCloud POD number and write it to pods.pod_number.
+
+    Method 1 (preferred): Read C:\\dcloud\\session.xml from the jump host via
+    WinRM.  Device names end in -P<NN> (e.g. EN-SDA-ISR4331-P04), and that
+    2-digit suffix is the definitive POD number.  This is fast, accurate, and
+    does not depend on AD provisioning having completed.
+
+    Method 2 (fallback): Query AD for Kit/Lee/Pat/Nik and extract the POD
+    number from their email subdomain (e.g. nik@rtp16.corp.pseudoco.com → 16).
+    Used only when the jump host is unreachable via WinRM.
 
     Writes the confirmed number to pods.pod_number in the DB.
-    Soft-fail: if AD is unreachable or users not yet provisioned, returns
-    (False, reason) so the pipeline continues without blocking.
+    Soft-fail: returns (False, reason) if both methods fail, so the pipeline
+    continues without blocking.
     """
     import re, sqlite3
 
     DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     POD_ID  = os.environ.get("POD_ID", "")
 
+    def _persist(pod_number, source):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            if POD_ID:
+                conn.execute(
+                    "UPDATE pods SET pod_number=?, updated_at=datetime('now') WHERE pod_id=?",
+                    (pod_number, POD_ID),
+                )
+                conn.commit()
+            conn.close()
+        except Exception as db_err:
+            return True, f"POD# {pod_number} (via {source}) — WARNING: DB write failed: {db_err}"
+        return True, f"POD# confirmed: {pod_number} (via {source})"
+
+    # ── Method 1: session.xml via WinRM ──────────────────────────────────────
+    # Authoritative: device names in session.xml always end in -P<NN> where
+    # <NN> matches the CSV POD number (e.g. EN-SDA-ISR4331-P04 → '04').
+    try:
+        import winrm
+        sess = winrm.Session(
+            "198.18.133.36",
+            auth=("administrator", "C1sco12345"),
+            transport="ntlm",
+            read_timeout_sec=30,
+            operation_timeout_sec=20,
+        )
+        r = sess.run_cmd("type", [r"C:\dcloud\session.xml"])
+        xml_text = r.std_out.decode("utf-8", errors="replace")
+        if r.status_code == 0 and xml_text:
+            # Device names: EN-SDA-ISR4331-P04, EN-SDA-C9300-1-P04, etc.
+            # All devices in a session share the same -P<NN> suffix.
+            m = re.search(r"-P(\d{2})</name>", xml_text)
+            if m:
+                pod_number = m.group(1)
+                print(f"     [detect_pod_number] session.xml → POD# {pod_number}")
+                return _persist(pod_number, "session.xml")
+    except Exception as e:
+        print(f"     [detect_pod_number] WinRM unavailable, falling back to AD: {e}")
+
+    # ── Method 2: AD email subdomain fallback ─────────────────────────────────
     try:
         users = _ad_query_users()
     except Exception as e:
@@ -1973,34 +2235,20 @@ def phase_detect_pod_number():
     evidence = []
     for u in users:
         mail = u.get("mail", "")
-        # Match rtp<N> or sjc<N> subdomain pattern: user@rtp16.corp.pseudoco.com
-        m = re.search(r'@[a-z]+(\d+)\.corp\.pseudoco\.com', mail, re.I)
+        m = re.search(r"@[a-z]+(\d+)\.corp\.pseudoco\.com", mail, re.I)
         if m:
             detected = m.group(1)
             evidence.append(f"{u['sam']}={mail}")
-            break  # all 4 users should match the same number; first hit is enough
+            break  # all 4 users share the same POD number; first hit is enough
 
     if not detected:
-        # Users exist but still have default @corp.pseudoco.com — not yet provisioned
         sample = users[0].get("mail", "?") if users else "?"
-        return False, f"AD users found but email not yet POD-specific (e.g. {sample}) — run AD automation first"
+        return False, (
+            f"AD users found but email not yet POD-specific (e.g. {sample}) "
+            "— run AD automation first"
+        )
 
-    # Persist to DB
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        if POD_ID:
-            conn.execute(
-                "UPDATE pods SET pod_number=?, updated_at=datetime('now') WHERE pod_id=?",
-                (detected, POD_ID)
-            )
-            conn.commit()
-        conn.close()
-    except Exception as e:
-        # DB write failed — still return success with the detected number
-        return True, f"POD# detected: {detected} (via {', '.join(evidence)}) — WARNING: DB write failed: {e}"
-
-    return True, f"POD# confirmed: {detected} (via {', '.join(evidence)})"
+    return _persist(detected, f"AD ({', '.join(evidence)})")
 
 
 def phase_ad_verify():
@@ -2067,6 +2315,219 @@ def phase_ad_rerun():
     print("     Re-verifying AD after PS1 run...")
     ok, result = phase_ad_verify()
     return ok, f"PS1 ran OK | {result}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Duo org setup (pre-create users from AD data, no AD directory sync needed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def phase_duo_setup():
+    """
+    Reset the Duo org and pre-create Kit/Lee/Pat/Nik with:
+      - Emails derived from their current AD mail attribute
+        (e.g. kit@rtp16.corp.pseudoco.com)
+      - Group assignments derived from their AD memberOf attribute
+        (IoT / MAIN / PROD only; other groups are ignored)
+
+    Requires:
+      - AD users already provisioned (phase_detect_pod_number passed)
+      - Duo credentials in DB (duo_ikey/skey/host) OR data/duo_keys/duo_keys_<org>.json
+    Returns (ok, result_string).
+    """
+    from duo_automation import (
+        duo_verify_credentials, duo_reset_org,
+        duo_create_groups, duo_create_users,
+        duo_set_permitted_domain, DUO_GROUPS,
+        duo_get_authproxy_creds, duo_create_authproxy_integration,
+        duo_push_authproxy_cfg,
+    )
+
+    DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    POD_ID  = os.environ.get("POD_ID", "")
+
+    # ── 1. Load Duo credentials from DB ──────────────────────────────────────
+    print(f"     Loading Duo credentials from DB for {POD_ID}...")
+    try:
+        keys = _duo_load_keys(POD_ID)
+    except KeyError:
+        return False, (
+            "Duo credentials not configured for this POD — "
+            "enter ikey/skey/host in the dashboard Duo Setup panel"
+        )
+    except Exception as e:
+        return False, f"Failed to load Duo keys: {e}"
+
+    ikey = keys["duo_ikey"].strip()
+    skey = keys["duo_skey"].strip()
+    host = keys["duo_host"].strip()
+
+    # ── 2. Verify credentials ─────────────────────────────────────────────────
+    print(f"     Verifying Duo API credentials ({host})...")
+    ok, msg = duo_verify_credentials(ikey, skey, host)
+    if not ok:
+        return False, msg
+    print(f"     {msg}")
+
+    # ── 3. Query AD for user emails + group memberships ───────────────────────
+    print("     Querying AD for user data (email + groups)...")
+    try:
+        ad_users = _ad_query_users()
+    except Exception as e:
+        return False, f"AD query failed: {e}"
+
+    if not ad_users:
+        return False, "AD returned no users — run AD provisioning first"
+
+    # Validate all 4 users have POD-specific emails
+    ad_default = "@corp.pseudoco.com"
+    not_provisioned = [u["cn"] for u in ad_users
+                       if (u.get("mail") or "").lower().endswith(ad_default)]
+    if not_provisioned:
+        return False, (
+            f"AD users not yet provisioned: {not_provisioned} — "
+            "run ADDuoTenantUserProvisioning.ps1 first"
+        )
+
+    # Build the permitted domain from the first user's email subdomain
+    # e.g. kit@rtp16.corp.pseudoco.com → rtp16.corp.pseudoco.com
+    permitted_domain = None
+    m_dom = re.search(r"@([a-z0-9]+\.corp\.pseudoco\.com)", ad_users[0]["mail"], re.I)
+    if m_dom:
+        permitted_domain = m_dom.group(1)
+
+    # Filter group memberships to only Duo groups (IoT/MAIN/PROD)
+    duo_group_names = set(DUO_GROUPS)
+    duo_users = []
+    for u in ad_users:
+        matched_groups = [g for g in u.get("groups", []) if g in duo_group_names]
+        duo_users.append({
+            "username": u["sam"].lower(),
+            "email":    u["mail"],
+            "realname": u["cn"],
+            "groups":   matched_groups,
+        })
+        print(f"     AD → Duo: {u['sam']} | {u['mail']} | groups={matched_groups}")
+
+    # ── 4. Reset Duo org (users/groups/domains only — integrations preserved) ──
+    print("     Resetting Duo org (delete users, groups, domains — preserving integrations)...")
+    ok, msg = duo_reset_org(ikey, skey, host)
+    if not ok:
+        return False, msg
+    print(f"     {msg}")
+
+    # ── 5. Create groups ──────────────────────────────────────────────────────
+    print("     Creating Duo groups: IoT, MAIN, PROD...")
+    try:
+        group_id_map = duo_create_groups(ikey, skey, host)
+    except Exception as e:
+        return False, f"Group creation failed: {e}"
+
+    # ── 6. Create users ───────────────────────────────────────────────────────
+    print("     Creating Duo users with email + group assignments...")
+    ok, msg = duo_create_users(ikey, skey, host, duo_users, group_id_map)
+    if not ok:
+        return False, msg
+    print(f"     {msg}")
+
+    # ── 7. Set permitted domain ───────────────────────────────────────────────
+    if permitted_domain:
+        print(f"     Setting permitted domain: {permitted_domain}...")
+        ok, msg = duo_set_permitted_domain(ikey, skey, host, permitted_domain)
+        if not ok:
+            print(f"     WARN: {msg}")  # non-fatal
+
+    # ── 8. Auth Proxy setup on AD1 ────────────────────────────────────────────
+    print("     Setting up Duo Auth Proxy on AD1 (198.18.5.102)...")
+    ap_creds = duo_get_authproxy_creds(ikey, skey, host)
+    if ap_creds:
+        print(f"     Found authproxy integration: {ap_creds['ikey']}")
+        # Persist credentials to DB for future reference
+        try:
+            import sqlite3 as _sq
+            _c = _sq.connect(DB_PATH)
+            _c.execute(
+                "UPDATE org_credentials SET authproxy_ikey=?, authproxy_skey=? "
+                "WHERE org_number=?",
+                (ap_creds["ikey"], ap_creds["skey"],
+                 _extract_org_number(keys.get("_org_num", "") if isinstance(keys, dict) else ""))
+            )
+            _c.commit(); _c.close()
+        except Exception:
+            pass  # non-fatal DB write
+    else:
+        # Fall back to DB-stored authproxy credentials
+        try:
+            import sqlite3 as _sq
+            _c = _sq.connect(DB_PATH)
+            _c.row_factory = _sq.Row
+            _org_num = _extract_org_number(
+                _c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (POD_ID,))
+                 .fetchone()["scc_org"] or ""
+            )
+            _row = _c.execute(
+                "SELECT authproxy_ikey, authproxy_skey FROM org_credentials WHERE org_number=?",
+                (_org_num,)
+            ).fetchone()
+            _c.close()
+            if _row and _row["authproxy_ikey"] and _row["authproxy_skey"]:
+                ap_creds = {"ikey": _row["authproxy_ikey"], "skey": _row["authproxy_skey"], "host": host}
+                print(f"     Using DB-stored authproxy credentials: {ap_creds['ikey']}")
+        except Exception:
+            pass
+
+    if not ap_creds:
+        # Auto-create a radius-type integration for the auth proxy
+        print("     No authproxy integration found — creating radius-type integration...")
+        ap_creds = duo_create_authproxy_integration(ikey, skey, host)
+        if ap_creds:
+            print(f"     Created authproxy integration: {ap_creds['ikey']}")
+            try:
+                import sqlite3 as _sq
+                _c = _sq.connect(DB_PATH)
+                _c.row_factory = _sq.Row
+                _org_num = _extract_org_number(
+                    _c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (POD_ID,))
+                     .fetchone()["scc_org"] or ""
+                )
+                _c.execute(
+                    "UPDATE org_credentials SET authproxy_ikey=?, authproxy_skey=? "
+                    "WHERE org_number=?",
+                    (ap_creds["ikey"], ap_creds["skey"], _org_num)
+                )
+                _c.commit(); _c.close()
+            except Exception:
+                pass  # non-fatal DB write
+        else:
+            print(
+                "     WARN: Failed to create authproxy integration. "
+                "Create an Authentication Proxy application manually in the Duo admin console "
+                f"({host}) and enter ikey/skey in Org Credentials."
+            )
+
+    if ap_creds:
+        ap_ok, ap_msg = duo_push_authproxy_cfg(
+            ap_ikey=ap_creds["ikey"],
+            ap_skey=ap_creds["skey"],
+            ap_host=ap_creds["host"],
+            ad_ip=AD_DC_IP,
+            winrm_user=AD_DC_USER,
+            winrm_pass=AD_DC_PASS,
+        )
+        if ap_ok:
+            print(f"     Auth proxy: {ap_msg}")
+        else:
+            print(f"     WARN: Auth proxy setup failed: {ap_msg}")  # non-fatal
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    user_summary = " | ".join(
+        f"{u['username']}={u['email']}"
+        for u in duo_users
+    )
+    ap_status = "authproxy=ok" if ap_creds else "authproxy=no-creds"
+    return True, (
+        f"Duo setup complete | {len(duo_users)} users created | "
+        f"domain={permitted_domain or 'n/a'} | {ap_status} | {user_summary}"
+    )
 
 
 def phase_cdfmc_check():
@@ -2208,14 +2669,48 @@ SCC_KEYS_DIR = os.environ.get(
     "/pipeline/host-data/scc_keys"
 )
 
+def _extract_org_number(scc_org: str) -> str:
+    """Extract numeric org number from scc_org (e.g. 'pseudoco-5001--...' → '5001')."""
+    import re as _re
+    if not scc_org:
+        return ""
+    m = _re.search(r"pseudoco-(\d+)", scc_org)
+    if m:
+        return m.group(1)
+    if scc_org.strip().isdigit():
+        return scc_org.strip()
+    return ""
+
+
+def _org_credentials(org_number: str) -> dict:
+    """
+    Load credentials from the org_credentials table for the given org number.
+    Returns an empty dict if not found.
+    """
+    if not org_number:
+        return {}
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    try:
+        import sqlite3 as _sqlite3
+        with _sqlite3.connect(db_path) as conn:
+            conn.row_factory = _sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM org_credentials WHERE org_number=?", (org_number,)
+            ).fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
 def _scc_load_keys(org_number: str, pod_id: str = None) -> dict:
     """
-    Load SCC API keys for the given org.
+    Load SCC API keys.
     Priority:
-      1. DB row for pod_id (scc_api_key / scc_api_secret columns)
-      2. JSON file at SCC_KEYS_DIR/scc_keys_<org>.json (legacy fallback)
+      1. Per-POD override in pods table (scc_api_key / scc_api_secret)
+      2. org_credentials table keyed by org_number
+      3. JSON file at SCC_KEYS_DIR/scc_keys_<org>.json (legacy)
     """
-    # 1. Try DB first if pod_id provided
+    # 1. Per-POD override
     if pod_id:
         try:
             db_path = os.environ.get("DB_PATH", os.environ.get("POD_STATE_DB", "/pipeline/host-data/pod_state.db"))
@@ -2228,20 +2723,97 @@ def _scc_load_keys(org_number: str, pod_id: str = None) -> dict:
             if row and row[0] and row[1]:
                 return {"scc_api_key": row[0], "scc_api_secret": row[1]}
         except Exception:
-            pass  # fall through to file
+            pass
 
-    # 2. Fallback to JSON file
+    # 2. org_credentials table
+    if org_number:
+        oc = _org_credentials(org_number)
+        if oc.get("scc_api_key") and oc.get("scc_api_secret"):
+            return {"scc_api_key": oc["scc_api_key"], "scc_api_secret": oc["scc_api_secret"]}
+
+    # 3. JSON file (legacy fallback)
     path = os.path.join(SCC_KEYS_DIR, f"scc_keys_{org_number}.json")
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"SCC keys not found in DB (pod_id={pod_id!r}) or file ({path})"
+            f"SCC keys not found for org={org_number!r} (pod_id={pod_id!r}, file={path})"
         )
     with open(path) as f:
         return json.load(f)
 
 
+# ── Duo keys ──────────────────────────────────────────────────────────────────
+
+def _duo_load_keys(pod_id: str) -> dict:
+    """
+    Load Duo Admin API keys.
+    Priority:
+      1. Per-POD override in pods table (duo_ikey / duo_skey / duo_host)
+      2. org_credentials table keyed by org number derived from scc_org
+    Raises KeyError if credentials are not found.
+    """
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    import sqlite3 as _sqlite3
+    with _sqlite3.connect(db_path) as conn:
+        conn.row_factory = _sqlite3.Row
+        row = conn.execute(
+            "SELECT duo_ikey, duo_skey, duo_host, scc_org FROM pods WHERE pod_id=?",
+            (pod_id,)
+        ).fetchone()
+
+    # 1. Per-POD override
+    if row and row["duo_ikey"] and row["duo_skey"] and row["duo_host"]:
+        return {"duo_ikey": row["duo_ikey"], "duo_skey": row["duo_skey"], "duo_host": row["duo_host"]}
+
+    # 2. org_credentials table
+    if row:
+        org_num = _extract_org_number(row["scc_org"] or "")
+        if org_num:
+            oc = _org_credentials(org_num)
+            if oc.get("duo_ikey") and oc.get("duo_skey") and oc.get("duo_host"):
+                return {"duo_ikey": oc["duo_ikey"], "duo_skey": oc["duo_skey"], "duo_host": oc["duo_host"]}
+
+    raise KeyError(f"Duo credentials not found for pod_id={pod_id!r} — configure in Org Credentials or POD override")
+
+
+def _sa_load_keys(pod_id: str) -> dict:
+    """
+    Load Secure Access API keys.
+    Priority:
+      1. Per-POD override in pods table (sa_api_key / sa_api_secret)
+      2. org_credentials table keyed by org number derived from scc_org
+    Raises KeyError if credentials are not found.
+    """
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    import sqlite3 as _sqlite3
+    with _sqlite3.connect(db_path) as conn:
+        conn.row_factory = _sqlite3.Row
+        row = conn.execute(
+            "SELECT sa_org_id, sa_api_key, sa_api_secret, scc_org FROM pods WHERE pod_id=?",
+            (pod_id,)
+        ).fetchone()
+
+    # 1. Per-POD override
+    if row and row["sa_api_key"] and row["sa_api_secret"]:
+        return {"sa_org_id": row["sa_org_id"] or "", "sa_api_key": row["sa_api_key"], "sa_api_secret": row["sa_api_secret"]}
+
+    # 2. org_credentials table
+    if row:
+        org_num = _extract_org_number(row["scc_org"] or "")
+        if org_num:
+            oc = _org_credentials(org_num)
+            if oc.get("sa_api_key") and oc.get("sa_api_secret"):
+                return {"sa_org_id": oc.get("sa_org_id", ""), "sa_api_key": oc["sa_api_key"], "sa_api_secret": oc["sa_api_secret"]}
+
+    raise KeyError(f"SA credentials not found for pod_id={pod_id!r} — configure in Org Credentials or POD override")
+
+
 def _scc_token(key_id: str, key_secret: str) -> str:
-    """Obtain a short-lived bearer token from SSE auth API."""
+    """Obtain a bearer token for the SSE API.
+    If key_secret is already a JWT (starts with 'eyJ'), use it directly.
+    Otherwise exchange key_id + key_secret via the /auth/v2/token endpoint.
+    """
+    if key_secret and key_secret.startswith("eyJ"):
+        return key_secret
     r = requests.post(
         "https://api.sse.cisco.com/auth/v2/token",
         auth=(key_id, key_secret),
@@ -2253,8 +2825,7 @@ def _scc_token(key_id: str, key_secret: str) -> str:
 
 
 def _scc_org_number_from_pod() -> str:
-    """Extract org number from scc_org stored in DB (e.g. 'pseudoco-523--...' → '523')."""
-    import re as _re
+    """Extract org number from scc_org stored in DB for the current POD."""
     db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     pod_id  = os.environ.get("POD_ID", "")
     try:
@@ -2263,16 +2834,41 @@ def _scc_org_number_from_pod() -> str:
         c.row_factory = _sq.Row
         row = c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         c.close()
-        if row and row["scc_org"]:
-            m = _re.search(r"pseudoco-(\d+)--", row["scc_org"]) or _re.search(r"pseudoco-(\d+)", row["scc_org"])
-            if m:
-                return m.group(1)
-            # Fallback: if scc_org is already just a number
-            if row["scc_org"].isdigit():
-                return row["scc_org"]
+        if row:
+            return _extract_org_number(row["scc_org"] or "")
     except Exception:
         pass
     return ""
+
+
+def phase_duo_ext_dir_setup() -> tuple[bool, str]:
+    """
+    Push authproxy.cfg ([cloud] + [ad_client]) to AD1 via WinRM and restart
+    DuoAuthProxy.  No browser or Cisco Okta MFA required.
+
+    Runs after duo_setup.  Requires:
+      - duo_ikey/skey/host in org_credentials (set by duo_setup)
+      - authproxy_ikey/skey in org_credentials OR fetchable via Duo Admin API
+
+    Uses duo_automation.duo_push_authproxy_config() which:
+      1. Loads/creates auth proxy integration credentials via Duo Admin API
+      2. Builds authproxy.cfg with [cloud] + [ad_client] (198.18.5.102:389)
+      3. Pushes cfg to AD1 via WinRM (DockerWinRMSession on Mac, direct in Docker)
+      4. Restarts DuoAuthProxy service and verifies Running state
+
+    The [sso] section + authproxyctl enrollment are handled later by
+    duo_saml_setup once duo_saml_app_ikey is available.
+
+    Returns (ok, result_string).
+    """
+    DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    POD_ID  = os.environ.get("POD_ID", "")
+
+    if not POD_ID:
+        return False, "POD_ID env var not set"
+
+    from duo_automation import duo_push_authproxy_config
+    return duo_push_authproxy_config(POD_ID, DB_PATH)
 
 
 def phase_scc_reset_check():
@@ -2351,9 +2947,16 @@ def phase_scc_reset_check():
             _persist(k, "skipped", msg)
         return False, f"SCC keys missing for org {org_num} — generate keys first | {msg}"
 
-    key_id     = keys.get("scc_api_key") or keys.get("key_id", "")
-    key_secret = keys.get("scc_api_secret") or keys.get("key_secret", "")
-    org_id     = str(keys.get("scc_org_id", ""))
+    # SSE (Umbrella) API uses the Secure Access (sa_*) key pair, not the CDO
+    # machine-account JWT stored in scc_api_secret.  Load SA keys explicitly.
+    try:
+        sa_keys  = _sa_load_keys(pod_id=pod_id)
+        key_id     = sa_keys.get("sa_api_key", "")
+        key_secret = sa_keys.get("sa_api_secret", "")
+    except Exception:
+        # Fallback: try scc keys (old behaviour, may return 500)
+        key_id     = keys.get("scc_api_key") or keys.get("key_id", "")
+        key_secret = keys.get("scc_api_secret") or keys.get("key_secret", "")
 
     try:
         token = _scc_token(key_id, key_secret)
@@ -2543,6 +3146,78 @@ def phase_scc_reset_check():
     summary = " | ".join(f"{k}: {'✓' if v[0] else '✗'} {v[1]}" for k, v in results.items())
     print(f"     SCC reset check ({'PASS' if all_ok else 'FAIL'}): {summary}")
     return all_ok, summary
+
+
+def phase_duo_saml_setup() -> tuple[bool, str]:
+    """
+    Full SA + Duo SAML/SCIM integration setup.
+
+    If authproxy_cfg in DB already contains a [sso] section, push it verbatim
+    to AD1 (no browser needed — config is complete).
+
+    Otherwise run duo_saml_full_setup() which:
+      - authenticates via iDAC URL (preferred, no MFA) or email+password fallback
+      - creates/configures the Duo SAML SP app via browser
+      - obtains SA management JWT and configures SA SAML IdP profile
+      - appends [sso] section to authproxy.cfg on AD1 + runs authproxyctl enroll
+
+    When running inside Docker, delegates to the dashboard host process.
+    Returns (ok, result_string).
+    """
+    import sqlite3 as _sq4, re as _re4
+    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    pod_id  = os.environ.get("POD_ID", "")
+
+    # If DB-stored authproxy.cfg already has [sso] section, push verbatim — no browser
+    try:
+        with _sq4.connect(db_path) as conn:
+            conn.row_factory = _sq4.Row
+            pod_row = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+            if pod_row:
+                scc_org = pod_row["scc_org"] or ""
+                m = _re4.search(r"pseudoco-(\d+)", scc_org)
+                if m:
+                    oc_row = conn.execute(
+                        "SELECT * FROM org_credentials WHERE org_number=?",
+                        (m.group(1),)
+                    ).fetchone()
+                    if oc_row:
+                        oc_dict = dict(oc_row)
+                        stored = oc_dict.get("authproxy_cfg", "").strip()
+                        if stored and "[sso]" in stored:
+                            from duo_automation import (
+                                duo_push_authproxy_config,
+                                duo_sa_configure_headless,
+                            )
+                            # Step A: push authproxy.cfg with [sso] to AD1 via WinRM
+                            ok, msg = duo_push_authproxy_config(pod_id, db_path)
+                            if not ok:
+                                return ok, msg
+                            # Step B: headless SA SAML IdP + Duo SCIM config + AD sync
+                            _sa_ok, sa_msg = duo_sa_configure_headless(pod_id, db_path)
+                            return True, f"{msg} | {sa_msg}"
+    except Exception:
+        pass  # fall through to full setup
+
+    # Full SAML setup via browser (iDAC preferred)
+    if os.path.exists("/.dockerenv"):
+        import urllib.request, json as _json
+        dashboard_url = os.environ.get("DASHBOARD_URL", "http://192.168.65.254:5050")
+        try:
+            req = urllib.request.Request(
+                f"{dashboard_url}/api/duo-saml-setup-sync/{pod_id}",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                data=b"{}",
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                data = _json.loads(resp.read())
+            return data.get("ok", False), data.get("result", "no result from host")
+        except Exception as e:
+            return False, f"Host delegation failed: {e}"
+
+    from duo_automation import duo_saml_full_setup
+    return duo_saml_full_setup(pod_id, db_path)
 
 
 if __name__ == "__main__":

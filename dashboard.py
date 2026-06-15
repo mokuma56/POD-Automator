@@ -59,6 +59,16 @@ def _db():
     conn.execute("PRAGMA synchronous=FULL")
     return conn
 
+def _get_global_config(conn, key, default=""):
+    row = conn.execute("SELECT value FROM global_config WHERE key=?", (key,)).fetchone()
+    return row["value"] if row and row["value"] else default
+
+def _set_global_config(conn, key, value):
+    conn.execute(
+        "INSERT INTO global_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
 def _migrate():
     conn = _db()
     conn.execute("""
@@ -105,6 +115,71 @@ def _migrate():
         conn.execute("ALTER TABLE pods ADD COLUMN scc_api_secret TEXT DEFAULT ''")
     except Exception:
         pass
+    # Migration: add Duo Admin API credentials columns
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN duo_ikey TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN duo_skey TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN duo_host TEXT DEFAULT ''")
+    except Exception:
+        pass
+    # Migration: add Secure Access API credentials columns
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN sa_org_id TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN sa_api_key TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN sa_api_secret TEXT DEFAULT ''")
+    except Exception:
+        pass
+    # Org-level credentials (keyed by org number; pods link at runtime via scc_org)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS org_credentials (
+            org_number      TEXT PRIMARY KEY,
+            duo_ikey        TEXT DEFAULT '',
+            duo_skey        TEXT DEFAULT '',
+            duo_host        TEXT DEFAULT '',
+            scc_api_key     TEXT DEFAULT '',
+            scc_api_secret  TEXT DEFAULT '',
+            sa_org_id       TEXT DEFAULT '',
+            sa_api_key      TEXT DEFAULT '',
+            sa_api_secret   TEXT DEFAULT '',
+            authproxy_ikey  TEXT DEFAULT '',
+            authproxy_skey  TEXT DEFAULT '',
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Migration: add columns if upgrading from older schema
+    for _col in ("authproxy_ikey", "authproxy_skey",
+                 "duo_saml_app_ikey", "sa_saml_profile_id",
+                 "scc_password", "scc_email", "authproxy_cfg",
+                 "sa_scim_token"):
+        try:
+            conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
+        except Exception:
+            pass
+    # Migration: drop obsolete columns (Playwright-only, no active code path uses these)
+    for _col in ("scc_org_uuid", "idac_url", "duo_admin_email", "duo_admin_password", "duo_totp_secret"):
+        try:
+            conn.execute(f"ALTER TABLE org_credentials DROP COLUMN {_col}")
+        except Exception:
+            pass
+    # Global key-value config (CCO credentials etc.)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS global_config (
+            key   TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pipeline_steps (
             pod_id TEXT, step_name TEXT, status TEXT, started_at TEXT,
@@ -155,12 +230,23 @@ def _migrate():
 
 _migrate()
 
+# ── Duo card table init ───────────────────────────────────────────────────────
+def _ensure_duo_table():
+    import duo_automation as _da_init
+    _da_init.duo_ensure_table(str(DB_PATH))
+
+_ensure_duo_table()
+
 # ---- Log helpers ----
 def log(pod_id, msg):
-    conn = _db()
-    conn.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=5)
+        conn.row_factory = sqlite3.Row
+        conn.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # never crash the _run() thread over a log write
 
 def clear_logs(pod_id):
     conn = _db()
@@ -286,16 +372,19 @@ SWITCH_CHECKS = {
         "VRF (expect Mgmt-vrf only)",
         "Version (expect 17.12.x)",
         "VLAN (expect default + VLAN 5)",
+        "AAA (base config only)",
     ]},
     "leaf1": {"name": "Leaf 1", "ip": "198.18.128.22", "checks": [
         "VRF (expect Mgmt-vrf only)",
         "Version (expect 17.12.x)",
         "VLAN (expect default only)",
+        "AAA (base config only)",
     ]},
     "leaf2": {"name": "Leaf 2", "ip": "198.18.128.23", "checks": [
         "VRF (expect Mgmt-vrf only)",
         "Version (expect 17.12.x)",
         "VLAN (expect default only)",
+        "AAA (base config only)",
     ]},
 }
 
@@ -330,7 +419,7 @@ def api_switches(pod_id):
 
         checks = []
         for i, label in enumerate(info["checks"]):
-            if step.get("status") == "completed" and i < len(check_parts):
+            if step.get("status") in ("completed", "failed") and i < len(check_parts):
                 part = check_parts[i]
                 if part.startswith("PASS"):
                     checks.append({"label": label, "status": "pass", "result": part.replace("PASS: ", "")})
@@ -338,6 +427,8 @@ def api_switches(pod_id):
                     checks.append({"label": label, "status": "fail", "result": part.replace("FAIL: ", "")})
                 else:
                     checks.append({"label": label, "status": "pass", "result": part})
+            elif step.get("status") in ("completed", "failed"):
+                checks.append({"label": label, "status": "na", "result": "no data"})
             elif step.get("status") == "running":
                 checks.append({"label": label, "status": "na", "result": "checking..."})
             elif step.get("status") == "failed":
@@ -366,7 +457,7 @@ def api_switches(pod_id):
     ct_checks = []
     switch_order = [("border_spine", "Border Spine"), ("leaf1", "Leaf 1"), ("leaf2", "Leaf 2")]
     for i, (_, label) in enumerate(switch_order):
-        if ct_status == "completed" and i < len(ct_parts):
+        if ct_status in ("completed", "failed") and i < len(ct_parts):
             part = ct_parts[i]
             if part.startswith("PASS"):
                 ct_checks.append({"label": label + " → 198.18.5.100", "status": "pass", "result": part.replace("PASS: ", "")})
@@ -374,6 +465,8 @@ def api_switches(pod_id):
                 ct_checks.append({"label": label + " → 198.18.5.100", "status": "fail", "result": part.replace("FAIL: ", "")})
             else:
                 ct_checks.append({"label": label + " → 198.18.5.100", "status": "pass", "result": part})
+        elif ct_status in ("completed", "failed"):
+            ct_checks.append({"label": label + " → 198.18.5.100", "status": "na", "result": "no data"})
         elif ct_status == "running":
             ct_checks.append({"label": label + " → 198.18.5.100", "status": "na", "result": "checking..."})
         elif ct_status == "failed":
@@ -487,7 +580,7 @@ def api_switches_recheck(pod_id):
                     "--network", f"container:vpn-{pod_id}",
                     "--entrypoint", "python3",
                     "pod-automator:latest", "-c", script
-                ], capture_output=True, text=True, timeout=120)
+                ], capture_output=True, text=True, timeout=240)
                 # Parse the printed repr (last line of stdout)
                 stdout = result.stdout.strip()
                 stderr = result.stderr.strip()
@@ -955,6 +1048,112 @@ def api_scc_run_check_sync(pod_id):
         return jsonify({"ok": False, "result": str(e)}), 500
 
 
+@app.route("/api/duo-saml-setup/<pod_id>", methods=["POST"])
+def api_duo_saml_setup(pod_id):
+    """Run duo_saml_full_setup in a background thread.
+    Called directly by the UI or delegated from the pipeline container."""
+    import threading, importlib, sys, os as _os
+
+    db_path = str(Path(__file__).parent / "data" / "pod_state.db")
+
+    # Mark as running
+    c = _db()
+    c.execute(
+        "INSERT OR REPLACE INTO pipeline_steps "
+        "(pod_id, step_name, status, started_at, result) VALUES (?,?,?,datetime('now'),?)",
+        (pod_id, "duo_saml_setup", "running", ""),
+    )
+    c.commit(); c.close()
+    log(pod_id, "[duo_saml_setup] Starting SA+Duo SAML/SCIM setup...")
+
+    def _run():
+        sys.path.insert(0, str(Path(__file__).parent))
+        _os.environ["POD_ID"] = pod_id
+        _os.environ["DB_PATH"] = db_path
+        try:
+            import importlib as _il
+            import duo_automation as _da
+            _il.reload(_da)
+
+            def _log_fn(msg):
+                log(pod_id, f"[duo_saml_setup] {msg}")
+
+            ok, result = _da.duo_saml_full_setup(pod_id, db_path, log=_log_fn)
+            log(pod_id, f"[duo_saml_setup] {'OK' if ok else 'FAILED'}: {result}")
+            c2 = _db()
+            c2.execute(
+                "INSERT OR REPLACE INTO pipeline_steps "
+                "(pod_id, step_name, status, result) VALUES (?,?,?,?)",
+                (pod_id, "duo_saml_setup", "completed" if ok else "failed", result),
+            )
+            c2.commit(); c2.close()
+        except Exception as e:
+            msg = f"ERROR: {e}"
+            log(pod_id, f"[duo_saml_setup] {msg}")
+            c3 = _db()
+            c3.execute(
+                "INSERT OR REPLACE INTO pipeline_steps "
+                "(pod_id, step_name, status, result) VALUES (?,?,?,?)",
+                (pod_id, "duo_saml_setup", "failed", msg),
+            )
+            c3.commit(); c3.close()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "ok", "message": f"Duo SAML setup started for {pod_id}"})
+
+
+@app.route("/api/duo-saml-setup-sync/<pod_id>", methods=["POST"])
+def api_duo_saml_setup_sync(pod_id):
+    """Synchronous variant — called by the pipeline container via host.docker.internal.
+
+    Uses the no-browser headless path:
+      1. duo_push_authproxy_config  — push authproxy.cfg to AD1 via WinRM (pre-stored cfg)
+      2. duo_sa_configure_headless  — SA client-creds + saved scc_session.json cookies
+    Avoids Cisco Okta MFA / browser login entirely.
+    """
+    import sys, os as _os
+    db_path = str(Path(__file__).parent / "data" / "pod_state.db")
+    sys.path.insert(0, str(Path(__file__).parent))
+    _os.environ["POD_ID"] = pod_id
+    _os.environ["DB_PATH"] = db_path
+    try:
+        import importlib, duo_automation
+        importlib.reload(duo_automation)
+        logs = []
+        _log = lambda msg: logs.append(msg)
+
+        # Step 1: push authproxy.cfg to AD1 via WinRM
+        ok1, msg1 = duo_automation.duo_push_authproxy_config(pod_id, db_path, log=_log)
+        _log(f"authproxy push: {'OK' if ok1 else 'FAILED'}: {msg1}")
+
+        # Step 2: headless SA SAML + Duo SCIM (all soft-fail internally)
+        ok2, msg2 = duo_automation.duo_sa_configure_headless(pod_id, db_path, log=_log)
+        _log(f"headless SA/SCIM: {'OK' if ok2 else 'FAILED'}: {msg2}")
+
+        ok = ok1 and ok2
+        result = " | ".join(logs[-6:]) if logs else f"{msg1} | {msg2}"
+        return jsonify({"ok": ok, "result": result, "authproxy": msg1, "sa_scim": msg2, "logs": logs})
+    except Exception as e:
+        return jsonify({"ok": False, "result": str(e)}), 500
+
+
+@app.route("/api/duo-ext-dir-setup-sync/<pod_id>", methods=["POST"])
+def api_duo_ext_dir_setup_sync(pod_id):
+    """Synchronous variant — called by the pipeline container via host.docker.internal."""
+    import sys, os as _os
+    db_path = str(Path(__file__).parent / "data" / "pod_state.db")
+    sys.path.insert(0, str(Path(__file__).parent))
+    _os.environ["POD_ID"] = pod_id
+    _os.environ["DB_PATH"] = db_path
+    try:
+        import importlib, duo_automation
+        importlib.reload(duo_automation)
+        ok, result = duo_automation.duo_push_authproxy_config(pod_id, db_path)
+        return jsonify({"ok": ok, "result": result})
+    except Exception as e:
+        return jsonify({"ok": False, "result": str(e)}), 500
+
+
 @app.route("/api/scc/confirm/<pod_id>/<item_key>", methods=["POST"])
 def api_scc_confirm(pod_id, item_key):
     """Mark a manual SCC checklist item as confirmed by proctor."""
@@ -1138,7 +1337,7 @@ def _clear_stuck_running(pod_id, table, mode=None):
 # ---------------------------------------------------------------------------
 
 SDA_DEPLOY_STEPS   = ["discovery", "provision", "fabric_site", "virtual_networks",
-                       "anycast_gateways", "transit", "clean_fabric_vlans", "fabric_devices",
+                       "anycast_gateways", "transit", "fabric_devices", "ise_nads",
                        "l3_handoff", "configure_handoff_interface", "deploy_anycast_gateways",
                        "port_assignments", "verify"]
 SDA_ROLLBACK_STEPS = ["remove_port_assignments", "remove_l3_handoffs", "restore_handoff_interface",
@@ -1148,7 +1347,7 @@ SDA_ROLLBACK_STEPS = ["remove_port_assignments", "remove_l3_handoffs", "restore_
                        "delete_ise_nads", "remove_network_profile"]
 
 
-SDA_DEPLOY_STEP_KEYS   = ["discovery","provision","fabric_site","virtual_networks","anycast_gateways","transit","clean_fabric_vlans","fabric_devices","l3_handoff","configure_handoff_interface","deploy_anycast_gateways","port_assignments","verify"]
+SDA_DEPLOY_STEP_KEYS   = ["discovery","provision","fabric_site","virtual_networks","anycast_gateways","transit","fabric_devices","ise_nads","l3_handoff","configure_handoff_interface","deploy_anycast_gateways","port_assignments","verify"]
 SDA_ROLLBACK_STEP_KEYS = ["remove_port_assignments","remove_l3_handoffs","restore_handoff_interface","remove_fabric_devices","remove_anycast_gateways","disable_gbac_policy","remove_transit","remove_vn_assignments","remove_virtual_networks","remove_fabric_site","delete_devices","delete_discovery","delete_ise_nads","remove_network_profile"]
 
 
@@ -1176,7 +1375,17 @@ def api_sda_status(pod_id):
             "started_at":   started_at or "",
             "completed_at": completed_at or "",
         }
-    return jsonify({"pod_id": pod_id, "deploy": steps["deploy"], "rollback": steps["rollback"]})
+    # Compute overall from deploy steps
+    deploy_statuses = [v["status"] for v in steps["deploy"].values()]
+    if "running" in deploy_statuses:
+        overall = "running"
+    elif "failed" in deploy_statuses:
+        overall = "failed"
+    elif deploy_statuses and all(s == "completed" for s in deploy_statuses):
+        overall = "completed"
+    else:
+        overall = "pending"
+    return jsonify({"pod_id": pod_id, "overall": overall, "deploy": steps["deploy"], "rollback": steps["rollback"]})
 
 
 @app.route("/api/sda/deploy/<pod_id>", methods=["POST"])
@@ -1263,6 +1472,7 @@ def api_sda_rollback(pod_id):
     return jsonify({"status": "ok", "message": f"SDA rollback started for {pod_id}"})
 
 
+
 @app.route("/api/sda/clear/<pod_id>", methods=["POST"])
 def api_sda_clear(pod_id):
     """Clear all SDA step rows and log lines for a POD."""
@@ -1273,6 +1483,76 @@ def api_sda_clear(pod_id):
     c.commit(); c.close()
     return jsonify({"status": "ok", "message": f"SDA state cleared for {pod_id}"})
 
+
+# ── Duo Card API ──────────────────────────────────────────────────────────────
+
+@app.route("/api/duo/status/<pod_id>")
+def api_duo_status(pod_id):
+    """Return Duo card step status for a POD."""
+    _ensure_duo_table()
+    c = _db()
+    rows = c.execute(
+        "SELECT step_name, status, result, started_at, completed_at "
+        "FROM duo_steps WHERE pod_id=?", (pod_id,)
+    ).fetchall()
+    c.close()
+    steps = {r["step_name"]: dict(r) for r in rows}
+    # Detect mode from org_credentials
+    mode = "unknown"
+    try:
+        c2 = _db()
+        pod_row = c2.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if pod_row:
+            import re as _re_dm, duo_automation as _da_dm
+            m = _re_dm.search(r"pseudoco-(\d+)", pod_row["scc_org"] or "")
+            if m:
+                oc = c2.execute("SELECT duo_saml_app_ikey, sa_scim_token, authproxy_cfg FROM org_credentials WHERE org_number=?", (m.group(1),)).fetchone()
+                if oc:
+                    app_ikey  = (oc["duo_saml_app_ikey"] or "").strip()
+                    scim_tok  = (oc["sa_scim_token"] or "").strip()
+                    ap_cfg    = (oc["authproxy_cfg"] or "")
+                    if app_ikey and scim_tok and "[sso]" in ap_cfg:
+                        mode = "refresh"
+                    elif app_ikey or scim_tok:
+                        mode = "partial"
+                    else:
+                        mode = "full_setup"
+        c2.close()
+    except Exception:
+        pass
+    return jsonify({"steps": steps, "mode": mode})
+
+
+@app.route("/api/duo/run/<pod_id>", methods=["POST"])
+def api_duo_run(pod_id):
+    """Start Duo card pipeline in a background thread."""
+    import threading, duo_automation as _da_run
+    _ensure_duo_table()
+    data = request.get_json(silent=True) or {}
+    from_step = int(data.get("from_step", 0))
+    db_path = str(DB_PATH)
+
+    def _run():
+        def _log_fn(msg):
+            log(pod_id, f"[duo] {msg}")
+        try:
+            ok, result = _da_run.duo_run_card(pod_id, db_path, from_step=from_step, log=_log_fn)
+            log(pod_id, f"[duo] {'OK' if ok else 'FAILED'}: {result}")
+        except Exception as e:
+            log(pod_id, f"[duo] exception: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "pod_id": pod_id, "from_step": from_step})
+
+
+@app.route("/api/duo/reset/<pod_id>", methods=["POST"])
+def api_duo_reset(pod_id):
+    """Clear all Duo card step rows for a POD."""
+    _ensure_duo_table()
+    c = _db()
+    c.execute("DELETE FROM duo_steps WHERE pod_id=?", (pod_id,))
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "message": f"Duo state cleared for {pod_id}"})
 
 
 @app.route("/api/catc/discover/<pod_id>", methods=["POST"])
@@ -1787,10 +2067,10 @@ def upload_event():
                 if "C8231" in val or "ISR" in val or "C8000" in val:
                     router_serial = val
 
-        vpn_host = row.get(vpn_host_col, "") if vpn_host_col else ""
-        vpn_user = row.get(vpn_user_col, "") if vpn_user_col else ""
-        vpn_pass = row.get(vpn_pass_col, "") if vpn_pass_col else ""
-        session_id = row.get(session_col, "") if session_col else ""
+        vpn_host = row.get(vpn_host_col, "").strip() if vpn_host_col else ""
+        vpn_user = row.get(vpn_user_col, "").strip() if vpn_user_col else ""
+        vpn_pass = row.get(vpn_pass_col, "").strip() if vpn_pass_col else ""
+        session_id = row.get(session_col, "").strip() if session_col else ""
         assigned_to = (row.get(assigned_col, "").strip() if assigned_col else "")
 
         router_ip = row.get(router_ip_col, "") if router_ip_col else ""
@@ -2137,7 +2417,264 @@ def save_scc_keys(pod_id):
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/pod-duo-keys/<pod_id>", methods=["GET"])
+def get_duo_keys(pod_id):
+    """Return Duo Admin API credentials for a POD."""
+    conn = _db()
+    row = conn.execute(
+        "SELECT duo_ikey, duo_skey, duo_host FROM pods WHERE pod_id=?", (pod_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"duo_ikey": "", "duo_skey": "", "duo_host": ""})
+    return jsonify({
+        "duo_ikey": row["duo_ikey"] or "",
+        "duo_skey": row["duo_skey"] or "",
+        "duo_host": row["duo_host"] or "",
+    })
 
+
+@app.route("/api/pod-duo-keys/<pod_id>", methods=["POST"])
+def save_duo_keys(pod_id):
+    """Save Duo Admin API credentials for a POD."""
+    data = request.get_json(force=True)
+    ikey = data.get("duo_ikey", "").strip()
+    skey = data.get("duo_skey", "").strip()
+    host = data.get("duo_host", "").strip()
+    conn = _db()
+    conn.execute(
+        "UPDATE pods SET duo_ikey=?, duo_skey=?, duo_host=?, updated_at=datetime('now') WHERE pod_id=?",
+        (ikey, skey, host, pod_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/pod-sa-keys/<pod_id>", methods=["GET"])
+def get_sa_keys(pod_id):
+    """Return Secure Access API credentials for a POD."""
+    conn = _db()
+    row = conn.execute(
+        "SELECT sa_org_id, sa_api_key, sa_api_secret FROM pods WHERE pod_id=?", (pod_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"sa_org_id": "", "sa_api_key": "", "sa_api_secret": ""})
+    return jsonify({
+        "sa_org_id":     row["sa_org_id"] or "",
+        "sa_api_key":    row["sa_api_key"] or "",
+        "sa_api_secret": row["sa_api_secret"] or "",
+    })
+
+
+@app.route("/api/pod-sa-keys/<pod_id>", methods=["POST"])
+def save_sa_keys(pod_id):
+    """Save Secure Access API credentials for a POD."""
+    data = request.get_json(force=True)
+    org_id = data.get("sa_org_id", "").strip()
+    key    = data.get("sa_api_key", "").strip()
+    secret = data.get("sa_api_secret", "").strip()
+    conn = _db()
+    conn.execute(
+        "UPDATE pods SET sa_org_id=?, sa_api_key=?, sa_api_secret=?, updated_at=datetime('now') WHERE pod_id=?",
+        (org_id, key, secret, pod_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+
+# ── Org-level credentials (shared across all PODs of the same org) ────────────
+
+@app.route("/api/org-credentials", methods=["GET"])
+def list_org_credentials():
+    """List all org numbers that have credentials configured."""
+    conn = _db()
+    rows = conn.execute(
+        "SELECT org_number, duo_saml_app_ikey, updated_at FROM org_credentials ORDER BY CAST(org_number AS INTEGER)"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/org-credentials/<org_number>", methods=["GET"])
+def get_org_credentials(org_number):
+    """Return all credentials for a given org number."""
+    conn = _db()
+    row = conn.execute(
+        "SELECT * FROM org_credentials WHERE org_number=?", (org_number,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"org_number": org_number, "duo_ikey": "", "duo_skey": "", "duo_host": "",
+                        "duo_saml_app_ikey": "",
+                        "scc_api_key": "", "scc_api_secret": "",
+                        "sa_org_id": "", "sa_api_key": "", "sa_api_secret": "",
+                        "scc_email": "", "scc_password": "", "authproxy_cfg": "",
+                        "sa_scim_token": ""})
+    return jsonify(dict(row))
+
+
+@app.route("/api/org-credentials/<org_number>", methods=["POST"])
+def save_org_credentials(org_number):
+    """Create or update credentials for a given org number.
+    Empty string values are ignored — existing DB values are preserved.
+    This prevents accidental wipes when password fields aren't visible in the form.
+    """
+    data = request.get_json(force=True)
+    conn = _db()
+    # For new orgs: insert with whatever values were provided (empty is fine as placeholder)
+    conn.execute("""
+        INSERT OR IGNORE INTO org_credentials (org_number, updated_at)
+        VALUES (?, datetime('now'))
+    """, (org_number,))
+    # For each field: only update if the submitted value is non-empty
+    fields = {
+        "duo_ikey":          data.get("duo_ikey", "").strip(),
+        "duo_skey":          data.get("duo_skey", "").strip(),
+        "duo_host":          data.get("duo_host", "").strip(),
+        "duo_saml_app_ikey": data.get("duo_saml_app_ikey", "").strip(),
+        "scc_api_key":       data.get("scc_api_key", "").strip(),
+        "scc_api_secret":    data.get("scc_api_secret", "").strip(),
+        "sa_org_id":         data.get("sa_org_id", "").strip(),
+        "sa_api_key":        data.get("sa_api_key", "").strip(),
+        "sa_api_secret":     data.get("sa_api_secret", "").strip(),
+        "scc_email":         data.get("scc_email", "").strip(),
+        "scc_password":      data.get("scc_password", "").strip(),
+        "authproxy_cfg":     data.get("authproxy_cfg", ""),  # preserve whitespace
+        "sa_scim_token":     data.get("sa_scim_token", "").strip(),
+    }
+    updates = {k: v for k, v in fields.items() if v != ""}
+    if updates:
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        conn.execute(
+            f"UPDATE org_credentials SET {set_clause}, updated_at=datetime('now') WHERE org_number=?",
+            list(updates.values()) + [org_number]
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+
+ORG_CSV_COLS = [
+    "org_number", "duo_ikey", "duo_skey", "duo_host",
+    "duo_saml_app_ikey",
+    "scc_api_key", "scc_api_secret",
+    "sa_org_id", "sa_api_key", "sa_api_secret",
+    "scc_email", "scc_password", "authproxy_cfg",
+    "sa_scim_token",
+]
+
+
+@app.route("/api/org-credentials/export.csv")
+def export_org_credentials_csv():
+    """Download all org credentials as a CSV file."""
+    import csv, io
+    conn = _db()
+    rows = conn.execute(
+        "SELECT " + ",".join(ORG_CSV_COLS) + " FROM org_credentials ORDER BY CAST(org_number AS INTEGER)"
+    ).fetchall()
+    conn.close()
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=ORG_CSV_COLS)
+    w.writeheader()
+    for r in rows:
+        w.writerow(dict(r))
+    output = buf.getvalue()
+    return output, 200, {
+        "Content-Type": "text/csv",
+        "Content-Disposition": "attachment; filename=org_credentials.csv",
+    }
+
+
+@app.route("/api/org-credentials/import", methods=["POST"])
+def import_org_credentials_csv():
+    """Bulk upsert org credentials from an uploaded CSV file."""
+    import csv, io
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file uploaded"}), 400
+    try:
+        text = f.read().decode("utf-8-sig")  # strip BOM if present
+        reader = csv.DictReader(io.StringIO(text))
+        # Validate header
+        missing = [c for c in ORG_CSV_COLS if c not in (reader.fieldnames or [])]
+        if missing:
+            return jsonify({"error": "Missing columns: " + ", ".join(missing)}), 400
+        conn = _db()
+        imported = 0
+        skipped = 0
+        for row in reader:
+            org_num = row.get("org_number", "").strip()
+            if not org_num:
+                skipped += 1
+                continue
+            conn.execute("""
+                INSERT INTO org_credentials
+                    (org_number, duo_ikey, duo_skey, duo_host,
+                     duo_saml_app_ikey,
+                     scc_api_key, scc_api_secret,
+                     sa_org_id, sa_api_key, sa_api_secret,
+                     scc_email, scc_password, authproxy_cfg, sa_scim_token, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+                ON CONFLICT(org_number) DO UPDATE SET
+                    duo_ikey=excluded.duo_ikey, duo_skey=excluded.duo_skey, duo_host=excluded.duo_host,
+                    duo_saml_app_ikey=excluded.duo_saml_app_ikey,
+                    scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret,
+                    sa_org_id=excluded.sa_org_id, sa_api_key=excluded.sa_api_key, sa_api_secret=excluded.sa_api_secret,
+                    scc_email=excluded.scc_email,
+                    scc_password=excluded.scc_password,
+                    authproxy_cfg=excluded.authproxy_cfg,
+                    sa_scim_token=excluded.sa_scim_token,
+                    updated_at=datetime('now')
+            """, (
+                org_num,
+                row.get("duo_ikey", "").strip(), row.get("duo_skey", "").strip(), row.get("duo_host", "").strip(),
+                row.get("duo_saml_app_ikey", "").strip(),
+                row.get("scc_api_key", "").strip(), row.get("scc_api_secret", "").strip(),
+                row.get("sa_org_id", "").strip(), row.get("sa_api_key", "").strip(), row.get("sa_api_secret", "").strip(),
+                row.get("scc_email", "").strip(),
+                row.get("scc_password", "").strip(),
+                row.get("authproxy_cfg", "").strip(),
+                row.get("sa_scim_token", "").strip(),
+            ))
+            imported += 1
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok", "imported": imported, "skipped": skipped})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/global-config", methods=["GET"])
+def get_global_config():
+    """Return global key-value config (CCO credentials etc.)."""
+    conn = _db()
+    cco_user = _get_global_config(conn, "cco_username")
+    cco_pass = _get_global_config(conn, "cco_password")
+    conn.close()
+    return jsonify({"cco_username": cco_user, "cco_password": cco_pass})
+
+
+@app.route("/api/global-config", methods=["POST"])
+def save_global_config():
+    """Save global key-value config."""
+    data = request.get_json(force=True)
+    conn = _db()
+    for key in ("cco_username", "cco_password"):
+        if key in data:
+            _set_global_config(conn, key, (data[key] or "").strip())
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+
+
+
+
+
+# !! DO NOT REMOVE THE DECORATOR BELOW — this has been dropped 3 times by edits inserting new routes above this function !!
 @app.route("/api/run-pod/<pod_id>", methods=["POST"])
 def run_pod(pod_id):
     """Run the pipeline for a single POD (VPN must already be connected)."""
@@ -2288,6 +2825,9 @@ DASHBOARD_HTML = """
   .upload-zone:hover { border-color: #02c8ff; }
   .upload-zone.dragover { border-color: #00e68a; background: #0a1f3d; }
   .upload-zone input[type=file] { display: none; }
+  .org-card { background:#0d1e30; border:1px solid #1a3a5a; border-radius:6px; padding:10px 12px; cursor:pointer; transition:border-color 0.15s,background 0.15s; }
+  .org-card:hover { border-color:#02c8ff; }
+  .org-card.selected { border-color:#02c8ff; background:#0a1f3a; }
   .upload-zone .hint { color: #667788; font-size: 12px; margin-top: 6px; }
   .upload-result { margin-top: 8px; font-size: 13px; }
 
@@ -2470,9 +3010,46 @@ DASHBOARD_HTML = """
       <div id="router-image-status" style="font-size:11px;color:#667788;margin-top:6px;"></div>
     </div>
 
-  </div>
+   </div>
 
-  <div class="summary" id="summary"></div>
+   <!-- Org Credentials -->
+   <div class="upload-section" id="org-creds-section" style="margin-bottom:20px;padding:0;">
+     <!-- Collapsed header (always visible) -->
+     <div id="org-creds-header" onclick="toggleOrgCreds()" style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;cursor:pointer;user-select:none;">
+       <div style="display:flex;align-items:center;gap:10px;">
+         <span id="org-creds-chevron" style="font-size:12px;color:#445566;transition:transform 0.2s;">&#9654;</span>
+         <h3 style="margin:0;">Org Credentials</h3>
+         <span id="org-creds-count" style="font-size:11px;color:#445566;background:#0d1e30;border:1px solid #1a3a5a;border-radius:10px;padding:1px 8px;"></span>
+       </div>
+       <span style="font-size:11px;color:#445566;">click to expand</span>
+     </div>
+      <!-- Expandable body -->
+      <div id="org-creds-body" style="display:none;padding:0 16px 16px 16px;border-top:1px solid #1a2d4a;">
+        <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:10px 0 8px 0;">
+         <a href="/api/org-credentials/export.csv" download style="padding:5px 12px;background:#0d1e30;border:1px solid #00e68a;color:#00e68a;border-radius:4px;cursor:pointer;font-size:11px;text-decoration:none;">&#8595; Export CSV</a>
+         <label style="padding:5px 12px;background:#0d1e30;border:1px solid #ffa502;color:#ffa502;border-radius:4px;cursor:pointer;font-size:11px;">
+           &#8593; Import CSV
+           <input type="file" accept=".csv" style="display:none;" onchange="importOrgCsv(this)">
+         </label>
+         <span id="org-import-status" style="font-size:11px;color:#667788;"></span>
+         <button onclick="orgCredsNew()" style="padding:5px 12px;background:#0d1e30;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">+ New Org</button>
+       </div>
+       <div id="org-creds-list" style="margin-bottom:10px;"></div>
+       <div id="org-new-row" style="display:none;margin-bottom:10px;">
+         <div style="display:flex;gap:8px;align-items:center;">
+           <input id="org-num-input" type="text" placeholder="Org number e.g. 5001"
+             style="background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:5px 8px;font-size:12px;width:150px;">
+           <button onclick="loadOrgCreds(document.getElementById('org-num-input').value.trim())"
+             style="padding:5px 10px;background:#0d1e30;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">Create / Load</button>
+           <button onclick="document.getElementById('org-new-row').style.display='none'"
+             style="padding:5px 10px;background:transparent;border:1px solid #334455;color:#667788;border-radius:4px;cursor:pointer;font-size:11px;">Cancel</button>
+         </div>
+       </div>
+       <div id="org-creds-form" style="display:none;"></div>
+     </div>
+   </div>
+
+   <div class="summary" id="summary"></div>
 
   <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
     <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
@@ -2513,19 +3090,20 @@ DASHBOARD_HTML = """
         <div class="progress-text"><span id="progress-text">0%</span></div>
       </div>
     </div>
-    <div class="detail-tabs">
-      <button class="tab-btn active" onclick="switchTab(this, 'steps')">Pipeline Steps</button>
-      <button class="tab-btn" onclick="switchTab(this, 'logs')">Live Logs</button>
-      <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches</button>
-      <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
-      <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
-      <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
+     <div class="detail-tabs">
+       <button class="tab-btn active" onclick="switchTab(this, 'steps')">Pipeline Steps</button>
+       <button class="tab-btn" onclick="switchTab(this, 'logs')">Live Logs</button>
+       <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches</button>
+       <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
+       <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
        <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
-       <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
-       <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
-      <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
-      <button class="tab-btn" onclick="switchTab(this, 'kb')">&#128218; Knowledge Base</button>
-    </div>
+        <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
+        <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
+        <button class="tab-btn" onclick="switchTab(this, 'duo')">&#x1F512; Duo</button>
+        <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
+       <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
+       <button class="tab-btn" onclick="switchTab(this, 'kb')">&#128218; Knowledge Base</button>
+     </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
     </div>
@@ -2552,19 +3130,11 @@ DASHBOARD_HTML = """
          <button id="ad-recheck-btn" class="btn-reconnect">⟳ Re-check</button>
          <button id="ad-rerun-btn" class="btn-reconnect" style="color:#ff4757;border-color:#ff4757;">⚠ Re-run AD Automation</button>
        </div>
-       <div id="ad-grid" style="padding:16px;">
-         <div style="color:#667788;font-size:13px;">Select a POD to load AD verification status</div>
-       </div>
-     </div>
-     <div class="tab-content" id="tab-scc">
-       <div id="scc-actions" style="display:none;margin-bottom:10px;">
-         <button id="scc-recheck-btn" class="btn-reconnect" onclick="sccRecheckCurrent()">&#x21bb; Re-check Auto</button>
-       </div>
-       <div id="scc-grid" style="min-height:260px;">
-         <div style="color:#667788;font-size:13px;">Select a POD to load SCC reset checklist</div>
-       </div>
-     </div>
-     <div class="tab-content" id="tab-fabric">
+      <div id="ad-grid" style="padding:16px;">
+          <div style="color:#667788;font-size:13px;">Select a POD to load AD verification status</div>
+        </div>
+      </div>
+      <div class="tab-content" id="tab-fabric">
        <div id="fabric-grid" style="padding:16px;min-height:260px;">
          <div style="color:#667788;font-size:13px;">Select a POD to load EVPN Fabric status</div>
        </div>
@@ -2576,6 +3146,21 @@ DASHBOARD_HTML = """
          <div style="color:#667788;font-size:13px;">Select a POD to manage SDA Fabric</div>
        </div>
      </div>
+
+      <div class="tab-content" id="tab-duo">
+        <div id="duo-grid" style="padding:16px;min-height:260px;">
+          <div style="color:#667788;font-size:13px;">Select a POD to manage Duo integration</div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab-scc">
+        <div id="scc-actions" style="display:none;margin-bottom:10px;">
+          <button id="scc-recheck-btn" class="btn-reconnect" onclick="sccRecheckCurrent()">&#x21bb; Re-check Auto</button>
+        </div>
+        <div id="scc-grid" style="min-height:260px;">
+          <div style="color:#667788;font-size:13px;">Select a POD to load SCC reset checklist</div>
+        </div>
+      </div>
 
     <div class="tab-content" id="tab-baseconfig">
       <div id="baseconfig-grid" style="padding:16px;min-height:260px;">
@@ -2610,6 +3195,7 @@ const PIPELINE_ORDER = [
   "copy_bootstrap",
   "controller_mode_enable",
   "verify_online",
+  "redeploy_config_group",
   "verify_border_spine",
   "verify_leaf1",
   "verify_leaf2",
@@ -2658,15 +3244,16 @@ async function load() {
     // Only refresh the active tab to avoid re-rendering all tabs and causing page jumps
     const activeTab = document.querySelector('.tab-btn.active');
     const tabName = activeTab ? activeTab.getAttribute('onclick').match(/switchTab\(this,\s*'(\w+)'\)/)?.[1] : null;
-    if (tabName === 'steps' || tabName === 'pipeline' || !tabName) loadSteps(detailId);
-    else if (tabName === 'switches')  loadSwitches(detailId);
-    else if (tabName === 'cdfmc')     loadCdfmc(detailId);
-    else if (tabName === 'ad')        loadAd(detailId);
-    else if (tabName === 'upgrade')   loadUpgrade(detailId);
-    else if (tabName === 'scc')       loadSccChecklist(detailId);
-    else if (tabName === 'fabric')    loadFabricStatus(detailId);
-    else if (tabName === 'sda')       loadSdaStatus(detailId);
-    else if (tabName === 'baseconfig') loadBaseConfig(detailId);
+     if (tabName === 'steps' || tabName === 'pipeline' || !tabName) loadSteps(detailId);
+     else if (tabName === 'switches')  loadSwitches(detailId);
+     else if (tabName === 'cdfmc')     loadCdfmc(detailId);
+     else if (tabName === 'ad')        loadAd(detailId);
+     else if (tabName === 'upgrade')   loadUpgrade(detailId);
+     else if (tabName === 'fabric')    loadFabricStatus(detailId);
+     else if (tabName === 'sda')       loadSdaStatus(detailId);
+     else if (tabName === 'duo')       loadDuoStatus(detailId);
+     else if (tabName === 'scc')       loadSccChecklist(detailId);
+     else if (tabName === 'baseconfig') loadBaseConfig(detailId);
     // logs tab has its own 2s poller; kb tab is static
   }
 }
@@ -2937,6 +3524,20 @@ function formatDur(start, end) {
 }
 
 async function showPipeline(podId) {
+  // Kill any pollers that were running for a previously-open POD so their
+  // async callbacks cannot write stale data into this panel after the switch.
+  if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
+  if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
+  if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
+  if (window._duoPoller)    { clearInterval(window._duoPoller);    window._duoPoller    = null; }
+  if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
+  // Reset CatC tile so it re-initialises for the new POD
+  const _ct = document.getElementById('catc-tile-container');
+  if (_ct) { _ct._initialized = false; _ct._podId = null; }
+  // Clear the SDA grid so it doesn't flash old-POD data before loadSdaStatus fires
+  const _sg = document.getElementById('sda-grid');
+  if (_sg) { _sg.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>'; _sg._lastHtml = null; _sg._lastPodId = null; }
+
   const panel = document.getElementById('detail-panel');
   const podData = window._lastPods ? window._lastPods.find(p => p.pod_id === podId) : null;
   const podLabel = (podData && podData.pod_number)
@@ -2969,7 +3570,7 @@ async function loadSteps(podId) {
   const done    = steps.filter(s => s.status === 'completed' || s.status === 'skipped').length;
   const skipped = steps.filter(s => s.status === 'skipped').length;
   const running = steps.some(s => s.status === 'running');
-  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify','scc_reset_check']);
+  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','redeploy_config_group','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify']);
   const hardFailed = steps.some(s => s.status === 'failed' && !SOFT_FAIL.has(s.step_name));
   const softFailed = steps.some(s => s.status === 'failed' && SOFT_FAIL.has(s.step_name));
   const allAccountedFor = steps.length > 0 && steps.every(s => s.status === 'completed' || s.status === 'skipped' || s.status === 'failed');
@@ -3545,6 +4146,233 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
+// ── Org Credentials Management ───────────────────────────────────────────────
+async function initOrgCredsList() {
+  const listEl   = document.getElementById('org-creds-list');
+  const countEl  = document.getElementById('org-creds-count');
+  if (!listEl) return;
+  try {
+    const r = await fetch('/api/org-credentials');
+    const orgs = await r.json();
+    // Always update the count badge regardless of panel state
+    if (countEl) countEl.textContent = orgs.length + ' org' + (orgs.length !== 1 ? 's' : '');
+    if (!orgs.length) {
+      listEl.innerHTML = '<div style="font-size:12px;color:#445566;padding:6px 0;">No orgs configured yet. Click <strong style="color:#02c8ff">+ New Org</strong> to add one.</div>';
+    } else {
+      let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:8px;">';
+      orgs.forEach(o => {
+        const upd = (o.updated_at||'').substring(0,10);
+        const uuid = o.scc_org_uuid ? o.scc_org_uuid.substring(0,8) + '\u2026' : '\u2014';
+        html += '<div class="org-card" data-org="' + escHtml(o.org_number) + '">'
+          + '<div style="font-size:14px;font-weight:700;color:#02c8ff;">Org ' + escHtml(o.org_number) + '</div>'
+          + '<div style="font-size:10px;color:#556677;margin-top:3px;font-family:monospace;">' + escHtml(uuid) + '</div>'
+          + '<div style="font-size:10px;color:#334455;margin-top:2px;">' + escHtml(upd) + '</div>'
+          + '</div>';
+      });
+      html += '</div>';
+      listEl.innerHTML = html;
+      setTimeout(() => {
+        listEl.querySelectorAll('.org-card').forEach(el => {
+          el.onclick = () => loadOrgCreds(el.dataset.org);
+        });
+      }, 0);
+    }
+  } catch(e) { listEl.innerHTML = ''; }
+}
+
+function toggleOrgCreds() {
+  const body    = document.getElementById('org-creds-body');
+  const chevron = document.getElementById('org-creds-chevron');
+  const hint    = document.querySelector('#org-creds-header span:last-child');
+  const open    = body.style.display === 'none';
+  body.style.display   = open ? 'block' : 'none';
+  chevron.style.transform = open ? 'rotate(90deg)' : '';
+  if (hint) hint.textContent = open ? 'click to collapse' : 'click to expand';
+  if (open && !document.querySelector('#org-creds-list .org-card')) initOrgCredsList();
+}
+
+async function importOrgCsv(input) {
+  const statusEl = document.getElementById('org-import-status');
+  if (!input.files.length) return;
+  const fd = new FormData();
+  fd.append('file', input.files[0]);
+  input.value = '';  // reset so same file can be re-uploaded
+  statusEl.style.color = '#ffa502'; statusEl.textContent = 'Importing...';
+  try {
+    const r = await fetch('/api/org-credentials/import', {method:'POST', body: fd});
+    const d = await r.json();
+    if (d.error) {
+      statusEl.style.color = '#ff4757'; statusEl.textContent = '\u2717 ' + d.error;
+    } else {
+      statusEl.style.color = '#00e68a';
+      statusEl.textContent = '\u2713 ' + d.imported + ' imported' + (d.skipped ? ', ' + d.skipped + ' skipped' : '');
+      await initOrgCredsList();
+    }
+  } catch(e) {
+    statusEl.style.color = '#ff4757'; statusEl.textContent = '\u2717 ' + e.message;
+  }
+  setTimeout(() => { statusEl.textContent = ''; }, 6000);
+}
+
+async function loadOrgCreds(orgNum) {
+  if (!orgNum) return;
+  window._currentEditOrg = orgNum;  // store for saveOrgCreds onclick
+  document.getElementById('org-new-row').style.display = 'none';
+  // Highlight selected card
+  document.querySelectorAll('.org-card').forEach(el => el.classList.remove('selected'));
+  const card = document.querySelector('.org-card[data-org="' + orgNum + '"]');
+  if (card) card.classList.add('selected');
+
+  const formEl = document.getElementById('org-creds-form');
+  formEl.style.display = 'block';
+  formEl.innerHTML = '<div style="color:#667788;font-size:12px;">Loading...</div>';
+
+  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', duo_saml_app_ikey:'', scc_api_key:'', scc_api_secret:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', scc_email:'', scc_password:'', authproxy_cfg:'', sa_scim_token:''};
+  try {
+    const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum));
+    d = await r.json();
+  } catch(e) {}
+
+  const inp = (id, val, ph, pw) =>
+    '<input id="oc-' + id + '" type="' + (pw ? 'password' : 'text') + '" placeholder="' + escHtml(ph) + '"'
+    + ' style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:4px 7px;font-size:11px;font-family:monospace;box-sizing:border-box;">';
+  const lbl = t => '<div style="font-size:10px;color:#667788;margin-bottom:2px;text-transform:uppercase;">' + t + '</div>';
+  const col = (label, id, val, ph, pw) => '<div>' + lbl(label) + inp(id, val, ph, pw) + '</div>';
+
+  formEl.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">'
+    + '<div style="font-size:12px;font-weight:600;color:#e0e8f0;">Editing: Org ' + escHtml(orgNum) + '</div>'
+    + '<button id="oc-close-btn" style="background:transparent;border:1px solid #334455;color:#667788;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;">&#x2715; Close</button>'
+    + '</div>'
+    + '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px;">'
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;">Duo Admin API</div>'
+    + col('Integration Key (ikey)', 'duo_ikey', d.duo_ikey, 'DIRIBLQ...', false)
+    + col('Secret Key (skey)', 'duo_skey', d.duo_skey, 'Secret...', true)
+    + col('API Hostname', 'duo_host', d.duo_host, 'api-xxxxx.duosecurity.com', false)
+    + '<div style="grid-column:1/-1;">'
+    + lbl('SAML App Integration Key (duo_saml_app_ikey)')
+    + inp('duo_saml_app_ikey', d.duo_saml_app_ikey || '', 'ikey of the Cisco Secure Access SAML app in Duo', false)
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">In Duo Admin portal: Applications \u2192 Protect an Application \u2192 Cisco Secure Access \u2192 copy the Integration Key. Required for step 4 (verify) and step 5 (enroll).</div>'
+    + '</div>'
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Secure Access (SA)</div>'
+    + '<div style="grid-column:1/-1;">'
+    + lbl('SA SCIM Provisioning Token')
+    + inp('sa_scim_token', d.sa_scim_token || '', 'Paste token from SA portal \u2192 Directories \u2192 Integrate \u2192 Duo \u2192 Generate Token', true)
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">One-time token from Cisco Secure Access. Navigate: Connect \u2192 Users, Groups & Endpoint Devices \u2192 Directories \u2192 Integrate \u2192 IdP \u2192 Duo \u2192 Generate Token. Shown only once \u2014 copy immediately. SCIM URL is always <code style="color:#02c8ff;">https://api.sse.cisco.com/identity/v2/scim</code></div>'
+    + '</div>'
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Security Cloud Control (SCC)</div>'
+    + col('SCC API Key', 'scc_api_key', d.scc_api_key, 'e8b04af7-...', false)
+    + col('SCC API Secret', 'scc_api_secret', d.scc_api_secret, 'Secret or eyJ...', true)
+    + '<div style="grid-column:1/-1;font-size:10px;color:#445566;margin-top:-4px;margin-bottom:4px;">Used by the SCC reset check step (step 20). Set once per org \u2014 permanent.</div>'
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Secure Access (SA) API</div>'
+    + col('SA Org ID', 'sa_org_id', d.sa_org_id, '8381539', false)
+    + col('SA API Key', 'sa_api_key', d.sa_api_key, '6671146f...', false)
+    + col('SA API Secret', 'sa_api_secret', d.sa_api_secret, 'Secret...', true)
+    + '<div style="grid-column:1/-1;font-size:10px;color:#445566;margin-top:-4px;margin-bottom:4px;">Used by step 20 (SCC reset) for SSE/Umbrella API (api.sse.cisco.com). Different from SCC CDO credentials above.</div>'
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">SCC Admin Credentials</div>'
+    + '<div style="grid-column:1/-1;">'
+    + lbl('SCC Admin Email')
+    + inp('scc_email', d.scc_email || '', 'ciscoxar1@gmail.com', false)
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Cisco account email used to log into security.cisco.com. Varies per facilitator.</div>'
+    + '</div>'
+    + '<div style="grid-column:1/-1;">'
+    + lbl('SCC Admin Password')
+    + inp('scc_password', d.scc_password || '', 'C1sco12345!!', true)
+    + '</div>'
+    + '<div style="grid-column:1/-1;">'
+    + lbl('Auth Proxy Config (authproxy.cfg content)')
+    + '<textarea id="oc-authproxy_cfg" rows="10" placeholder="[cloud]&#10;ikey=...&#10;skey=...&#10;api_host=api-xxx.duosecurity.com&#10;&#10;[ad_client]&#10;host=198.18.5.102&#10;..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:4px 7px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical;"></textarea>'
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Paste the complete authproxy.cfg downloaded from Duo Admin portal. Include [cloud], [ad_client], and [sso] sections. Stored per-org and pushed verbatim to AD1 at pipeline time.</div>'
+    + '</div>'
+    + '</div>'
+     + '<div id="oc-save-banner" style="display:none;margin-top:8px;padding:8px 14px;border-radius:6px;font-size:13px;font-weight:600;"></div>'
+    + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px;">'
+    + '<button id="oc-save-btn" type="button" onclick="saveOrgCreds(window._currentEditOrg)" style="padding:7px 20px;background:#0d4f6e;border:2px solid #02c8ff;color:#02c8ff;border-radius:5px;cursor:pointer;font-size:13px;font-weight:600;min-width:140px;">&#128190; Save Org ' + escHtml(orgNum) + '</button>'
+    + '<span id="oc-status" style="font-size:11px;color:#667788;"></span>'
+    + '</div>';
+
+  setTimeout(() => {
+    const closeBtn = document.getElementById('oc-close-btn');
+    if (closeBtn) closeBtn.onclick = closeOrgCredsForm;
+
+    // Browsers block HTML value= attribute on type="password" inputs (security feature).
+    // Programmatically setting .value bypasses this — values are visible in the field.
+    const _setVal = (id, val) => { const el = document.getElementById(id); if (el) el.value = val || ''; };
+    _setVal('oc-duo_ikey',          d.duo_ikey);
+    _setVal('oc-duo_skey',          d.duo_skey);
+    _setVal('oc-duo_host',          d.duo_host);
+    _setVal('oc-duo_saml_app_ikey', d.duo_saml_app_ikey);
+    _setVal('oc-sa_scim_token',     d.sa_scim_token);
+    _setVal('oc-scc_api_key',       d.scc_api_key);
+    _setVal('oc-scc_api_secret',    d.scc_api_secret);
+    _setVal('oc-sa_org_id',         d.sa_org_id);
+    _setVal('oc-sa_api_key',        d.sa_api_key);
+    _setVal('oc-sa_api_secret',     d.sa_api_secret);
+    _setVal('oc-scc_email',         d.scc_email);
+    _setVal('oc-scc_password',      d.scc_password);
+    _setVal('oc-authproxy_cfg',     d.authproxy_cfg);
+  }, 0);
+}
+
+async function saveOrgCreds(orgNum) {
+  const btn    = document.getElementById('oc-save-btn');
+  const banner = document.getElementById('oc-save-banner');
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = 'Saving\u2026'; }
+  if (banner) banner.style.display = 'none';
+  const _g = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+  const payload = {
+    duo_ikey:          _g('oc-duo_ikey').trim(),
+    duo_skey:          _g('oc-duo_skey').trim(),
+    duo_host:          _g('oc-duo_host').trim(),
+    duo_saml_app_ikey: _g('oc-duo_saml_app_ikey').trim(),
+    sa_scim_token:     _g('oc-sa_scim_token').trim(),
+    scc_api_key:       _g('oc-scc_api_key').trim(),
+    scc_api_secret:    _g('oc-scc_api_secret').trim(),
+    sa_org_id:         _g('oc-sa_org_id').trim(),
+    sa_api_key:        _g('oc-sa_api_key').trim(),
+    sa_api_secret:     _g('oc-sa_api_secret').trim(),
+    scc_email:         _g('oc-scc_email').trim(),
+    scc_password:      _g('oc-scc_password').trim(),
+    authproxy_cfg:     _g('oc-authproxy_cfg'),
+  };
+  const _showBanner = (ok, msg) => {
+    if (!banner) return;
+    banner.style.display = 'block';
+    banner.style.background = ok ? '#0a3320' : '#3a0a0a';
+    banner.style.border     = ok ? '1px solid #00e68a' : '1px solid #ff4757';
+    banner.style.color      = ok ? '#00e68a' : '#ff4757';
+    banner.textContent      = msg;
+    if (ok) setTimeout(() => { banner.style.display = 'none'; }, 8000);
+  };
+  const _reset = () => {
+    if (!btn) return;
+    btn.disabled = false; btn.style.opacity = '1';
+    btn.style.background = '#0d4f6e'; btn.style.borderColor = '#02c8ff'; btn.style.color = '#02c8ff';
+    btn.textContent = 'Save Org ' + orgNum;
+  };
+  try {
+    const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum),
+      {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    if (r.ok) {
+      const now = new Date().toLocaleTimeString();
+      if (btn) {
+        btn.disabled = false; btn.style.opacity = '1';
+        btn.style.background = '#0a3320'; btn.style.borderColor = '#00e68a'; btn.style.color = '#00e68a';
+        btn.textContent = '\u2713 Saved!';
+        setTimeout(_reset, 3000);
+      }
+      _showBanner(true, '\u2713 Org ' + orgNum + ' saved to database at ' + now);
+      initOrgCredsList();
+    } else {
+      _showBanner(false, '\u2717 Save failed (HTTP ' + r.status + ')');
+      _reset();
+    }
+  } catch(e) {
+    _showBanner(false, '\u2717 Error: ' + e.message);
+    _reset();
+  }
+}
+
 // ── SCC Reset Checklist ──────────────────────────────────────────
 const SCC_AUTO_ITEMS = [
   { key: 'access_policy_rules',  label: 'Access Policy Rules cleared',
@@ -3576,6 +4404,204 @@ const SCC_MANUAL_ITEMS = [
   { key: 'te_integration',label: 'ThousandEyes integration removed',
     desc: 'Secure Access → Experience and Insights → Account Management. Delete ThousandEyes integration.' },
 ];
+
+// ── Duo Setup Panel ──────────────────────────────────────────────────────────
+async function loadDuoPanel(podId) {
+  const grid = document.getElementById('duo-grid');
+  if (!grid) return;
+
+  // Preserve inputs if user is typing
+  if (window._duoKeysDirty) {
+    const ik = document.getElementById('duo-ikey-input');
+    const sk = document.getElementById('duo-skey-input');
+    const hk = document.getElementById('duo-host-input');
+    var savedIkey = ik ? ik.value : '';
+    var savedSkey = sk ? sk.value : '';
+    var savedHost = hk ? hk.value : '';
+  }
+
+  // Fetch stored credentials + latest duo_setup + duo_saml_setup step results
+  let keysD = {duo_ikey: '', duo_skey: '', duo_host: ''};
+  let stepResult = '';
+  let stepStatus = '';
+  let samlResult = '';
+  let samlStatus = '';
+  try {
+    const kr = await fetch('/api/pod-duo-keys/' + podId);
+    keysD = await kr.json();
+  } catch(e) {}
+  try {
+    const sr = await fetch('/api/steps/' + podId);
+    const steps = await sr.json();
+    const s = (steps || []).find(x => x.step_name === 'duo_setup');
+    if (s) { stepResult = s.result || ''; stepStatus = s.status || ''; }
+    const ss = (steps || []).find(x => x.step_name === 'duo_saml_setup');
+    if (ss) { samlResult = ss.result || ''; samlStatus = ss.status || ''; }
+  } catch(e) {}
+
+  if (window._duoKeysDirty) {
+    keysD.duo_ikey = savedIkey;
+    keysD.duo_skey = savedSkey;
+    keysD.duo_host = savedHost;
+  }
+
+  const statusColor = stepStatus === 'completed' ? '#00e68a' : stepStatus === 'failed' ? '#ff4757' : stepStatus === 'running' ? '#ffa502' : '#667788';
+  const statusIcon  = stepStatus === 'completed' ? '✓' : stepStatus === 'failed' ? '✗' : stepStatus === 'running' ? '⟳' : '○';
+  const samlColor   = samlStatus === 'completed' ? '#00e68a' : samlStatus === 'failed' ? '#ff4757' : samlStatus === 'running' ? '#ffa502' : '#667788';
+  const samlIcon    = samlStatus === 'completed' ? '✓' : samlStatus === 'failed' ? '✗' : samlStatus === 'running' ? '⟳' : '○';
+
+  grid.innerHTML =
+    '<div class="switch-card" style="margin-bottom:12px;">'
+    + '<div class="switch-card-title"><span class="role-tag cc">OVERRIDE</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Duo Credentials — POD Override</span></div>'
+    + '<div style="font-size:11px;color:#445566;margin-bottom:6px;">Org-level credentials are used by default. Fill in below only to override for this POD (e.g. if a key was rotated).</div>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:center;margin-top:6px;">'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">Integration Key (ikey)</div>'
+    + '<input id="duo-ikey-input" type="text" value="' + escHtml(keysD.duo_ikey || '') + '" placeholder="DIRIBLQ..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">Secret Key (skey)</div>'
+    + '<input id="duo-skey-input" type="password" value="' + escHtml(keysD.duo_skey || '') + '" placeholder="Secret..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">API Hostname</div>'
+    + '<input id="duo-host-input" type="text" value="' + escHtml(keysD.duo_host || '') + '" placeholder="api-xxxxx.duosecurity.com" style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<button id="duo-keys-save-btn" class="btn-reconnect" style="margin-top:16px;white-space:nowrap;">Save</button>'
+    + '</div>'
+    + '<div id="duo-keys-status" style="font-size:11px;color:#667788;margin-top:4px;min-height:16px;"></div>'
+    + '</div>'
+    + '<div class="switch-card" style="margin-bottom:12px;">'
+    + '<div class="switch-card-title"><span class="role-tag ' + (stepStatus === 'completed' ? 'pass' : 'cc') + '">' + stepStatus.toUpperCase() + '</span>'
+    + '<span style="color:#e0e6ed;font-size:13px;font-weight:600;">duo_setup — Last Run</span>'
+    + '<span style="margin-left:auto;font-size:18px;color:' + statusColor + ';">' + statusIcon + '</span></div>'
+    + (stepResult
+        ? '<div style="font-size:12px;font-family:monospace;color:#c0ccd8;background:#0a1628;border-radius:4px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;word-break:break-all;">'
+           + escHtml(stepResult.replace(/\s*\|\s*/g, '\\n')) + '</div>'
+         : '<div style="color:#445566;font-size:12px;margin-top:6px;">No result yet — run the pipeline to execute this step.</div>')
+     + '</div>'
+     + '<div class="switch-card">'
+     + '<div class="switch-card-title"><span class="role-tag ' + (samlStatus === 'completed' ? 'pass' : samlStatus === 'failed' ? 'fail' : 'cc') + '">' + (samlStatus || 'pending').toUpperCase() + '</span>'
+     + '<span style="color:#e0e6ed;font-size:13px;font-weight:600;">duo_saml_setup — SA+Duo SAML/SCIM</span>'
+     + '<span style="margin-left:auto;font-size:18px;color:' + samlColor + ';">' + samlIcon + '</span></div>'
+     + '<div style="font-size:11px;color:#667788;margin-top:4px;">Configures Duo as IdP for Secure Access SSO via SAML, and syncs users via SCIM. Requires iDAC URL in Org Credentials.</div>'
+     + (samlResult
+         ? '<div style="font-size:12px;font-family:monospace;color:#c0ccd8;background:#0a1628;border-radius:4px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;word-break:break-all;">'
+           + escHtml(samlResult.replace(/\s*\|\s*/g, '\\n')) + '</div>'
+        : '<div style="color:#445566;font-size:12px;margin-top:6px;">Not yet run — click "Setup Duo SAML" to execute.</div>')
+    + '</div>';
+
+  // Show action buttons
+  const actionsEl = document.getElementById('duo-actions');
+  if (actionsEl) {
+    actionsEl.style.display = 'flex';
+    window._duoSamlCurrentPodId = podId;
+  }
+
+  setTimeout(() => {
+    const saveBtn = document.getElementById('duo-keys-save-btn');
+    if (saveBtn) saveBtn.onclick = async () => {
+      const ikey = document.getElementById('duo-ikey-input').value.trim();
+      const skey = document.getElementById('duo-skey-input').value.trim();
+      const host = document.getElementById('duo-host-input').value.trim();
+      const statusEl = document.getElementById('duo-keys-status');
+      if (!ikey || !skey || !host) {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ ikey, skey, and host are all required';
+        return;
+      }
+      statusEl.style.color = '#ffa502';
+      statusEl.textContent = 'Saving...';
+      try {
+        const res = await fetch('/api/pod-duo-keys/' + podId, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({duo_ikey: ikey, duo_skey: skey, duo_host: host})
+        });
+        const d = await res.json();
+        if (d.status === 'ok') {
+          window._duoKeysDirty = false;
+          statusEl.style.color = '#00e68a';
+          statusEl.textContent = '✓ Saved — ready to run duo_setup step';
+        } else {
+          statusEl.style.color = '#ff4757';
+          statusEl.textContent = '✗ Save failed: ' + (d.message || 'unknown error');
+        }
+      } catch(e) {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ Save failed: ' + e;
+      }
+    };
+    const ikeyEl = document.getElementById('duo-ikey-input');
+    const skeyEl = document.getElementById('duo-skey-input');
+    const hostEl = document.getElementById('duo-host-input');
+    if (ikeyEl) ikeyEl.addEventListener('input', () => { window._duoKeysDirty = true; });
+     if (skeyEl) skeyEl.addEventListener('input', () => { window._duoKeysDirty = true; });
+     if (hostEl) hostEl.addEventListener('input', () => { window._duoKeysDirty = true; });
+  }, 0);
+}
+
+// ── Secure Access Keys Panel ─────────────────────────────────────────────────
+async function loadSaPanel(podId) {
+  const grid = document.getElementById('sa-grid');
+  if (!grid) return;
+
+  let keysD = {sa_org_id: '', sa_api_key: '', sa_api_secret: ''};
+  try {
+    const kr = await fetch('/api/pod-sa-keys/' + podId);
+    keysD = await kr.json();
+  } catch(e) {}
+
+  const hasKeys = keysD.sa_api_key && keysD.sa_api_secret;
+
+  grid.innerHTML =
+    '<div class="switch-card" style="margin-bottom:12px;">'
+    + '<div class="switch-card-title"><span class="role-tag cc">OVERRIDE</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Secure Access Credentials — POD Override</span></div>'
+    + '<div style="font-size:11px;color:#445566;margin-bottom:6px;">Org-level credentials are used by default. Fill in below only to override for this POD.</div>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:center;margin-top:6px;">'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">Org ID</div>'
+    + '<input id="sa-orgid-input" type="text" value="' + escHtml(keysD.sa_org_id || '') + '" placeholder="8381539" style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">API Key</div>'
+    + '<input id="sa-apikey-input" type="text" value="' + escHtml(keysD.sa_api_key || '') + '" placeholder="6671146f..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<div><div style="font-size:10px;color:#667788;margin-bottom:3px;text-transform:uppercase;">API Secret</div>'
+    + '<input id="sa-secret-input" type="password" value="' + escHtml(keysD.sa_api_secret || '') + '" placeholder="Secret..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:5px 8px;font-size:12px;font-family:monospace;box-sizing:border-box;" /></div>'
+    + '<button id="sa-keys-save-btn" class="btn-reconnect" style="margin-top:16px;white-space:nowrap;">Save</button>'
+    + '</div>'
+    + '<div id="sa-keys-status" style="font-size:11px;color:#667788;margin-top:4px;min-height:16px;">'
+    + (hasKeys ? '&#10003; Keys stored in DB' : '') + '</div>'
+    + '</div>'
+    + '<div class="switch-card">'
+    + '<div class="switch-card-title"><span class="role-tag cc">INFO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automation Status</span></div>'
+    + '<div style="font-size:12px;color:#667788;margin-top:6px;">SA SCIM token provisioning and Duo SAML/SCIM integration are automated via the <b>duo_saml_setup</b> pipeline step. Configure iDAC URL in Org Credentials then click "Setup Duo SAML" in the Duo tab.</div>'
+    + '</div>';
+
+  setTimeout(() => {
+    const saveBtn = document.getElementById('sa-keys-save-btn');
+    if (saveBtn) saveBtn.onclick = async () => {
+      const org_id = document.getElementById('sa-orgid-input').value.trim();
+      const key    = document.getElementById('sa-apikey-input').value.trim();
+      const secret = document.getElementById('sa-secret-input').value.trim();
+      const statusEl = document.getElementById('sa-keys-status');
+      if (!org_id || !key || !secret) {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ org_id, api_key, and api_secret are all required';
+        return;
+      }
+      statusEl.style.color = '#ffa502';
+      statusEl.textContent = 'Saving...';
+      try {
+        const res = await fetch('/api/pod-sa-keys/' + podId, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({sa_org_id: org_id, sa_api_key: key, sa_api_secret: secret})
+        });
+        if (res.ok) {
+          statusEl.style.color = '#00e68a';
+          statusEl.textContent = '✓ Saved to DB';
+        } else {
+          statusEl.style.color = '#ff4757';
+          statusEl.textContent = '✗ Save failed';
+        }
+      } catch(e) {
+        statusEl.style.color = '#ff4757';
+        statusEl.textContent = '✗ ' + e.message;
+      }
+    };
+  }, 0);
+}
 
 async function loadSccChecklist(podId) {
   const grid = document.getElementById('scc-grid');
@@ -3732,6 +4758,43 @@ async function sccRecheckCurrent() {
   if (window._sccCurrentPodId) sccRecheck(window._sccCurrentPodId);
 }
 
+async function duoSamlSetupCurrent() {
+  const podId = window._duoSamlCurrentPodId;
+  if (!podId) return;
+  const grid = document.getElementById('duo-grid');
+  await fetch('/api/duo-saml-setup/' + podId, { method: 'POST' });
+
+  // Poll for completion
+  let polls = 0;
+  const MAX_POLLS = 120; // 10 min max (5s interval)
+  const notice = document.createElement('div');
+  notice.id = 'duo-saml-status-notice';
+  notice.style.cssText = 'padding:10px 0;color:#02c8ff;font-size:13px;';
+  notice.textContent = '⟳ Running SA+Duo SAML/SCIM setup (this may take ~60s)...';
+  if (grid) grid.prepend(notice);
+
+  const poller = setInterval(async () => {
+    polls++;
+    try {
+      const r = await fetch('/api/pipeline-steps/' + podId);
+      const steps = await r.json();
+      const s = (steps || []).find(x => x.step_name === 'duo_saml_setup');
+      if (s && s.status !== 'running') {
+        clearInterval(poller);
+        loadDuoPanel(podId);
+        return;
+      }
+      const n = document.getElementById('duo-saml-status-notice');
+      if (n) n.textContent = '⟳ Running SA+Duo SAML/SCIM setup (' + (polls * 5) + 's)...';
+      if (polls >= MAX_POLLS) {
+        clearInterval(poller);
+        loadDuoPanel(podId);
+      }
+    } catch(e) { /* keep polling */ }
+  }, 5000);
+  window._duoSamlPoller = poller;
+}
+
 async function sccRecheck(podId) {
   const grid = document.getElementById('scc-grid');
   await fetch('/api/scc/recheck/' + podId, { method: 'POST' });
@@ -3776,25 +4839,29 @@ async function sccRecheckCancel(podId) {
 }
 
 function switchTab(btn, name) {
+  // Kill pollers that belong to the tab we are leaving so they don't
+  // bleed data into a tab that is no longer visible.
+  if (name !== 'fabric') {
+    if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
+    if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
+  }
+  if (name !== 'sda') {
+    if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
+    if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
+  }
+
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
-  if (name === 'scc') {
-    const podId = document.getElementById('detail-pod-id').dataset.podId;
-    if (podId) loadSccChecklist(podId);
-  }
-  if (name === 'fabric') {
-    const podId = document.getElementById('detail-pod-id').dataset.podId;
-    if (podId) loadFabricStatus(podId);
-  }
-  if (name === 'baseconfig') {
-    const podId = document.getElementById('detail-pod-id').dataset.podId;
-    if (podId) loadBaseConfig(podId);
-  }
-  if (name === 'kb') {
-    loadKbTab();
-  }
+
+  const podId = document.getElementById('detail-pod-id').dataset.podId;
+  if (name === 'duo')        { if (podId) loadDuoStatus(podId); }
+  if (name === 'scc')        { if (podId) loadSccChecklist(podId); }
+  if (name === 'fabric')     { if (podId) loadFabricStatus(podId); }
+  if (name === 'sda')        { if (podId) loadSdaStatus(podId); }
+  if (name === 'baseconfig') { if (podId) loadBaseConfig(podId); }
+  if (name === 'kb')         { loadKbTab(); }
 }
 
 const FABRIC_STEPS = [
@@ -3841,14 +4908,35 @@ const FABRIC_STEP_COMMANDS = {
   verify_nve_peers: "show nve peers",
 };
 
-async function loadFabricStatus(podId) {
-  const grid = document.getElementById('fabric-grid');
-  if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
-  if (!grid._lastHtml) grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
-  const r = await fetch('/api/fabric/status/' + podId);
-  const data = await r.json();
-  renderFabricGrid(podId, data.steps || {});
-}
+ async function loadFabricStatus(podId) {
+   // Kill any stale poller before rendering (e.g. POD switch)
+   if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
+   const grid = document.getElementById('fabric-grid');
+   if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+   if (!grid._lastHtml) grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
+   const r = await fetch('/api/fabric/status/' + podId);
+   const data = await r.json();
+   renderFabricGrid(podId, data.steps || {});
+   // Start a poller if any step is currently running (mirrors _sdaPoller behaviour)
+   const anyRunning = Object.values(data.steps || {}).some(s => (s || {}).status === 'running');
+   if (anyRunning) _fabricStartPoller(podId);
+ }
+
+ function _fabricStartPoller(podId) {
+   if (window._fabricPoller) clearInterval(window._fabricPoller);
+   let polls = 0;
+   window._fabricPoller = setInterval(async () => {
+     polls++;
+     const r = await fetch('/api/fabric/status/' + podId);
+     const data = await r.json();
+     renderFabricGrid(podId, data.steps || {});
+     const anyRunning = Object.values(data.steps || {}).some(s => (s || {}).status === 'running');
+     if (!anyRunning || polls > 200) {
+       clearInterval(window._fabricPoller);
+       window._fabricPoller = null;
+     }
+   }, 3000);
+ }
 
 function renderFabricGrid(podId, steps) {
   const grid = document.getElementById('fabric-grid');
@@ -3945,11 +5033,12 @@ function renderFabricGrid(podId, steps) {
   html += '</div>';
 
   // Only update DOM if content changed — prevents scroll jump on re-render
-  // Include podId in the key so switching PODs always forces a re-render + button rewire
-  const newHtml = podId + '|' + html;
-  if (grid._lastHtml === newHtml) return;
+  // Also force re-render when podId changes so button handlers are re-attached
+  const newHtml = html;
+  if (grid._lastHtml === newHtml && grid._lastPodId === podId) return;
   grid._lastHtml = newHtml;
-  grid.innerHTML = html;
+  grid._lastPodId = podId;
+  grid.innerHTML = newHtml;
 
   setTimeout(() => {
     const runBtn    = document.getElementById('fabric-run-btn');
@@ -3978,7 +5067,7 @@ const BASECONFIG_SWITCHES = {
 
 const SDA_DEPLOY_STEP_KEYS = [
   "discovery","provision","fabric_site","virtual_networks",
-  "anycast_gateways","transit","clean_fabric_vlans","fabric_devices","l3_handoff",
+  "anycast_gateways","transit","fabric_devices","ise_nads","l3_handoff",
   "configure_handoff_interface","deploy_anycast_gateways",
   "port_assignments","verify"
 ];
@@ -3989,8 +5078,8 @@ const SDA_DEPLOY_STEP_LABELS = {
   virtual_networks:             "Create L3 VNs",
   anycast_gateways:             "Anycast Gateways",
   transit:                      "XAR-Transit",
-  clean_fabric_vlans:           "Clean Conflicting VLANs",
   fabric_devices:               "Fabric Devices",
+  ise_nads:                     "Register ISE NADs",
   l3_handoff:                   "L3 Handoff",
   configure_handoff_interface:  "Configure Handoff Interface",
   deploy_anycast_gateways:      "Deploy Anycast Gateways",
@@ -4004,8 +5093,8 @@ const SDA_DEPLOY_STEP_TARGETS = {
   virtual_networks:             "Main / PROD / IOT",
   anycast_gateways:             "VLAN 10 / 101 / 102",
   transit:                      "BGP ASN 65534",
-  clean_fabric_vlans:           "All 3 switches",
   fabric_devices:               "Border+CP + Leaf1+Leaf2",
+  ise_nads:                     "Loopback0 172.30.255.x",
   l3_handoff:                   "CatC API",
   configure_handoff_interface:  "Gi1/0/48 sub-ints",
   deploy_anycast_gateways:      "CatC → Leaf2 SVIs",
@@ -4158,9 +5247,9 @@ function renderSdaGrid(podId, data) {
   });
   html += '</div>';
 
-  // Include podId in the key so switching PODs always forces a re-render + button rewire
-  if (grid._lastHtml === podId + '|' + html) return;
-  grid._lastHtml = podId + '|' + html;
+  if (grid._lastHtml === html && grid._lastPodId === podId) return;
+  grid._lastHtml = html;
+  grid._lastPodId = podId;
   grid.innerHTML = html;
 
   // Wire buttons
@@ -4181,10 +5270,16 @@ function renderSdaCatcTile(podId) {
   const container = document.getElementById('sda-catc-tile-container');
   if (!container || !podId) return;
 
-  // Build HTML shell only once; always rewire buttons for current podId
-  if (!container._initialized) {
-    container._initialized = true;
-    container.innerHTML =
+  // Re-initialize if podId changed — avoids stale closure on buttons when switching PODs
+  if (container._initialized && container._podId === podId) {
+    loadSdaCatcStatus(podId);
+    return;
+  }
+  container._initialized = true;
+  container._podId = podId;
+  // Clear any stale poll from previous POD
+  if (window._sdaCatcPoll) { clearInterval(window._sdaCatcPoll); window._sdaCatcPoll = null; }
+  container.innerHTML =
       '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
         '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
           '<div>' +
@@ -4199,11 +5294,10 @@ function renderSdaCatcTile(podId) {
         '</div>' +
         '<div id="sda-catc-progress-area"></div>' +
       '</div>';
-  }
-  // Always rewire so switching PODs updates the target (onclick replaces any prior handler)
-  document.getElementById('sda-catc-discover-btn').onclick = () => triggerSdaCatcDiscover(podId);
-  document.getElementById('sda-catc-rerun-btn').onclick    = () => triggerSdaCatcDiscover(podId);
-  document.getElementById('sda-catc-reset-btn').onclick    = () => resetSdaCatcDiscover(podId);
+
+  document.getElementById('sda-catc-discover-btn').addEventListener('click', () => triggerSdaCatcDiscover(podId));
+  document.getElementById('sda-catc-rerun-btn').addEventListener('click',    () => triggerSdaCatcDiscover(podId));
+  document.getElementById('sda-catc-reset-btn').addEventListener('click',    () => resetSdaCatcDiscover(podId));
 
   loadSdaCatcStatus(podId);
 }
@@ -4250,6 +5344,9 @@ async function loadSdaCatcStatus(podId) {
 }
 
 async function triggerSdaCatcDiscover(podId) {
+  // Clear any stale poll (re-click or POD switch mid-run)
+  if (window._sdaCatcPoll) { clearInterval(window._sdaCatcPoll); window._sdaCatcPoll = null; }
+
   const btn   = document.getElementById('sda-catc-discover-btn');
   const rerun = document.getElementById('sda-catc-rerun-btn');
   const area  = document.getElementById('sda-catc-progress-area');
@@ -4267,11 +5364,12 @@ async function triggerSdaCatcDiscover(podId) {
   }
 
   let polls = 0;
-  const poll = setInterval(async () => {
+  window._sdaCatcPoll = setInterval(async () => {
     polls++;
     const sr = await loadSdaCatcStatus(podId);
     if (!sr || !sr.running || polls >= 60) {
-      clearInterval(poll);
+      clearInterval(window._sdaCatcPoll);
+      window._sdaCatcPoll = null;
       // Final refresh to ensure terminal state is rendered
       await loadSdaCatcStatus(podId);
       if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
@@ -4292,6 +5390,8 @@ async function resetSdaCatcDiscover(podId) {
 }
 
 async function loadSdaStatus(podId) {
+  // Always kill any stale poller from a previous POD before rendering
+  if (window._sdaPoller) { clearInterval(window._sdaPoller); window._sdaPoller = null; }
   const grid = document.getElementById('sda-grid');
   if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
   const data = await fetch('/api/sda/status/' + podId).then(r => r.json());
@@ -4388,6 +5488,135 @@ async function triggerSda(podId, action) {
 async function clearSda(podId) {
   await fetch('/api/sda/clear/' + podId, { method: 'POST' });
   loadSdaStatus(podId);
+}
+
+// ── Duo Card JS ───────────────────────────────────────────────────────────────
+
+const DUO_CARD_STEPS = ['org_setup','authproxy_push','ad_sync','saml_scim_config','authproxy_enroll','scim_push','verify'];
+const DUO_CARD_LABELS = {
+  org_setup:        'Duo Org Setup',
+  authproxy_push:   'Auth Proxy Push',
+  ad_sync:          'AD Directory Sync',
+  saml_scim_config: 'SA SAML + SCIM Config',
+  authproxy_enroll: 'Auth Proxy Enroll',
+  scim_push:        'SA SCIM User Push',
+  verify:           'Verify Auth Proxy',
+};
+const DUO_REFRESH_ONLY = new Set(['saml_scim_config']);  // skipped in refresh mode
+
+async function loadDuoStatus(podId) {
+  if (window._duoPoller) { clearInterval(window._duoPoller); window._duoPoller = null; }
+  const grid = document.getElementById('duo-grid');
+  if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+  if (!grid._lastHtml) grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
+  const r = await fetch('/api/duo/status/' + podId);
+  const data = await r.json();
+  renderDuoGrid(podId, data);
+  const anyRunning = Object.values(data.steps || {}).some(s => (s||{}).status === 'running');
+  if (anyRunning) _duoStartPoller(podId);
+}
+
+function _duoStartPoller(podId) {
+  if (window._duoPoller) clearInterval(window._duoPoller);
+  let polls = 0;
+  window._duoPoller = setInterval(async () => {
+    polls++;
+    const r = await fetch('/api/duo/status/' + podId);
+    const data = await r.json();
+    renderDuoGrid(podId, data);
+    const anyRunning = Object.values(data.steps || {}).some(s => (s||{}).status === 'running');
+    if (!anyRunning || polls > 200) {
+      clearInterval(window._duoPoller);
+      window._duoPoller = null;
+    }
+  }, 3000);
+}
+
+function renderDuoGrid(podId, data) {
+  const grid = document.getElementById('duo-grid');
+  if (!grid) return;
+  const steps = data.steps || {};
+  const mode  = data.mode  || 'unknown';
+  const total   = DUO_CARD_STEPS.length;
+  const done    = DUO_CARD_STEPS.filter(s => ['completed','skipped'].includes((steps[s]||{}).status)).length;
+  const failed  = DUO_CARD_STEPS.filter(s => (steps[s]||{}).status === 'failed').length;
+  const running = DUO_CARD_STEPS.some(s => (steps[s]||{}).status === 'running');
+  const pct     = Math.min(100, Math.round(done / total * 100));
+  const barColor = failed ? '#ff4757' : running ? '#02c8ff' : done === total ? '#00e68a' : '#667788';
+  const labelText = failed  ? 'Failed — ' + failed + ' step(s) failed'
+                  : running ? 'Running \u2014 ' + done + '/' + total
+                  : done === total ? 'Complete!'
+                  : done === 0    ? 'Not started'
+                  : 'Paused \u2014 ' + done + '/' + total;
+  const modeBadge = mode === 'refresh'    ? '<span style="background:#1a3a5c;color:#02c8ff;font-size:10px;padding:2px 7px;border-radius:10px;margin-left:8px;">SESSION REFRESH</span>'
+                  : mode === 'full_setup' ? '<span style="background:#2a1a4a;color:#b39ddb;font-size:10px;padding:2px 7px;border-radius:10px;margin-left:8px;">FULL SETUP</span>'
+                  : mode === 'partial'    ? '<span style="background:#3a2a0a;color:#ffb74d;font-size:10px;padding:2px 7px;border-radius:10px;margin-left:8px;">PARTIAL</span>'
+                  : '';
+  const isRunning = running;
+
+  let html = '';
+  // Header
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
+  html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">Duo / SA Integration' + modeBadge + '</span>';
+  html += '<div style="display:flex;gap:8px;">';
+  html += '<button id="duo-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>&#9654; Run</button>';
+  html += '<button id="duo-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;"' + (isRunning ? ' disabled' : '') + '>&#8635; Reset</button>';
+  html += '</div></div>';
+  // Progress bar
+  html += '<div style="margin-bottom:14px;">';
+  html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
+  html += '<span>' + labelText + '</span><span>' + pct + '% (' + done + '/' + total + ')</span></div>';
+  html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
+  html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
+  html += '</div></div>';
+  // Step cards
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px;">';
+  DUO_CARD_STEPS.forEach((s, i) => {
+    const info   = steps[s] || {};
+    const st     = info.status || 'pending';
+    const result = (info.result || '').substring(0, 180);
+    const dur    = formatDur(info.started_at, info.completed_at);
+    const cardBorder = st === 'failed'    ? 'border-left:3px solid #ff4757;'
+                     : st === 'running'   ? 'border-left:3px solid #02c8ff;'
+                     : st === 'completed' ? 'border-left:3px solid #00e68a;'
+                     : st === 'skipped'   ? 'border-left:3px solid #445566;opacity:0.7;'
+                     : '';
+    html += '<div class="step-card" style="' + cardBorder + '">';
+    html += '<div class="step-num">Step ' + (i+1) + '/' + total + '</div>';
+    html += '<div class="step-name">' + (DUO_CARD_LABELS[s]||s) + '</div>';
+    html += pipelineBadge(st);
+    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (dur)    html += '<div class="step-dur">' + dur + '</div>';
+    html += '</div>';
+  });
+  html += '</div>';
+
+  grid.innerHTML = html;
+  grid._lastHtml = true;
+
+  // Wire buttons after render
+  setTimeout(() => {
+    const runBtn   = document.getElementById('duo-run-btn');
+    const resetBtn = document.getElementById('duo-reset-btn');
+    if (runBtn)   runBtn.onclick   = () => duoRun(podId);
+    if (resetBtn) resetBtn.onclick = () => duoReset(podId);
+  }, 0);
+}
+
+async function duoRun(podId, fromStep) {
+  await fetch('/api/duo/run/' + podId, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({from_step: fromStep || 0}),
+  });
+  await loadDuoStatus(podId);
+  _duoStartPoller(podId);
+}
+
+async function duoReset(podId) {
+  if (!confirm('Clear all Duo steps for ' + podId + '?')) return;
+  await fetch('/api/duo/reset/' + podId, { method: 'POST' });
+  loadDuoStatus(podId);
 }
 
 // Tick running switch-reset timers every second without a full re-render.
@@ -4573,8 +5802,9 @@ function renderBaseConfigGrid(podId, statusData) {
   html += '<div id="baseconfig-log" style="margin-top:14px;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:10px;font-size:11px;font-family:monospace;color:#8899aa;max-height:160px;overflow-y:auto;display:none;"></div>';
 
   // Only rebuild DOM if content changed
-  if (grid._lastHtml === html) return;
+  if (grid._lastHtml === html && grid._lastPodId === podId) return;
   grid._lastHtml = html;
+  grid._lastPodId = podId;
   grid.innerHTML = html;
 
   // Rebuild the 1-second timer registry from the current status data
@@ -4755,10 +5985,16 @@ function renderCatcTile(podId) {
   const container = document.getElementById('catc-tile-container');
   if (!container || !podId) return;
 
-  // Build HTML shell only once; always rewire buttons for current podId
-  if (!container._initialized) {
-    container._initialized = true;
-    container.innerHTML =
+  // Re-initialize if podId changed — avoids stale closure on buttons when switching PODs
+  if (container._initialized && container._podId === podId) {
+    loadCatcStatus(podId);
+    return;
+  }
+  container._initialized = true;
+  container._podId = podId;
+  // Clear any stale poll from previous POD
+  if (window._catcPoll) { clearInterval(window._catcPoll); window._catcPoll = null; }
+  container.innerHTML =
       '<div style="background:#0a1628;border:1px solid #1a2d4a;border-radius:8px;padding:14px;">' +
         '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
           '<div>' +
@@ -4773,16 +6009,18 @@ function renderCatcTile(podId) {
         '</div>' +
         '<div id="catc-progress-area"></div>' +
       '</div>';
-  }
-  // Always rewire so switching PODs updates the target (onclick replaces any prior handler)
-  document.getElementById('catc-discover-btn').onclick = () => triggerCatcDiscover(podId);
-  document.getElementById('catc-rerun-btn').onclick    = () => triggerCatcDiscover(podId);
-  document.getElementById('catc-reset-btn').onclick    = () => resetCatcDiscover(podId);
+
+  document.getElementById('catc-discover-btn').addEventListener('click', () => triggerCatcDiscover(podId));
+  document.getElementById('catc-rerun-btn').addEventListener('click',    () => triggerCatcDiscover(podId));
+  document.getElementById('catc-reset-btn').addEventListener('click',    () => resetCatcDiscover(podId));
 
   loadCatcStatus(podId);
 }
 
 async function triggerCatcDiscover(podId) {
+  // Clear any stale poll (re-click or POD switch mid-run)
+  if (window._catcPoll) { clearInterval(window._catcPoll); window._catcPoll = null; }
+
   const btn   = document.getElementById('catc-discover-btn');
   const rerun = document.getElementById('catc-rerun-btn');
   const area  = document.getElementById('catc-progress-area');
@@ -4801,11 +6039,12 @@ async function triggerCatcDiscover(podId) {
 
   // Poll until done
   let polls = 0;
-  const poll = setInterval(async () => {
+  window._catcPoll = setInterval(async () => {
     polls++;
     const sr = await loadCatcStatus(podId);
     if (!sr || !sr.running || polls >= 60) {
-      clearInterval(poll);
+      clearInterval(window._catcPoll);
+      window._catcPoll = null;
       // Final refresh to ensure terminal state is rendered
       await loadCatcStatus(podId);
       if (btn)   { btn.disabled = false;   btn.innerHTML = '&#128269; Discover'; }
@@ -4832,6 +6071,15 @@ function closeDetail() {
   el.dataset.podId = '';
   if (logPollId) clearInterval(logPollId);
   if (stepPollId) { clearInterval(stepPollId); stepPollId = null; }
+  // Clear CatC tile polls and reset _initialized so buttons re-wire on next open
+  if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
+  if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
+  if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
+  if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
+  const ct = document.getElementById('catc-tile-container');
+  if (ct) { ct._initialized = false; ct._podId = null; }
+  const sct = document.getElementById('sda-catc-tile-container');
+  if (sct) { sct._initialized = false; sct._podId = null; }
 }
 
 async function connectAllVpn() {
@@ -4869,6 +6117,7 @@ async function dockerDown() {
 load();
 setInterval(load, 5000);
 loadUpgradeConfig();
+initOrgCredsList();
 
 // ── Knowledge Base ────────────────────────────────────────────────────────────
 let _kbCurrentId = null;

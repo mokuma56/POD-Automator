@@ -51,7 +51,7 @@ DB_PATH = os.environ.get("DB_PATH", os.path.expanduser("~/sw_projects/pod_automa
 
 def ensure_sda_table():
     try:
-        c = sqlite3.connect(DB_PATH)
+        c = sqlite3.connect(DB_PATH, timeout=10)
         c.execute("""
             CREATE TABLE IF NOT EXISTS sda_steps (
                 pod_id       TEXT NOT NULL,
@@ -70,30 +70,42 @@ def ensure_sda_table():
         print(f"Warning: could not create sda_steps table: {e}")
 
 
-def _set_step(mode, step_name, status, result=None):
-    """Upsert a step row. Sets started_at on first RUNNING, completed_at on OK/FAILED."""
-    try:
-        c = sqlite3.connect(DB_PATH)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        row = c.execute(
-            "SELECT started_at FROM sda_steps WHERE pod_id=? AND mode=? AND step_name=?",
-            (POD_ID, mode, step_name)
-        ).fetchone()
-        started = (row[0] if row else None) or (now if status == "running" else None)
-        completed = now if status in ("completed", "failed") else None
-        c.execute("""
-            INSERT INTO sda_steps (pod_id, mode, step_name, status, started_at, completed_at, result)
-            VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT(pod_id, mode, step_name) DO UPDATE SET
-                status=excluded.status,
-                started_at=COALESCE(excluded.started_at, started_at),
-                completed_at=excluded.completed_at,
-                result=excluded.result
-        """, (POD_ID, mode, step_name, status, started, completed, result))
-        c.commit()
-        c.close()
-    except Exception as e:
-        print(f"Warning: _set_step failed: {e}")
+def _set_step(mode, step_name, status, result=None, _retries=5, _retry_delay=2):
+    """Upsert a step row. Sets started_at on first RUNNING, completed_at on OK/FAILED.
+
+    Retries up to _retries times on transient SQLite errors (locked / disk I/O)
+    so that a momentary volume-mount hiccup cannot silently leave a step stuck
+    at 'running' forever.
+    """
+    last_err = None
+    for attempt in range(1, _retries + 1):
+        try:
+            c = sqlite3.connect(DB_PATH, timeout=10)
+            now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            row = c.execute(
+                "SELECT started_at FROM sda_steps WHERE pod_id=? AND mode=? AND step_name=?",
+                (POD_ID, mode, step_name)
+            ).fetchone()
+            started = (row[0] if row else None) or (now if status == "running" else None)
+            completed = now if status in ("completed", "failed") else None
+            c.execute("""
+                INSERT INTO sda_steps (pod_id, mode, step_name, status, started_at, completed_at, result)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(pod_id, mode, step_name) DO UPDATE SET
+                    status=excluded.status,
+                    started_at=COALESCE(excluded.started_at, started_at),
+                    completed_at=excluded.completed_at,
+                    result=excluded.result
+            """, (POD_ID, mode, step_name, status, started, completed, result))
+            c.commit()
+            c.close()
+            return  # success
+        except Exception as e:
+            last_err = e
+            if attempt < _retries:
+                print(f"Warning: _set_step attempt {attempt}/{_retries} failed ({e}), retrying in {_retry_delay}s...")
+                time.sleep(_retry_delay)
+    print(f"Warning: _set_step permanently failed after {_retries} attempts: {last_err}")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -115,7 +127,7 @@ WLC_IP      = "198.18.5.103"
 WLC_SITE_ID = "ac7aeac8-fba7-4776-9b3e-feb20384bb44"  # Global/CALIFORNIA/San Jose/DC-Site-10/MAIN
 WLC_SITE    = "Global/CALIFORNIA/San Jose/DC-Site-10/MAIN"
 WLC_CRED_IDS = [
-    "498ac0e2-c14f-4e2a-8365-249055daf3ee",  # CLI admin/C1sco12345 (WLC)
+    "82d24eba-dcc0-4fb8-8810-137d190bf90f",  # CLI netadmin (same cred as switches)
     "e6b5e009-5aa3-41b2-a576-d92e6a4c8f02",  # SNMPv2 Read
     "07d96097-7dac-4929-a9d6-622eb43f3d3e",  # SNMPv2 Write
     "d6e2d122-0a7b-42a9-87cf-6a21f1d12e2a",  # NETCONF
@@ -210,6 +222,7 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
 
     # Ordered teardown: dependent commands first, then aaa new-model
     pre_cmds = [
+        "no aaa accounting dot1x default start-stop group dnac-client-radius-group",
         "no aaa accounting identity default start-stop group dnac-client-radius-group",
         "no aaa accounting update newinfo periodic 2880",
         "no aaa authorization network dnac-cts-list group dnac-client-radius-group",
@@ -306,7 +319,18 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
         for pm in POLICY_MAPS:
             send(f"no policy-map type control subscriber {pm}", 0.5)
 
-        # Step 4: Remove AAA/dot1x config
+        # Step 4a: Dynamically discover and remove ALL radius server entries.
+        # CatC names its server 'dnac-radius_<IP>'; our DOT1X_SECURITY uses 'ISE';
+        # both match CatC's NCSO20070 "radius server groupName" pre-flight check.
+        rs_out = send("show run | include ^radius server", 1.5)
+        for line in rs_out.splitlines():
+            line = line.strip()
+            if line.startswith("radius server "):
+                rs_name = line[len("radius server "):].strip()
+                if rs_name:
+                    send(f"no radius server {rs_name}", 0.4)
+
+        # Step 4b: Remove AAA/dot1x config
         for cmd in pre_cmds:
             send(cmd, 0.4)
         # aaa new-model requires [confirm] on IOS-XE
@@ -322,6 +346,16 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
             except Exception:
                 pass
         send("no aaa session-id common", 0.5)
+        # Restore minimal AAA so SSH stays functional after cleaning
+        send("configure terminal", 0.5)
+        send("aaa new-model", 0.5)
+        send("aaa authentication login default local", 0.5)
+        send("aaa authorization exec default local", 0.5)
+        send(f"username {SWITCH_USER} privilege 15 secret {SWITCH_PASS}", 0.5)
+        send("line vty 0 15", 0.3)
+        send("login authentication default", 0.3)
+        send("transport input ssh telnet", 0.3)
+        send("exit", 0.3)
         send("end", 0.5)
         # write memory — use copy run start in case privilege dropped
         chan.send("copy running-config startup-config\n"); _time.sleep(1)
@@ -363,6 +397,104 @@ def _ssh_clean_auth_config(mgmt_ip, log_fn=print):
             log_fn(f"    {mgmt_ip}: auth config cleaned (NETCONF class-map delete skipped: {e})")
     except Exception as e:
         log_fn(f"    WARNING: auth cleanup SSH to {mgmt_ip} failed: {e}")
+
+
+def _ssh_push_aaa_config(mgmt_ip, log_fn=print):
+    """Push the full AAA/RADIUS/dot1x stack to an edge node via SSH.
+
+    CatC does NOT push AAA config after a fabric-devices POST (despite what
+    its documentation implies).  We push it directly so workstations can
+    authenticate against ISE via dot1x/MAB.
+    """
+    import time as _time
+    ISE_IP  = "198.18.5.101"
+    ISE_KEY = "C1sco12345"
+    RS_NAME = f"dnac-radius_{ISE_IP}"
+
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=20, allow_agent=False, look_for_keys=False)
+        chan = client.invoke_shell()
+        chan.settimeout(10)
+        _time.sleep(1)
+        try:
+            chan.recv(4096)
+        except Exception:
+            pass
+
+        def send(cmd, wait=0.5):
+            chan.send(cmd + "\n")
+            _time.sleep(wait)
+            out = b""
+            while chan.recv_ready():
+                try:
+                    out += chan.recv(4096)
+                except Exception:
+                    break
+            return out.decode(errors="ignore")
+
+        send("terminal length 0", 0.5)
+        send("enable", 0.5)
+        send("configure terminal", 0.5)
+
+        # Radius server sub-mode
+        send(f"radius server {RS_NAME}", 0.4)
+        send(f"address ipv4 {ISE_IP} auth-port 1812 acct-port 1813", 0.4)
+        send("automate-tester username dummy ignore-acct-port probe-on", 0.4)
+        send(f"key {ISE_KEY}", 0.4)
+        send("exit", 0.4)
+
+        # AAA server group
+        send("aaa group server radius dnac-client-radius-group", 0.4)
+        send(f"server name {RS_NAME}", 0.4)
+        send("ip radius source-interface Loopback0", 0.4)
+        send("exit", 0.4)
+
+        # AAA authentication
+        send("aaa authentication login dnac-cts-list group dnac-client-radius-group local", 0.4)
+        send("aaa authentication dot1x default group dnac-client-radius-group", 0.4)
+
+        # AAA authorization
+        send("aaa authorization network default group dnac-client-radius-group", 0.4)
+        send("aaa authorization network dnac-cts-list group dnac-client-radius-group", 0.4)
+
+        # AAA accounting
+        send("aaa accounting update newinfo periodic 2880", 0.4)
+        send("aaa accounting dot1x default start-stop group dnac-client-radius-group", 0.4)
+        send("aaa accounting identity default start-stop group dnac-client-radius-group", 0.4)
+
+        # Dynamic authorization (CoA from ISE)
+        send("aaa server radius dynamic-author", 0.4)
+        send(f"client {ISE_IP} server-key {ISE_KEY}", 0.4)
+        send("auth-type all", 0.4)
+        send("exit", 0.4)
+
+        # Global radius source interface
+        send("ip radius source-interface Loopback0", 0.4)
+
+        send("end", 0.5)
+
+        # Save config
+        chan.send("copy running-config startup-config\n")
+        _time.sleep(1)
+        try:
+            out = chan.recv(4096).decode(errors="ignore")
+        except Exception:
+            out = ""
+        if "?" in out or "filename" in out.lower():
+            chan.send("\n")
+            _time.sleep(3)
+            try:
+                chan.recv(4096)
+            except Exception:
+                pass
+
+        log_fn(f"    {mgmt_ip}: AAA/dot1x config pushed OK")
+        client.close()
+    except Exception as e:
+        log_fn(f"    WARNING: _ssh_push_aaa_config to {mgmt_ip} failed: {e}")
 
 
 def _catc_resync_device(s, dev_id, log_fn=print, wait=True):
@@ -525,14 +657,25 @@ def step_discovery(log_fn=print):
     s = _catc_session(log_fn)
     disc_id = _get_discovery_id(s)
     if disc_id:
-        log_fn(f"  Discovery '{DISCOVERY_NAME}' already exists (id={disc_id}), reusing...")
-    else:
+        log_fn(f"  Discovery '{DISCOVERY_NAME}' already exists (id={disc_id}), checking devices...")
+        # Quick check — if not all 3 switches are in inventory, delete and re-create
+        r_chk = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
+        found = [d for d in r_chk.json().get("response", [])
+                 if any(sw["name"] in (d.get("hostname") or "") for sw in SWITCH_IPS.values())]
+        if len(found) < 3:
+            log_fn(f"  Only {len(found)}/3 switches in inventory — deleting stale discovery and re-creating...")
+            s.delete(f"{CATC_BASE}/dna/intent/api/v1/discovery/{disc_id}")
+            time.sleep(3)
+            disc_id = None
+        else:
+            log_fn(f"  All 3 switches present — reusing discovery...")
+    if not disc_id:
         log_fn(f"  Creating discovery job '{DISCOVERY_NAME}'...")
         payload = {
             "name": DISCOVERY_NAME,
             "discoveryType": "Range",
             "ipAddressList": DISCOVERY_RANGE,
-            "protocolOrder": "SSH",
+            "protocolOrder": "ssh",
             "globalCredentialIdList": GLOBAL_CRED_IDS,
             "preferredMgmtIPMethod": "UseLoopBack",
             "siteId": SITE_ID,
@@ -576,7 +719,7 @@ def step_discovery(log_fn=print):
             "name":                    wlc_job,
             "discoveryType":           "Single",
             "ipAddressList":           WLC_IP,
-            "protocolOrder":           "SSH",
+            "protocolOrder":           "ssh",
             "globalCredentialIdList":  WLC_CRED_IDS,
             "retryCount":              3,
             "timeOut":                 5,
@@ -606,6 +749,16 @@ def step_discovery(log_fn=print):
                     if r_d.json().get("response", {}).get("discoveryStatus") == "Inactive":
                         break
                     time.sleep(10)
+
+                # Job Inactive ≠ inventory collection done — poll per-device until Managed
+                log_fn(f"  Waiting for WLC inventory collection to complete...")
+                deadline_coll = time.time() + 120
+                while time.time() < deadline_coll:
+                    r_dev = s.get(f"{CATC_BASE}/dna/intent/api/v1/discovery/{wlc_disc_id}/network-device")
+                    devs = r_dev.json().get("response", [])
+                    if devs and devs[0].get("inventoryCollectionStatus", "") not in ("In Progress", ""):
+                        break
+                    time.sleep(5)
 
             r_inv2 = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
             wlc = {d["managementIpAddress"]: d
@@ -643,8 +796,230 @@ def step_discovery(log_fn=print):
     return True, "discovery OK"
 
 
+def _clean_sda_aaa(mgmt_ip, name, log_fn=print):
+    """SSH to a switch and remove SDA-specific AAA CLIs that CatC pushes
+    site-wide when provisioning the CP/Border node.
+
+    CatC rejects provisioning a device that already has these CLIs with
+    "AAA CLI(s) are already present on the device".  Running this before
+    provision makes the step idempotent regardless of what previous partial
+    runs pushed.  Base-config AAA (local auth/authz) is left untouched.
+    """
+    SDA_AAA_REMOVES = [
+        "no aaa group server radius dnac-client-radius-group",
+        "no aaa authentication dot1x default group dnac-client-radius-group",
+        "no aaa authentication login dnac-cts-list group dnac-client-radius-group local",
+        "no aaa authorization network dnac-cts-list group dnac-client-radius-group",
+        "no aaa accounting dot1x default start-stop group dnac-client-radius-group",
+        "no aaa accounting identity default start-stop group dnac-client-radius-group",
+        "no aaa accounting network default start-stop group dnac-client-radius-group",
+        "no aaa accounting update newinfo periodic 2880",
+        "no aaa server radius dynamic-author",
+        "no radius server dnac-radius_198.18.5.101",
+        "no ip radius source-interface Loopback0",
+    ]
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=10, allow_agent=False, look_for_keys=False)
+
+        # Check if any SDA AAA is actually present before touching anything
+        _, stdout, _ = client.exec_command("show run | section ^aaa|^radius")
+        current = stdout.read().decode(errors="ignore")
+        if "dnac" not in current and "dynamic-author" not in current:
+            log_fn(f"    {name}: no SDA AAA present — skipping clean")
+            client.close()
+            return
+
+        log_fn(f"    {name}: SDA AAA detected — cleaning before provision...")
+        chan = client.invoke_shell()
+        time.sleep(1)
+        chan.recv(2000)
+        chan.send("conf t\n")
+        time.sleep(0.5)
+        for cmd in SDA_AAA_REMOVES:
+            chan.send(cmd + "\n")
+            time.sleep(0.3)
+        chan.send("end\nwrite memory\n")
+        time.sleep(4)
+        out = chan.recv(8096).decode(errors="ignore")
+        if "[OK]" in out:
+            log_fn(f"    {name}: SDA AAA cleaned and saved")
+        else:
+            log_fn(f"    {name}: WARNING — write memory may not have completed")
+        client.close()
+    except Exception as e:
+        log_fn(f"    {name}: WARNING — could not clean SDA AAA ({e}), provision may fail")
+
+
+def _clean_lisp(mgmt_ip, name, log_fn=print):
+    """SSH to a switch and remove any leftover LISP config.
+
+    CatC rejects adding a fabric device that already has 'router lisp' with
+    "The LISP configuration is already present on device … Remove the LISP
+    configuration from the device and retry."  Running this before
+    step_fabric_devices makes the step idempotent.
+    """
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=10, allow_agent=False, look_for_keys=False)
+
+        _, stdout, _ = client.exec_command("show run | include ^router lisp")
+        if "router lisp" not in stdout.read().decode(errors="ignore"):
+            log_fn(f"    {name}: no LISP config present — skipping clean")
+            client.close()
+            return
+
+        log_fn(f"    {name}: LISP config detected — cleaning before fabric add...")
+        chan = client.invoke_shell()
+        time.sleep(1)
+        chan.recv(2000)
+        chan.send("conf t\n")
+        time.sleep(0.5)
+        chan.send("no router lisp\n")
+        time.sleep(2)
+        chan.send("end\nwrite memory\n")
+        time.sleep(5)
+        out = chan.recv(8096).decode(errors="ignore")
+        if "[OK]" in out:
+            log_fn(f"    {name}: LISP cleaned and saved")
+        else:
+            log_fn(f"    {name}: WARNING — write memory may not have completed after LISP clean")
+        client.close()
+    except Exception as e:
+        log_fn(f"    {name}: WARNING — could not clean LISP ({e}), fabric_devices may fail")
+
+
+def _clean_fabric_remnants(mgmt_ip, name, log_fn=print):
+    """SSH to a switch and remove all SDA fabric-specific remnants.
+
+    CatC rejects fabric device add if any of these are present from a prior
+    fabric run (even after rollback, CatC only removes its own DB records — it
+    does NOT clean the switch config).  Covers:
+      - interface templates  (DefaultWiredDot1x*)
+      - policy-map type control subscriber  (PMAP_DefaultWiredDot1x* / BridgeVM)
+      - class-map type control subscriber   (DOT1X, MAB, IN_CRITICAL_AUTH, etc.)
+      - service-template  (DefaultCritical*_SRV_TEMPLATE)
+      - router lisp  (already handled by _clean_lisp but included for completeness)
+
+    Order matters:
+      1. Remove service-policy from inside each template body
+      2. Delete the template  (now unreferenced)
+      3. Delete the policy-maps
+      4. Delete the class-maps
+      5. Delete the service-templates
+      6. Remove LISP
+    """
+    SDA_TEMPLATES_PM = [
+        ("DefaultWiredDot1xClosedAuth",    "PMAP_DefaultWiredDot1xClosedAuth_1X_MAB"),
+        ("DefaultWiredDot1xLowImpactAuth", "PMAP_DefaultWiredDot1xLowImpactAuth_1X_MAB"),
+        ("DefaultWiredDot1xOpenAuth",      "PMAP_DefaultWiredDot1xOpenAuth_1X_MAB"),
+    ]
+    SDA_POLICY_MAPS = [
+        "PMAP_DefaultBridgeModeVM_MAB",
+        "PMAP_DefaultWiredDot1xClosedAuth_1X_MAB",
+        "PMAP_DefaultWiredDot1xClosedAuth_MAB_1X",
+        "PMAP_DefaultWiredDot1xLowImpactAuth_1X_MAB",
+        "PMAP_DefaultWiredDot1xLowImpactAuth_MAB_1X",
+        "PMAP_DefaultWiredDot1xOpenAuth_1X_MAB",
+        "PMAP_DefaultWiredDot1xOpenAuth_MAB_1X",
+    ]
+    SDA_CLASS_MAPS = [
+        "AAA_SVR_DOWN_AUTHD_HOST", "AAA_SVR_DOWN_UNAUTHD_HOST",
+        "AUTHC_SUCCESS-AUTHZ_FAIL", "DOT1X", "DOT1X_FAILED",
+        "DOT1X_MEDIUM_PRIO", "DOT1X_NO_RESP", "DOT1X_TIMEOUT",
+        "IN_CRITICAL_AUTH", "IN_CRITICAL_AUTH_CLOSED_MODE",
+        "IN_CRITICAL_BRIDGE_VM_MODE", "MAB", "MAB_FAILED",
+        "NOT_IN_CRITICAL_AUTH", "NOT_IN_CRITICAL_AUTH_CLOSED_MODE",
+        "NOT_IN_CRITICAL_BRIDGE_VM_MODE",
+    ]
+    SDA_SVC_TEMPLATES = [
+        "DefaultCriticalBridgeVM_SRV_TEMPLATE",
+        "DefaultCriticalAuthVlan_SRV_TEMPLATE",
+        "DefaultCriticalVoice_SRV_TEMPLATE",
+        "DefaultCriticalAccess_SRV_TEMPLATE",
+    ]
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
+                       timeout=10, allow_agent=False, look_for_keys=False)
+
+        # Quick check — skip entirely if nothing SDA-fabric is present
+        _, stdout, _ = client.exec_command(
+            "show run | include ^template DefaultWiredDot1x|^router lisp|^policy-map type control subscriber PMAP_"
+        )
+        probe = stdout.read().decode(errors="ignore")
+        if "DefaultWiredDot1x" not in probe and "router lisp" not in probe and "PMAP_" not in probe:
+            log_fn(f"    {name}: no fabric remnants found — skipping clean")
+            client.close()
+            return
+
+        log_fn(f"    {name}: fabric remnants detected — cleaning...")
+        chan = client.invoke_shell()
+        time.sleep(1)
+        chan.recv(2000)
+
+        def send(cmd, wait=0.5):
+            chan.send(cmd + "\n")
+            time.sleep(wait)
+            buf = b""
+            end = time.time() + wait + 1.0
+            while time.time() < end:
+                if chan.recv_ready():
+                    buf += chan.recv(8192)
+                    end = time.time() + 0.4
+                else:
+                    time.sleep(0.1)
+            return buf.decode(errors="ignore")
+
+        send("conf t", wait=0.4)
+
+        # 1. Remove service-policy from inside each template, then delete template
+        for tmpl, pm in SDA_TEMPLATES_PM:
+            send(f"template {tmpl}", wait=0.3)
+            send(f" no service-policy type control subscriber {pm}", wait=0.3)
+            send("exit", wait=0.3)
+            send(f"no template {tmpl}", wait=0.5)
+
+        # 2. Delete policy-maps
+        for pm in SDA_POLICY_MAPS:
+            send(f"no policy-map type control subscriber {pm}", wait=0.4)
+
+        # 3. Delete class-maps
+        for cm in SDA_CLASS_MAPS:
+            send(f"no class-map type control subscriber {cm}", wait=0.3)
+
+        # 4. Delete service-templates
+        for st in SDA_SVC_TEMPLATES:
+            send(f"no service-template {st}", wait=0.3)
+
+        # 5. Remove LISP
+        send("no router lisp", wait=1.0)
+
+        send("end", wait=0.4)
+        out = send("write memory", wait=6)
+        if "[OK]" in out:
+            log_fn(f"    {name}: fabric remnants cleaned and saved")
+        else:
+            log_fn(f"    {name}: WARNING — write memory may not have completed")
+        client.close()
+    except Exception as e:
+        log_fn(f"    {name}: WARNING — could not clean fabric remnants ({e}), fabric_devices may fail")
+
+
 def step_provision(log_fn=print):
-    """Provision the 3 switches to MAIN site via SDA wired provisioning."""
+    """Provision the 3 switches to MAIN site via SDA wired provisioning.
+
+    Pre-cleans all SDA/fabric remnants from switches before provisioning so
+    CatC starts from a clean baseline.  Skips devices already provisioned in
+    CatC (idempotent).  Note: step_fabric_devices also pre-cleans remnants
+    immediately before the fabric add, which covers any re-push that occurs
+    between provision and fabric add (e.g. transit side-effects).
+    """
     s = _catc_session(log_fn)
 
     # Check which devices are already SDA-provisioned
@@ -660,21 +1035,33 @@ def step_provision(log_fn=print):
         if dev_id in already:
             log_fn(f"    Already SDA-provisioned, skipping")
         else:
-            to_provision.append({"networkDeviceId": dev_id, "siteId": SITE_ID})
+            to_provision.append({"networkDeviceId": dev_id, "siteId": SITE_ID,
+                                  "_mgmt": info["mgmt"], "_name": info["name"]})
 
     if not to_provision:
         log_fn(f"  All devices already SDA-provisioned")
         return True, "provision already done"
 
-    log_fn(f"  SDA-provisioning {len(to_provision)} device(s)...")
+    # Pre-clean SDA AAA CLIs and any fabric remnants from each device
+    log_fn(f"  Pre-cleaning SDA config from {len(to_provision)} device(s)...")
     for p in to_provision:
-        r = s.post(f"{CATC_BASE}/dna/intent/api/v1/sda/provisionDevices", json=[p])
-        if r.status_code not in (200, 201, 202):
-            raise RuntimeError(f"SDA provision failed: {r.status_code} {r.text[:200]}")
-        task_id = r.json().get("response", {}).get("taskId")
-        if task_id:
-            _wait_task(s, task_id, log_fn=log_fn, timeout=300)
-        log_fn(f"    Provisioned {p['networkDeviceId']}")
+        _clean_sda_aaa(p["_mgmt"], p["_name"], log_fn)
+        _clean_fabric_remnants(p["_mgmt"], p["_name"], log_fn)
+
+    # Strip internal keys before posting to CatC
+    payload = [{"networkDeviceId": p["networkDeviceId"], "siteId": p["siteId"]}
+               for p in to_provision]
+
+    # Provision all devices in a single batch POST so CatC handles
+    # CP-vs-edge ordering internally.
+    log_fn(f"  SDA-provisioning {len(payload)} device(s) in a single batch...")
+    r = s.post(f"{CATC_BASE}/dna/intent/api/v1/sda/provisionDevices", json=payload)
+    if r.status_code not in (200, 201, 202):
+        raise RuntimeError(f"SDA provision failed: {r.status_code} {r.text[:200]}")
+    task_id = r.json().get("response", {}).get("taskId")
+    if task_id:
+        _wait_task(s, task_id, log_fn=log_fn, timeout=600)
+    log_fn(f"  All {len(payload)} device(s) provisioned")
 
     return True, "provision OK"
 
@@ -785,8 +1172,26 @@ def step_transit(log_fn=print):
 
 
 def step_clean_fabric_vlans(log_fn=print):
-    """Remove conflicting VLANs/SVIs and prior-run sub-interfaces from switches."""
+    """Remove conflicting VLANs/SVIs from switches before a fresh fabric add.
+
+    Only cleans VLANs when devices are NOT yet in the fabric.  If devices are
+    already in fabric, CatC owns those VLANs and will clean them during its
+    own device-delete task — running our clean first causes CatC's delete to
+    fail on 'no interface VlanXXX' (interface already gone).
+    """
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
+
+    # Check if devices are already in fabric — skip VLAN clean if so
+    try:
+        s = _catc_session(log_fn)
+        fabric_id = _get_fabric_id(s)
+        if fabric_id:
+            existing = s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}").json().get("response", [])
+            if existing:
+                log_fn(f"  Devices already in fabric — skipping VLAN clean (CatC will handle on delete)")
+                return True, "clean_fabric_vlans skipped (devices in fabric)"
+    except Exception as e:
+        log_fn(f"  WARNING: could not check fabric state, proceeding with VLAN clean: {e}")
 
     log_fn(f"  Cleaning VLANs {FABRIC_CONFLICT_VLANS} and Gi1/0/48 sub-interfaces from switches...")
     for key, info in SWITCH_IPS.items():
@@ -799,30 +1204,6 @@ def step_clean_fabric_vlans(log_fn=print):
                 log_fn(f"    WARNING: VLAN cleanup on {info['mgmt']} timed out after 60s — continuing")
             except Exception as e:
                 log_fn(f"    WARNING: VLAN cleanup on {info['mgmt']} failed: {e}")
-
-    log_fn(f"  Removing any prior AAA/dot1x/access-session config from switches...")
-    for key, info in SWITCH_IPS.items():
-        log_fn(f"  → {info['name']} ({info['mgmt']})")
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_ssh_clean_auth_config, info["mgmt"], log_fn)
-            try:
-                fut.result(timeout=90)
-            except _TimeoutError:
-                log_fn(f"    WARNING: auth cleanup on {info['mgmt']} timed out after 90s — continuing")
-            except Exception as e:
-                log_fn(f"    WARNING: auth cleanup on {info['mgmt']} failed: {e}")
-
-    # Also clean Border Spine Gi1/0/48 sub-interfaces from any prior run
-    border_ip = SWITCH_IPS["border_spine"]["mgmt"]
-    log_fn(f"  Cleaning Gi1/0/48 sub-interfaces on Border Spine ({border_ip})...")
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(_ssh_border_restore_trunk, border_ip, log_fn)
-        try:
-            fut.result(timeout=60)
-        except _TimeoutError:
-            log_fn(f"    WARNING: trunk restore on {border_ip} timed out after 60s — continuing")
-        except Exception as e:
-            log_fn(f"    WARNING: trunk restore on {border_ip} failed: {e}")
 
     log_fn(f"  ✓ clean_fabric_vlans done")
     return True, "clean_fabric_vlans OK"
@@ -1007,7 +1388,7 @@ def step_configure_handoff_interface(log_fn=print):
                        timeout=15, allow_agent=False, look_for_keys=False)
         _, out, _ = client.exec_command("show ip interface brief | include Vlan5")
         vlan5 = out.read().decode()
-        _, out2, _ = client.exec_command("show run | include GigabitEthernet1/0/48\.")
+        _, out2, _ = client.exec_command(r"show run | include GigabitEthernet1/0/48\.")
         sub_ifaces = out2.read().decode()
         client.close()
         has_vlan5_ip = "192.168.255.7" in vlan5 and "unassigned" not in vlan5
@@ -1134,6 +1515,58 @@ def step_deploy_anycast_gateways(log_fn=print):
     if not ags:
         raise RuntimeError("No anycast gateways found — run step_anycast_gateways first")
 
+    # Detect gateways that were created before IP pools existed at the correct site level.
+    # Symptom: leaf SVIs have 'no ip address' even though gateways exist in CatC.
+    # Fix: delete and re-create gateways so CatC allocates IPs from the now-available pools.
+    import time as _time2
+    leaf_ip = SWITCH_IPS["leaf1"]["mgmt"]
+    try:
+        _client = paramiko.SSHClient()
+        _client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        _client.connect(leaf_ip, username=SWITCH_USER, password=SWITCH_PASS, timeout=15,
+                        allow_agent=False, look_for_keys=False)
+        _, _out, _ = _client.exec_command("show run | include ^interface Vlan10$")
+        _vlan_exists = "Vlan10" in _out.read().decode()
+        _, _out2, _ = _client.exec_command("show ip interface brief | include Vlan10")
+        _brief = _out2.read().decode()
+        _client.close()
+        _has_ip = _vlan_exists and "unassigned" not in _brief and "10." in _brief
+    except Exception:
+        _has_ip = True  # assume OK if we can't check
+
+    if not _has_ip:
+        log_fn(f"  WARNING: Leaf1 Vlan10 has no IP — gateways created before pools existed.")
+        log_fn(f"  Deleting and re-creating anycast gateways to trigger IP allocation...")
+        for ag in ags:
+            r_del = s.delete(f"{CATC_BASE}/dna/intent/api/v1/sda/anycastGateways/{ag['id']}")
+            log_fn(f"    DELETE {ag['virtualNetworkName']}: {r_del.status_code}")
+            _time2.sleep(2)
+        # Wait for deletes to settle
+        for _ in range(12):
+            _time2.sleep(5)
+            _remaining = s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/anycastGateways?fabricId={fabric_id}").json().get("response", [])
+            if not _remaining:
+                break
+        log_fn(f"  Re-creating anycast gateways...")
+        _payload = [{
+            "fabricId": fabric_id,
+            "virtualNetworkName": ag["vn"],
+            "ipPoolName": ag["ipPool"],
+            "vlanName": ag["vlanName"],
+            "vlanId": ag["vlanId"],
+            "trafficType": ag["trafficType"],
+            "securityGroupName": ag["sgName"],
+            "isCriticalPool": False,
+            "isLayer2FloodingEnabled": False,
+            "isWirelessPool": False,
+            "isIpDirectedBroadcast": False,
+            "isIntraSubnetRoutingEnabled": False,
+            "isMultipleIpToMacAddresses": True,
+            "isGroupBasedPolicyEnforcementEnabled": True,
+        } for ag in ANYCAST_GATEWAYS]
+        _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/anycastGateways", _payload, log_fn=log_fn, timeout=300)
+        ags = s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/anycastGateways?fabricId={fabric_id}").json().get("response", [])
+
     payload = [{
         "id": ag["id"],
         "fabricId": fabric_id,
@@ -1208,8 +1641,50 @@ def step_deploy_anycast_gateways(log_fn=print):
 
 
 def step_fabric_devices(log_fn=print):
-    """Add Border+CP node and 2 edge nodes to the fabric."""
+    """Add Border+CP node and 2 edge nodes to the fabric.
+
+    Expects switches to be in clean base-config state (no SDA VLANs).
+    If conflicting VLANs are detected the step fails immediately with a
+    clear message — reset the switches and re-run.
+
+    CatC handles all config push (AAA, dot1x, TrustSec) on fabric POST.
+    """
     s = _catc_session(log_fn)
+
+    # --- Pre-check: fail fast if conflicting VLANs exist on any switch ---
+    log_fn("  Checking for VLAN conflicts before fabric add...")
+    conflicts = {}
+    for key, info in SWITCH_IPS.items():
+        try:
+            client = __import__("paramiko").SSHClient()
+            client.set_missing_host_key_policy(__import__("paramiko").AutoAddPolicy())
+            client.connect(info["mgmt"], username=SWITCH_USER, password=SWITCH_PASS,
+                           timeout=10, allow_agent=False, look_for_keys=False)
+            _, stdout, _ = client.exec_command("show vlan brief")
+            vlan_out = stdout.read().decode(errors="ignore")
+            client.close()
+            found = [v for v in FABRIC_CONFLICT_VLANS if f"\n{v} " in vlan_out or f"\n{v}\t" in vlan_out]
+            if found:
+                conflicts[info["name"]] = found
+        except Exception as e:
+            log_fn(f"    WARNING: could not check VLANs on {info['name']} ({info['mgmt']}): {e}")
+
+    if conflicts:
+        lines = "\n".join(f"  {name}: VLANs {vlans}" for name, vlans in conflicts.items())
+        raise RuntimeError(
+            f"VLAN conflict — fabric VLANs already exist on switches. "
+            f"Reset the switches to base config and re-run.\n{lines}"
+        )
+    log_fn("  No VLAN conflicts — proceeding.")
+
+    # Pre-clean all SDA fabric remnants (LISP, templates, policy-maps, class-maps).
+    # CatC rejects fabric add if any of these are present from a prior run.
+    # No CatC sync needed here — step_provision's fresh re-provision already
+    # refreshed CatC's device config cache with a clean baseline.
+    log_fn("  Pre-cleaning fabric remnants on all switches...")
+    for key, info in SWITCH_IPS.items():
+        _clean_fabric_remnants(info["mgmt"], info["name"], log_fn)
+
     fabric_id = _get_fabric_id(s)
     if not fabric_id:
         raise RuntimeError("Fabric site not found")
@@ -1221,12 +1696,46 @@ def step_fabric_devices(log_fn=print):
     if not all([border_id, leaf1_id, leaf2_id]):
         raise RuntimeError(f"Could not resolve device IDs: border={border_id} leaf1={leaf1_id} leaf2={leaf2_id}")
 
-    existing = {fd["networkDeviceId"] for fd in
-                s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}").json().get("response", [])}
+    existing_records = {fd["networkDeviceId"]: fd
+                        for fd in s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}").json().get("response", [])}
 
-    to_add = []
-    if border_id not in existing:
-        to_add.append({
+    if existing_records:
+        log_fn(f"  {len(existing_records)} device(s) already in fabric — removing before re-add so CatC pushes fresh config...")
+        # Must remove port assignments and L3 handoffs before CatC allows device delete
+        log_fn(f"  Removing port assignments...")
+        rollback_port_assignments(log_fn)
+        log_fn(f"  Removing L3 handoffs...")
+        rollback_l3_handoffs(log_fn)
+        # Delete edges first, then border/CP
+        edges       = [fd for fd in existing_records.values() if fd.get("deviceRoles") == ["EDGE_NODE"]]
+        border_devs = [fd for fd in existing_records.values()
+                       if "BORDER_NODE" in fd.get("deviceRoles", []) or "CONTROL_PLANE_NODE" in fd.get("deviceRoles", [])]
+        for group, label in [(edges, "edge"), (border_devs, "border/CP")]:
+            for fd in group:
+                nd_id = fd["networkDeviceId"]
+                log_fn(f"    Deleting {label} device {nd_id[:8]}...")
+                r = s.delete(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}&networkDeviceId={nd_id}")
+                if r.status_code not in (200, 202):
+                    raise RuntimeError(f"Delete fabric device failed: {r.status_code} {r.text[:200]}")
+                task_id = r.json().get("response", {}).get("taskId")
+                if task_id:
+                    try:
+                        _wait_task(s, task_id, log_fn=log_fn, timeout=300)
+                    except RuntimeError as e:
+                        # CatC delete task can fail if switch state already clean
+                        # (e.g. VLANs pre-cleaned).  Check if device actually left fabric.
+                        still_in = {fd2["networkDeviceId"] for fd2 in
+                                    s.get(f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices?fabricId={fabric_id}").json().get("response", [])}
+                        if nd_id not in still_in:
+                            log_fn(f"    WARNING: delete task reported failure but device is gone — continuing ({e})")
+                        else:
+                            raise
+                time.sleep(3)
+
+    # POST all 3 devices — CatC pushes full AAA/dot1x/TrustSec config
+    log_fn(f"  Adding Border-Spine as BORDER_NODE + CONTROL_PLANE_NODE...")
+    to_add = [
+        {
             "fabricId": fabric_id,
             "networkDeviceId": border_id,
             "deviceRoles": ["BORDER_NODE", "CONTROL_PLANE_NODE"],
@@ -1240,22 +1749,77 @@ def step_fabric_devices(log_fn=print):
                     "isDefaultExit": True,
                 },
             },
-        })
+        },
+    ]
     for dev_id, name in [(leaf1_id, "Leaf1"), (leaf2_id, "Leaf2")]:
-        if dev_id not in existing:
-            to_add.append({
-                "fabricId": fabric_id,
-                "networkDeviceId": dev_id,
-                "deviceRoles": ["EDGE_NODE"],
-            })
+        log_fn(f"  Adding {name} as EDGE_NODE...")
+        to_add.append({"fabricId": fabric_id, "networkDeviceId": dev_id, "deviceRoles": ["EDGE_NODE"]})
 
-    if not to_add:
-        log_fn(f"  All fabric devices already configured")
-        return True, "fabric_devices already configured"
-
-    log_fn(f"  Adding {len(to_add)} fabric device(s)...")
     _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/fabricDevices", to_add, log_fn=log_fn, timeout=600)
     return True, "fabric_devices OK"
+
+
+def step_ise_nads(log_fn=print):
+    """Register switch Loopback0 IPs as NADs in ISE.
+
+    The switches use 'ip radius source-interface Loopback0', so RADIUS requests
+    arrive at ISE from 172.30.255.x.  ISE drops requests from unregistered
+    sources — this step ensures all 3 loopback IPs are registered NADs with
+    the correct shared secret before port_assignments enables dot1x.
+
+    Idempotent: skips any NAD whose loopback IP is already registered.
+    """
+    import requests as req
+    ise_s = req.Session()
+    ise_s.verify = False
+    ise_s.auth = (ISE_USER, ISE_PASS)
+    ise_s.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+
+    # Fetch all existing NADs and build a loopback-IP → id map
+    r = ise_s.get(f"https://{ISE_HOST}/ers/config/networkdevice?size=100")
+    if r.status_code != 200:
+        raise RuntimeError(f"ISE NAD list failed: {r.status_code} {r.text[:200]}")
+
+    existing_by_ip = {}
+    for nad in r.json().get("SearchResult", {}).get("resources", []):
+        detail = ise_s.get(f"https://{ISE_HOST}/ers/config/networkdevice/{nad['id']}").json()
+        dev = detail.get("NetworkDevice", {})
+        for p in dev.get("NetworkDeviceIPList", []):
+            existing_by_ip[p.get("ipaddress")] = nad["id"]
+
+    added = 0
+    skipped = 0
+    for key, info in SWITCH_IPS.items():
+        lb_ip = info["loopback"]
+        name  = info["name"]
+        if lb_ip in existing_by_ip:
+            log_fn(f"  ISE NAD already registered: {name} ({lb_ip}) — skipping")
+            skipped += 1
+            continue
+
+        payload = {
+            "NetworkDevice": {
+                "name": name,
+                "description": "SDA switch — auto-registered by pod_automator",
+                "authenticationSettings": {
+                    "networkProtocol": "RADIUS",
+                    "radiusSharedSecret": ISE_PASS,
+                    "enableKeyWrap": False,
+                },
+                "NetworkDeviceIPList": [
+                    {"ipaddress": lb_ip, "mask": 32}
+                ],
+                "profileName": "Cisco",
+            }
+        }
+        pr = ise_s.post(f"https://{ISE_HOST}/ers/config/networkdevice", json=payload)
+        if pr.status_code in (200, 201):
+            log_fn(f"  Registered ISE NAD: {name} ({lb_ip})")
+            added += 1
+        else:
+            raise RuntimeError(f"ISE NAD create failed for {name}: {pr.status_code} {pr.text[:300]}")
+
+    return True, f"ise_nads OK — {added} added, {skipped} already present"
 
 
 def step_l3_handoff(log_fn=print):
@@ -1335,53 +1899,10 @@ def step_port_assignments(log_fn=print):
 
     if not to_add:
         log_fn(f"  Port assignments already configured")
-        return True, "port_assignments already configured"
-
-    log_fn(f"  Adding {len(to_add)} port assignment(s)...")
-    for entry in to_add:
-        _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/portAssignments", [entry], log_fn=log_fn, timeout=300)
-
-    # Also ensure closed auth template is applied via SSH (CatC may lag)
-    log_fn(f"  Ensuring Gi1/0/3 closed auth template applied via SSH on both leaves...")
-    import time as _time
-    closed_auth_cmds = [
-        "conf t",
-        "interface GigabitEthernet1/0/1",
-        " dot1x timeout tx-period 7",
-        " dot1x max-reauth-req 3",
-        " source template DefaultWiredDot1xClosedAuth",
-        " spanning-tree bpduguard enable",
-        "interface GigabitEthernet1/0/3",
-        " dot1x timeout tx-period 7",
-        " dot1x max-reauth-req 3",
-        " source template DefaultWiredDot1xClosedAuth",
-        " spanning-tree bpduguard enable",
-        "end",
-        "write memory",
-    ]
-    for key in ("leaf1", "leaf2"):
-        mgmt_ip = SWITCH_IPS[key]["mgmt"]
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(mgmt_ip, username=SWITCH_USER, password=SWITCH_PASS,
-                           timeout=15, allow_agent=False, look_for_keys=False)
-            chan = client.invoke_shell()
-            _time.sleep(0.5)
-            def send(cmd, w=0.6):
-                chan.send(cmd + "\n")
-                _time.sleep(w)
-                out = b""
-                while chan.recv_ready():
-                    out += chan.recv(4096)
-                return out.decode(errors="ignore")
-            send("terminal length 0")
-            for cmd in closed_auth_cmds:
-                send(cmd)
-            client.close()
-            log_fn(f"    {key} ({mgmt_ip}): Gi1/0/3 closed auth applied")
-        except Exception as e:
-            log_fn(f"    WARNING: SSH closed auth fix failed on {key} ({mgmt_ip}): {e}")
+    else:
+        log_fn(f"  Adding {len(to_add)} port assignment(s)...")
+        for entry in to_add:
+            _deploy_and_wait(s, "post", f"{CATC_BASE}/dna/intent/api/v1/sda/portAssignments", [entry], log_fn=log_fn, timeout=300)
 
     return True, "port_assignments OK"
 
@@ -1635,40 +2156,60 @@ def rollback_fabric_site(log_fn=print):
 def rollback_delete_devices(log_fn=print):
     """Delete the 3 switches from CATC inventory one at a time via DELETE /network-device/{id}.
 
-    Retries up to 5 times with 60s backoff if CATC reports a provisioning lock.
+    Retries up to 10 times with 30s backoff on provisioning locks.
+    After each task completion, verifies the device is actually absent from
+    inventory — CatC tasks can return 'success' while the device stays present.
     """
     s = _catc_session(log_fn)
-    r = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
-    devs = [d for d in r.json().get("response", [])
-            if any(sw["name"] in (d.get("hostname") or "") for sw in SWITCH_IPS.values())]
+
+    def _fetch_switch_devices():
+        r = s.get(f"{CATC_BASE}/dna/intent/api/v1/network-device")
+        return {d["id"]: d for d in r.json().get("response", [])
+                if any(sw["name"] in (d.get("hostname") or "") for sw in SWITCH_IPS.values())}
+
+    devs = _fetch_switch_devices()
     if not devs:
         log_fn("  No switch devices found in inventory")
         return True, "skipped"
 
-    for d in devs:
-        d_id = d["id"]
+    deleted = 0
+    for d_id, d in list(devs.items()):
         hostname = d.get("hostname", d_id)
-        max_retries = 5
+        max_retries = 10
+        success = False
         for attempt in range(1, max_retries + 1):
-            log_fn(f"  Deleting {hostname} from inventory (attempt {attempt}/{max_retries})...")
-            r2 = s.delete(f"{CATC_BASE}/dna/intent/api/v1/network-device/{d_id}?cleanConfig=false")
-            if r2.status_code not in (200, 202):
-                raise RuntimeError(f"Delete device failed: {r2.status_code} {r2.text[:200]}")
-            task_id = r2.json().get("response", {}).get("taskId")
-            if task_id:
-                try:
+            try:
+                log_fn(f"  Deleting {hostname} from inventory (attempt {attempt}/{max_retries})...")
+                r2 = s.delete(f"{CATC_BASE}/dna/intent/api/v1/network-device/{d_id}?cleanConfig=false")
+                if r2.status_code == 404:
+                    log_fn(f"  {hostname} already gone (404) — skipping")
+                    success = True
+                    break
+                if r2.status_code not in (200, 202):
+                    raise RuntimeError(f"Delete device failed: {r2.status_code} {r2.text[:200]}")
+                task_id = r2.json().get("response", {}).get("taskId")
+                if task_id:
                     _wait_task(s, task_id, log_fn=log_fn, timeout=300)
-                    break  # success
-                except RuntimeError as e:
-                    if "being provisioned" in str(e) and attempt < max_retries:
-                        log_fn(f"  CATC provisioning lock — waiting 60s before retry...")
-                        time.sleep(60)
-                        continue
-                    raise
-            else:
-                break
+                # Verify the device is actually gone — CatC tasks can succeed silently
+                time.sleep(5)
+                still_there = _fetch_switch_devices()
+                if d_id not in still_there:
+                    log_fn(f"  {hostname} confirmed removed from inventory")
+                    success = True
+                    break
+                raise RuntimeError(f"{hostname} still present in inventory after delete task")
+            except Exception as e:
+                log_fn(f"  Attempt {attempt} failed ({type(e).__name__}): {e}")
+                if attempt >= max_retries:
+                    raise RuntimeError(f"{hostname}: all {max_retries} delete attempts failed — last error: {e}") from e
+                log_fn(f"  Waiting 30s before retry...")
+                time.sleep(30)
+
+        if success:
+            deleted += 1
         time.sleep(3)
-    return True, f"rollback_delete_devices OK — {len(devs)} deleted"
+
+    return True, f"rollback_delete_devices OK — {deleted}/{len(devs)} deleted"
 
 
 def rollback_delete_discovery(log_fn=print):
@@ -1821,8 +2362,8 @@ DEPLOY_STEPS = [
     ("virtual_networks",             step_virtual_networks),
     ("anycast_gateways",             step_anycast_gateways),
     ("transit",                      step_transit),
-    ("clean_fabric_vlans",           step_clean_fabric_vlans),
     ("fabric_devices",               step_fabric_devices),
+    ("ise_nads",                     step_ise_nads),
     ("l3_handoff",                   step_l3_handoff),
     ("configure_handoff_interface",  step_configure_handoff_interface),
     ("deploy_anycast_gateways",      step_deploy_anycast_gateways),
@@ -1856,6 +2397,19 @@ def run_deploy(from_step=None, log_fn=print, pod_id=None, db_path=None):
     if db_path:
         DB_PATH = db_path
     ensure_sda_table()
+
+    # Reset any stale 'running' rows from a previous crashed run
+    try:
+        c = sqlite3.connect(DB_PATH, timeout=10)
+        c.execute(
+            "UPDATE sda_steps SET status='pending', completed_at=NULL "
+            "WHERE pod_id=? AND mode='deploy' AND status='running'",
+            (POD_ID,)
+        )
+        c.commit()
+        c.close()
+    except Exception as e:
+        log_fn(f"Warning: could not clear stale running steps: {e}")
 
     started = from_step is None
     # Pre-mark skipped steps as pending, active steps as pending
@@ -1899,11 +2453,26 @@ def run_rollback(log_fn=print, pod_id=None, db_path=None, resume=True):
         DB_PATH = db_path
     ensure_sda_table()
 
+    # Reset any stale 'running' rows from a previous crashed/interrupted run.
+    # This ensures a stuck step is never permanently frozen — the next invocation
+    # of run_rollback will re-run it rather than skip (completed) or loop (running).
+    try:
+        c = sqlite3.connect(DB_PATH, timeout=10)
+        c.execute(
+            "UPDATE sda_steps SET status='pending', completed_at=NULL "
+            "WHERE pod_id=? AND mode='rollback' AND status='running'",
+            (POD_ID,)
+        )
+        c.commit()
+        c.close()
+    except Exception as e:
+        log_fn(f"Warning: could not reset stale running steps: {e}")
+
     # Build set of already-completed step names from DB
     completed_in_db = set()
     if resume:
         try:
-            c = sqlite3.connect(DB_PATH)
+            c = sqlite3.connect(DB_PATH, timeout=10)
             rows = c.execute(
                 "SELECT step_name FROM sda_steps WHERE pod_id=? AND mode='rollback' AND status='completed'",
                 (POD_ID,)
