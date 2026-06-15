@@ -150,7 +150,6 @@ def _migrate():
             duo_host        TEXT DEFAULT '',
             scc_api_key     TEXT DEFAULT '',
             scc_api_secret  TEXT DEFAULT '',
-            scc_org_uuid    TEXT DEFAULT '',
             sa_org_id       TEXT DEFAULT '',
             sa_api_key      TEXT DEFAULT '',
             sa_api_secret   TEXT DEFAULT '',
@@ -159,14 +158,19 @@ def _migrate():
             updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Migration: add authproxy + SAML columns if upgrading from older schema
+    # Migration: add columns if upgrading from older schema
     for _col in ("authproxy_ikey", "authproxy_skey",
-                 "idac_url", "duo_saml_app_ikey", "sa_saml_profile_id",
+                 "duo_saml_app_ikey", "sa_saml_profile_id",
                  "scc_password", "scc_email", "authproxy_cfg",
-                 "duo_admin_email", "duo_admin_password", "duo_totp_secret",
                  "sa_scim_token"):
         try:
             conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
+        except Exception:
+            pass
+    # Migration: drop obsolete columns (Playwright-only, no active code path uses these)
+    for _col in ("scc_org_uuid", "idac_url", "duo_admin_email", "duo_admin_password", "duo_totp_secret"):
+        try:
+            conn.execute(f"ALTER TABLE org_credentials DROP COLUMN {_col}")
         except Exception:
             pass
     # Global key-value config (CCO credentials etc.)
@@ -2488,7 +2492,7 @@ def list_org_credentials():
     """List all org numbers that have credentials configured."""
     conn = _db()
     rows = conn.execute(
-        "SELECT org_number, scc_org_uuid, updated_at FROM org_credentials ORDER BY CAST(org_number AS INTEGER)"
+        "SELECT org_number, duo_saml_app_ikey, updated_at FROM org_credentials ORDER BY CAST(org_number AS INTEGER)"
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
@@ -2504,9 +2508,10 @@ def get_org_credentials(org_number):
     conn.close()
     if not row:
         return jsonify({"org_number": org_number, "duo_ikey": "", "duo_skey": "", "duo_host": "",
-                        "scc_api_key": "", "scc_api_secret": "", "scc_org_uuid": "",
+                        "duo_saml_app_ikey": "",
+                        "scc_api_key": "", "scc_api_secret": "",
                         "sa_org_id": "", "sa_api_key": "", "sa_api_secret": "",
-                        "idac_url": "", "scc_email": "", "scc_password": "", "authproxy_cfg": "",
+                        "scc_email": "", "scc_password": "", "authproxy_cfg": "",
                         "sa_scim_token": ""})
     return jsonify(dict(row))
 
@@ -2519,15 +2524,17 @@ def save_org_credentials(org_number):
     conn.execute("""
         INSERT INTO org_credentials
             (org_number, duo_ikey, duo_skey, duo_host,
-             scc_api_key, scc_api_secret, scc_org_uuid,
-             sa_org_id, sa_api_key, sa_api_secret, idac_url, scc_email, scc_password,
+             duo_saml_app_ikey,
+             scc_api_key, scc_api_secret,
+             sa_org_id, sa_api_key, sa_api_secret,
+             scc_email, scc_password,
              authproxy_cfg, sa_scim_token, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
         ON CONFLICT(org_number) DO UPDATE SET
             duo_ikey=excluded.duo_ikey, duo_skey=excluded.duo_skey, duo_host=excluded.duo_host,
-            scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret, scc_org_uuid=excluded.scc_org_uuid,
+            duo_saml_app_ikey=excluded.duo_saml_app_ikey,
+            scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret,
             sa_org_id=excluded.sa_org_id, sa_api_key=excluded.sa_api_key, sa_api_secret=excluded.sa_api_secret,
-            idac_url=excluded.idac_url,
             scc_email=excluded.scc_email,
             scc_password=excluded.scc_password,
             authproxy_cfg=excluded.authproxy_cfg,
@@ -2536,9 +2543,9 @@ def save_org_credentials(org_number):
     """, (
         org_number,
         data.get("duo_ikey", "").strip(), data.get("duo_skey", "").strip(), data.get("duo_host", "").strip(),
-        data.get("scc_api_key", "").strip(), data.get("scc_api_secret", "").strip(), data.get("scc_org_uuid", "").strip(),
+        data.get("duo_saml_app_ikey", "").strip(),
+        data.get("scc_api_key", "").strip(), data.get("scc_api_secret", "").strip(),
         data.get("sa_org_id", "").strip(), data.get("sa_api_key", "").strip(), data.get("sa_api_secret", "").strip(),
-        data.get("idac_url", "").strip(),
         data.get("scc_email", "").strip(),
         data.get("scc_password", "").strip(),
         data.get("authproxy_cfg", "").strip(),
@@ -2551,9 +2558,10 @@ def save_org_credentials(org_number):
 
 ORG_CSV_COLS = [
     "org_number", "duo_ikey", "duo_skey", "duo_host",
-    "scc_org_uuid", "scc_api_key", "scc_api_secret",
+    "duo_saml_app_ikey",
+    "scc_api_key", "scc_api_secret",
     "sa_org_id", "sa_api_key", "sa_api_secret",
-    "idac_url", "scc_email", "scc_password", "authproxy_cfg",
+    "scc_email", "scc_password", "authproxy_cfg",
     "sa_scim_token",
 ]
 
@@ -2604,19 +2612,31 @@ def import_org_credentials_csv():
             conn.execute("""
                 INSERT INTO org_credentials
                     (org_number, duo_ikey, duo_skey, duo_host,
-                     scc_api_key, scc_api_secret, scc_org_uuid,
-                     sa_org_id, sa_api_key, sa_api_secret, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))
+                     duo_saml_app_ikey,
+                     scc_api_key, scc_api_secret,
+                     sa_org_id, sa_api_key, sa_api_secret,
+                     scc_email, scc_password, authproxy_cfg, sa_scim_token, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
                 ON CONFLICT(org_number) DO UPDATE SET
                     duo_ikey=excluded.duo_ikey, duo_skey=excluded.duo_skey, duo_host=excluded.duo_host,
-                    scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret, scc_org_uuid=excluded.scc_org_uuid,
+                    duo_saml_app_ikey=excluded.duo_saml_app_ikey,
+                    scc_api_key=excluded.scc_api_key, scc_api_secret=excluded.scc_api_secret,
                     sa_org_id=excluded.sa_org_id, sa_api_key=excluded.sa_api_key, sa_api_secret=excluded.sa_api_secret,
+                    scc_email=excluded.scc_email,
+                    scc_password=excluded.scc_password,
+                    authproxy_cfg=excluded.authproxy_cfg,
+                    sa_scim_token=excluded.sa_scim_token,
                     updated_at=datetime('now')
             """, (
                 org_num,
                 row.get("duo_ikey", "").strip(), row.get("duo_skey", "").strip(), row.get("duo_host", "").strip(),
-                row.get("scc_api_key", "").strip(), row.get("scc_api_secret", "").strip(), row.get("scc_org_uuid", "").strip(),
+                row.get("duo_saml_app_ikey", "").strip(),
+                row.get("scc_api_key", "").strip(), row.get("scc_api_secret", "").strip(),
                 row.get("sa_org_id", "").strip(), row.get("sa_api_key", "").strip(), row.get("sa_api_secret", "").strip(),
+                row.get("scc_email", "").strip(),
+                row.get("scc_password", "").strip(),
+                row.get("authproxy_cfg", "").strip(),
+                row.get("sa_scim_token", "").strip(),
             ))
             imported += 1
         conn.commit()
@@ -2648,65 +2668,6 @@ def save_global_config():
     conn.close()
     return jsonify({"status": "ok"})
 
-
-@app.route("/api/fetch-idac-url/<org_number>", methods=["POST"])
-def fetch_idac_url_route(org_number):
-    """
-    Run fetch_idac_url_from_dcloud() inside a running VPN container so it can
-    reach the jump host (198.18.133.36 is only reachable via VPN).
-    Uses ?pod_id=POD-N if supplied, otherwise picks the first running vpn-POD-* container.
-    """
-    import subprocess
-
-    pod_id = request.args.get("pod_id", "").strip()
-    if not pod_id:
-        try:
-            out = subprocess.check_output(
-                ["docker", "ps", "--format", "{{.Names}}", "--filter", "name=vpn-POD"],
-                text=True,
-            ).strip()
-            names = [n.strip() for n in out.splitlines() if n.strip()]
-            if not names:
-                return jsonify({"status": "error", "message": "No running VPN container found — start a POD first"}), 500
-            pod_id = names[0].replace("vpn-", "", 1)
-        except Exception as e:
-            return jsonify({"status": "error", "message": f"Docker lookup error: {e}"}), 500
-
-    py_cmd = (
-        "import sys; sys.path.insert(0,'/pipeline'); "
-        "from duo_automation import fetch_idac_url_from_dcloud; "
-        "print(fetch_idac_url_from_dcloud(), end='')"
-    )
-    try:
-        result = subprocess.run(
-            [
-                "docker", "run", "--rm",
-                "--network", f"container:vpn-{pod_id}",
-                "--entrypoint", "python3",
-                "pod-automator:latest", "-c", py_cmd,
-            ],
-            capture_output=True, text=True, timeout=600,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip()[-400:] or result.stdout.strip()[-200:])
-        idac_url = result.stdout.strip()
-        if not idac_url or "idac.cat-dcloud.com" not in idac_url:
-            raise RuntimeError(
-                f"Unexpected output from container — stdout: {result.stdout[:100]} | stderr: {result.stderr[:100]}"
-            )
-    except subprocess.TimeoutExpired:
-        return jsonify({"status": "error", "message": "Timeout (>600s) fetching iDAC URL — idac_sdk can take ~4min, try again"}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    conn = _db()
-    conn.execute(
-        "UPDATE org_credentials SET idac_url=?, updated_at=datetime('now') WHERE org_number=?",
-        (idac_url, org_number),
-    )
-    conn.commit()
-    conn.close()
-    return jsonify({"status": "ok", "idac_url": idac_url, "via_pod": pod_id})
 
 
 
@@ -4265,7 +4226,7 @@ async function loadOrgCreds(orgNum) {
   formEl.style.display = 'block';
   formEl.innerHTML = '<div style="color:#667788;font-size:12px;">Loading...</div>';
 
-  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', scc_api_key:'', scc_api_secret:'', scc_org_uuid:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', idac_url:'', scc_email:'', scc_password:'', authproxy_cfg:'', sa_scim_token:''};
+  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', duo_saml_app_ikey:'', scc_api_key:'', scc_api_secret:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', scc_email:'', scc_password:'', authproxy_cfg:'', sa_scim_token:''};
   try {
     const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum));
     d = await r.json();
@@ -4287,42 +4248,40 @@ async function loadOrgCreds(orgNum) {
     + col('Integration Key (ikey)', 'duo_ikey', d.duo_ikey, 'DIRIBLQ...', false)
     + col('Secret Key (skey)', 'duo_skey', d.duo_skey, 'Secret...', true)
     + col('API Hostname', 'duo_host', d.duo_host, 'api-xxxxx.duosecurity.com', false)
-    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Security Cloud Control (SCC)</div>'
-    + col('SCC Org UUID', 'scc_org_uuid', d.scc_org_uuid, '52ba65f9-...', false)
-    + col('API Key / Key ID', 'scc_api_key', d.scc_api_key, 'e8b04af7-...', false)
-    + col('API Secret / Bearer Token', 'scc_api_secret', d.scc_api_secret, 'Secret or eyJ...', true)
+    + '<div style="grid-column:1/-1;">'
+    + lbl('SAML App Integration Key (duo_saml_app_ikey)')
+    + inp('duo_saml_app_ikey', d.duo_saml_app_ikey || '', 'ikey of the Cisco Secure Access SAML app in Duo', false)
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">In Duo Admin portal: Applications \u2192 Protect an Application \u2192 Cisco Secure Access \u2192 copy the Integration Key. Required for step 4 (verify) and step 5 (enroll).</div>'
+    + '</div>'
     + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Secure Access (SA)</div>'
-    + col('SA Org ID', 'sa_org_id', d.sa_org_id, '8381539', false)
-    + col('API Key', 'sa_api_key', d.sa_api_key, '6671146f...', false)
-    + col('API Secret', 'sa_api_secret', d.sa_api_secret, 'Secret...', true)
     + '<div style="grid-column:1/-1;">'
     + lbl('SA SCIM Provisioning Token')
     + inp('sa_scim_token', d.sa_scim_token || '', 'Paste token from SA portal \u2192 Directories \u2192 Integrate \u2192 Duo \u2192 Generate Token', true)
     + '<div style="font-size:10px;color:#445566;margin-top:2px;">One-time token from Cisco Secure Access. Navigate: Connect \u2192 Users, Groups & Endpoint Devices \u2192 Directories \u2192 Integrate \u2192 IdP \u2192 Duo \u2192 Generate Token. Shown only once \u2014 copy immediately. SCIM URL is always <code style="color:#02c8ff;">https://api.sse.cisco.com/identity/v2/scim</code></div>'
     + '</div>'
-    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">iDAC / SCC Auto-Login</div>'
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Security Cloud Control (SCC)</div>'
+    + col('SCC API Key', 'scc_api_key', d.scc_api_key, 'e8b04af7-...', false)
+    + col('SCC API Secret', 'scc_api_secret', d.scc_api_secret, 'Secret or eyJ...', true)
+    + '<div style="grid-column:1/-1;font-size:10px;color:#445566;margin-top:-4px;margin-bottom:4px;">Used by the SCC reset check step (step 20). Set once per org \u2014 permanent.</div>'
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Secure Access (SA) API</div>'
+    + col('SA Org ID', 'sa_org_id', d.sa_org_id, '8381539', false)
+    + col('SA API Key', 'sa_api_key', d.sa_api_key, '6671146f...', false)
+    + col('SA API Secret', 'sa_api_secret', d.sa_api_secret, 'Secret...', true)
+    + '<div style="grid-column:1/-1;font-size:10px;color:#445566;margin-top:-4px;margin-bottom:4px;">Used by step 20 (SCC reset) for SSE/Umbrella API (api.sse.cisco.com). Different from SCC CDO credentials above.</div>'
+    + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">SCC Admin Credentials</div>'
     + '<div style="grid-column:1/-1;">'
     + lbl('SCC Admin Email')
     + inp('scc_email', d.scc_email || '', 'ciscoxar1@gmail.com', false)
-    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Cisco account email used to log into security.cisco.com (Mac browser mode). Varies per facilitator.</div>'
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Cisco account email used to log into security.cisco.com. Varies per facilitator.</div>'
     + '</div>'
     + '<div style="grid-column:1/-1;">'
     + lbl('SCC Admin Password')
     + inp('scc_password', d.scc_password || '', 'C1sco12345!!', true)
-    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Password for SCC admin email. When set, fully automates Duo browser steps — no manual MFA needed.</div>'
-    + '</div>'
-    + '<div style="grid-column:1/-1;">'
-    + lbl('iDAC Auto-Login URL')
-    + '<div style="display:flex;gap:6px;align-items:center;">'
-    + inp('idac_url', d.idac_url || '', 'https://idac.cat-dcloud.com/loaders/loader-cisco-wheel-autologin-saml.php?id=...', false)
-    + '<button id="oc-fetch-idac-btn" style="padding:4px 10px;background:#0d1e30;border:1px solid #ffa502;color:#ffa502;border-radius:4px;cursor:pointer;font-size:11px;white-space:nowrap;flex-shrink:0;">&#8635; Fetch</button>'
-    + '</div>'
-    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Used in Docker/pipeline mode. Click &#8635; Fetch to auto-retrieve from the lab jump host (VPN must be connected).</div>'
     + '</div>'
     + '<div style="grid-column:1/-1;">'
     + lbl('Auth Proxy Config (authproxy.cfg content)')
     + '<textarea id="oc-authproxy_cfg" rows="10" placeholder="[cloud]&#10;ikey=...&#10;skey=...&#10;api_host=api-xxx.duosecurity.com&#10;&#10;[ad_client]&#10;host=198.18.5.102&#10;..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:4px 7px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical;"></textarea>'
-    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Paste the complete authproxy.cfg downloaded from Duo Admin portal. Include [cloud], [ad_client], and [sso] sections. Stored per-org and pushed verbatim to AD1 at pipeline time — no browser or MFA required.</div>'
+    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Paste the complete authproxy.cfg downloaded from Duo Admin portal. Include [cloud], [ad_client], and [sso] sections. Stored per-org and pushed verbatim to AD1 at pipeline time.</div>'
     + '</div>'
     + '</div>'
      + '<div id="oc-save-banner" style="display:none;margin-top:8px;padding:8px 14px;border-radius:6px;font-size:13px;font-weight:600;"></div>'
@@ -4338,24 +4297,19 @@ async function loadOrgCreds(orgNum) {
     // Browsers block HTML value= attribute on type="password" inputs (security feature).
     // Programmatically setting .value bypasses this — values are visible in the field.
     const _setVal = (id, val) => { const el = document.getElementById(id); if (el) el.value = val || ''; };
-    _setVal('oc-duo_ikey',      d.duo_ikey);
-    _setVal('oc-duo_skey',      d.duo_skey);
-    _setVal('oc-duo_host',      d.duo_host);
-    _setVal('oc-scc_org_uuid',  d.scc_org_uuid);
-    _setVal('oc-scc_api_key',   d.scc_api_key);
-    _setVal('oc-scc_api_secret',d.scc_api_secret);
-    _setVal('oc-sa_org_id',     d.sa_org_id);
-    _setVal('oc-sa_api_key',    d.sa_api_key);
-    _setVal('oc-sa_api_secret', d.sa_api_secret);
-    _setVal('oc-idac_url',      d.idac_url);
-    _setVal('oc-scc_email',     d.scc_email);
-    _setVal('oc-scc_password',  d.scc_password);
-    _setVal('oc-authproxy_cfg', d.authproxy_cfg);
-    _setVal('oc-sa_scim_token', d.sa_scim_token);
-
-    // Fetch iDAC URL button
-    const fetchBtn = document.getElementById('oc-fetch-idac-btn');
-    if (fetchBtn) fetchBtn.onclick = () => fetchIdacUrl(orgNum);
+    _setVal('oc-duo_ikey',          d.duo_ikey);
+    _setVal('oc-duo_skey',          d.duo_skey);
+    _setVal('oc-duo_host',          d.duo_host);
+    _setVal('oc-duo_saml_app_ikey', d.duo_saml_app_ikey);
+    _setVal('oc-sa_scim_token',     d.sa_scim_token);
+    _setVal('oc-scc_api_key',       d.scc_api_key);
+    _setVal('oc-scc_api_secret',    d.scc_api_secret);
+    _setVal('oc-sa_org_id',         d.sa_org_id);
+    _setVal('oc-sa_api_key',        d.sa_api_key);
+    _setVal('oc-sa_api_secret',     d.sa_api_secret);
+    _setVal('oc-scc_email',         d.scc_email);
+    _setVal('oc-scc_password',      d.scc_password);
+    _setVal('oc-authproxy_cfg',     d.authproxy_cfg);
   }, 0);
 }
 
@@ -4366,20 +4320,19 @@ async function saveOrgCreds(orgNum) {
   if (banner) banner.style.display = 'none';
   const _g = id => { const el = document.getElementById(id); return el ? el.value : ''; };
   const payload = {
-    duo_ikey:      _g('oc-duo_ikey').trim(),
-    duo_skey:      _g('oc-duo_skey').trim(),
-    duo_host:      _g('oc-duo_host').trim(),
-    scc_org_uuid:  _g('oc-scc_org_uuid').trim(),
-    scc_api_key:   _g('oc-scc_api_key').trim(),
-    scc_api_secret:_g('oc-scc_api_secret').trim(),
-    sa_org_id:     _g('oc-sa_org_id').trim(),
-    sa_api_key:    _g('oc-sa_api_key').trim(),
-    sa_api_secret: _g('oc-sa_api_secret').trim(),
-    idac_url:      _g('oc-idac_url').trim(),
-    scc_email:     _g('oc-scc_email').trim(),
-    scc_password:  _g('oc-scc_password').trim(),
-    authproxy_cfg: _g('oc-authproxy_cfg'),
-    sa_scim_token: _g('oc-sa_scim_token').trim(),
+    duo_ikey:          _g('oc-duo_ikey').trim(),
+    duo_skey:          _g('oc-duo_skey').trim(),
+    duo_host:          _g('oc-duo_host').trim(),
+    duo_saml_app_ikey: _g('oc-duo_saml_app_ikey').trim(),
+    sa_scim_token:     _g('oc-sa_scim_token').trim(),
+    scc_api_key:       _g('oc-scc_api_key').trim(),
+    scc_api_secret:    _g('oc-scc_api_secret').trim(),
+    sa_org_id:         _g('oc-sa_org_id').trim(),
+    sa_api_key:        _g('oc-sa_api_key').trim(),
+    sa_api_secret:     _g('oc-sa_api_secret').trim(),
+    scc_email:         _g('oc-scc_email').trim(),
+    scc_password:      _g('oc-scc_password').trim(),
+    authproxy_cfg:     _g('oc-authproxy_cfg'),
   };
   const _showBanner = (ok, msg) => {
     if (!banner) return;
@@ -4416,29 +4369,6 @@ async function saveOrgCreds(orgNum) {
   } catch(e) {
     _showBanner(false, '\u2717 Error: ' + e.message);
     _reset();
-  }
-}
-
-async function fetchIdacUrl(orgNum) {
-  const fetchBtn = document.getElementById('oc-fetch-idac-btn');
-  const status   = document.getElementById('oc-status');
-  const urlInput = document.getElementById('oc-idac_url');
-  if (fetchBtn) { fetchBtn.disabled = true; fetchBtn.textContent = 'Fetching...'; }
-  if (status)   { status.style.color = '#ffa502'; status.textContent = 'Fetching iDAC URL from dCloud...'; }
-  try {
-    const r = await fetch('/api/fetch-idac-url/' + encodeURIComponent(orgNum), {method:'POST'});
-    const d = await r.json();
-    if (d.status === 'ok' && d.idac_url) {
-      if (urlInput) urlInput.value = d.idac_url;
-      if (status) { status.style.color = '#00e68a'; status.textContent = '\u2713 iDAC URL fetched — click Save to persist'; }
-    } else {
-      const msg = d.message || 'Unknown error';
-      if (status) { status.style.color = '#ff4757'; status.textContent = '\u2717 ' + msg; }
-    }
-  } catch(e) {
-    if (status) { status.style.color = '#ff4757'; status.textContent = '\u2717 ' + e.message; }
-  } finally {
-    if (fetchBtn) { fetchBtn.disabled = false; fetchBtn.textContent = '\u21BB Fetch'; }
   }
 }
 
