@@ -5502,7 +5502,7 @@ const DUO_CARD_LABELS = {
   ad_sync:          'AD Directory Sync',
   saml_scim_config: 'SA SAML + SCIM Config',
   authproxy_enroll: 'Auth Proxy Enroll',
-  scim_push:        'SA SCIM User Push',
+  scim_push:        'SA SCIM Verify Users',
   verify:           'Verify Auth Proxy',
 };
 const DUO_REFRESH_ONLY = new Set(['saml_scim_config']);  // skipped in refresh mode
