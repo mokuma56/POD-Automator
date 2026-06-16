@@ -6394,10 +6394,31 @@ def duo_run_card(
         """
         import time as _te
 
+        AUTHPROXY_LOG = (
+            r"C:\Program Files\Duo Security Authentication Proxy\log\authproxy.log"
+        )
         SSO_ENROLL_EXE = (
             r"C:\Program Files\Duo Security Authentication Proxy\bin"
             r"\authproxy_update_sso_enrollment_code.exe"
         )
+
+        def _drpc_status(winrm_s, label=""):
+            """Read last 25 lines of authproxy.log; return ('connected'|'failed'|'unknown')."""
+            try:
+                r = winrm_s.run_ps(
+                    f'Get-Content "{AUTHPROXY_LOG}" -Tail 25 -ErrorAction SilentlyContinue'
+                )
+                lines = r.std_out.decode(errors="replace").splitlines()
+                has_401 = any("Invalid signature" in l for l in lines)
+                has_idp = any("configured IdP" in l for l in lines)
+                manual  = any("manual intervention" in l.lower() for l in lines)
+                if has_idp and not has_401:
+                    return "connected"
+                if has_401 or manual:
+                    return "failed"
+                return "unknown"
+            except Exception:
+                return "unknown"
 
         if not enroll_blob:
             return False, (
@@ -6437,7 +6458,14 @@ def duo_run_card(
             return False, f"WinRM connect failed: {e}"
 
         try:
-            # Run the enrollment EXE with the blob
+            # ── Pre-check: skip EXE if proxy is already connected ────────────
+            pre = _drpc_status(winrm_sess, "pre")
+            if pre == "connected":
+                _log("DRPC already connected — skipping re-enrollment")
+                return True, "enrollment skipped — proxy already connected to Duo SSO ✓"
+            _log(f"DRPC pre-status: {pre} — proceeding with enrollment")
+
+            # ── Run the enrollment EXE with the blob ─────────────────────────
             # Note: use run_ps directly (not _winrm_run_cmd) to avoid
             # double-& issue — _winrm_run_cmd prepends "& " to the cmd
             _log(f"running authproxy_update_sso_enrollment_code.exe ...")
@@ -6449,22 +6477,38 @@ def duo_run_card(
             if _out: _log(f"enroll stdout: {_out[:300]}")
             if _err: _log(f"enroll stderr: {_err[:200]}")
 
-            # Stop and start DuoAuthProxy
+            exe_ok = "ENROLL_DONE" in _out or "secrets stored" in _out.lower()
+            if not exe_ok:
+                _log("WARN: EXE did not report success — may be an expired blob")
+
+            # ── Restart DuoAuthProxy ─────────────────────────────────────────
             _log("restarting DuoAuthProxy ...")
             winrm_sess.run_ps(
                 "Stop-Service -Name DuoAuthProxy -Force -ErrorAction SilentlyContinue"
             )
             _te.sleep(3)
             winrm_sess.run_ps("Start-Service -Name DuoAuthProxy")
-            _te.sleep(3)
+            _te.sleep(5)  # give DRPC time to connect or fail
 
-            # The EXE stores enrollment secrets in its own internal store —
-            # they are NOT written to authproxy.cfg.  No read-back needed.
-            success = "ENROLL_DONE" in _out or "secrets stored" in _out.lower()
-            if success:
-                return True, "enrollment OK (secrets stored internally by EXE)" + blob_age_warn
-            # EXE ran but no explicit success marker — treat as soft-success
-            return True, "enrollment ran (verify DuoAuthProxy is Running in step 7)" + blob_age_warn
+            # ── Post-check: verify DRPC connection from log ──────────────────
+            post = _drpc_status(winrm_sess, "post")
+            _log(f"DRPC post-status: {post}")
+
+            if post == "connected":
+                return True, "enrollment OK — DRPC connected, IdPs registered ✓" + blob_age_warn
+            if post == "failed":
+                return False, (
+                    "enrollment EXE ran but DRPC is still rejected (401 Invalid signature) — "
+                    "the blob is a one-time code that was already consumed. "
+                    "Generate a NEW command: Duo Admin portal → SSO Settings → "
+                    "External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command, "
+                    "paste into org credentials card, then re-run this step."
+                )
+            # Unknown — service restarted but log unclear
+            return True, (
+                "enrollment ran, DRPC status unclear — check step 7 to confirm"
+                + blob_age_warn
+            )
 
         except Exception as e:
             return False, f"authproxy enrollment failed: {e}"
@@ -6502,17 +6546,39 @@ def duo_run_card(
             return True, f"SA SCIM verify failed (soft-fail): {e}"
 
     def step_verify():
-        """WinRM: check DuoAuthProxy service is Running."""
+        """WinRM: check DuoAuthProxy is Running AND DRPC is connected."""
+        AUTHPROXY_LOG = (
+            r"C:\Program Files\Duo Security Authentication Proxy\log\authproxy.log"
+        )
         try:
             sess = _winrm_connect_for_pod(pod_id)
-            ok_v, msg_v = _winrm_run_cmd(
-                sess,
-                'powershell -Command "(Get-Service DuoAuthProxy).Status"',
-                _log,
+
+            # Service status
+            r_svc = sess.run_ps("(Get-Service DuoAuthProxy).Status")
+            svc_status = r_svc.std_out.decode(errors="replace").strip()
+            if "running" not in svc_status.lower():
+                return False, f"DuoAuthProxy service: {svc_status} (not running)"
+
+            # DRPC connection status from log
+            r_log = sess.run_ps(
+                f'Get-Content "{AUTHPROXY_LOG}" -Tail 30 -ErrorAction SilentlyContinue'
             )
-            if ok_v and "running" in msg_v.lower():
-                return True, f"DuoAuthProxy service: {msg_v.strip()}"
-            return False, f"DuoAuthProxy status: {msg_v.strip()}"
+            lines = r_log.std_out.decode(errors="replace").splitlines()
+            has_401    = any("Invalid signature" in l for l in lines)
+            has_idp    = any("configured IdP"    in l for l in lines)
+            manual_int = any("manual intervention" in l.lower() for l in lines)
+
+            if has_idp and not has_401:
+                idp_line = next(l for l in reversed(lines) if "configured IdP" in l)
+                return True, f"DuoAuthProxy Running + DRPC connected ✓ ({idp_line.strip()[-40:]})"
+            if has_401 or manual_int:
+                return False, (
+                    "DuoAuthProxy Running but DRPC NOT connected (401 Invalid signature) — "
+                    "enrollment blob is spent. Generate a new blob: Duo Admin portal → "
+                    "SSO Settings → External Auth Sources → AD → Auth Proxy → Step 2 → "
+                    "Generate Command, paste into org credentials, re-run step 5."
+                )
+            return True, f"DuoAuthProxy service: {svc_status} (DRPC log status unclear)"
         except Exception as e:
             return False, f"WinRM verify error: {e}"
 
