@@ -923,236 +923,31 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     continue
 
             # === Configure SCC Platform Integration ===
-            log("Opening SCC Platform Integrations")
-            # Load stored session — new format is full storage_state (cookies + localStorage),
-            # old format is just a cookies array. Use storage_state at context creation time
-            # so localStorage tokens (org-scoped JWTs) are restored before any navigation.
-            _session_data = json.loads(Path(session_path).read_text())
-            if isinstance(_session_data, dict) and "cookies" in _session_data:
-                # New format: full storage_state — create dedicated context with all tokens
-                log(f"Loading full storage state ({len(_session_data.get('cookies',[]))} cookies, "
-                    f"{len(_session_data.get('origins', []))} origins)")
-                scc_ctx = await browser.new_context(
-                    storage_state=_session_data,
-                    no_viewport=True,
-                )
-            else:
-                # Old format: cookies array only
-                log(f"Loading legacy cookie session ({len(_session_data)} cookies)")
-                scc_ctx = await browser.new_context(no_viewport=True)
-                await scc_ctx.add_cookies(_session_data)
-            scc_page = await scc_ctx.new_page()
-            scc_page.set_default_timeout(30000)
-
-            # Step 1: Extract enterpriseId from session localStorage, then load
-            # the dashboard with it so the React SPA initialises with full org context
-            # before we navigate anywhere else.
-            _eid = ""
-            for _origin in _session_data.get("origins", []):
-                for _item in _origin.get("localStorage", []):
-                    if _item.get("name") == "enterpriseId":
-                        _eid = _item["value"]
-                        break
-            _dashboard_url = (
-                f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
-                if _eid else "https://security.cisco.com/dashboard"
-            )
-            log(f"Loading SCC dashboard (enterpriseId={_eid[:8]}...) to init SPA")
-            await scc_page.goto(_dashboard_url, wait_until="domcontentloaded", timeout=60000)
-            await scc_page.wait_for_timeout(2000)
-
-            if "login" in scc_page.url.lower() or "sign-on" in scc_page.url.lower():
-                log("SCC session expired — attempting re-login with stored credentials")
-                relogin_ok = await _scc_relogin(ctx, scc_page, session_path, creds, log)
-                if not relogin_ok:
-                    return False, "SCC session expired and re-login failed — check scc_email/scc_password in org credentials or complete MFA manually"
-                await scc_page.goto(_dashboard_url, wait_until="domcontentloaded", timeout=60000)
-                await scc_page.wait_for_timeout(2000)
-                if "login" in scc_page.url.lower() or "sign-on" in scc_page.url.lower():
-                    return False, "SCC still at login after re-login attempt — MFA may be required"
-
-            # Dismiss the org-picker dropdown modal (pre-selected → just click Continue)
-            await _scc_dismiss_org_picker(scc_page, log)
-            await scc_page.wait_for_timeout(2000)
-
-            # Step 2: Navigate to Platform Integrations via the sidebar nav link.
-            # Direct URL navigation to /platforms/integrations always redirects back
-            # to /dashboard — the SPA must be initialised first (done above) and then
-            # we click the nav link so the React router performs a client-side transition.
-            log("Clicking Platform Integrations in SCC sidebar nav")
-            _nav_clicked = False
-            for _nav_sel in [
-                'a:has-text("Platform Integrations")',
-                'a[href*="platform"]:has-text("Integration")',
-                '[role="link"]:has-text("Platform Integrations")',
-                'nav a:has-text("Platform")',
-                'li a:has-text("Platform")',
-                'a[href*="platforms/integrations"]',
-                'a[href*="platform-integrations"]',
-            ]:
+            # Docker routes ALL traffic through OpenConnect VPN. This breaks the
+            # Okta silent-renew iframe that security.cisco.com SPA uses on every
+            # load → storage_state is always rejected → /login/callback redirect.
+            # Fix: hand off to the HOST dashboard which runs Playwright outside VPN.
+            log("Handing SCC navigation to host dashboard (VPN-bypass)...")
+            import urllib.request as _urlreq
+            _payload = json.dumps({"pod_id": pod_id, "otp_token": otp_token}).encode()
+            for _host_url in ["http://host.docker.internal:5050", "http://172.17.0.1:5050"]:
                 try:
-                    _nav_link = scc_page.locator(_nav_sel).first
-                    await _nav_link.wait_for(state="visible", timeout=5000)
-                    await _nav_link.click()
-                    await scc_page.wait_for_load_state("domcontentloaded", timeout=20000)
-                    await scc_page.wait_for_timeout(3000)
-                    log(f"Clicked Platform Integrations nav via {_nav_sel!r} → {scc_page.url[:80]}")
-                    _nav_clicked = True
-                    break
-                except Exception:
+                    _req = _urlreq.Request(
+                        f"{_host_url}/api/ise/scc-complete",
+                        data=_payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with _urlreq.urlopen(_req, timeout=180) as _resp:
+                        _result = json.loads(_resp.read())
+                    if _result.get("ok"):
+                        return True, _result.get("message", "ISE \u2192 SCC integration complete")
+                    else:
+                        return False, _result.get("message", "ISE \u2192 SCC integration failed on host")
+                except Exception as _e:
+                    log(f"Host callback failed ({_host_url}): {_e}")
                     continue
-
-            if not _nav_clicked:
-                # Fallback: screenshot what we have and try direct URL anyway
-                try:
-                    await scc_page.screenshot(path="/pipeline/host-data/scc_nav_fallback.png")
-                except Exception:
-                    pass
-                log("WARN: Platform Integrations nav link not found — saved scc_nav_fallback.png; trying direct URL")
-                await scc_page.goto("https://security.cisco.com/platforms/integrations",
-                                    wait_until="domcontentloaded", timeout=60000)
-                await scc_page.wait_for_timeout(3000)
-                await _scc_dismiss_org_picker(scc_page, log)
-                await scc_page.wait_for_timeout(2000)
-
-            # Wait for the React SPA to finish rendering — domcontentloaded fires before
-            # the JS app renders any content. Wait up to 30s for the Add Integration Module
-            # button (or any visible button) to appear before attempting interactions.
-            log("Waiting for Platform Integrations page to render...")
-            try:
-                await scc_page.wait_for_selector(
-                    'button:has-text("Add Integration"), '
-                    'a:has-text("Add Integration"), '
-                    '[role="button"]:has-text("Add Integration"), '
-                    'button:has-text("Add Module"), '
-                    'button:has-text("Add")',
-                    timeout=30000,
-                )
-                log("Platform Integrations page rendered")
-            except Exception:
-                try:
-                    await scc_page.screenshot(path="/pipeline/host-data/scc_integrations_loaded.png")
-                    log("WARN: Add Integration button not found after 30s — saved scc_integrations_loaded.png")
-                except Exception:
-                    pass
-                await scc_page.wait_for_timeout(3000)
-
-            log("Clicking Add Integration Module")
-            _add_clicked = False
-            for add_sel in [
-                'button:has-text("Add Integration")',
-                'a:has-text("Add Integration")',
-                '[role="button"]:has-text("Add Integration")',
-                'button:has-text("Add Module")',
-                'a:has-text("Add Module")',
-                '[role="button"]:has-text("Add Module")',
-                'button:has-text("Add")',
-                'a:has-text("Add")',
-            ]:
-                try:
-                    add_btn = scc_page.locator(add_sel).first
-                    if await add_btn.is_visible(timeout=4000):
-                        await add_btn.click()
-                        await scc_page.wait_for_timeout(2000)
-                        log(f"Clicked Add Integration button via {add_sel!r}")
-                        _add_clicked = True
-                        break
-                except Exception:
-                    continue
-            if not _add_clicked:
-                log("WARN: 'Add Integration Module' button not found — proceeding to find ISE Start/Edit button directly")
-
-            log("Starting ISE integration")
-            # SCC may show "Start" (fresh), "Edit"/"Configure"/"Connect" (existing integration),
-            # or "Activate" depending on prior run state. Try all candidates.
-            _ise_btn_clicked = False
-            for _btn_label in ["Start", "Edit", "Configure", "Connect", "Setup", "Activate"]:
-                for _scope in [
-                    scc_page.locator('[class*="card"], [class*="tile"], li').filter(has_text="ISE").first,
-                    scc_page,
-                ]:
-                    try:
-                        _btn = _scope.locator(f'button:has-text("{_btn_label}")').first
-                        if await _btn.is_visible(timeout=3000):
-                            await _btn.click(timeout=6000)
-                            log(f"Clicked ISE '{_btn_label}' button on SCC")
-                            _ise_btn_clicked = True
-                            break
-                    except Exception:
-                        continue
-                if _ise_btn_clicked:
-                    break
-            if not _ise_btn_clicked:
-                # Screenshot for debugging then raise
-                try:
-                    _ss = f"/pipeline/host-data/scc_ise_nobutton_{pod_id}.png"
-                    await scc_page.screenshot(path=_ss)
-                    log(f"Screenshot saved → data/scc_ise_nobutton_{pod_id}.png")
-                except Exception:
-                    pass
-                raise RuntimeError("No ISE integration button found on SCC (tried Start/Edit/Configure/Connect/Setup/Activate) — check screenshot")
-            await scc_page.wait_for_timeout(2000)
-
-            log("Clicking Connect")
-            for _conn_sel in ['button:has-text("Connect")', 'a:has-text("Connect")', '[role="button"]:has-text("Connect")']:
-                try:
-                    _conn_btn = scc_page.locator(_conn_sel).first
-                    if await _conn_btn.is_visible(timeout=5000):
-                        await _conn_btn.click(timeout=8000)
-                        log(f"Clicked Connect via {_conn_sel!r}")
-                        break
-                except Exception:
-                    continue
-            await scc_page.wait_for_timeout(2000)
-
-            log("Filling name and token")
-            import time as _time
-            _integ_name = f"ISE-POD-{pod_id}-{int(_time.time()) % 10000}"
-            for name_sel in ['input[placeholder*="name" i]', 'input[id*="name"]']:
-                try:
-                    name_inp = scc_page.locator(name_sel).first
-                    if await name_inp.is_visible(timeout=3000):
-                        await name_inp.fill(_integ_name)
-                        log(f"Filled integration name: {_integ_name}")
-                        break
-                except Exception:
-                    continue
-            for tok_sel in ['input[placeholder*="token" i]', 'textarea[placeholder*="token" i]', 'input[id*="token"]']:
-                try:
-                    tok_inp = scc_page.locator(tok_sel).first
-                    if await tok_inp.is_visible(timeout=3000):
-                        await tok_inp.fill(otp_token)
-                        log(f"Pasted OTP token ({len(otp_token)} chars)")
-                        break
-                except Exception:
-                    continue
-
-            log("Clicking Save")
-            await scc_page.locator('button:has-text("Save")').first.click(timeout=8000)
-            await scc_page.wait_for_timeout(3000)
-            # Handle duplicate-name error: append extra chars and retry once
-            _page_txt = (await scc_page.inner_text("body")).lower()
-            if "unique" in _page_txt or "already exists" in _page_txt or "error" in _page_txt:
-                log("Name conflict detected — retrying with alternate name")
-                _integ_name = f"ISE-POD-{pod_id}-{int(_time.time()) % 10000}x"
-                for name_sel in ['input[placeholder*="name" i]', 'input[id*="name"]']:
-                    try:
-                        name_inp = scc_page.locator(name_sel).first
-                        if await name_inp.is_visible(timeout=3000):
-                            await name_inp.fill(_integ_name)
-                            break
-                    except Exception:
-                        continue
-                await scc_page.locator('button:has-text("Save")').first.click(timeout=8000)
-                await scc_page.wait_for_timeout(5000)
-            else:
-                await scc_page.wait_for_timeout(2000)
-
-            # Check status — may not be Active yet (step 4 will fix it)
-            content = (await scc_page.content()).lower()
-            if "active" in content and "ise" in content:
-                return True, f"ISE \u2192 Secure Access integration Active (token: {otp_token[:20]}...)"
-            return True, f"ISE \u2192 SCC integration saved (token: {otp_token[:20]}...) — run step 4 if status is Waiting for activation"
+            return False, "Could not reach dashboard host — ensure dashboard is running at localhost:5050"
 
         except Exception as e:
             return False, f"ISE \u2192 Secure Access integration error: {e}"
