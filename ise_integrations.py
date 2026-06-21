@@ -1964,199 +1964,87 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
 
             # === Configure SCC Platform Integration ===
             log("Opening SCC Platform Integrations")
-            # Load stored session — new format is full storage_state (cookies + localStorage),
-            # old format is just a cookies array. Use storage_state at context creation time
-            # so localStorage tokens (org-scoped JWTs) are restored before any navigation.
             _session_data = json.loads(Path(session_path).read_text())
             if isinstance(_session_data, dict) and "cookies" in _session_data:
-                # New format: full storage_state — create dedicated context with all tokens
                 log(f"Loading full storage state ({len(_session_data.get('cookies',[]))} cookies, "
                     f"{len(_session_data.get('origins', []))} origins)")
-                scc_ctx = await browser.new_context(
-                    storage_state=_session_data,
-                    no_viewport=True,
-                )
+                scc_ctx = await browser.new_context(storage_state=_session_data, no_viewport=True)
             else:
-                # Old format: cookies array only
                 log(f"Loading legacy cookie session ({len(_session_data)} cookies)")
                 scc_ctx = await browser.new_context(no_viewport=True)
                 await scc_ctx.add_cookies(_session_data)
             scc_page = await scc_ctx.new_page()
             scc_page.set_default_timeout(30000)
 
-            # Step 1: Navigate to SCC root — select org tile only if needed.
-            # If the stored session has enterpriseId in localStorage (full storage_state),
-            # the page lands directly on Home with org already selected — no tile click needed.
-            log("Navigating to SCC root...")
-            await scc_page.goto("https://security.cisco.com",
-                                wait_until="domcontentloaded", timeout=60000)
-            # Wait for React SPA to hydrate — networkidle catches API-driven content
-            try:
-                await scc_page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
+            # Extract enterpriseId from session localStorage
+            _eid = ""
+            for _o in _session_data.get("origins", []):
+                for _it in _o.get("localStorage", []):
+                    if _it.get("name") == "enterpriseId":
+                        _eid = _it["value"]
+                        break
+            _dashboard_url = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
+                              if _eid else "https://security.cisco.com/dashboard")
+
+            # Step 1: Load dashboard with enterpriseId to initialise the React SPA
+            # in the correct org context before any other navigation.
+            log(f"Loading SCC dashboard (eid={_eid[:8]}...) to init SPA")
+            await scc_page.goto(_dashboard_url, wait_until="domcontentloaded", timeout=60000)
             await scc_page.wait_for_timeout(2000)
 
-            # Screenshot root page so we can see what the org picker looks like
-            try:
-                await scc_page.screenshot(path="/pipeline/host-data/scc_root_page.png")
-                log(f"Root page screenshot saved (URL: {scc_page.url[:80]})")
-            except Exception:
-                pass
-
-            # Dump all visible text to help diagnose tile selector
-            _body_text = (await scc_page.inner_text("body")).lower()
-            _org_already_selected = (
-                f"pseudoco-{org_number}" in _body_text or
-                f"pseudoco{org_number}" in _body_text
-            )
-            # Log first 300 chars of body text for debugging
-            log(f"Root body snippet: {_body_text[:300]!r}")
-
-            if _org_already_selected and "org-picker" not in scc_page.url.lower() and "select" not in scc_page.url.lower():
-                log(f"Org PseudoCo-{org_number} already active in session — skipping tile click")
-            else:
-                org_slug = f"pseudoco-{org_number}"
-                clicked_org = False
-                for sel in [
-                    f"button:has-text('PseudoCo-{org_number}')",
-                    f"button:has-text('{org_slug}')",
-                    f"a:has-text('PseudoCo-{org_number}')",
-                    f"a:has-text('{org_slug}')",
-                    f"[data-testid*='{org_slug}']",
-                    f"div[role='button']:has-text('{org_slug}')",
-                    f"li:has-text('{org_slug}')",
-                    # Broader fallbacks
-                    f"[class*='card']:has-text('{org_slug}')",
-                    f"[class*='tile']:has-text('{org_slug}')",
-                    f"[class*='org']:has-text('{org_slug}')",
-                    f"*:has-text('PseudoCo-{org_number}') >> nth=0",
-                ]:
-                    try:
-                        tile = scc_page.locator(sel).first
-                        await tile.wait_for(state="visible", timeout=4000)
-                        await tile.click()
-                        await scc_page.wait_for_load_state("domcontentloaded", timeout=20000)
-                        await scc_page.wait_for_timeout(2000)
-                        log(f"Clicked org tile via {sel!r} → {scc_page.url[:80]}")
-                        clicked_org = True
-                        break
-                    except Exception:
-                        continue
-                if not clicked_org:
-                    log("WARN: Org tile not found — trying Continue fallback")
-                    await _scc_dismiss_org_picker(scc_page, log)
-
-            # Extract enterpriseId from stored session localStorage for direct URL use
-            _enterprise_id = ""
-            try:
-                for _o in _session_data.get("origins", []):
-                    for _item in _o.get("localStorage", []):
-                        if _item.get("name") == "enterpriseId":
-                            _enterprise_id = _item.get("value", "")
-                            break
-                if _enterprise_id:
-                    log(f"enterpriseId from session: {_enterprise_id}")
-            except Exception:
-                pass
-
-            # Step 2: Navigate to Platform Integrations.
-            # After Continue, SCC React app always redirects to /dashboard.
-            # Re-navigating WITH ?enterpriseId= in the URL bypasses the org picker
-            # and loads the page in the correct org context.
-            _platform_url = None
-            _ei_suffix = f"?enterpriseId={_enterprise_id}" if _enterprise_id else ""
-            for _url in [
-                f"https://security.cisco.com/platforms/integrations{_ei_suffix}",
-                "https://security.cisco.com/platforms/integrations",
-                f"https://security.cisco.com/secure-access/platform-integrations{_ei_suffix}",
-                "https://security.cisco.com/secure-access/integrations",
-                "https://security.cisco.com/integration-hub",
-            ]:
-                log(f"Trying: {_url}")
-                await scc_page.goto(_url, wait_until="domcontentloaded", timeout=60000)
+            if "login" in scc_page.url.lower() or "sign-on" in scc_page.url.lower():
+                log("SCC session expired — attempting re-login")
+                relogin_ok = await _scc_relogin(ctx, scc_page, session_path, creds, log)
+                if not relogin_ok:
+                    return False, "SCC session expired and re-login failed"
+                await scc_page.goto(_dashboard_url, wait_until="domcontentloaded", timeout=60000)
                 await scc_page.wait_for_timeout(2000)
-                # Dismiss org picker if it appears — Continue redirects to /dashboard (org now set)
-                _picker_dismissed = await _scc_dismiss_org_picker(scc_page, log)
-                # Wait for React client-side navigation to finish (Continue → /dashboard)
-                await scc_page.wait_for_timeout(4000)
-                _dest = scc_page.url
-                log(f"  After dismiss, URL: {_dest[:80]}")
+                if "login" in scc_page.url.lower() or "sign-on" in scc_page.url.lower():
+                    return False, "SCC still at login after re-login — MFA may be required"
 
-                if "login" in _dest.lower() or "sign-on" in _dest.lower():
-                    log("SCC session expired — attempting re-login")
-                    relogin_ok = await _scc_relogin(ctx, scc_page, session_path, creds, log)
-                    if not relogin_ok:
-                        return False, "SCC session expired and re-login failed"
-                    await scc_page.goto(_url, wait_until="domcontentloaded", timeout=60000)
-                    await scc_page.wait_for_timeout(2000)
-                    await _scc_dismiss_org_picker(scc_page, log)
-                    await scc_page.wait_for_timeout(4000)
-                    _dest = scc_page.url
-
-                _path = _dest.split("security.cisco.com")[-1].lstrip("/").split("?")[0]
-                _is_home = not _path or _path in ("home", "dashboard") or _path.startswith("home")
-
-                if not _is_home and "integrations" in _dest.lower():
-                    log(f"Landed on Platform Integrations: {_dest[:80]}")
-                    _platform_url = _dest
-                    break
-
-                # If Continue was clicked (org now set) and we landed on dashboard,
-                # re-navigate to the target URL — org context should persist now
-                if _picker_dismissed and _is_home and _enterprise_id:
-                    _retry_url = f"https://security.cisco.com/platforms/integrations?enterpriseId={_enterprise_id}"
-                    log(f"  Org set — re-navigating to {_retry_url}")
-                    await scc_page.goto(_retry_url, wait_until="domcontentloaded", timeout=60000)
-                    await scc_page.wait_for_timeout(5000)
-                    _dest2 = scc_page.url
-                    log(f"  Re-navigate result: {_dest2[:80]}")
-                    _path2 = _dest2.split("security.cisco.com")[-1].lstrip("/").split("?")[0]
-                    _is_home2 = not _path2 or _path2 in ("home", "dashboard") or _path2.startswith("home")
-                    if not _is_home2:
-                        log(f"Landed on Platform Integrations: {_dest2[:80]}")
-                        _platform_url = _dest2
-                        break
-                        _platform_url = _dest
-                        break
-                log(f"  → redirected to {_dest[:70]}")
-
-            if not _platform_url:
-                log("Direct URLs redirected — navigating via Secure Access sidebar")
-                await scc_page.goto("https://security.cisco.com", wait_until="domcontentloaded", timeout=60000)
-                await scc_page.wait_for_timeout(2000)
-                for _sa_sel in [
-                    'a:has-text("Secure Access")',
-                    'nav a[href*="secure-access"]',
-                    '[class*="nav"] a:has-text("Secure Access")',
-                ]:
-                    try:
-                        _sa = scc_page.locator(_sa_sel).first
-                        if await _sa.is_visible(timeout=4000):
-                            await _sa.click()
-                            await scc_page.wait_for_timeout(3000)
-                            log(f"Clicked Secure Access nav → {scc_page.url[:80]}")
-                            break
-                    except Exception:
-                        continue
-                for _il in [
-                    'a:has-text("Platform Integrations")',
-                    'a:has-text("Integrations")',
-                    'a[href*="integrations"]',
-                ]:
-                    try:
-                        _il_el = scc_page.locator(_il).first
-                        if await _il_el.is_visible(timeout=4000):
-                            await _il_el.click()
-                            await scc_page.wait_for_timeout(3000)
-                            log(f"Integrations link via {_il!r} → {scc_page.url[:80]}")
-                            break
-                    except Exception:
-                        continue
-
-            # Final org picker dismiss — in case a fresh navigation triggered it again
+            # Dismiss org picker modal (dropdown pre-selected → just click Continue)
             await _scc_dismiss_org_picker(scc_page, log)
             await scc_page.wait_for_timeout(2000)
+
+            # Step 2: Navigate to Platform Integrations via the sidebar nav link.
+            # Direct URL navigation always redirects to /dashboard — the SPA must be
+            # initialised first (done above) then we use a nav link click so the React
+            # router performs a client-side transition.
+            log("Clicking Platform Integrations in SCC sidebar nav")
+            _nav_clicked = False
+            for _nav_sel in [
+                'a:has-text("Platform Integrations")',
+                'a[href*="platform"]:has-text("Integration")',
+                '[role="link"]:has-text("Platform Integrations")',
+                'nav a:has-text("Platform")',
+                'li a:has-text("Platform")',
+                'a[href*="platforms/integrations"]',
+                'a[href*="platform-integrations"]',
+            ]:
+                try:
+                    _nl = scc_page.locator(_nav_sel).first
+                    await _nl.wait_for(state="visible", timeout=5000)
+                    await _nl.click()
+                    await scc_page.wait_for_load_state("domcontentloaded", timeout=20000)
+                    await scc_page.wait_for_timeout(3000)
+                    log(f"Clicked Platform Integrations nav via {_nav_sel!r} → {scc_page.url[:80]}")
+                    _nav_clicked = True
+                    break
+                except Exception:
+                    continue
+
+            if not _nav_clicked:
+                try:
+                    await scc_page.screenshot(path="/pipeline/host-data/scc_nav_fallback.png")
+                except Exception:
+                    pass
+                log("WARN: Platform Integrations nav link not found — saved scc_nav_fallback.png; trying direct URL")
+                await scc_page.goto("https://security.cisco.com/platforms/integrations",
+                                    wait_until="domcontentloaded", timeout=60000)
+                await scc_page.wait_for_timeout(3000)
+                await _scc_dismiss_org_picker(scc_page, log)
+                await scc_page.wait_for_timeout(2000)
+
 
             # Screenshot always for diagnostics
             try:
