@@ -95,45 +95,53 @@ def run(db_path: str, log=None):
             _log(f"  Initial navigation warning (continuing): {e}")
 
         # ── 3. Wait until authenticated (okta-token-storage non-empty) ───────
+        # Detection uses ctx.storage_state() — checks ALL origins including
+        # security.cisco.com even if the active page is still on sign-on domain
+        # (e.g. during the OAuth callback redirect chain).
         _log("Waiting for authentication (up to 5 minutes)...")
         deadline = time.time() + 300
         org_page_ready = False
 
         while time.time() < deadline:
             time.sleep(2)
-            all_pages = list(ctx.pages)
-            found = False
-            for pg in all_pages:
-                try:
-                    url = pg.url
-                except Exception:
-                    continue
-                if "sign-on.security.cisco.com" in url or "duosecurity.com" in url:
-                    _log(f"  Waiting for MFA... ({url[:80]})")
-                    continue
-                if "security.cisco.com" not in url:
-                    continue
-                # Check okta-token-storage
-                try:
-                    raw = pg.evaluate(
-                        "JSON.stringify(JSON.parse(localStorage.getItem('okta-token-storage') || '{}'))"
-                    )
-                    tokens = json.loads(raw)
-                    if tokens and isinstance(tokens, dict) and len(tokens) > 0:
-                        _log(f"Authenticated — URL: {url[:80]}")
-                        try:
-                            pg.screenshot(path=str(DATA_DIR / "scc_auth_state.png"))
-                        except Exception:
-                            pass
-                        org_page_ready = True
-                        found = True
-                        break
-                    else:
-                        _log(f"  On security.cisco.com but tokens not ready yet ({url[:60]})")
-                except Exception as ex:
-                    _log(f"  Waiting for app ({ex})")
-            if found:
-                break
+
+            # Primary: check storage_state for okta tokens in any origin
+            try:
+                _state = ctx.storage_state()
+                for _origin in _state.get("origins", []):
+                    for _item in _origin.get("localStorage", []):
+                        if _item.get("name") == "okta-token-storage":
+                            try:
+                                _tok = json.loads(_item.get("value", "{}"))
+                                if _tok and len(_tok) > 0:
+                                    _cur_url = ctx.pages[0].url if ctx.pages else "unknown"
+                                    _log(f"Authenticated (storage_state) — URL: {_cur_url[:80]}")
+                                    try:
+                                        ctx.pages[0].screenshot(
+                                            path=str(DATA_DIR / "scc_auth_state.png"))
+                                    except Exception:
+                                        pass
+                                    org_page_ready = True
+                            except Exception:
+                                pass
+                if org_page_ready:
+                    break
+            except Exception as _e:
+                pass  # context not ready yet
+
+            # Fallback: log current page URLs for diagnostics
+            try:
+                for pg in ctx.pages:
+                    try:
+                        url = pg.url
+                        if "sign-on" in url or "duosecurity" in url:
+                            _log(f"  Waiting for login... ({url[:80]})")
+                        elif "security.cisco.com" in url:
+                            _log(f"  On SCC, waiting for tokens... ({url[:60]})")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         if not org_page_ready:
             _log("ERROR: Timeout — did not reach authenticated security.cisco.com within 5 minutes")
