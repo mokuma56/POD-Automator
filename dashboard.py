@@ -238,6 +238,12 @@ def _ensure_duo_table():
 
 _ensure_duo_table()
 
+def _ensure_ise_table():
+    import ise_integrations as _ise_init
+    _ise_init.ise_ensure_table(str(DB_PATH))
+
+_ensure_ise_table()
+
 # ---- Log helpers ----
 def log(pod_id, msg):
     try:
@@ -1556,6 +1562,173 @@ def api_duo_reset(pod_id):
     return jsonify({"status": "ok", "message": f"Duo state cleared for {pod_id}"})
 
 
+# ── ISE Integration Card API ──────────────────────────────────────────────────
+
+@app.route("/api/ise/status/<pod_id>")
+def api_ise_status(pod_id):
+    """Return ISE card step status for a POD."""
+    _ensure_ise_table()
+    c = _db()
+    rows = c.execute(
+        "SELECT step_name, status, result, started_at, completed_at "
+        "FROM ise_steps WHERE pod_id=?", (pod_id,)
+    ).fetchall()
+    c.close()
+    steps = {r["step_name"]: dict(r) for r in rows}
+    return jsonify({"steps": steps})
+
+
+@app.route("/api/ise/run/<pod_id>", methods=["POST"])
+def api_ise_run(pod_id):
+    """Start ISE integration card via docker run inside the VPN network namespace."""
+    import threading
+    _ensure_ise_table()
+    data = request.get_json(silent=True) or {}
+    from_step = int(data.get("from_step", 0))
+
+    # Verify VPN container is running
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    def _run():
+        proc = subprocess.Popen([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-u", "-c",
+            f"import sys; sys.path.insert(0,'/pipeline'); "
+            f"from ise_integrations import ise_run_card, ise_ensure_table; "
+            f"ise_ensure_table('/pipeline/host-data/pod_state.db'); "
+            f"ok, r = ise_run_card('{pod_id}', '/pipeline/host-data/pod_state.db', "
+            f"    log=print, from_step={from_step}); "
+            f"print(('OK' if ok else 'FAIL') + ': ' + str(r))"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, f"[ise] {line}")
+
+        proc.wait()
+        _clear_stuck_running(pod_id, "ise_steps")
+        log(pod_id, f"[ise] container exited (rc={proc.returncode})")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "pod_id": pod_id, "from_step": from_step})
+
+
+@app.route("/api/ise/reset/<pod_id>", methods=["POST"])
+def api_ise_reset(pod_id):
+    """Clear all ISE card step rows for a POD."""
+    _ensure_ise_table()
+    c = _db()
+    c.execute("DELETE FROM ise_steps WHERE pod_id=?", (pod_id,))
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "message": f"ISE state cleared for {pod_id}"})
+
+
+_scc_refresh_thread = [None]  # track running refresh thread
+
+
+@app.route("/api/scc/refresh-sessions", methods=["POST"])
+def api_scc_refresh_sessions():
+    """Launch refresh_scc_sessions.py locally (headed Chrome) to refresh per-POD SCC
+    session files for all active PODs.  Streams progress to pipeline_logs under
+    pod_id='SCC_REFRESH'.  Runs on the Mac — NOT in Docker."""
+    import threading, os
+
+    req_data = request.get_json(silent=True) or {}
+    trigger_pod = req_data.get("pod_id", "SCC_REFRESH")  # for log attribution
+
+    script = DATA_DIR / "refresh_scc_sessions.py"
+    if not script.exists():
+        return jsonify({"status": "error", "message": "refresh_scc_sessions.py not found"}), 404
+
+    def _run():
+        log(trigger_pod, "[scc-refresh] Starting SCC session refresh for all active PODs...")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", str(script), str(DB_PATH)],
+                cwd=str(DATA_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    log(trigger_pod, line if line.startswith("[scc-refresh]") else f"[scc-refresh] {line}")
+            proc.wait()
+            status = "completed" if proc.returncode == 0 else "failed"
+            log(trigger_pod, f"[scc-refresh] {status} (rc={proc.returncode})")
+        except Exception as e:
+            log(trigger_pod, f"[scc-refresh] ERROR: {e}")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    _scc_refresh_thread[0] = t
+    return jsonify({"status": "started", "pod_id": trigger_pod})
+
+
+@app.route("/api/scc/refresh-cancel", methods=["POST"])
+def api_scc_refresh_cancel():
+    """Kill the running refresh_scc_sessions.py process."""
+    import signal
+    killed = 0
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "refresh_scc_sessions.py"],
+            capture_output=True, text=True
+        )
+        for pid in result.stdout.strip().split():
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+                killed += 1
+            except Exception:
+                pass
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+    return jsonify({"status": "ok", "killed": killed})
+
+
+@app.route("/api/scc/session-status", methods=["GET"])
+def api_scc_session_status():
+    """Return freshness of per-POD SCC session files."""
+    import time as _time
+    pod_id = request.args.get("pod_id")
+    result = {}
+    # If specific pod_id, just check that one; otherwise check all
+    if pod_id:
+        f = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
+        if not f.exists():
+            # Fallback: legacy scc_session.json
+            f = DATA_DIR / "data" / "scc_session.json"
+        result[pod_id] = {
+            "exists": f.exists(),
+            "age_hours": round((_time.time() - f.stat().st_mtime) / 3600, 1) if f.exists() else None,
+            "file": f.name if f.exists() else None,
+        }
+    else:
+        # Only include real POD sessions (scc_session_POD-*.json) so stale
+        # orphan files (scc_session_fresh.json, scc_session.json, etc.) don't
+        # inflate `total` in the JS poller and prevent it from ever declaring done.
+        for f in (DATA_DIR / "data").glob("scc_session_POD-*.json"):
+            pid = f.stem.replace("scc_session_", "")
+            result[pid] = {
+                "exists": True,
+                "age_hours": round((_time.time() - f.stat().st_mtime) / 3600, 1),
+                "file": f.name,
+            }
+    return jsonify(result)
+
+
 @app.route("/api/catc/discover/<pod_id>", methods=["POST"])
 def api_catc_discover(pod_id):
     """Run Catalyst Center discovery for a POD's switches (manual trigger)."""
@@ -2514,7 +2687,9 @@ def get_org_credentials(org_number):
                         "sa_org_id": "", "sa_api_key": "", "sa_api_secret": "",
                         "scc_email": "", "scc_password": "", "authproxy_cfg": "",
                         "sa_scim_token": "", "authproxy_enroll_blob": "",
-                        "authproxy_blob_saved_at": ""})
+                        "authproxy_blob_saved_at": "",
+                        "pxgrid_cloud_email": "", "pxgrid_cloud_password": "",
+                        "pxgrid_cloud_account": ""})
     return jsonify(dict(row))
 
 
@@ -2547,6 +2722,9 @@ def save_org_credentials(org_number):
         "authproxy_cfg":          data.get("authproxy_cfg", ""),  # preserve whitespace
         "sa_scim_token":          data.get("sa_scim_token", "").strip(),
         "authproxy_enroll_blob":  data.get("authproxy_enroll_blob", "").strip(),
+        "pxgrid_cloud_email":     data.get("pxgrid_cloud_email", "").strip(),
+        "pxgrid_cloud_password":  data.get("pxgrid_cloud_password", "").strip(),
+        "pxgrid_cloud_account":   data.get("pxgrid_cloud_account", "").strip(),
     }
     updates = {k: v for k, v in fields.items() if v != ""}
     if updates:
@@ -3060,13 +3238,15 @@ DASHBOARD_HTML = """
 
    <div class="summary" id="summary"></div>
 
-  <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-    <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
-    <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
-    <button class="btn-start-all" id="btn-docker-down" onclick="dockerDown()" style="background:#ff4757;color:#fff;">&#9632; Teardown All</button>
-    <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
-    <span id="docker-status" style="font-size:12px;color:#667788;"></span>
-  </div>
+   <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+     <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
+     <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
+     <button class="btn-start-all" id="btn-docker-down" onclick="dockerDown()" style="background:#ff4757;color:#fff;">&#9632; Teardown All</button>
+     <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
+     <button class="btn-start-all" id="btn-scc-refresh-global" onclick="refreshSccSessionsGlobal()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#8635; Refresh SCC Sessions</button>
+     <span id="scc-refresh-global-status" style="font-size:12px;color:#667788;"></span>
+     <span id="docker-status" style="font-size:12px;color:#667788;"></span>
+   </div>
 
   <table>
     <thead>
@@ -3108,8 +3288,9 @@ DASHBOARD_HTML = """
        <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
         <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
         <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
-        <button class="tab-btn" onclick="switchTab(this, 'duo')">&#x1F512; Duo</button>
-        <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
+         <button class="tab-btn" onclick="switchTab(this, 'duo')">&#x1F512; Duo</button>
+         <button class="tab-btn" onclick="switchTab(this, 'ise')">&#x1F4F6; ISE</button>
+         <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
        <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
        <button class="tab-btn" onclick="switchTab(this, 'kb')">&#128218; Knowledge Base</button>
      </div>
@@ -3156,11 +3337,17 @@ DASHBOARD_HTML = """
        </div>
      </div>
 
-      <div class="tab-content" id="tab-duo">
-        <div id="duo-grid" style="padding:16px;min-height:260px;">
-          <div style="color:#667788;font-size:13px;">Select a POD to manage Duo integration</div>
-        </div>
-      </div>
+       <div class="tab-content" id="tab-duo">
+         <div id="duo-grid" style="padding:16px;min-height:260px;">
+           <div style="color:#667788;font-size:13px;">Select a POD to manage Duo integration</div>
+         </div>
+       </div>
+
+       <div class="tab-content" id="tab-ise">
+         <div id="ise-grid" style="padding:16px;min-height:260px;">
+           <div style="color:#667788;font-size:13px;">Select a POD to manage ISE integrations</div>
+         </div>
+       </div>
 
       <div class="tab-content" id="tab-scc">
         <div id="scc-actions" style="display:none;margin-bottom:10px;">
@@ -3261,6 +3448,7 @@ async function load() {
      else if (tabName === 'fabric')    loadFabricStatus(detailId);
      else if (tabName === 'sda')       loadSdaStatus(detailId);
      else if (tabName === 'duo')       loadDuoStatus(detailId);
+     else if (tabName === 'ise')       loadIseStatus(detailId);
      else if (tabName === 'scc')       loadSccChecklist(detailId);
      else if (tabName === 'baseconfig') loadBaseConfig(detailId);
     // logs tab has its own 2s poller; kb tab is static
@@ -4253,7 +4441,7 @@ async function loadOrgCreds(orgNum) {
   formEl.style.display = 'block';
   formEl.innerHTML = '<div style="color:#667788;font-size:12px;">Loading...</div>';
 
-  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', duo_saml_app_ikey:'', scc_api_key:'', scc_api_secret:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', scc_email:'', scc_password:'', authproxy_cfg:'', sa_scim_token:'', authproxy_enroll_blob:''};
+  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', duo_saml_app_ikey:'', scc_api_key:'', scc_api_secret:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', scc_email:'', scc_password:'', authproxy_cfg:'', sa_scim_token:'', authproxy_enroll_blob:'', pxgrid_cloud_email:'', pxgrid_cloud_password:'', pxgrid_cloud_account:''};
   try {
     const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum));
     d = await r.json();
@@ -4306,10 +4494,16 @@ async function loadOrgCreds(orgNum) {
     + lbl('SCC Admin Password')
     + inp('scc_password', d.scc_password || '', 'C1sco12345!!', true)
     + '</div>'
-    + '<div style="grid-column:1/-1;">'
-    + lbl('Auth Proxy Config (authproxy.cfg content)')
-    + '<textarea id="oc-authproxy_cfg" rows="10" placeholder="[cloud]&#10;ikey=...&#10;skey=...&#10;api_host=api-xxx.duosecurity.com&#10;&#10;[ad_client]&#10;host=198.18.5.102&#10;..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:4px 7px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical;"></textarea>'
-    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Paste the complete authproxy.cfg downloaded from Duo Admin portal. Include [cloud], [ad_client], and [sso] sections. Stored per-org and pushed verbatim to AD1 at pipeline time.</div>'
+     + '<div style="grid-column:1/-1;">'
+     + lbl('Auth Proxy Config (authproxy.cfg content)')
+     + '<textarea id="oc-authproxy_cfg" rows="10" placeholder="[cloud]&#10;ikey=...&#10;skey=...&#10;api_host=api-xxx.duosecurity.com&#10;&#10;[ad_client]&#10;host=198.18.5.102&#10;..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:4px 7px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical;"></textarea>'
+     + '<div style="font-size:10px;color:#445566;margin-top:2px;">Paste the complete authproxy.cfg downloaded from Duo Admin portal. Include [cloud], [ad_client], and [sso] sections. Stored per-org and pushed verbatim to AD1 at pipeline time.</div>'
+     + '</div>'
+     + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">pxGrid Cloud Portal (ISE Integration)</div>'
+     + '<div style="grid-column:1/-1;font-size:10px;color:#445566;margin-bottom:6px;">Credentials for the Catalyst Cloud Portal used during ISE pxGrid Cloud registration (Step 1 of ISE tab). The account name is in the format <code style="color:#02c8ff;">SEC-NET-CL25-02</code> — shown on the account selection screen after login.</div>'
+     + col('Catalyst Cloud Email', 'pxgrid_cloud_email', d.pxgrid_cloud_email, 'user@example.com', false)
+     + col('Catalyst Cloud Password', 'pxgrid_cloud_password', d.pxgrid_cloud_password, 'Password', true)
+     + col('Account Name', 'pxgrid_cloud_account', d.pxgrid_cloud_account, 'SEC-NET-CL25-02', false)
     + '</div>'
     + '</div>'
      + '<div id="oc-save-banner" style="display:none;margin-top:8px;padding:8px 14px;border-radius:6px;font-size:13px;font-weight:600;"></div>'
@@ -4339,6 +4533,9 @@ async function loadOrgCreds(orgNum) {
     _setVal('oc-scc_email',              d.scc_email);
     _setVal('oc-scc_password',           d.scc_password);
     _setVal('oc-authproxy_cfg',          d.authproxy_cfg);
+    _setVal('oc-pxgrid_cloud_email',     d.pxgrid_cloud_email);
+    _setVal('oc-pxgrid_cloud_password',  d.pxgrid_cloud_password);
+    _setVal('oc-pxgrid_cloud_account',   d.pxgrid_cloud_account);
   }, 0);
 }
 
@@ -4363,6 +4560,9 @@ async function saveOrgCreds(orgNum) {
     scc_email:              _g('oc-scc_email').trim(),
     scc_password:           _g('oc-scc_password').trim(),
     authproxy_cfg:          _g('oc-authproxy_cfg'),
+    pxgrid_cloud_email:     _g('oc-pxgrid_cloud_email').trim(),
+    pxgrid_cloud_password:  _g('oc-pxgrid_cloud_password').trim(),
+    pxgrid_cloud_account:   _g('oc-pxgrid_cloud_account').trim(),
   };
   const _showBanner = (ok, msg) => {
     if (!banner) return;
@@ -4886,6 +5086,7 @@ function switchTab(btn, name) {
 
   const podId = document.getElementById('detail-pod-id').dataset.podId;
   if (name === 'duo')        { if (podId) loadDuoStatus(podId); }
+  if (name === 'ise')        { if (podId) loadIseStatus(podId); }
   if (name === 'scc')        { if (podId) loadSccChecklist(podId); }
   if (name === 'fabric')     { if (podId) loadFabricStatus(podId); }
   if (name === 'sda')        { if (podId) loadSdaStatus(podId); }
@@ -6138,9 +6339,87 @@ async function dockerDown() {
   const data = await r.json();
   status.textContent = data.output.slice(0, 300);
   btn.disabled = false;
-  btn.textContent = '■ Teardown All';
+  btn.textContent = '\u25a0 Teardown All';
   setTimeout(() => status.textContent = '', 10000);
   load();
+}
+
+async function refreshSccSessionsGlobal() {
+  const btn    = document.getElementById('btn-scc-refresh-global');
+  const status = document.getElementById('scc-refresh-global-status');
+  btn.disabled = true;
+  btn.textContent = '\u23f3 Opening browser...';
+  status.style.color = '#02c8ff';
+  status.textContent = 'Log in to security.cisco.com and complete MFA in the browser window that just opened';
+
+  // Cancel button
+  let cancelBtn = document.getElementById('scc-refresh-cancel-btn');
+  if (!cancelBtn) {
+    cancelBtn = document.createElement('button');
+    cancelBtn.id = 'scc-refresh-cancel-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.cssText = 'margin-left:10px;background:#c0392b;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px;';
+    btn.parentNode.insertBefore(cancelBtn, btn.nextSibling);
+  }
+  cancelBtn.style.display = 'inline-block';
+
+  let poller = null;
+  const _reset = () => {
+    if (poller) { clearInterval(poller); poller = null; }
+    cancelBtn.style.display = 'none';
+    btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions';
+  };
+  cancelBtn.onclick = async () => {
+    _reset();
+    status.style.color = '#667788'; status.textContent = '';
+    await fetch('/api/scc/refresh-cancel', {method:'POST'});
+  };
+
+  try {
+    const r = await fetch('/api/scc/refresh-sessions', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({pod_id: 'SCC_REFRESH'}),
+    });
+    const d = await r.json();
+    if (d.status !== 'started') {
+      _reset();
+      status.style.color = '#ff4757';
+      status.textContent = 'Error: ' + (d.message || 'unknown');
+      return;
+    }
+
+    // Poll — same logic as per-pod (age < 1h), show per-POD progress
+    let polls = 0;
+    poller = setInterval(async () => {
+      polls++;
+      try {
+        const sr = await fetch('/api/scc/session-status');
+        const sd = await sr.json();
+        const entries  = Object.entries(sd);
+        const fresh    = entries.filter(([,s]) => s.exists && (s.age_hours || 99) < 1);
+        const total    = entries.length;
+        if (fresh.length > 0 && fresh.length >= total) {
+          _reset();
+          status.style.color = '#00e68a';
+          status.textContent = '\u2713 Sessions refreshed for ' + fresh.length + ' org(s)';
+          setTimeout(() => { status.textContent = ''; status.style.color = '#667788'; }, 15000);
+        } else if (polls > 90) {
+          _reset();
+          status.style.color = '#f0a500';
+          status.textContent = 'Timeout — check Live Logs for [scc-refresh] output';
+        } else {
+          const doneList = fresh.map(([pid]) => pid).join(', ');
+          status.textContent = 'Running... (' + (polls * 5) + 's)'
+            + (doneList ? ' \u2713 ' + doneList : '') + ' — complete login in browser window';
+        }
+      } catch(e) {}
+    }, 5000);
+  } catch(e) {
+    _reset();
+    status.style.color = '#ff4757';
+    status.textContent = 'Request failed';
+  }
 }
 
 load();
@@ -6318,6 +6597,221 @@ async function kbDeleteArticle() {
 
 // Hook into switchTab to load KB when selected
 const _origSwitchTab = typeof switchTab === 'function' ? switchTab : null;
+
+// ── ISE Integration Card JS ────────────────────────────────────────────────
+
+const ISE_STEPS = ['ise_pxgrid_register', 'ise_scc_integrate', 'ise_cdfmc_integrate'];
+const ISE_STEP_LABELS = {
+  ise_pxgrid_register: 'pxGrid Cloud Register',
+  ise_scc_integrate:   'ISE \u2192 Secure Access (SGTs)',
+  ise_cdfmc_integrate: 'ISE \u2192 cdFMC (SGTs)',
+};
+
+async function loadIseStatus(podId) {
+  if (window._isePoller) { clearInterval(window._isePoller); window._isePoller = null; }
+  const grid = document.getElementById('ise-grid');
+  if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+  if (!grid._lastHtml) grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
+  const [r, sr] = await Promise.all([
+    fetch('/api/ise/status/' + podId),
+    fetch('/api/scc/session-status?pod_id=' + podId),
+  ]);
+  const data = await r.json();
+  const sessMap = await sr.json();
+  data.session = sessMap[podId] || {};
+  renderIseGrid(podId, data);
+  const anyRunning = Object.values(data.steps || {}).some(s => (s||{}).status === 'running');
+  if (anyRunning) _iseStartPoller(podId);
+}
+
+function _iseStartPoller(podId) {
+  if (window._isePoller) clearInterval(window._isePoller);
+  let polls = 0;
+  window._isePoller = setInterval(async () => {
+    polls++;
+    const [r, sr] = await Promise.all([
+      fetch('/api/ise/status/' + podId),
+      fetch('/api/scc/session-status?pod_id=' + podId),
+    ]);
+    const data = await r.json();
+    const sessMap = await sr.json();
+    data.session = sessMap[podId] || {};
+    renderIseGrid(podId, data);
+    const anyRunning = Object.values(data.steps || {}).some(s => (s||{}).status === 'running');
+    if (!anyRunning || polls > 200) { clearInterval(window._isePoller); window._isePoller = null; }
+  }, 3000);
+}
+
+function renderIseGrid(podId, data) {
+  const grid = document.getElementById('ise-grid');
+  if (!grid) return;
+  const steps = data.steps || {};
+  const sess  = data.session || {};          // { exists, age_hours, file }
+  const total   = ISE_STEPS.length;
+  const done    = ISE_STEPS.filter(s => ['completed','skipped'].includes((steps[s]||{}).status)).length;
+  const failed  = ISE_STEPS.filter(s => (steps[s]||{}).status === 'failed').length;
+  const running = ISE_STEPS.some(s => (steps[s]||{}).status === 'running');
+  const pct     = Math.min(100, Math.round(done / total * 100));
+  const barColor = failed ? '#ff4757' : running ? '#02c8ff' : done === total ? '#00e68a' : '#667788';
+  const labelText = failed  ? 'Failed \u2014 ' + failed + ' step(s) failed'
+                  : running ? 'Running \u2014 ' + done + '/' + total
+                  : done === total ? 'Complete!'
+                  : done === 0    ? 'Not started'
+                  : 'Paused \u2014 ' + done + '/' + total;
+  const isRunning = running;
+
+  // ── Session freshness indicator ──────────────────────────────────────────
+  let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No SCC session \u2014 refresh required';
+  if (sess.exists) {
+    const h = sess.age_hours || 0;
+    if (h < 4)       { sessColor = '#00e68a'; sessIcon = '\u2713'; sessLabel = 'SCC session fresh (' + h.toFixed(1) + 'h ago)'; }
+    else if (h < 8)  { sessColor = '#f0a500'; sessIcon = '\u26a0'; sessLabel = 'SCC session ageing (' + h.toFixed(1) + 'h ago)'; }
+    else             { sessColor = '#ff4757'; sessIcon = '\u26a0'; sessLabel = 'SCC session stale (' + h.toFixed(1) + 'h) \u2014 refresh'; }
+  }
+
+  let html = '';
+
+  // ── Pre-flight: Refresh SCC Sessions ─────────────────────────────────────
+  html += '<div style="background:#0d1117;border:1px solid #1e2d3d;border-radius:6px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">';
+  html += '<div>';
+  html += '<span style="font-size:12px;font-weight:600;color:#8899aa;text-transform:uppercase;letter-spacing:.5px;">Pre-flight</span>&nbsp;';
+  html += '<span id="scc-sess-badge" style="font-size:12px;color:' + sessColor + ';">' + sessIcon + ' ' + sessLabel + '</span>';
+  html += '</div>';
+  html += '<button id="scc-refresh-btn" style="background:#445566;color:#cdd6e0;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u21bb Refresh SCC Sessions</button>';
+  html += '</div>';
+
+  // ── Header + Run / Reset buttons ─────────────────────────────────────────
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
+  html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">ISE Integrations</span>';
+  html += '<div style="display:flex;gap:8px;">';
+  html += '<button id="ise-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u25b6 Run</button>';
+  html += '<button id="ise-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;"' + (isRunning ? ' disabled' : '') + '>\u21bb Reset</button>';
+  html += '</div></div>';
+  html += '<div style="margin-bottom:14px;">';
+  html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
+  html += '<span>' + labelText + '</span><span>' + pct + '% (' + done + '/' + total + ')</span></div>';
+  html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
+  html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
+  html += '</div></div>';
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;">';
+  ISE_STEPS.forEach((s, i) => {
+    const info   = steps[s] || {};
+    const st     = info.status || 'pending';
+    const result = (info.result || '').substring(0, 180);
+    const dur    = formatDur(info.started_at, info.completed_at);
+    const cardBorder = st === 'failed'    ? 'border-left:3px solid #ff4757;'
+                     : st === 'running'   ? 'border-left:3px solid #02c8ff;'
+                     : st === 'completed' ? 'border-left:3px solid #00e68a;'
+                     : st === 'skipped'   ? 'border-left:3px solid #445566;opacity:0.7;'
+                     : '';
+    html += '<div class="step-card" style="' + cardBorder + '">';
+    html += '<div class="step-num">Step ' + (i+1) + '/' + total + '</div>';
+    html += '<div class="step-name">' + (ISE_STEP_LABELS[s]||s) + '</div>';
+    html += pipelineBadge(st);
+    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (dur)    html += '<div class="step-dur">' + dur + '</div>';
+    html += '</div>';
+  });
+  html += '</div>';
+  html += '<div style="margin-top:12px;font-size:11px;color:#445566;">ISE: 198.18.5.101 &nbsp;|&nbsp; pxGrid Cloud credentials set in Org Credentials card below</div>';
+
+  grid.innerHTML = html;
+  grid._lastHtml = true;
+
+  setTimeout(() => {
+    const runBtn      = document.getElementById('ise-run-btn');
+    const resetBtn    = document.getElementById('ise-reset-btn');
+    const refreshBtn  = document.getElementById('scc-refresh-btn');
+    if (runBtn)     runBtn.onclick     = () => iseRun(podId);
+    if (resetBtn)   resetBtn.onclick   = () => iseReset(podId);
+    if (refreshBtn) refreshBtn.onclick = () => iseRefreshSessions(podId);
+  }, 0);
+}
+
+async function iseRun(podId, fromStep) {
+  // Start the poller immediately — don't wait for the first status fetch.
+  // The Docker container takes a few seconds to update the DB to 'running',
+  // so checking status synchronously right after POST would still show the
+  // old state and the poller would never start.
+  _iseStartPoller(podId);
+  await fetch('/api/ise/run/' + podId, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({from_step: fromStep || 0}),
+  });
+}
+
+async function iseReset(podId) {
+  if (!confirm('Clear all ISE steps for ' + podId + '?')) return;
+  await fetch('/api/ise/reset/' + podId, { method: 'POST' });
+  loadIseStatus(podId);
+}
+
+async function iseRefreshSessions(podId) {
+  const btn   = document.getElementById('scc-refresh-btn');
+  const badge = document.getElementById('scc-sess-badge');
+  if (btn) { btn.disabled = true; btn.textContent = '\u23f3 Refreshing...'; }
+  if (badge) { badge.style.color = '#02c8ff'; badge.textContent = '\u23f3 Browser opening — log in and complete MFA...'; }
+
+  // Add cancel button next to refresh button
+  let cancelBtn = document.getElementById('scc-refresh-cancel-pod-btn');
+  if (!cancelBtn && btn) {
+    cancelBtn = document.createElement('button');
+    cancelBtn.id = 'scc-refresh-cancel-pod-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.cssText = 'margin-left:8px;background:#c0392b;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;';
+    btn.parentNode.insertBefore(cancelBtn, btn.nextSibling);
+  }
+  if (cancelBtn) cancelBtn.style.display = 'inline-block';
+
+  let poller = null;
+  if (cancelBtn) cancelBtn.onclick = async () => {
+    if (poller) clearInterval(poller);
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+    if (badge) { badge.style.color = '#667788'; badge.textContent = 'Cancelled'; }
+    await fetch('/api/scc/refresh-cancel', {method:'POST'});
+  };
+
+  try {
+    const r = await fetch('/api/scc/refresh-sessions', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({pod_id: podId}),
+    });
+    const d = await r.json();
+    if (d.status === 'started') {
+      if (badge) badge.textContent = '\u23f3 Running — complete login in the browser window';
+      let polls = 0;
+      poller = setInterval(async () => {
+        polls++;
+        const sr = await fetch('/api/scc/session-status?pod_id=' + podId);
+        const sd = await sr.json();
+        const s = sd[podId] || {};
+        if (s.exists && (s.age_hours || 99) < 1) {
+          clearInterval(poller);
+          if (cancelBtn) cancelBtn.style.display = 'none';
+          if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+          if (badge) { badge.style.color = '#00e68a'; badge.textContent = '\u2713 SCC session refreshed just now'; }
+          loadIseStatus(podId);
+        } else if (polls > 72) { // 6 min timeout
+          clearInterval(poller);
+          if (cancelBtn) cancelBtn.style.display = 'none';
+          if (btn) { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+          loadIseStatus(podId);
+        }
+      }, 5000);
+    } else {
+      if (cancelBtn) cancelBtn.style.display = 'none';
+      if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+      if (badge) { badge.style.color = '#ff4757'; badge.textContent = '\u26a0 Error: ' + (d.message || 'unknown'); }
+    }
+  } catch (e) {
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+    if (badge) { badge.style.color = '#ff4757'; badge.textContent = '\u26a0 Request failed'; }
+  }
+}
 </script>
 </body>
 </html>
