@@ -148,19 +148,44 @@ def run(db_path: str, log=None):
             ctx.close()
             return False, "Login timeout"
 
+        def _clean_storage(raw: dict) -> dict:
+            """Strip mid-auth-flow cookies and non-SCC origins that cause headless
+            Chromium to re-trigger OAuth when the session is loaded.
+
+            Keep only:
+            - Cookies whose domain ends with .security.cisco.com or security.cisco.com
+              (excludes sign-on.security.cisco.com, id.cisco.com, duosecurity.com)
+            - Cookies that are NOT oktaStateToken / JSESSIONID (auth-flow temporaries)
+            - Only the https://security.cisco.com localStorage origin
+            """
+            _keep_cookies = []
+            for c in raw.get("cookies", []):
+                dom = c.get("domain", "")
+                name = c.get("name", "")
+                # Skip sign-on, id.cisco.com, duosecurity cookies
+                if any(x in dom for x in ["sign-on", "id.cisco.com", "duosecurity", "login.cisco"]):
+                    continue
+                # Skip mid-flow temp tokens
+                if name in ("oktaStateToken", "JSESSIONID", "DT"):
+                    continue
+                _keep_cookies.append(c)
+
+            _keep_origins = [
+                o for o in raw.get("origins", [])
+                if o.get("origin", "") == "https://security.cisco.com"
+            ]
+
+            return {"cookies": _keep_cookies, "origins": _keep_origins}
+
         # ── 4. Capture auth storage state and save immediately ───────────────
-        # Save to all POD session files RIGHT NOW before the per-POD navigation
-        # loop. This guarantees a fresh session file is written even if the
-        # org-picker navigation fails — the per-POD loop below overwrites with
-        # an org-context-specific state if it succeeds.
-        auth_storage = ctx.storage_state()
-        _log(f"Captured: {len(auth_storage.get('cookies', []))} cookies, "
+        auth_storage = _clean_storage(ctx.storage_state())
+        _log(f"Captured (cleaned): {len(auth_storage.get('cookies', []))} cookies, "
              f"{len(auth_storage.get('origins', []))} origins")
         for pod_id, org_number, scc_org in pod_orgs:
             _early_path = DATA_DIR / f"scc_session_{pod_id}.json"
             try:
                 _early_path.write_text(json.dumps(auth_storage, indent=2))
-                _log(f"Early save → {_early_path.name} (org context nav will follow)")
+                _log(f"Early save → {_early_path.name}")
             except Exception as _e:
                 _log(f"Early save failed for {pod_id}: {_e}")
 
@@ -191,7 +216,7 @@ def run(db_path: str, log=None):
                 except Exception:
                     _log(f"  No org picker modal → {pg.url[:80]}")
 
-                pod_storage = ctx.storage_state()
+                pod_storage = _clean_storage(ctx.storage_state())
                 n_cookies = len(pod_storage.get("cookies", []))
                 n_origins = len(pod_storage.get("origins", []))
                 session_path.write_text(json.dumps(pod_storage, indent=2))
