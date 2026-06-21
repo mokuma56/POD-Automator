@@ -1842,6 +1842,39 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
 
 async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path: str, log) -> tuple[bool, str]:
     from playwright.async_api import async_playwright
+    import time as _time, base64 as _b64
+
+    # ── Early session validity check ──────────────────────────────────────────
+    # Validate the SCC session file BEFORE spending 4+ minutes on ISE steps.
+    try:
+        _sp = Path(session_path)
+        if not _sp.exists():
+            return False, "SCC session file not found — click 'Refresh SCC Sessions' first"
+        _age_h = (_time.time() - _sp.stat().st_mtime) / 3600
+        if _age_h > 1.5:
+            return False, f"SCC session is {_age_h:.1f}h old (>1.5h) — click 'Refresh SCC Sessions' first"
+        _sd = json.loads(_sp.read_text())
+        _okta_raw = ""
+        for _o in _sd.get("origins", []):
+            for _it in _o.get("localStorage", []):
+                if _it.get("name") == "okta-token-storage":
+                    _okta_raw = _it.get("value", "")
+        if _okta_raw:
+            _tok = json.loads(_okta_raw)
+            _id_tok = _tok.get("idToken", {}).get("idToken", "")
+            if _id_tok:
+                _parts = _id_tok.split(".")
+                if len(_parts) == 3:
+                    _payload = _parts[1] + "=" * (-len(_parts[1]) % 4)
+                    _claims = json.loads(_b64.b64decode(_payload))
+                    _exp = _claims.get("exp", 0)
+                    _remaining = _exp - _time.time()
+                    if _remaining < 120:  # less than 2 min remaining
+                        return False, f"SCC token expires in {_remaining/60:.1f} min — click 'Refresh SCC Sessions' then immediately retry"
+                    log(f"SCC session valid — token expires in {_remaining/60:.1f} min")
+    except Exception as _e:
+        log(f"SCC session pre-check warning: {_e} — continuing anyway")
+    # ─────────────────────────────────────────────────────────────────────────
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True,
