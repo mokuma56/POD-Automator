@@ -1976,40 +1976,27 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
             scc_page = await scc_ctx.new_page()
             scc_page.set_default_timeout(30000)
 
-            # Extract enterpriseId from session localStorage
-            _eid = ""
-            for _o in _session_data.get("origins", []):
-                for _it in _o.get("localStorage", []):
-                    if _it.get("name") == "enterpriseId":
-                        _eid = _it["value"]
-                        break
-            _dashboard_url = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
-                              if _eid else "https://security.cisco.com/dashboard")
-
-            # Step 1: Load dashboard with enterpriseId to initialise the React SPA
-            # in the correct org context before any other navigation.
-            log(f"Loading SCC dashboard (eid={_eid[:8]}...) to init SPA")
-            await scc_page.goto(_dashboard_url, wait_until="domcontentloaded", timeout=60000)
+            # Step 1: Navigate to SCC root — cookies work here; direct /dashboard
+            # URL triggers Okta re-auth in headless Chromium. Root shows the
+            # org-picker modal which we dismiss with Continue, then the SPA
+            # navigates us to /dashboard in the correct org context.
+            log("Navigating to SCC root to load org context...")
+            await scc_page.goto("https://security.cisco.com",
+                                wait_until="domcontentloaded", timeout=60000)
             await scc_page.wait_for_timeout(2000)
 
             if "login" in scc_page.url.lower() or "sign-on" in scc_page.url.lower():
-                log("SCC session expired — attempting re-login")
-                relogin_ok = await _scc_relogin(ctx, scc_page, session_path, creds, log)
-                if not relogin_ok:
-                    return False, "SCC session expired and re-login failed"
-                await scc_page.goto(_dashboard_url, wait_until="domcontentloaded", timeout=60000)
-                await scc_page.wait_for_timeout(2000)
-                if "login" in scc_page.url.lower() or "sign-on" in scc_page.url.lower():
-                    return False, "SCC still at login after re-login — MFA may be required"
+                log(f"SCC session expired (URL: {scc_page.url[:80]}) — re-run Refresh SCC Sessions")
+                return False, "SCC session expired — click 'Refresh SCC Sessions' on the dashboard then retry"
 
-            # Dismiss org picker modal (dropdown pre-selected → just click Continue)
+            # Dismiss org picker modal (Continue button — org pre-selected in dropdown)
             await _scc_dismiss_org_picker(scc_page, log)
             await scc_page.wait_for_timeout(2000)
+            log(f"After org picker: {scc_page.url[:80]}")
 
             # Step 2: Navigate to Platform Integrations via the sidebar nav link.
-            # Direct URL navigation always redirects to /dashboard — the SPA must be
-            # initialised first (done above) then we use a nav link click so the React
-            # router performs a client-side transition.
+            # Direct URL navigation always redirects to /dashboard — nav link click
+            # lets the React router perform a client-side transition instead.
             log("Clicking Platform Integrations in SCC sidebar nav")
             _nav_clicked = False
             for _nav_sel in [
