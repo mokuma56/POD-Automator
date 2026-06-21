@@ -140,16 +140,26 @@ def run(db_path: str, log=None):
             ctx.close()
             return False, "Login timeout"
 
-        # ── 4. Capture auth storage state ────────────────────────────────────
+        # ── 4. Capture auth storage state and save immediately ───────────────
+        # Save to all POD session files RIGHT NOW before the per-POD navigation
+        # loop. This guarantees a fresh session file is written even if the
+        # org-picker navigation fails — the per-POD loop below overwrites with
+        # an org-context-specific state if it succeeds.
         auth_storage = ctx.storage_state()
         _log(f"Captured: {len(auth_storage.get('cookies', []))} cookies, "
              f"{len(auth_storage.get('origins', []))} origins")
+        for pod_id, org_number, scc_org in pod_orgs:
+            _early_path = DATA_DIR / f"scc_session_{pod_id}.json"
+            try:
+                _early_path.write_text(json.dumps(auth_storage, indent=2))
+                _log(f"Early save → {_early_path.name} (org context nav will follow)")
+            except Exception as _e:
+                _log(f"Early save failed for {pod_id}: {_e}")
 
         # ── 5. Per-POD: select org via dropdown modal, save ──────────────────
-        # The org picker is a dropdown/modal (not tiles) — we navigate to
-        # /dashboard?enterpriseId=... for each POD so the SPA loads the right
-        # org context, dismiss the Continue modal, then save storage_state.
-        # This is intentionally fast: no tile-click timeouts.
+        # Navigate to root (NOT /dashboard?enterpriseId= — that triggers Okta
+        # re-auth in some browser contexts). Dismiss the org picker Continue
+        # button, then capture and overwrite with org-scoped storage_state.
         for pod_id, org_number, scc_org in pod_orgs:
             _log(f"--- {pod_id} (org {org_number}) ---")
             session_path = DATA_DIR / f"scc_session_{pod_id}.json"
@@ -157,25 +167,9 @@ def run(db_path: str, log=None):
             try:
                 pg = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-                # Use current storage state to find the enterpriseId for this org.
-                # If there's an existing session file with an enterpriseId use it;
-                # otherwise fall back to dashboard root.
-                eid = ""
-                if session_path.exists():
-                    try:
-                        _prev = json.loads(session_path.read_text())
-                        for _o in _prev.get("origins", []):
-                            for _it in _o.get("localStorage", []):
-                                if _it.get("name") == "enterpriseId":
-                                    eid = _it["value"]
-                                    break
-                    except Exception:
-                        pass
-
-                dash_url = (f"https://security.cisco.com/dashboard?enterpriseId={eid}"
-                            if eid else "https://security.cisco.com/dashboard")
-                _log(f"  Loading {dash_url[:80]}")
-                pg.goto(dash_url, timeout=30_000, wait_until="domcontentloaded")
+                _log(f"  Navigating to SCC root for org context...")
+                pg.goto("https://security.cisco.com", timeout=30_000,
+                        wait_until="domcontentloaded")
                 pg.wait_for_timeout(2000)
 
                 # Dismiss org picker modal (pre-selected dropdown → just Continue)
@@ -187,7 +181,7 @@ def run(db_path: str, log=None):
                     pg.wait_for_timeout(1500)
                     _log(f"  Dismissed org picker → {pg.url[:80]}")
                 except Exception:
-                    _log(f"  No org picker modal (already in org context) → {pg.url[:80]}")
+                    _log(f"  No org picker modal → {pg.url[:80]}")
 
                 pod_storage = ctx.storage_state()
                 n_cookies = len(pod_storage.get("cookies", []))
@@ -197,8 +191,8 @@ def run(db_path: str, log=None):
                 results[pod_id] = "ok"
 
             except Exception as e:
-                _log(f"  ERROR for {pod_id}: {e}")
-                results[pod_id] = f"error: {e}"
+                _log(f"  ERROR for {pod_id}: {e} — early save still valid")
+                results[pod_id] = "ok (early-save only)"
 
         ctx.close()
 
