@@ -149,26 +149,18 @@ def run(db_path: str, log=None):
             return False, "Login timeout"
 
         def _clean_storage(raw: dict) -> dict:
-            """Strip mid-auth-flow cookies and non-SCC origins that cause headless
-            Chromium to re-trigger OAuth when the session is loaded.
-
-            Keep only:
-            - Cookies whose domain ends with .security.cisco.com or security.cisco.com
-              (excludes sign-on.security.cisco.com, id.cisco.com, duosecurity.com)
-            - Cookies that are NOT oktaStateToken / JSESSIONID (auth-flow temporaries)
-            - Only the https://security.cisco.com localStorage origin
+            """Keep all cross-domain cookies (Okta sid etc. needed for silent renew)
+            but strip only:
+            - In-progress auth-flow cookie: oktaStateToken, DT
+            - Extra localStorage origins beyond security.cisco.com (Duo/id.cisco.com
+              localStorage conflicts cause the SPA to re-trigger OAuth)
+            The Jun 16 working session: 27 multi-domain cookies + 1 origin — this
+            pattern is what we want to preserve.
             """
-            _keep_cookies = []
-            for c in raw.get("cookies", []):
-                dom = c.get("domain", "")
-                name = c.get("name", "")
-                # Skip sign-on, id.cisco.com, duosecurity cookies
-                if any(x in dom for x in ["sign-on", "id.cisco.com", "duosecurity", "login.cisco"]):
-                    continue
-                # Skip mid-flow temp tokens
-                if name in ("oktaStateToken", "JSESSIONID", "DT"):
-                    continue
-                _keep_cookies.append(c)
+            _keep_cookies = [
+                c for c in raw.get("cookies", [])
+                if c.get("name", "") not in ("oktaStateToken", "DT")
+            ]
 
             _keep_origins = [
                 o for o in raw.get("origins", [])
