@@ -6344,6 +6344,8 @@ async function dockerDown() {
   load();
 }
 
+let _sccRefreshPoller = null;  // module-level so re-clicks cancel the old poller
+
 async function refreshSccSessionsGlobal() {
   const btn    = document.getElementById('btn-scc-refresh-global');
   const status = document.getElementById('scc-refresh-global-status');
@@ -6363,9 +6365,11 @@ async function refreshSccSessionsGlobal() {
   }
   cancelBtn.style.display = 'inline-block';
 
-  let poller = null;
+  // Clear any previous poller before starting a new one
+  if (_sccRefreshPoller) { clearInterval(_sccRefreshPoller); _sccRefreshPoller = null; }
+
   const _reset = () => {
-    if (poller) { clearInterval(poller); poller = null; }
+    if (_sccRefreshPoller) { clearInterval(_sccRefreshPoller); _sccRefreshPoller = null; }
     cancelBtn.style.display = 'none';
     btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions';
   };
@@ -6391,7 +6395,7 @@ async function refreshSccSessionsGlobal() {
 
     // Poll — same logic as per-pod (age < 1h), show per-POD progress
     let polls = 0;
-    poller = setInterval(async () => {
+    _sccRefreshPoller = setInterval(async () => {
       polls++;
       try {
         const sr = await fetch('/api/scc/session-status');
