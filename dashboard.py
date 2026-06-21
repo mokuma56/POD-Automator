@@ -1634,6 +1634,245 @@ def api_ise_reset(pod_id):
     return jsonify({"status": "ok", "message": f"ISE state cleared for {pod_id}"})
 
 
+def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) -> tuple:
+    """Run SCC Platform Integrations on the HOST (not Docker).
+    Docker routes all traffic through OpenConnect VPN which breaks Okta silent-renew.
+    On the host, storage_state → security.cisco.com works correctly.
+    Called by /api/ise/scc-complete which the Docker ISE container POSTs to.
+    """
+    import time as _time
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            _sd = json.loads(Path(session_path).read_text())
+            if isinstance(_sd, dict) and "cookies" in _sd:
+                log_fn(f"[scc-nav] storage_state: {len(_sd.get('cookies',[]))} cookies, "
+                       f"{len(_sd.get('origins', []))} origins")
+                scc_ctx = browser.new_context(storage_state=_sd, no_viewport=True)
+            else:
+                log_fn("[scc-nav] legacy cookie session")
+                scc_ctx = browser.new_context(no_viewport=True)
+                scc_ctx.add_cookies(_sd)
+            page = scc_ctx.new_page()
+            page.set_default_timeout(30000)
+
+            _eid = ""
+            for _o in _sd.get("origins", []):
+                for _it in _o.get("localStorage", []):
+                    if _it.get("name") == "enterpriseId":
+                        _eid = _it["value"]
+                        break
+            _url = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
+                    if _eid else "https://security.cisco.com/dashboard")
+            log_fn(f"[scc-nav] Navigating to SCC dashboard...")
+            page.goto(_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+
+            if "login" in page.url.lower() or "sign-on" in page.url.lower():
+                return False, f"SCC session expired (URL: {page.url}) — re-run Refresh SCC Sessions"
+            log_fn(f"[scc-nav] On dashboard: {page.url[:70]}")
+
+            # Dismiss org picker
+            try:
+                cont = page.locator('button:has-text("Continue")').first
+                cont.wait_for(state="visible", timeout=6000)
+                cont.click()
+                log_fn("[scc-nav] Dismissed org picker")
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+                page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            # Click Platform Integrations nav link
+            _nav_clicked = False
+            for _sel in [
+                'a:has-text("Platform Integrations")',
+                'a[href*="platform"]:has-text("Integration")',
+                '[role="link"]:has-text("Platform Integrations")',
+                'nav a:has-text("Platform")',
+                'li a:has-text("Platform")',
+                'a[href*="platforms/integrations"]',
+                'a[href*="platform-integrations"]',
+            ]:
+                try:
+                    lnk = page.locator(_sel).first
+                    lnk.wait_for(state="visible", timeout=5000)
+                    lnk.click()
+                    page.wait_for_load_state("domcontentloaded", timeout=20000)
+                    page.wait_for_timeout(3000)
+                    log_fn(f"[scc-nav] Clicked Platform Integrations via {_sel!r}")
+                    _nav_clicked = True
+                    break
+                except Exception:
+                    continue
+            if not _nav_clicked:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "scc_nav_fallback.png"))
+                except Exception:
+                    pass
+                log_fn("[scc-nav] WARN: nav link not found — trying direct URL")
+                page.goto("https://security.cisco.com/platforms/integrations",
+                          wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                try:
+                    page.locator('button:has-text("Continue")').first.click(timeout=4000)
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+
+            # Wait for Add Integration button
+            log_fn("[scc-nav] Waiting for Platform Integrations to render...")
+            try:
+                page.wait_for_selector(
+                    'button:has-text("Add Integration"), a:has-text("Add Integration"), '
+                    '[role="button"]:has-text("Add Integration"), '
+                    'button:has-text("Add Module"), button:has-text("Add")',
+                    timeout=30000)
+                log_fn("[scc-nav] Platform Integrations page ready")
+            except Exception:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "scc_integrations_loaded.png"))
+                    log_fn("[scc-nav] WARN: Add Integration button not found — saved screenshot")
+                except Exception:
+                    pass
+                page.wait_for_timeout(3000)
+
+            log_fn("[scc-nav] Clicking Add Integration Module")
+            for _sel in ['button:has-text("Add Integration")', 'a:has-text("Add Integration")',
+                         '[role="button"]:has-text("Add Integration")', 'button:has-text("Add Module")',
+                         'a:has-text("Add Module")', 'button:has-text("Add")']:
+                try:
+                    btn = page.locator(_sel).first
+                    if btn.is_visible(timeout=4000):
+                        btn.click(); page.wait_for_timeout(2000)
+                        log_fn(f"[scc-nav] Clicked Add Integration via {_sel!r}")
+                        break
+                except Exception:
+                    continue
+
+            log_fn("[scc-nav] Clicking ISE Start/Edit button")
+            _ise_clicked = False
+            for _lbl in ["Start", "Edit", "Configure", "Connect", "Setup", "Activate"]:
+                for _scope in [
+                    page.locator('[class*="card"], [class*="tile"], li').filter(has_text="ISE").first,
+                    page,
+                ]:
+                    try:
+                        b = _scope.locator(f'button:has-text("{_lbl}")').first
+                        if b.is_visible(timeout=3000):
+                            b.click(timeout=6000)
+                            log_fn(f"[scc-nav] Clicked ISE '{_lbl}' button")
+                            _ise_clicked = True
+                            break
+                    except Exception:
+                        continue
+                if _ise_clicked:
+                    break
+            if not _ise_clicked:
+                try:
+                    page.screenshot(path=str(DATA_DIR / f"scc_ise_nobutton_{pod_id}.png"))
+                    log_fn(f"[scc-nav] Screenshot: data/scc_ise_nobutton_{pod_id}.png")
+                except Exception:
+                    pass
+                return False, "No ISE integration button found on SCC (tried Start/Edit/Configure/Connect/Setup/Activate)"
+            page.wait_for_timeout(2000)
+
+            log_fn("[scc-nav] Clicking Connect")
+            for _sel in ['button:has-text("Connect")', 'a:has-text("Connect")',
+                         '[role="button"]:has-text("Connect")']:
+                try:
+                    b = page.locator(_sel).first
+                    if b.is_visible(timeout=5000):
+                        b.click(timeout=8000)
+                        log_fn("[scc-nav] Clicked Connect")
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(2000)
+
+            log_fn("[scc-nav] Filling integration name and OTP token")
+            _name = f"ISE-POD-{pod_id}-{int(_time.time()) % 10000}"
+            for _sel in ['input[placeholder*="name" i]', 'input[id*="name"]']:
+                try:
+                    inp = page.locator(_sel).first
+                    if inp.is_visible(timeout=3000):
+                        inp.fill(_name)
+                        log_fn(f"[scc-nav] Filled name: {_name}")
+                        break
+                except Exception:
+                    continue
+            for _sel in ['input[placeholder*="token" i]', 'textarea[placeholder*="token" i]',
+                         'input[id*="token"]']:
+                try:
+                    inp = page.locator(_sel).first
+                    if inp.is_visible(timeout=3000):
+                        inp.fill(otp_token)
+                        log_fn(f"[scc-nav] Pasted OTP ({len(otp_token)} chars)")
+                        break
+                except Exception:
+                    continue
+
+            log_fn("[scc-nav] Clicking Save")
+            page.locator('button:has-text("Save")').first.click(timeout=8000)
+            page.wait_for_timeout(3000)
+            _txt = page.inner_text("body").lower()
+            if "unique" in _txt or "already exists" in _txt or "error" in _txt:
+                log_fn("[scc-nav] Name conflict — retrying with alternate name")
+                _name = f"ISE-POD-{pod_id}-{int(_time.time()) % 10000}x"
+                for _sel in ['input[placeholder*="name" i]', 'input[id*="name"]']:
+                    try:
+                        inp = page.locator(_sel).first
+                        if inp.is_visible(timeout=3000):
+                            inp.fill(_name)
+                            break
+                    except Exception:
+                        continue
+                page.locator('button:has-text("Save")').first.click(timeout=8000)
+                page.wait_for_timeout(5000)
+            else:
+                page.wait_for_timeout(2000)
+
+            content = page.content().lower()
+            if "active" in content and "ise" in content:
+                return True, f"ISE \u2192 Secure Access integration Active (token: {otp_token[:20]}...)"
+            return True, (f"ISE \u2192 SCC integration saved (token: {otp_token[:20]}...) "
+                          f"— run step 4 if status is Waiting for activation")
+
+        except Exception as e:
+            return False, f"ISE \u2192 Secure Access integration error: {e}"
+        finally:
+            browser.close()
+
+
+@app.route("/api/ise/scc-complete", methods=["POST"])
+def api_ise_scc_complete():
+    """Called by the Docker ISE container after getting the OTP from ISE.
+    Runs SCC Platform Integrations Playwright navigation on the HOST (not Docker)
+    because Docker's VPN routing breaks Okta silent-renew in headless Chromium.
+    Returns {ok, message} — DB status is updated by the calling container.
+    """
+    data = request.get_json(silent=True) or {}
+    pod_id = data.get("pod_id", "")
+    otp_token = data.get("otp_token", "")
+    if not pod_id or not otp_token:
+        return jsonify({"ok": False, "message": "pod_id and otp_token required"}), 400
+
+    session_path = DATA_DIR / f"scc_session_{pod_id}.json"
+    if not session_path.exists():
+        return jsonify({"ok": False, "message": f"No SCC session file for {pod_id}"}), 404
+
+    log(pod_id, f"[scc-nav] Host SCC nav starting for {pod_id} (OTP: {otp_token[:12]}...)")
+
+    def _lf(msg):
+        log(pod_id, msg)
+
+    ok, message = _host_scc_integrate(pod_id, otp_token, str(session_path), _lf)
+    log(pod_id, f"[scc-nav] {'OK' if ok else 'FAIL'}: {message}")
+    return jsonify({"ok": ok, "message": message})
+
+
 _scc_refresh_thread = [None]  # track running refresh thread
 
 
