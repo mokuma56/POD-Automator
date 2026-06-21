@@ -1791,24 +1791,32 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
                     continue
 
             # === Configure SCC Platform Integration ===
-            log("Opening SCC Platform Integrations")
-            _session_data = json.loads(Path(session_path).read_text())
-            if isinstance(_session_data, dict) and "cookies" in _session_data:
-                log(f"Loading full storage state ({len(_session_data.get('cookies',[]))} cookies, "
-                    f"{len(_session_data.get('origins', []))} origins)")
-                scc_ctx = await browser.new_context(storage_state=_session_data, no_viewport=True)
-            else:
-                log(f"Loading legacy cookie session ({len(_session_data)} cookies)")
-                scc_ctx = await browser.new_context(no_viewport=True)
-                await scc_ctx.add_cookies(_session_data)
-            scc_page = await scc_ctx.new_page()
-            scc_page.set_default_timeout(30000)
+            # Docker routes ALL traffic through OpenConnect VPN which breaks Okta
+            # silent-renew → storage_state always rejected. Hand off to the HOST
+            # dashboard which runs Playwright outside the VPN container.
+            log("Handing SCC navigation to host dashboard (VPN-bypass)...")
+            import urllib.request as _urlreq
+            _payload = json.dumps({"pod_id": pod_id, "otp_token": otp_token}).encode()
+            for _host_url in ["http://host.docker.internal:5050", "http://172.17.0.1:5050"]:
+                try:
+                    _req = _urlreq.Request(
+                        f"{_host_url}/api/ise/scc-complete",
+                        data=_payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with _urlreq.urlopen(_req, timeout=180) as _resp:
+                        _result = json.loads(_resp.read())
+                    if _result.get("ok"):
+                        return True, _result.get("message", "ISE \u2192 SCC integration complete")
+                    else:
+                        return False, _result.get("message", "ISE \u2192 SCC integration failed on host")
+                except Exception as _e:
+                    log(f"Host callback failed ({_host_url}): {_e}")
+                    continue
+            return False, "Could not reach dashboard host — ensure dashboard is running at localhost:5050"
 
-            # Step 1: Navigate to SCC root — cookies work here; direct /dashboard
-            # URL triggers Okta re-auth in headless Chromium. Root shows the
-            # org-picker modal which we dismiss with Continue, then the SPA
-            # navigates us to /dashboard in the correct org context.
-            log("Navigating to SCC root to load org context...")
+            pass  # unreachable — host callback returns above
             await scc_page.goto("https://security.cisco.com",
                                 wait_until="domcontentloaded", timeout=60000)
             await scc_page.wait_for_timeout(2000)
@@ -1998,12 +2006,6 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
                 await scc_page.wait_for_timeout(5000)
             else:
                 await scc_page.wait_for_timeout(2000)
-
-            # Check status — may not be Active yet (step 4 will fix it)
-            content = (await scc_page.content()).lower()
-            if "active" in content and "ise" in content:
-                return True, f"ISE \u2192 Secure Access integration Active (token: {otp_token[:20]}...)"
-            return True, f"ISE \u2192 SCC integration saved (token: {otp_token[:20]}...) — run step 4 if status is Waiting for activation"
 
         except Exception as e:
             return False, f"ISE \u2192 Secure Access integration error: {e}"
