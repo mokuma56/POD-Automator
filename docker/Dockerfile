@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /pipeline
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Install Playwright Chromium and its system dependencies
+RUN playwright install --with-deps chromium
 
 ENV VMANAGE=198.18.133.10 \
     VMANAGE_USER=admin \
@@ -19,7 +21,7 @@ ENV VMANAGE=198.18.133.10 \
     ROUTER_PASS=C1sco12345 \
     PYTHONUNBUFFERED=1
 
-COPY onboard.py onboard_router.py evpn_fabric.py reset_switches.py tftp_server.py sda_fabric.py duo_automation.py PseudocoBranches_Config-Group-Template.csv ./
+COPY onboard.py onboard_router.py evpn_fabric.py reset_switches.py tftp_server.py sda_fabric.py duo_automation.py ise_integrations.py PseudocoBranches_Config-Group-Template.csv ./
 COPY base_configs/ ./base_configs/
 COPY docker/vpn-entrypoint.sh /vpn-entrypoint.sh
 COPY data/ ./data/

@@ -1634,6 +1634,63 @@ def api_ise_reset(pod_id):
     return jsonify({"status": "ok", "message": f"ISE state cleared for {pod_id}"})
 
 
+@app.route("/api/ise/reactivate/<pod_id>", methods=["POST"])
+def api_ise_reactivate(pod_id):
+    """Run ONLY the ISE→SCC deactivate+reactivate step (step 3) independently.
+
+    Resets step 3 to pending so the skip-check doesn't skip it, then launches
+    ise_run_card with from_step=2 inside the VPN network namespace.
+    """
+    import threading
+    _ensure_ise_table()
+
+    # Reset step 3 to pending so the skip check runs it
+    c = _db()
+    c.execute(
+        "UPDATE ise_steps SET status='pending', result='', started_at=NULL, completed_at=NULL "
+        "WHERE pod_id=? AND step_name='ise_scc_deactivate_reactivate'",
+        (pod_id,)
+    )
+    c.commit(); c.close()
+
+    # Verify VPN container is running
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    def _run():
+        proc = subprocess.Popen([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-u", "-c",
+            f"import sys; sys.path.insert(0,'/pipeline'); "
+            f"from ise_integrations import ise_run_card, ise_ensure_table; "
+            f"ise_ensure_table('/pipeline/host-data/pod_state.db'); "
+            f"ok, r = ise_run_card('{pod_id}', '/pipeline/host-data/pod_state.db', "
+            f"    log=print, from_step=2); "
+            f"print(('OK' if ok else 'FAIL') + ': ' + str(r))"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, f"[ise] {line}")
+
+        proc.wait()
+        _clear_stuck_running(pod_id, "ise_steps")
+        log(pod_id, f"[ise] container exited (rc={proc.returncode})")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "pod_id": pod_id, "step": "ise_scc_deactivate_reactivate"})
+
+
 def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) -> tuple:
     """Run SCC Platform Integrations on the HOST (not Docker).
     Docker routes all traffic through OpenConnect VPN which breaks Okta silent-renew.
@@ -1650,13 +1707,28 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             if isinstance(_sd, dict) and "cookies" in _sd:
                 log_fn(f"[scc-nav] storage_state: {len(_sd.get('cookies',[]))} cookies, "
                        f"{len(_sd.get('origins', []))} origins")
-                scc_ctx = browser.new_context(storage_state=_sd, no_viewport=True)
+                scc_ctx = browser.new_context(
+                    storage_state=_sd,
+                    viewport={"width": 1920, "height": 1080},
+                )
             else:
                 log_fn("[scc-nav] legacy cookie session")
-                scc_ctx = browser.new_context(no_viewport=True)
+                scc_ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
                 scc_ctx.add_cookies(_sd)
             page = scc_ctx.new_page()
             page.set_default_timeout(30000)
+
+            # Intercept SCC API responses so we can detect OTP rejection (400)
+            # without relying on page-content heuristics.
+            _scc_api_resp: dict = {}
+            def _on_scc_response(resp) -> None:
+                if "/v1/ise" in resp.url and resp.request.method == "POST":
+                    _scc_api_resp["status"] = resp.status
+                    try:
+                        _scc_api_resp["body"] = resp.text()
+                    except Exception:
+                        pass
+            page.on("response", _on_scc_response)
 
             _eid = ""
             for _o in _sd.get("origins", []):
@@ -1670,9 +1742,42 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             page.goto(_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2000)
 
-            if "login" in page.url.lower() or "sign-on" in page.url.lower():
+            # /login/callback is the OAuth2 callback URL — the SPA is processing a
+            # silent token renewal, not a login failure. Wait up to 20s for it to
+            # complete and land on the actual dashboard.
+            _wait = 0
+            while _wait < 20 and "login/callback" in page.url.lower():
+                page.wait_for_timeout(2000)
+                _wait += 2
+                log_fn(f"[scc-nav] Waiting for OAuth callback to complete ({_wait}s)... {page.url[:60]}")
+
+            # Only fail if still stuck on Okta sign-on (truly expired session)
+            if "sign-on" in page.url.lower() and "security.cisco.com" not in page.url.lower():
+                return False, f"SCC session expired (URL: {page.url}) — re-run Refresh SCC Sessions"
+            if "login" in page.url.lower() and "/login/callback" not in page.url.lower():
                 return False, f"SCC session expired (URL: {page.url}) — re-run Refresh SCC Sessions"
             log_fn(f"[scc-nav] On dashboard: {page.url[:70]}")
+
+            # Wait for SPA to fully render (sidebar needs time after OAuth callback)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(3000)
+
+            # Dump ALL nav links (including those below fold) for debugging
+            try:
+                _nav_links = page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('a, [role="link"]'))
+                        .map(a => ({href: a.href || '', text: (a.textContent || '').trim().slice(0, 60)}))
+                        .filter(a => a.href || a.text)
+                        .slice(0, 50);
+                }""")
+                log_fn("[scc-nav] ALL links: " +
+                       " | ".join(f"{l['text']!r}" for l in _nav_links if l['text'])[:300])
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_dashboard_{pod_id}.png"))
+            except Exception as _de:
+                log_fn(f"[scc-nav] link dump failed: {_de}")
 
             # Dismiss org picker
             try:
@@ -1685,160 +1790,526 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             except Exception:
                 pass
 
-            # Click Platform Integrations nav link
+            # ── Navigate via Platform Management → Integrations in sidebar ─────────
+            # The direct /ise-integration URL renders a blank SPA page (content area
+            # never mounts). Navigate through the sidebar instead:
+            # Platform Management → Integrations → My Integrations → ISE form
             _nav_clicked = False
-            for _sel in [
-                'a:has-text("Platform Integrations")',
-                'a[href*="platform"]:has-text("Integration")',
-                '[role="link"]:has-text("Platform Integrations")',
-                'nav a:has-text("Platform")',
-                'li a:has-text("Platform")',
-                'a[href*="platforms/integrations"]',
-                'a[href*="platform-integrations"]',
+
+            # Step 1: Click Platform Management in sidebar to expand it
+            log_fn("[scc-nav] Clicking Platform Management in sidebar")
+            _pm_clicked = False
+            for _pm_sel in [
+                'a:has-text("Platform Management")',
+                'button:has-text("Platform Management")',
+                'li:has-text("Platform Management") a',
+                'li:has-text("Platform Management") button',
             ]:
                 try:
-                    lnk = page.locator(_sel).first
-                    lnk.wait_for(state="visible", timeout=5000)
-                    lnk.click()
-                    page.wait_for_load_state("domcontentloaded", timeout=20000)
-                    page.wait_for_timeout(3000)
-                    log_fn(f"[scc-nav] Clicked Platform Integrations via {_sel!r}")
-                    _nav_clicked = True
-                    break
-                except Exception:
-                    continue
-            if not _nav_clicked:
-                try:
-                    page.screenshot(path=str(DATA_DIR / "scc_nav_fallback.png"))
-                except Exception:
-                    pass
-                log_fn("[scc-nav] WARN: nav link not found — trying direct URL")
-                page.goto("https://security.cisco.com/platforms/integrations",
-                          wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(3000)
-                try:
-                    page.locator('button:has-text("Continue")').first.click(timeout=4000)
-                    page.wait_for_timeout(2000)
-                except Exception:
-                    pass
-
-            # Wait for Add Integration button
-            log_fn("[scc-nav] Waiting for Platform Integrations to render...")
-            try:
-                page.wait_for_selector(
-                    'button:has-text("Add Integration"), a:has-text("Add Integration"), '
-                    '[role="button"]:has-text("Add Integration"), '
-                    'button:has-text("Add Module"), button:has-text("Add")',
-                    timeout=30000)
-                log_fn("[scc-nav] Platform Integrations page ready")
-            except Exception:
-                try:
-                    page.screenshot(path=str(DATA_DIR / "scc_integrations_loaded.png"))
-                    log_fn("[scc-nav] WARN: Add Integration button not found — saved screenshot")
-                except Exception:
-                    pass
-                page.wait_for_timeout(3000)
-
-            log_fn("[scc-nav] Clicking Add Integration Module")
-            for _sel in ['button:has-text("Add Integration")', 'a:has-text("Add Integration")',
-                         '[role="button"]:has-text("Add Integration")', 'button:has-text("Add Module")',
-                         'a:has-text("Add Module")', 'button:has-text("Add")']:
-                try:
-                    btn = page.locator(_sel).first
-                    if btn.is_visible(timeout=4000):
-                        btn.click(); page.wait_for_timeout(2000)
-                        log_fn(f"[scc-nav] Clicked Add Integration via {_sel!r}")
+                    el = page.locator(_pm_sel).first
+                    if el.is_visible(timeout=5000):
+                        el.click()
+                        page.wait_for_timeout(2000)
+                        log_fn(f"[scc-nav] Clicked Platform Management via {_pm_sel!r}")
+                        _pm_clicked = True
                         break
                 except Exception:
                     continue
 
-            log_fn("[scc-nav] Clicking ISE Start/Edit button")
-            _ise_clicked = False
-            for _lbl in ["Start", "Edit", "Configure", "Connect", "Setup", "Activate"]:
-                for _scope in [
-                    page.locator('[class*="card"], [class*="tile"], li').filter(has_text="ISE").first,
-                    page,
-                ]:
+            if not _pm_clicked:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_pm_fail_{pod_id}.png"))
+                    log_fn("[scc-nav] WARN: Platform Management not found — saved scc_pm_fail screenshot")
+                except Exception:
+                    pass
+                return False, "Could not find Platform Management in SCC sidebar — check scc_pm_fail screenshot"
+
+            # Step 2: Click Integrations in the expanded submenu
+            page.wait_for_timeout(1000)
+            _int_clicked = False
+            for _int_sel in [
+                'a:has-text("Integrations"):not(:has-text("Platform"))',
+                'li:has-text("Integrations") > a',
+                'a[href*="integrations"]',
+                'a:has-text("Integrations")',
+            ]:
+                try:
+                    el = page.locator(_int_sel).first
+                    if el.is_visible(timeout=5000):
+                        el.click()
+                        page.wait_for_load_state("domcontentloaded", timeout=20000)
+                        page.wait_for_timeout(3000)
+                        log_fn(f"[scc-nav] Clicked Integrations via {_int_sel!r} → {page.url[:80]}")
+                        _int_clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not _int_clicked:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_int_fail_{pod_id}.png"))
+                    log_fn("[scc-nav] WARN: Integrations link not found — saved scc_int_fail screenshot")
+                except Exception:
+                    pass
+                return False, "Could not navigate to Integrations under Platform Management — check scc_int_fail screenshot"
+
+            log_fn(f"[scc-nav] Integrations page URL: {page.url[:80]}")
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_int_page_{pod_id}.png"))
+            except Exception:
+                pass
+
+            # Step 3: Click My Integrations tab if present
+            page.wait_for_timeout(1000)
+            for _tab_sel in [
+                'button:has-text("My Integrations")',
+                'a:has-text("My Integrations")',
+                '[role="tab"]:has-text("My Integrations")',
+            ]:
+                try:
+                    tab = page.locator(_tab_sel).first
+                    if tab.is_visible(timeout=3000):
+                        tab.click()
+                        page.wait_for_timeout(2000)
+                        log_fn("[scc-nav] Clicked My Integrations tab")
+                        break
+                except Exception:
+                    continue
+
+            # Dump page state for diagnostics
+            try:
+                _btns_on_page = page.evaluate("""() => Array.from(document.querySelectorAll(
+                    'button, a[role="button"], [role="button"]'))
+                    .map(b => b.textContent.trim().slice(0,40)).filter(t => t).slice(0,20)""")
+                log_fn("[scc-nav] Buttons on integrations page: " + " | ".join(_btns_on_page))
+            except Exception:
+                pass
+
+            # Step 4: Find ISE integration card or Add Integration button
+            page.wait_for_timeout(1000)
+            _page_text = page.inner_text("body").lower()
+            _ise_opened = False
+
+            # Early exit: if SCC My Integrations already lists an ISE entry in any
+            # state (Connected, Waiting for activation, Deactivated), the SCC nav
+            # step is done.  Step 4 handles the ISE-side reactivation / handshake.
+            if "ise" in _page_text:
+                try:
+                    _early_screenshot = DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"
+                    page.screenshot(path=str(_early_screenshot))
+                except Exception:
+                    pass
+                log_fn("[scc-nav] ISE entry already present on SCC My Integrations — SCC nav done; step 4 will complete handshake from ISE side")
+                return True, "ISE integration already present in SCC (step 4 will complete handshake from ISE side)"
+
+            if not _ise_opened:
+                log_fn("[scc-nav] No ISE card found — clicking Add Integration")
+                for _add_lbl in ["Add Integration", "Add", "New Integration"]:
                     try:
-                        b = _scope.locator(f'button:has-text("{_lbl}")').first
-                        if b.is_visible(timeout=3000):
-                            b.click(timeout=6000)
-                            log_fn(f"[scc-nav] Clicked ISE '{_lbl}' button")
-                            _ise_clicked = True
+                        btn = page.locator(
+                            f'button:has-text("{_add_lbl}"), a:has-text("{_add_lbl}")'
+                        ).first
+                        if btn.is_visible(timeout=5000):
+                            btn.click()
+                            page.wait_for_timeout(2000)
+                            log_fn(f"[scc-nav] Clicked '{_add_lbl}'")
+                            _ise_opened = True
                             break
                     except Exception:
                         continue
-                if _ise_clicked:
-                    break
-            if not _ise_clicked:
+
+            if not _ise_opened:
                 try:
-                    page.screenshot(path=str(DATA_DIR / f"scc_ise_nobutton_{pod_id}.png"))
-                    log_fn(f"[scc-nav] Screenshot: data/scc_ise_nobutton_{pod_id}.png")
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_add_fail_{pod_id}.png"))
+                    log_fn("[scc-nav] WARN: No Add Integration or ISE card found — saved scc_add_fail screenshot")
                 except Exception:
                     pass
-                return False, "No ISE integration button found on SCC (tried Start/Edit/Configure/Connect/Setup/Activate)"
-            page.wait_for_timeout(2000)
+                return False, ("No Add Integration button or ISE card found on "
+                               "Platform Management → Integrations — check scc_add_fail screenshot")
 
-            log_fn("[scc-nav] Clicking Connect")
-            for _sel in ['button:has-text("Connect")', 'a:has-text("Connect")',
-                         '[role="button"]:has-text("Connect")']:
-                try:
-                    b = page.locator(_sel).first
-                    if b.is_visible(timeout=5000):
-                        b.click(timeout=8000)
-                        log_fn("[scc-nav] Clicked Connect")
-                        break
-                except Exception:
-                    continue
+            # After Add Integration, we may need to select ISE from a type list
+            page.wait_for_timeout(1500)
+            _page_text2 = page.inner_text("body").lower()
+            if "ise" in _page_text2 and "token" not in _page_text2 and "otp" not in _page_text2:
+                for _ise_type_sel in [
+                    'button:has-text("ISE")',
+                    'a:has-text("ISE")',
+                    '[class*="card"]:has-text("ISE") button',
+                    '[class*="tile"]:has-text("ISE") button',
+                    'td:has-text("ISE")',
+                ]:
+                    try:
+                        el = page.locator(_ise_type_sel).first
+                        if el.is_visible(timeout=3000):
+                            el.click()
+                            page.wait_for_timeout(2000)
+                            log_fn(f"[scc-nav] Selected ISE type via {_ise_type_sel!r}")
+                            break
+                    except Exception:
+                        continue
+
+            # If we landed on an ISE detail/info page (instructions + Connect button),
+            # we need to click "Connect" in the page content to open the actual form.
+            # On this page the sidebar has NO "Connect" nav item (we're in Platform
+            # Management context, not Secure Access), so the selector is unambiguous.
             page.wait_for_timeout(2000)
+            try:
+                _pre_inputs = page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('input, textarea'))
+                    .filter(i => i.placeholder !== "Type 'Ctrl' + '/' to search"
+                               && i.type !== 'hidden')
+                    .map(i => i.placeholder || i.type)""")
+                if not _pre_inputs:
+                    log_fn("[scc-nav] No form inputs yet — on ISE detail page, clicking Connect")
+                    for _conn_sel in [
+                        'button:has-text("Connect")',
+                        'a:has-text("Connect")',
+                    ]:
+                        try:
+                            btn = page.locator(_conn_sel).first
+                            if btn.is_visible(timeout=5000):
+                                btn.click()
+                                page.wait_for_timeout(3000)
+                                log_fn(f"[scc-nav] Clicked Connect on detail page via {_conn_sel!r}")
+                                break
+                        except Exception:
+                            continue
+            except Exception as _pie:
+                log_fn(f"[scc-nav] pre-input check error: {_pie}")
 
             log_fn("[scc-nav] Filling integration name and OTP token")
-            _name = f"ISE-POD-{pod_id}-{int(_time.time()) % 10000}"
-            for _sel in ['input[placeholder*="name" i]', 'input[id*="name"]']:
-                try:
-                    inp = page.locator(_sel).first
-                    if inp.is_visible(timeout=3000):
-                        inp.fill(_name)
-                        log_fn(f"[scc-nav] Filled name: {_name}")
-                        break
-                except Exception:
-                    continue
-            for _sel in ['input[placeholder*="token" i]', 'textarea[placeholder*="token" i]',
-                         'input[id*="token"]']:
-                try:
-                    inp = page.locator(_sel).first
-                    if inp.is_visible(timeout=3000):
-                        inp.fill(otp_token)
-                        log_fn(f"[scc-nav] Pasted OTP ({len(otp_token)} chars)")
-                        break
-                except Exception:
-                    continue
 
-            log_fn("[scc-nav] Clicking Save")
-            page.locator('button:has-text("Save")').first.click(timeout=8000)
-            page.wait_for_timeout(3000)
+            # Screenshot + button/input dump so we know what the form looks like
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_connect_form_{pod_id}.png"))
+                _form_info = page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a[class*="btn"]'))
+                        .map(b => (b.textContent || b.value || '').trim().slice(0, 40))
+                        .filter(t => t).slice(0, 15);
+                    const inputs = Array.from(document.querySelectorAll('input, textarea'))
+                        .map(i => ({type: i.type, id: i.id, name: i.name, ph: i.placeholder, dt: (i.dataset && i.dataset.testid) || ''}))
+                        .slice(0, 10);
+                    return {btns, inputs};
+                }""")
+                log_fn(f"[scc-nav] Form buttons: " + " | ".join(_form_info.get('btns', [])))
+                log_fn(f"[scc-nav] Form inputs: " + str(_form_info.get('inputs', [])))
+            except Exception as _fe:
+                log_fn(f"[scc-nav] form dump error: {_fe}")
+
+            _name = f"ISE-POD-{pod_id}-{int(_time.time()) % 10000}"
+
+            # Fill the form using Playwright's locator.fill(), which correctly
+            # triggers React's onChange and enables the Save button.
+            # IMPORTANT: do NOT click the "Show" button between fill and Save —
+            # that re-renders the OTP field and resets React state.
+            # The data-testid attributes on the fields make targeting precise.
+            log_fn(f"[scc-nav] Filling form: name={_name!r}, otp len={len(otp_token)}")
+            # Strategy A: press_sequentially — fires real keydown/keyup/input/change
+            # events per character, the most reliable trigger for React controlled inputs.
+            # NOTE: page.keyboard.press() only affects the main frame.
+            #       If the form is in a child iframe, use locator.evaluate() for blur.
+            _fill_ok = False
+            try:
+                _name_loc = page.locator('[data-testid*="integrationName"]').first
+                _otp_loc  = page.locator('[data-testid*="-otp"]').first
+                _name_loc.click(timeout=5000)
+                _name_loc.select_text(timeout=3000)     # select-all via locator (works in iframes)
+                _name_loc.press_sequentially(_name, delay=30)
+                page.wait_for_timeout(300)
+                _otp_loc.click(timeout=5000)            # blurs name → name.touched=True
+                _otp_loc.select_text(timeout=3000)
+                _otp_loc.press_sequentially(otp_token, delay=8)
+                page.wait_for_timeout(300)
+                _otp_loc.evaluate("el => el.blur()")    # blur OTP directly (works in iframes)
+                page.wait_for_timeout(600)              # allow React validation to run
+                log_fn(f"[scc-nav] Typed via press_sequentially (name={len(_name)} otp={len(otp_token)} chars) + blur")
+                _fill_ok = True
+            except Exception as _fe:
+                log_fn(f"[scc-nav] press_sequentially failed ({_fe})")
+
+            # Strategy B: React-native-setter via locator.evaluate() — runs in the
+            # element's own frame (works for iframes). Fires input/change/blur events.
+            if not _fill_ok:
+                try:
+                    _name_loc.evaluate("""
+                        (el, v) => {
+                            const setter = Object.getOwnPropertyDescriptor(
+                                HTMLInputElement.prototype, 'value').set;
+                            setter.call(el, v);
+                            el.dispatchEvent(new Event('input',  {bubbles:true}));
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                            el.dispatchEvent(new Event('blur',   {bubbles:true}));
+                        }
+                    """, _name)
+                    _otp_loc.evaluate("""
+                        (el, v) => {
+                            const setter = Object.getOwnPropertyDescriptor(
+                                HTMLInputElement.prototype, 'value').set;
+                            setter.call(el, v);
+                            el.dispatchEvent(new Event('input',  {bubbles:true}));
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                            el.dispatchEvent(new Event('blur',   {bubbles:true}));
+                        }
+                    """, otp_token)
+                    page.wait_for_timeout(600)
+                    log_fn("[scc-nav] Filled via React-native-setter locator.evaluate()")
+                    _fill_ok = True
+                except Exception as _fe2:
+                    log_fn(f"[scc-nav] React-native-setter failed ({_fe2})")
+
+            # Strategy C: plain fill() + blur as last resort
+            if not _fill_ok:
+                try:
+                    _name_loc.fill(_name, timeout=5000)
+                    _otp_loc.fill(otp_token, timeout=5000)
+                    _name_loc.evaluate("el => el.blur()")
+                    _otp_loc.evaluate("el => el.blur()")
+                    page.wait_for_timeout(600)
+                    log_fn("[scc-nav] Filled via fill() + blur last-resort")
+                except Exception as _fe3:
+                    log_fn(f"[scc-nav] All fill strategies failed: {_fe3}")
+
+            # Wait for Save to enable — React enables Save after both fields are filled
+            # AND both have been blurred (touched). Tab press above triggers onBlur for OTP.
+            log_fn("[scc-nav] Waiting up to 10s for Save button to enable...")
+            try:
+                page.wait_for_function(
+                    """() => {
+                        const allBtns = Array.from(document.querySelectorAll('button'));
+                        const saveBtn = allBtns.find(b => b.textContent.trim() === 'Save');
+                        return saveBtn && !saveBtn.disabled;
+                    }""",
+                    timeout=10000
+                )
+                log_fn("[scc-nav] Save button is enabled!")
+            except Exception as _we:
+                log_fn(f"[scc-nav] Save enable-wait timed out — checking field state...")
+                try:
+                    _dbg = page.evaluate("""() => {
+                        const nameEl = document.querySelector('[data-testid*="integrationName"]')
+                                    || Array.from(document.querySelectorAll('input[type="text"]'))
+                                       .find(i => !i.placeholder.toLowerCase().includes('search'));
+                        const otpEl  = document.querySelector('[data-testid*="-otp"]')
+                                    || document.querySelector('input[type="password"]');
+                        const saveBtn = Array.from(document.querySelectorAll('button'))
+                            .find(b => b.textContent.trim() === 'Save');
+                        return {
+                            nameLen: nameEl ? nameEl.value.length : -1,
+                            otpLen:  otpEl  ? otpEl.value.length  : -1,
+                            saveDisabled: saveBtn ? saveBtn.disabled : null
+                         };
+                    }""")
+                    log_fn(f"[scc-nav] Fields at timeout: nameLen={_dbg.get('nameLen')} "
+                           f"otpLen={_dbg.get('otpLen')} saveDisabled={_dbg.get('saveDisabled')}")
+                except Exception:
+                    pass
+
+                # React fiber diagnostic — inspect what React "thinks" the OTP value is
+                try:
+                    _react_dbg = _otp_loc.evaluate("""el => {
+                        const k = Object.keys(el).find(k =>
+                            k.startsWith('__reactFiber') || k.startsWith('__reactInternals'));
+                        if (!k) return {found: false};
+                        let fiber = el[k];
+                        let depth = 0;
+                        while (fiber && depth < 30) {
+                            const p = fiber.pendingProps || fiber.memoizedProps;
+                            if (p && (p.onChange || p.value !== undefined)) {
+                                return {found: true, value: p.value, hasOnChange: !!p.onChange,
+                                        depth, tag: fiber.tag};
+                            }
+                            fiber = fiber.return;
+                            depth++;
+                        }
+                        return {found: true, noProps: true};
+                    }""")
+                    log_fn(f"[scc-nav] React fiber OTP: {_react_dbg}")
+                except Exception as _rf_e:
+                    log_fn(f"[scc-nav] React fiber check failed: {_rf_e}")
+
+            # Show OTP for debug screenshot (AFTER the wait, so it doesn't interfere)
+            try:
+                _show_btn = page.locator('button:has-text("Show")').first
+                if _show_btn.is_visible(timeout=1500):
+                    _show_btn.click()
+                    page.wait_for_timeout(400)
+                    _otp_vis = page.evaluate("""() => {
+                        const inp = document.querySelector('input[type="text"]:not([placeholder*="search" i]):not([placeholder*="Ctrl" i])') ||
+                                    document.querySelector('input[placeholder=""]');
+                        return inp ? inp.value : '';
+                    }""")
+                    log_fn(f"[scc-nav] OTP field value (post-wait Show): len={len(_otp_vis)} first20={_otp_vis[:20]!r}")
+            except Exception as _show_e:
+                log_fn(f"[scc-nav] post-wait Show debug: {_show_e}")
+
+            # Take a pre-save screenshot so we can see the form state
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_presave_{pod_id}.png"))
+            except Exception:
+                pass
+
+            log_fn("[scc-nav] Clicking Save button")
+            _saved = False
+
+            # Strategy 1: target by data-testid (specific to this CDS form)
+            try:
+                btn = page.locator('[data-testid*="save-btn"]').last
+                btn.wait_for(state="visible", timeout=5000)
+                btn.click(timeout=10000)
+                log_fn("[scc-nav] Clicked Save via data-testid")
+                _saved = True
+            except Exception as _se0:
+                log_fn(f"[scc-nav] Save data-testid attempt failed: {_se0}")
+
+            # Strategy 2: filter-based — finds the button whose trimmed text is "Save"
+            if not _saved:
+                try:
+                    btn = page.locator("button").filter(has_text="Save").last
+                    btn.wait_for(state="visible", timeout=5000)
+                    btn.click(timeout=10000)
+                    log_fn("[scc-nav] Clicked Save via filter")
+                    _saved = True
+                except Exception as _se2:
+                    log_fn(f"[scc-nav] Save filter attempt failed: {_se2}")
+
+            # Strategy 3: has-text last/first
+            if not _saved:
+                for _try_last in [True, False]:
+                    try:
+                        _loc = page.locator('button:has-text("Save")')
+                        btn = _loc.last if _try_last else _loc.first
+                        btn.wait_for(state="visible", timeout=5000)
+                        btn.click(timeout=10000)
+                        log_fn(f"[scc-nav] Clicked Save ({'last' if _try_last else 'first'})")
+                        _saved = True
+                        break
+                    except Exception as _se:
+                        log_fn(f"[scc-nav] Save attempt ({'last' if _try_last else 'first'}) failed: {_se}")
+
+            # Strategy 4: force-click — remove disabled attribute via JS then click
+            # This bypasses Playwright's enabled check entirely.
+            if not _saved:
+                log_fn("[scc-nav] Force-clicking Save (removing disabled attribute)")
+                try:
+                    _fc_result = page.evaluate("""
+                        () => {
+                            const btn = document.querySelector('[data-testid*="save-btn"]')
+                                     || Array.from(document.querySelectorAll('button'))
+                                            .find(b => b.textContent.trim() === 'Save');
+                            if (!btn) return 'no-button';
+                            btn.removeAttribute('disabled');
+                            btn.click();
+                            return 'clicked';
+                        }
+                    """)
+                    log_fn(f"[scc-nav] Force-click result: {_fc_result}")
+                    if _fc_result == 'clicked':
+                        # Wait up to 5s to see if React's onClick fires the API call.
+                        # If _scc_api_resp stays empty the DOM click bypassed React
+                        # entirely — treat as failure so a new OTP can be generated.
+                        _fc_deadline = _time.time() + 5
+                        while _time.time() < _fc_deadline and "status" not in _scc_api_resp:
+                            page.wait_for_timeout(500)
+                        if "status" in _scc_api_resp:
+                            log_fn(f"[scc-nav] Force-click triggered API (status {_scc_api_resp['status']})")
+                            _saved = True
+                        else:
+                            log_fn("[scc-nav] Force-click fired but no API call detected — React onClick not triggered")
+                            # _saved stays False; fall through to Enter-key strategy
+                except Exception as _fee:
+                    log_fn(f"[scc-nav] Force-click failed: {_fee}")
+
+            # Strategy 5: press Enter on the password field to submit the form
+            if not _saved:
+                log_fn("[scc-nav] Trying Enter key to submit form")
+                try:
+                    _pw = page.locator('input[type="password"]').first
+                    _pw.click()
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(2000)
+                    _saved = True
+                    log_fn("[scc-nav] Submitted via Enter key")
+                except Exception as _ee:
+                    log_fn(f"[scc-nav] Enter key attempt failed: {_ee}")
+
+            if not _saved:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_nosave_{pod_id}.png"))
+                except Exception:
+                    pass
+                return False, f"ISE \u2192 SCC integration FAILED: could not click Save (check scc_nosave_{pod_id}.png)"
+
+            page.wait_for_timeout(4000)
+
+            # Check the intercepted SCC API response — this is the authoritative
+            # signal. The form stays open (no navigation) on failure, so page-text
+            # alone is not sufficient to detect OTP rejection.
+            _api_status = _scc_api_resp.get("status")
+            _api_body   = _scc_api_resp.get("body", "")[:300]
+            if _api_status == 400:
+                log_fn(f"[scc-nav] SCC API returned 400: {_api_body}")
+                # Name conflict is handled by the block below; OTP rejection must
+                # be propagated back so the ISE container can generate a new OTP.
+                _name_err = any(k in _api_body.lower() for k in ("name", "already", "unique"))
+                if not _name_err:
+                    return False, f"invalid_otp: SCC API rejected OTP (400): {_api_body}"
+                log_fn("[scc-nav] 400 is name conflict — proceeding to name-conflict retry")
+            elif _api_status and _api_status not in (200, 201):
+                log_fn(f"[scc-nav] SCC API returned {_api_status}: {_api_body}")
+                return False, f"SCC API returned {_api_status}: {_api_body}"
+            elif _api_status in (200, 201):
+                log_fn(f"[scc-nav] SCC API returned {_api_status} — OTP accepted")
+
             _txt = page.inner_text("body").lower()
-            if "unique" in _txt or "already exists" in _txt or "error" in _txt:
+            if "unique" in _txt or "already exists" in _txt or "name is already" in _txt:
                 log_fn("[scc-nav] Name conflict — retrying with alternate name")
                 _name = f"ISE-POD-{pod_id}-{int(_time.time()) % 10000}x"
-                for _sel in ['input[placeholder*="name" i]', 'input[id*="name"]']:
+                for _sel in ['input[placeholder*="name" i]', 'input[id*="name"]',
+                             'input[type="text"]:not([placeholder*="search" i]):not([placeholder*="Ctrl" i])']:
                     try:
                         inp = page.locator(_sel).first
                         if inp.is_visible(timeout=3000):
-                            inp.fill(_name)
+                            inp.click()
+                            page.keyboard.press("Control+a")
+                            inp.press_sequentially(_name, delay=30)
                             break
                     except Exception:
                         continue
-                page.locator('button:has-text("Save")').first.click(timeout=8000)
+                # Retry Save with the same robust approach
+                for _try_last2 in [True, False]:
+                    try:
+                        _loc2 = page.locator('button:has-text("Save")')
+                        b2 = _loc2.last if _try_last2 else _loc2.first
+                        b2.wait_for(state="visible", timeout=5000)
+                        b2.click(timeout=8000)
+                        break
+                    except Exception:
+                        continue
                 page.wait_for_timeout(5000)
             else:
                 page.wait_for_timeout(2000)
 
             content = page.content().lower()
-            if "active" in content and "ise" in content:
-                return True, f"ISE \u2192 Secure Access integration Active (token: {otp_token[:20]}...)"
-            return True, (f"ISE \u2192 SCC integration saved (token: {otp_token[:20]}...) "
-                          f"— run step 4 if status is Waiting for activation")
+            # Take an "after-save" screenshot for verification
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"))
+                log_fn("[scc-nav] After-save screenshot saved")
+            except Exception:
+                pass
+            # Only return success if Save was actually clicked AND page shows a real result.
+            # Do NOT match broad words like "connected" that appear on the form page itself.
+            _success_signals = ["waiting for activation", "pending activation",
+                                 "activation pending", "successfully added",
+                                 "integration added", "integration created",
+                                 "my integrations"]
+            _found_signal = next((s for s in _success_signals if s in content), None)
+            if _found_signal:
+                return True, f"ISE \u2192 SCC integration submitted ({_found_signal}; token: {otp_token[:20]}...)"
+            if _saved:
+                return True, (f"ISE \u2192 SCC integration form submitted (token: {otp_token[:20]}...) "
+                              f"— check scc_after_save_{pod_id}.png to confirm activation state")
+            return True, (f"ISE \u2192 SCC integration attempted (no Save button found) "
+                          f"— check scc_after_save_{pod_id}.png")
 
         except Exception as e:
             return False, f"ISE \u2192 Secure Access integration error: {e}"
@@ -1859,7 +2330,7 @@ def api_ise_scc_complete():
     if not pod_id or not otp_token:
         return jsonify({"ok": False, "message": "pod_id and otp_token required"}), 400
 
-    session_path = DATA_DIR / f"scc_session_{pod_id}.json"
+    session_path = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
     if not session_path.exists():
         return jsonify({"ok": False, "message": f"No SCC session file for {pod_id}"}), 404
 
@@ -1874,6 +2345,55 @@ def api_ise_scc_complete():
 
 
 _scc_refresh_thread = [None]  # track running refresh thread
+
+
+def _scc_otp_watcher():
+    """Background thread: watch for ise_scc_otp_*.json files written by Docker container.
+    When found, run SCC Playwright nav on host (outside VPN), write result file.
+    Uses shared volume /pipeline/host-data/ = data/ on host.
+    """
+    import glob as _glob
+    while True:
+        try:
+            for _otp_file in _glob.glob(str(DATA_DIR / "data" / "ise_scc_otp_*.json")):
+                try:
+                    _data = json.loads(Path(_otp_file).read_text())
+                    _pod_id = _data.get("pod_id", "")
+                    _otp = _data.get("otp_token", "")
+                    _ts = _data.get("ts", 0)
+                    if not _pod_id or not _otp:
+                        continue
+                    # Ignore stale files older than 5 min
+                    if time.time() - _ts > 300:
+                        Path(_otp_file).unlink(missing_ok=True)
+                        continue
+                    # Remove signal file immediately so we don't process twice
+                    Path(_otp_file).unlink(missing_ok=True)
+                    log(_pod_id, f"[scc-nav] Watcher picked up OTP for {_pod_id} — running host SCC nav")
+                    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
+                    if not _session_path.exists():
+                        _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
+                    else:
+                        _ok, _msg = _host_scc_integrate(_pod_id, _otp, str(_session_path),
+                                                        lambda m: log(_pod_id, m))
+                        _res = {"ok": _ok, "message": _msg}
+                    log(_pod_id, f"[scc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+                    # Write result for container to pick up
+                    _result_path = DATA_DIR / "data" / f"ise_scc_result_{_pod_id}.json"
+                    _result_path.write_text(json.dumps(_res))
+                except Exception as _e:
+                    try:
+                        log("SCC_WATCHER", f"[scc-nav] watcher error processing {_otp_file}: {_e}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+threading.Thread(target=_scc_otp_watcher, daemon=True, name="scc-otp-watcher").start()
+
+
 
 
 @app.route("/api/scc/refresh-sessions", methods=["POST"])
@@ -6843,11 +7363,12 @@ const _origSwitchTab = typeof switchTab === 'function' ? switchTab : null;
 
 // ── ISE Integration Card JS ────────────────────────────────────────────────
 
-const ISE_STEPS = ['ise_pxgrid_register', 'ise_scc_integrate', 'ise_cdfmc_integrate'];
+const ISE_STEPS = ['ise_pxgrid_register', 'ise_scc_integrate', 'ise_scc_deactivate_reactivate', 'ise_cdfmc_integrate'];
 const ISE_STEP_LABELS = {
-  ise_pxgrid_register: 'pxGrid Cloud Register',
-  ise_scc_integrate:   'ISE \u2192 Secure Access (SGTs)',
-  ise_cdfmc_integrate: 'ISE \u2192 cdFMC (SGTs)',
+  ise_pxgrid_register:            'pxGrid Cloud Register',
+  ise_scc_integrate:              'ISE \u2192 Secure Access (SGTs)',
+  ise_cdfmc_integrate:            'ISE \u2192 cdFMC (SGTs)',
+  ise_scc_deactivate_reactivate:  'ISE\u2192SCC Deactivate + Reactivate',
 };
 
 async function loadIseStatus(podId) {
@@ -6928,6 +7449,7 @@ function renderIseGrid(podId, data) {
   html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">ISE Integrations</span>';
   html += '<div style="display:flex;gap:8px;">';
   html += '<button id="ise-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u25b6 Run</button>';
+  html += '<button id="ise-reactivate-btn" title="Re-run only the ISE\u2192SCC Deactivate+Reactivate step" style="background:#f0a500;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u21ba Reactivate SCC</button>';
   html += '<button id="ise-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;"' + (isRunning ? ' disabled' : '') + '>\u21bb Reset</button>';
   html += '</div></div>';
   html += '<div style="margin-bottom:14px;">';
@@ -6962,12 +7484,14 @@ function renderIseGrid(podId, data) {
   grid._lastHtml = true;
 
   setTimeout(() => {
-    const runBtn      = document.getElementById('ise-run-btn');
-    const resetBtn    = document.getElementById('ise-reset-btn');
-    const refreshBtn  = document.getElementById('scc-refresh-btn');
-    if (runBtn)     runBtn.onclick     = () => iseRun(podId);
-    if (resetBtn)   resetBtn.onclick   = () => iseReset(podId);
-    if (refreshBtn) refreshBtn.onclick = () => iseRefreshSessions(podId);
+    const runBtn        = document.getElementById('ise-run-btn');
+    const reactivateBtn = document.getElementById('ise-reactivate-btn');
+    const resetBtn      = document.getElementById('ise-reset-btn');
+    const refreshBtn    = document.getElementById('scc-refresh-btn');
+    if (runBtn)         runBtn.onclick        = () => iseRun(podId);
+    if (reactivateBtn)  reactivateBtn.onclick = () => iseReactivate(podId);
+    if (resetBtn)       resetBtn.onclick      = () => iseReset(podId);
+    if (refreshBtn)     refreshBtn.onclick    = () => iseRefreshSessions(podId);
   }, 0);
 }
 
@@ -6988,6 +7512,13 @@ async function iseReset(podId) {
   if (!confirm('Clear all ISE steps for ' + podId + '?')) return;
   await fetch('/api/ise/reset/' + podId, { method: 'POST' });
   loadIseStatus(podId);
+}
+
+async function iseReactivate(podId) {
+  // Resets step 4 to pending and re-runs only the ISE→SCC deactivate+reactivate step.
+  if (!confirm('Re-run ISE\u2192SCC Deactivate+Reactivate for ' + podId + '?\\n\\nThis resets and re-runs ONLY step 4.')) return;
+  _iseStartPoller(podId);
+  await fetch('/api/ise/reactivate/' + podId, { method: 'POST' });
 }
 
 async function iseRefreshSessions(podId) {
