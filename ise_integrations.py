@@ -42,6 +42,7 @@ ISE_STEPS = [
     "ise_scc_integrate",
     "ise_scc_deactivate_reactivate",
     "ise_cdfmc_integrate",
+    "ise_sgt_verify",
 ]
 
 ISE_STEP_LABELS = {
@@ -49,6 +50,7 @@ ISE_STEP_LABELS = {
     "ise_scc_integrate":            "ISE \u2192 Secure Access (SGTs)",
     "ise_cdfmc_integrate":          "ISE \u2192 cdFMC (SGTs)",
     "ise_scc_deactivate_reactivate":"ISE\u2192SCC Deactivate + Reactivate",
+    "ise_sgt_verify":               "Secure Access SGT Verify",
 }
 
 def _sanitize(s: str) -> str:
@@ -152,11 +154,14 @@ def _load_creds(pod_id: str, db_path: str) -> dict | None:
         pod = c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
             return None
-        m = re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        scc_org = pod["scc_org"] or ""
+        m = re.search(r"pseudoco-(\d+)", scc_org)
         if not m:
             return None
         oc = c.execute("SELECT * FROM org_credentials WHERE org_number=?", (m.group(1),)).fetchone()
-        return dict(oc) if oc else {}
+        result = dict(oc) if oc else {}
+        result["scc_org"] = scc_org  # always inject so steps can navigate directly
+        return result
 
 
 # ── ISE REST API helper ────────────────────────────────────────────────────────
@@ -368,6 +373,83 @@ def _scc_file_ipc(pod_id: str, otp_token: str, log) -> tuple:
     _otp_path.unlink(missing_ok=True)
     return False, "Host SCC nav timed out — no result after 3 min (is dashboard running?)"
 
+
+def _scc_file_ipc_cdfmc(pod_id: str, otp_token: str, instance_name: str, log) -> tuple:
+    """File-based IPC for step 4 (cdFMC pxGrid integration).
+
+    Writes ise_cdfmc_otp_{pod_id}.json → host watcher calls _host_cdfmc_integrate
+    → navigates SCC Firewall/cdFMC UI → submits OTP → writes ise_cdfmc_result_{pod_id}.json.
+    """
+    import time as _t
+    _otp_path    = Path(f"/pipeline/host-data/ise_cdfmc_otp_{pod_id}.json")
+    _result_path = Path(f"/pipeline/host-data/ise_cdfmc_result_{pod_id}.json")
+    _result_path.unlink(missing_ok=True)
+    _otp_path.write_text(json.dumps({
+        "pod_id": pod_id, "otp_token": otp_token,
+        "instance_name": instance_name, "ts": _t.time(),
+    }))
+    log("cdFMC OTP written to shared volume — waiting for host nav (up to 5 min)...")
+    _deadline = _t.time() + 300
+    while _t.time() < _deadline:
+        if _result_path.exists():
+            try:
+                _res = json.loads(_result_path.read_text())
+            except Exception:
+                _t.sleep(1)
+                continue
+            _result_path.unlink(missing_ok=True)
+            _otp_path.unlink(missing_ok=True)
+            return _res.get("ok", False), _res.get("message", "no message")
+        _t.sleep(3)
+    _otp_path.unlink(missing_ok=True)
+    return False, "Host cdFMC nav timed out — no result after 5 min (is dashboard running?)"
+
+
+def _scc_file_ipc_sgt_verify(pod_id: str, sa_org_id: str, log) -> tuple:
+    """File-based IPC for step 5 (Secure Access SGT propagation verify).
+
+    Writes ise_sgt_trigger_{pod_id}.json → host watcher calls _host_sgt_verify
+    → waits 15 min, navigates Secure Access → Resources → Security Group Tags,
+    checks SGT count; if none waits 10 more min and checks again.
+    Writes ise_sgt_result_{pod_id}.json with result.
+    """
+    import time as _t
+    _trigger_path = Path(f"/pipeline/host-data/ise_sgt_trigger_{pod_id}.json")
+    _result_path  = Path(f"/pipeline/host-data/ise_sgt_result_{pod_id}.json")
+    _result_path.unlink(missing_ok=True)
+    _trigger_path.write_text(json.dumps({
+        "pod_id": pod_id, "sa_org_id": sa_org_id, "ts": _t.time(),
+    }))
+    log("SGT verify trigger written — host will check SGTs after 15 min propagation wait...")
+    # Max wait: 15 min initial + 10 min retry + 5 min buffer = 30 min
+    _deadline = _t.time() + 1800
+    while _t.time() < _deadline:
+        if _result_path.exists():
+            try:
+                _res = json.loads(_result_path.read_text())
+            except Exception:
+                _t.sleep(2)
+                continue
+            _result_path.unlink(missing_ok=True)
+            _trigger_path.unlink(missing_ok=True)
+            return _res.get("ok", False), _res.get("message", "no message")
+        _t.sleep(5)
+    _trigger_path.unlink(missing_ok=True)
+    return False, "SGT verify timed out — host did not respond in 30 min (is dashboard running?)"
+
+
+def _phase_ise_sgt_verify(pod_id: str, creds: dict, log) -> tuple[bool, str]:
+    """Step 5: Verify Security Group Tags propagated to Secure Access.
+
+    Delegates to the host dashboard via file IPC (same pattern as step 4 cdFMC).
+    The host navigates to Secure Access → Resources → Security Group Tags with a
+    15-min propagation wait then a 10-min retry if no SGTs are found.
+    Soft-fails (warns) if no SGTs after 25 min — never blocks the pipeline.
+    """
+    sa_org_id = (creds.get("sa_org_id") or "").strip()
+    if not sa_org_id:
+        return True, f"{_SKIP_PREFIX} sa_org_id not set for this POD — SGT verify skipped"
+    return _scc_file_ipc_sgt_verify(pod_id, sa_org_id, log)
 
 async def _scc_load_session(context, session_path: str, log) -> bool:
     """Restore SCC browser cookies from saved session file.
@@ -1776,75 +1858,121 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                 return False, "Could not open Integration Catalog"
             await _ise_dismiss_modal(page)  # belt-and-suspenders: modal can reappear after nav
 
-            # Dismiss Session Info popup + internet connectivity banner before searching for cards
+            # ── Dismiss banners (Session Info + ISE error banner) ─────────────
             await _ise_dismiss_session_info(page)
-            for banner_sel in [
-                'button[aria-label="close"]', 'button[aria-label="Close"]',
-                '.alert-banner button', '.alert button', 'button.close',
-            ]:
-                try:
-                    el = page.locator(banner_sel).first
-                    if await el.is_visible(timeout=1500):
-                        await el.click()
-                        log(f"Dismissed banner via {banner_sel}")
-                        await page.wait_for_timeout(1000)
-                        break
-                except Exception:
-                    continue
+            async def _dismiss_ise_banners():
+                for banner_sel in [
+                    'button[aria-label="close"]', 'button[aria-label="Close"]',
+                    '.alert-banner button', '.alert button', 'button.close',
+                    'button:has-text("×")', 'button:has-text("✕")',
+                ]:
+                    try:
+                        el = page.locator(banner_sel).first
+                        if await el.is_visible(timeout=1000):
+                            await el.click()
+                            await page.wait_for_timeout(500)
+                    except Exception:
+                        continue
+                # JS fallback: remove any visible error/alert banners
+                await page.evaluate("""() => {
+                    document.querySelectorAll(
+                        '.alert, .alert-banner, [class*="error-banner"], [class*="notification"]')
+                    .forEach(el => { if (el.innerText.includes('Error') ||
+                                         el.innerText.includes('error')) el.remove(); });
+                }""")
+            await _dismiss_ise_banners()
 
-            # Click "More details" on Firewall Management Center card.
-            # The catalog shows cards in order; FMC is typically the 2nd card.
-            # Use nth(1) to get the second "More details" button (first is SCC).
-            # If catalog fails to load (internet error), retry up to 3 times.
+            # ── Navigate to FMC ────────────────────────────────────────────────
+            # Two possible states:
+            # A) FMC is in Available tiles → click its "More details" button
+            # B) FMC already activated → shows in "Activated integrations" table
+            #    (catalog available section shows "All current integrations are active")
+            #    In this case navigate via the table link, same as step 3 does for SCC.
             log("Opening Firewall Management Center details")
             more_btns = page.locator('button[data-label="More details"]')
             btn_count = await more_btns.count()
             log(f"Found {btn_count} 'More details' button(s)")
+
             for _retry in range(3):
                 if btn_count > 0:
                     break
-                # Catalog may not have loaded yet — dismiss any banner and retry
-                log(f"No 'More details' buttons — retry {_retry + 1}/3 (catalog may still be loading)")
-                for banner_sel in [
-                    'button[aria-label="close"]', 'button[aria-label="Close"]',
-                    '.alert-banner button', '.alert button', 'button.close',
-                ]:
-                    try:
-                        el = page.locator(banner_sel).first
-                        if await el.is_visible(timeout=1500):
-                            await el.click()
-                            await page.wait_for_timeout(500)
-                            break
-                    except Exception:
-                        continue
-                # Reload Integration Catalog
+                log(f"No 'More details' buttons — retry {_retry+1}/3")
+                await _dismiss_ise_banners()
                 if not await _navigate_to_integration_catalog(page, log):
                     break
                 await _ise_dismiss_modal(page)
                 await _ise_dismiss_session_info(page)
+                await _dismiss_ise_banners()
                 await page.wait_for_timeout(3000)
                 btn_count = await more_btns.count()
-                log(f"After retry {_retry + 1}: found {btn_count} 'More details' button(s)")
+                log(f"After retry {_retry+1}: found {btn_count} 'More details' button(s)")
 
-            if btn_count >= 2:
+            _fmc_nav_ok = False
+            if btn_count > 0:
                 await _ise_dismiss_modal(page)
                 await _ise_dismiss_session_info(page)
                 await page.wait_for_timeout(500)
-                await _ise_dismiss_modal(page)
-                await more_btns.nth(1).click(timeout=10000, force=True)
+
+                # Find the FMC tile specifically by its title text (not positional index).
+                # Available integrations order: [0]=FMC, [1]=OfficeSpace, [2]=pxGrid Demo...
+                # nth(1) was previously hardcoded here — WRONG (hits OfficeSpace).
+                _fmc_clicked = False
+                for _fmc_label in ["Firewall Management Center", "FMC", "Cisco Secure Firewall"]:
+                    try:
+                        # Find a container that has both the label text AND a More details button
+                        _containers = page.locator(
+                            ':has(button[data-label="More details"])'
+                        ).filter(has_text=_fmc_label)
+                        _cc = await _containers.count()
+                        if _cc > 0:
+                            _fmc_btn = _containers.first.locator(
+                                'button[data-label="More details"]'
+                            ).first
+                            await _fmc_btn.click(timeout=10000, force=True)
+                            log(f"Clicked FMC 'More details' via title {_fmc_label!r}")
+                            _fmc_nav_ok = True
+                            _fmc_clicked = True
+                            break
+                    except Exception as _fe:
+                        log(f"FMC tile search ({_fmc_label!r}): {_fe}")
+                        continue
+
+                if not _fmc_clicked:
+                    # Fallback: FMC is always nth(0) in Available integrations list
+                    log("FMC tile text search failed — falling back to nth(0)")
+                    await more_btns.nth(0).click(timeout=10000, force=True)
+                    _fmc_nav_ok = True
+
             elif btn_count == 1:
-                # Only one card visible — might already be on FMC
                 await more_btns.first.click(timeout=10000, force=True)
+                _fmc_nav_ok = True
             else:
-                # Fallback: click FMC card text directly
-                for fmc_sel in [':text("Firewall Management Center")', ':text("FMC")', 'text=Firewall']:
+                # Available tiles empty — FMC already activated.
+                # Look for it in the "Activated integrations" table (link text).
+                _body = (await page.inner_text("body")).lower()
+                log(f"Available catalog empty (body snippet: {_body[:120]!r})")
+                for fmc_sel in [
+                    ':text("Firewall Management Center")',
+                    ':text("Cisco Firepower")',
+                    'a:has-text("Firewall")',
+                    ':text("FMC")',
+                ]:
                     try:
                         el = page.locator(fmc_sel).first
-                        if await el.is_visible(timeout=4000):
+                        if await el.is_visible(timeout=3000):
                             await el.click()
+                            log(f"Clicked FMC in Activated integrations via {fmc_sel!r}")
+                            _fmc_nav_ok = True
+                            await page.wait_for_timeout(2000)
                             break
                     except Exception:
                         continue
+
+                if not _fmc_nav_ok:
+                    # ISE can't reach catalog at all — soft-fail
+                    await page.screenshot(path="/pipeline/host-data/ise_cdfmc_no_fmc.png", full_page=True)
+                    return True, f"{_SKIP_PREFIX} FMC not found in catalog (ISE error/no internet) — cdFMC integration skipped"
+
             await page.wait_for_timeout(2000)
 
             # Click "Configuration" tab
@@ -1867,37 +1995,30 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
             if "unable to reach internet" in page_text or ("please ensure ise has connectivity" in page_text):
                 return True, f"{_SKIP_PREFIX} ISE has no internet access to Integration Catalog — cdFMC integration skipped (lab environment constraint)"
 
-            # If there is an existing Active instance from a previous session, deactivate it first
-            fmc_existing_active = False
-            for act_chk in [':text("Active")', ':text("Activated")']:
+            # ── Idempotency: skip re-activation if FMC is already Active ────────
+            # Clicking "New instance" → "Activate" generates a fresh OTP in ISE.
+            # If that OTP is never consumed by a brand-new cdFMC Application Instance
+            # (e.g. because the instance already exists and we just select it), ISE
+            # marks the integration as Deactivated/Pending — an unintended side effect.
+            #
+            # Guard: the presence of a visible "Deactivate" button on the Configuration
+            # tab is ISE's definitive signal that the FMC integration is already Active.
+            # If found, return success immediately — no new OTP needed.
+            _deactivate_btn_visible = False
+            for _dv_sel in [
+                'button:has-text("Deactivate")',
+                'span.dijitButtonText:has-text("Deactivate")',
+                'a:has-text("Deactivate")',
+            ]:
                 try:
-                    if await page.locator(act_chk).first.is_visible(timeout=2000):
-                        fmc_existing_active = True
+                    if await page.locator(_dv_sel).first.is_visible(timeout=2000):
+                        _deactivate_btn_visible = True
                         break
                 except Exception:
-                    continue
-            if fmc_existing_active:
-                log("Found existing Active FMC instance — deactivating to force fresh token")
-                for da_sel in ['button:has-text("Deactivate")', 'a:has-text("Deactivate")', ':text("Deactivate")']:
-                    try:
-                        da = page.locator(da_sel).first
-                        if await da.is_visible(timeout=3000):
-                            await da.click()
-                            await page.wait_for_timeout(2000)
-                            for conf in ['button:has-text("Yes")', 'button:has-text("Confirm")', 'button:has-text("OK")']:
-                                try:
-                                    cb = page.locator(conf).first
-                                    if await cb.is_visible(timeout=2000):
-                                        await cb.click()
-                                        await page.wait_for_timeout(1000)
-                                        break
-                                except Exception:
-                                    continue
-                            log("Deactivated existing FMC instance")
-                            break
-                    except Exception:
-                        continue
-                await page.wait_for_timeout(1000)
+                    pass
+            if _deactivate_btn_visible:
+                log("FMC integration already Active (Deactivate button present) — skipping re-activation ✓")
+                return True, f"{_SKIP_PREFIX} cdFMC pxGrid integration already Active on ISE — no re-activation needed"
 
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1000)
@@ -2006,32 +2127,37 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                 except Exception:
                     continue
 
-            # === Configure cdFMC ===
-            log("Opening SCC → Firewall → Security Devices")
-            scc_page = await ctx.new_page()
-            scc_page.set_default_timeout(30000)
-            await _scc_load_session(ctx, session_path, log)
-            await scc_page.goto("https://security.cisco.com/firewall/security-devices",
-                                wait_until="domcontentloaded", timeout=60000)
-            await scc_page.wait_for_timeout(3000)
+            # === Configure cdFMC via host-side navigation ===
+            # Docker VPN breaks Okta silent-renew — same as step 2.
+            # Hand off OTP to host dashboard via file IPC; host navigates SCC
+            # to find cdFMC management UI and submits the OTP.
+            instance_name = f"ISE-FMC-POD-{pod_id}"
+            _ipc_ok, _ipc_msg = _scc_file_ipc_cdfmc(pod_id, otp_token, instance_name, log)
+            if not _ipc_ok:
+                return False, _ipc_msg
+            return True, _ipc_msg
 
-            if "login" in scc_page.url.lower():
-                return False, "SCC session expired — refresh SCC session and retry"
 
-            log("Selecting hqftdv")
-            await scc_page.locator('text=hqftdv').first.click(timeout=10000)
-            await scc_page.wait_for_timeout(2000)
+            # Handle org picker / login if redirected
+            if "login" in fmc_page.url.lower():
+                return False, "cdFMC SSO failed — SCC session expired. Refresh SCC session and retry."
+            try:
+                await fmc_page.wait_for_selector('button:has-text("Continue")', timeout=8000)
+                await fmc_page.locator('button:has-text("Continue")').first.click()
+                log("Dismissed cdFMC org modal (Continue)")
+                await fmc_page.wait_for_timeout(2000)
+            except Exception:
+                log("No org modal on cdFMC — proceeding")
 
-            log("Opening Device Overview")
-            await scc_page.locator('button:has-text("Device Overview"), a:has-text("Device Overview")').first.click(timeout=10000)
-            await scc_page.wait_for_timeout(4000)
-
-            fmc_page = scc_page
-            if len(ctx.pages) > 2:
-                fmc_page = ctx.pages[-1]
-                await fmc_page.wait_for_load_state("domcontentloaded", timeout=20000)
-                log(f"cdFMC tab: {fmc_page.url}")
-            fmc_page.set_default_timeout(30000)
+            try:
+                await fmc_page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+            await fmc_page.wait_for_timeout(3000)
+            log(f"cdFMC loaded at: {fmc_page.url}")
+            await fmc_page.screenshot(path="/pipeline/host-data/cdfmc_home.png", full_page=True)
+            _fmc_txt = await fmc_page.inner_text("body")
+            log(f"cdFMC body (first 400): {_fmc_txt.strip()[:400]!r}")
 
             log("Navigating to Integrations → Identity Sources")
             try:
@@ -2159,13 +2285,51 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
             if not await _navigate_to_integration_catalog(page, log):
                 return False, "Could not open Integration Catalog"
 
-            # Open SCC detail page via "More details" button (first card = SCC)
-            log("Opening Cisco Security Cloud via More details")
             await _ise_dismiss_modal(page)
             await _ise_dismiss_session_info(page)
-            await page.wait_for_timeout(500)
-            await _ise_dismiss_modal(page)  # second pass — modal can re-appear after nav settle
-            await page.locator('button[data-label="More details"]').first.click(timeout=10000, force=True)
+
+            # ISE SPA often restores the last-visited card detail page instead of the
+            # catalog list.  If we see the "← Integration Catalog" breadcrumb, click it
+            # to return to the list before looking for "More details" buttons.
+            log("Ensuring we are on the Integration Catalog list view")
+            try:
+                _back = page.locator('a, button, span').filter(has_text="Integration Catalog").first
+                if await _back.is_visible(timeout=4000):
+                    await _back.click()
+                    log("Clicked back to Integration Catalog list")
+                    await page.wait_for_timeout(2000)
+                    await _ise_dismiss_modal(page)
+            except Exception:
+                pass
+
+            # Wait for catalog to render (Activated integrations table)
+            try:
+                await page.wait_for_selector('text=Cisco Security Cloud', timeout=20000)
+            except Exception:
+                pass
+
+            # Cisco Security Cloud appears in the "Activated integrations" table as a
+            # clickable link — NOT as a "More details" button (those are only in
+            # "Available integrations").  Click the row link directly.
+            log("Clicking Cisco Security Cloud in Activated integrations")
+            _scc_clicked = False
+            for _sel in [
+                'a:has-text("Cisco Security Cloud")',
+                'td:has-text("Cisco Security Cloud") a',
+                ':text("Cisco Security Cloud")',
+            ]:
+                try:
+                    el = page.locator(_sel).first
+                    if await el.is_visible(timeout=5000):
+                        await el.click(timeout=10000)
+                        log(f"Clicked Cisco Security Cloud via {_sel!r}")
+                        _scc_clicked = True
+                        break
+                except Exception:
+                    continue
+            if not _scc_clicked:
+                await page.screenshot(path="/pipeline/host-data/ise_scc_link_fail.png")
+                return False, "Could not find Cisco Security Cloud link in Activated integrations — check ise_scc_link_fail.png"
             await page.wait_for_timeout(2000)
 
             # Click Configuration tab
@@ -2177,169 +2341,341 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
             except Exception:
                 pass
 
-            # Log button inventory + screenshot for debugging
-            btns_da = await page.evaluate("""() => {
-                return Array.from(document.querySelectorAll('button, a[role="button"]'))
-                  .map(b => ({tag:b.tagName, txt:b.innerText.trim().slice(0,40), dis:b.disabled}))
-                  .filter(b => b.txt);
-            }""")
-            log(f"Buttons on page (pre-deactivate): {btns_da[:15]}")
-            await page.screenshot(path="/pipeline/host-data/ise_scc_deactivate_pre.png")
+            # Dismiss Session Info popup, scroll to bottom, take screenshot
+            await _ise_dismiss_session_info(page)
+            await _ise_dismiss_modal(page)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1000)
+            await _ise_dismiss_session_info(page)  # dismiss again after scroll
+            await page.screenshot(path="/pipeline/host-data/ise_scc_deactivate_pre.png", full_page=True)
 
-            # ── Pre-check: if Activate is disabled, try clicking "Ok" first
-            #    (ISE may show an acknowledgement dialog that must be dismissed
-            #    before Deactivate/Activate become available) ──────────────────
-            has_deactivate_text = any("deactivate" in str(b.get('txt','')).lower() for b in btns_da)
-            has_activate_disabled = any(
-                "activate" in str(b.get('txt','')).lower() and b.get('dis', False)
-                for b in btns_da
-            )
-            if not has_deactivate_text and has_activate_disabled:
-                # Try clicking "Ok" / "Dismiss" — might unlock Deactivate
-                log("Activate disabled, no Deactivate found — trying Ok/Dismiss to unlock state")
-                for _ok_sel in ['button:has-text("Ok")', 'button:has-text("OK")',
-                                'button:has-text("Dismiss")', 'button:has-text("Close")']:
+            # ── Detect current Application status ─────────────────────────────
+            # If already Inactive (from a prior run) → skip Deactivate entirely.
+            # If Connected/Active (Deactivate button present) → Deactivate first.
+            _status_text = await page.evaluate("""() => {
+                // Use body text scan — Inactive must be checked before Active
+                // (Inactive contains the substring Active).
+                // \\b word-boundary ensures 'Active' won't match inside 'Activate'.
+                const t = document.body.innerText || '';
+                if (/\\bInactive\\b/.test(t)) return 'Inactive';
+                if (/\\bConnected\\b/.test(t)) return 'Connected';
+                if (/\\bActive\\b/.test(t)) return 'Active';
+                return null;
+            }""")
+            log(f"Application status detected: {_status_text!r}")
+
+            _already_inactive = _status_text == 'Inactive'
+
+            if _already_inactive:
+                log("Instance already Inactive — skipping Deactivate, going straight to Activate")
+            else:
+                # ── Deactivate (Active → Inactive) ────────────────────────────
+                log("Instance is Active — clicking Deactivate")
+                deactivate_found = False
+                for da_sel in [
+                    'button:has-text("Deactivate")',
+                    'a:has-text("Deactivate")',
+                    ':text("Deactivate")',
+                ]:
                     try:
-                        ok_btn = page.locator(_ok_sel).first
-                        if await ok_btn.is_visible(timeout=3000):
-                            await ok_btn.click()
-                            log(f"Clicked '{_ok_sel}' to dismiss acknowledgement")
-                            await page.wait_for_timeout(2000)
+                        da_btn = page.locator(da_sel).first
+                        if await da_btn.is_visible(timeout=5000):
+                            await da_btn.scroll_into_view_if_needed()
+                            await da_btn.click(force=True)
+                            deactivate_found = True
+                            log(f"Clicked Deactivate via: {da_sel}")
                             break
                     except Exception:
                         continue
-                # Re-read button state after dismissal
-                btns_da = await page.evaluate("""() => {
-                    return Array.from(document.querySelectorAll('button, a[role="button"]'))
-                      .map(b => ({tag:b.tagName, txt:b.innerText.trim().slice(0,40), dis:b.disabled}))
-                      .filter(b => b.txt);
-                }""")
-                log(f"Buttons after Ok-click: {btns_da[:15]}")
-                has_deactivate_text = any("deactivate" in str(b.get('txt','')).lower() for b in btns_da)
-                has_activate_disabled = any(
-                    "activate" in str(b.get('txt','')).lower() and b.get('dis', False)
-                    for b in btns_da
-                )
-                # If still no Deactivate and Activate is still disabled → skip (lab constraint)
-                if not has_deactivate_text and has_activate_disabled:
-                    return True, f"{_SKIP_PREFIX} ISE→SCC integration not yet active (Activate button still disabled after Ok — lab constraint)"
 
-            # Click Deactivate — try direct button, then kebab/action menu fallback
-            log("Clicking Deactivate")
-            deactivate_found = False
-
-            # Round 1: direct button/link
-            for da_sel in [
-                'button:has-text("Deactivate")',
-                'a:has-text("Deactivate")',
-                ':text("Deactivate")',
-            ]:
-                try:
-                    da_btn = page.locator(da_sel).first
-                    if await da_btn.is_visible(timeout=4000):
-                        await da_btn.click()
+                if not deactivate_found:
+                    # JS fallback
+                    _js_da = await page.evaluate("""() => {
+                        const el = Array.from(document.querySelectorAll('button, a, span'))
+                            .find(e => e.innerText && e.innerText.trim() === 'Deactivate');
+                        if (el) { el.click(); return el.tagName; }
+                        return null;
+                    }""")
+                    if _js_da:
                         deactivate_found = True
-                        log(f"Clicked Deactivate via: {da_sel}")
-                        break
-                except Exception:
-                    continue
+                        log(f"JS Deactivate fallback: {_js_da}")
+                    else:
+                        await page.screenshot(path="/pipeline/host-data/ise_deactivate_fail.png", full_page=True)
+                        return False, "Deactivate button not found — check ise_deactivate_fail.png"
 
-            # Round 2: open kebab / actions menu then pick Deactivate
-            if not deactivate_found:
-                log("Direct Deactivate not found — trying kebab/actions menu")
-                for menu_sel in [
-                    'button[aria-label*="action" i]',
-                    'button[aria-label*="more" i]',
-                    'button[title*="action" i]',
-                    'button[data-action*="more" i]',
-                    'button.kebab',
-                    '[class*="kebab"] button',
-                    '[class*="actions"] button',
-                    'td button',
-                    'button[aria-haspopup="true"]',
+                # Confirm dialog — ISE shows "Deactivate App" button in modal
+                await page.wait_for_timeout(1500)
+                for confirm_sel in [
+                    'button:has-text("Deactivate App")',
+                    'button:has-text("Deactivate")',
+                    'button:has-text("Yes")',
+                    'button:has-text("Confirm")',
+                    'button:has-text("OK")',
                 ]:
                     try:
-                        menu_btn = page.locator(menu_sel).first
-                        if await menu_btn.is_visible(timeout=3000):
-                            await menu_btn.click()
-                            await page.wait_for_timeout(1000)
-                            # Now look for Deactivate in the opened dropdown
-                            for da_sel2 in ['button:has-text("Deactivate")', 'li:has-text("Deactivate")', 'a:has-text("Deactivate")']:
-                                try:
-                                    da2 = page.locator(da_sel2).first
-                                    if await da2.is_visible(timeout=3000):
-                                        await da2.click()
-                                        deactivate_found = True
-                                        log(f"Clicked Deactivate via menu: {menu_sel} → {da_sel2}")
-                                        break
-                                except Exception:
-                                    continue
-                            if deactivate_found:
-                                break
+                        c_btn = page.locator(confirm_sel).first
+                        if await c_btn.is_visible(timeout=3000):
+                            await c_btn.click()
+                            log(f"Confirmed deactivation dialog via {confirm_sel!r}")
+                            break
                     except Exception:
                         continue
 
-            # Round 3: JS coordinate click on any element containing "Deactivate"
-            if not deactivate_found:
-                log("Trying JS coordinate click on Deactivate text")
-                try:
-                    clicked = await page.evaluate("""() => {
-                        const els = Array.from(document.querySelectorAll('button, a, li, span'));
-                        const el = els.find(e => e.innerText && e.innerText.trim() === 'Deactivate');
-                        if (el) { const r = el.getBoundingClientRect(); return {x: r.x + r.width/2, y: r.y + r.height/2}; }
-                        return null;
-                    }""")
-                    if clicked:
-                        await page.mouse.click(clicked['x'], clicked['y'])
-                        deactivate_found = True
-                        log(f"JS coordinate Deactivate clicked at {clicked}")
-                except Exception as e:
-                    log(f"JS click error: {e}")
+                # Wait for Inactive status to appear (confirms transition complete)
+                log("Waiting for Inactive status after Deactivate...")
+                _transitioned = False
+                for _ws in ['text=Inactive', 'text=Existing instances', 'input[type="radio"]']:
+                    try:
+                        await page.wait_for_selector(_ws, timeout=20000)
+                        log(f"Transition confirmed via {_ws!r} ✓")
+                        _transitioned = True
+                        break
+                    except Exception:
+                        continue
+                if not _transitioned:
+                    log("WARNING: transition not confirmed — continuing anyway")
 
-            if not deactivate_found:
-                return False, "Deactivate button not found — check /pipeline/host-data/ise_scc_deactivate_pre.png"
-
-            await page.wait_for_timeout(2000)
-            # Confirm deactivation if a dialog appears
-            for confirm_sel in ['button:has-text("Yes")', 'button:has-text("Confirm")', 'button:has-text("OK")']:
+            # ── Confirm deactivation dialog if one appears ────────────────────
+            await page.wait_for_timeout(1500)
+            for confirm_sel in [
+                'button:has-text("Deactivate App")',
+                'button:has-text("Deactivate")',
+                'button:has-text("Yes")',
+                'button:has-text("Confirm")',
+                'button:has-text("OK")',
+            ]:
                 try:
                     c_btn = page.locator(confirm_sel).first
                     if await c_btn.is_visible(timeout=3000):
                         await c_btn.click()
-                        log("Confirmed deactivation dialog")
-                        await page.wait_for_timeout(2000)
+                        log(f"Confirmed deactivation dialog via {confirm_sel!r}")
+                        # Give ISE time to fully process the deactivation
+                        await page.wait_for_timeout(5000)
                         break
                 except Exception:
                     continue
 
-            await page.wait_for_timeout(2000)
+            # ── Wait for the POST-deactivate transition ────────────────────────
+            # IMPORTANT: "App configuration" heading is already on the page
+            # BEFORE deactivation — waiting for it returns immediately.
+            # Must wait for "Inactive" status text or "Existing instances" radio
+            # which only appear AFTER the page has transitioned.
+            log("Waiting for Inactive status / Existing instances radio (post-deactivate)...")
+            _transitioned = False
+            for _wait_sel in [
+                'text=Inactive',
+                'text=Existing instances',
+                'input[type="radio"]',
+            ]:
+                try:
+                    await page.wait_for_selector(_wait_sel, timeout=20000)
+                    log(f"Post-deactivate transition confirmed via: {_wait_sel!r} ✓")
+                    _transitioned = True
+                    break
+                except Exception:
+                    continue
+            if not _transitioned:
+                log("WARNING: post-deactivate transition not confirmed — continuing anyway")
 
-            # Click Activate / Reactivate on the same instance
-            log("Clicking Activate/Reactivate")
+            # Let ISE fully settle into Inactive before we interact with the form
+            log("Waiting 5s for ISE to fully settle post-deactivate...")
+            await page.wait_for_timeout(5000)
+            await page.screenshot(path="/pipeline/host-data/ise_scc_post_deactivate.png", full_page=True)
+            log("Post-deactivate screenshot: ise_scc_post_deactivate.png")
+
+            # ── Verify / ensure "Existing instances" is selected ──────────────
+            # Per the UI (confirmed via screenshots): after Deactivate the page
+            # shows two radios — "Existing instances" (pre-selected) and
+            # "New instance".  We verify it is selected; if not, click it.
+            log("Checking 'Existing instances' radio state")
+            _ex_checked = await page.evaluate("""() => {
+                const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+                for (const r of radios) {
+                    // Check associated label or surrounding text
+                    const lbl = document.querySelector('label[for="' + r.id + '"]');
+                    const txt = lbl ? lbl.innerText :
+                                (r.closest('label') ? r.closest('label').innerText :
+                                 (r.parentElement ? r.parentElement.innerText : ''));
+                    if (txt && txt.toLowerCase().includes('existing')) {
+                        return r.checked;
+                    }
+                }
+                return null;
+            }""")
+            log(f"Existing instances radio checked={_ex_checked}")
+
+            if not _ex_checked:
+                log("Selecting 'Existing instances' radio")
+                _ex_result = await page.evaluate("""() => {
+                    // 1) Native radio input with label containing "Existing"
+                    const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+                    for (const r of radios) {
+                        const lbl = document.querySelector('label[for="' + r.id + '"]');
+                        const txt = lbl ? lbl.innerText :
+                                    (r.closest('label') ? r.closest('label').innerText :
+                                     (r.parentElement ? r.parentElement.innerText : ''));
+                        if (txt && txt.toLowerCase().includes('existing')) {
+                            r.click();
+                            return 'radio-click:' + txt.trim().slice(0, 40);
+                        }
+                    }
+                    // 2) Click the label/span that says "Existing instances"
+                    const all = Array.from(document.querySelectorAll('label, span, div'));
+                    const el = all.find(e => e.childElementCount === 0 &&
+                                            e.innerText && e.innerText.trim() === 'Existing instances');
+                    if (el) { el.click(); return 'label-text-click'; }
+                    // 3) Broad match
+                    const broad = all.find(e => e.innerText &&
+                                               e.innerText.trim().startsWith('Existing'));
+                    if (broad) { broad.click(); return 'broad:' + broad.innerText.trim().slice(0,30); }
+                    return null;
+                }""")
+                log(f"Existing instances selection result: {_ex_result}")
+                await page.wait_for_timeout(1500)
+
+            await page.screenshot(path="/pipeline/host-data/ise_scc_existing_selected.png", full_page=True)
+            log("Existing instances screenshot: ise_scc_existing_selected.png")
+
+            # ── Wait for instance dropdown to auto-populate ───────────────────
+            # After a live Deactivate the SPA pre-selects the just-deactivated
+            # instance (e.g. ISE-POD-POD-2-4825).  If the page was already
+            # Inactive before this run, the dropdown stays empty and we must
+            # open it and select the instance manually.
+            log("Waiting for instance dropdown to auto-populate (up to 5s)...")
+            _dropdown_populated = False
+            for _ in range(5):
+                await page.wait_for_timeout(1000)
+                _inst_val = await page.evaluate("""() => {
+                    // Look for any input/combobox that has a real value (not placeholder)
+                    const inp = document.querySelector(
+                        'input[role="combobox"], input[role="searchbox"], [class*="select"] input');
+                    if (inp && inp.value && inp.value.trim() &&
+                        inp.value !== inp.placeholder) return inp.value.trim();
+                    // Also check for a visible selected-value span (custom dropdowns)
+                    const spans = Array.from(document.querySelectorAll(
+                        '[class*="selected"] span, [class*="value"] span, [class*="select__single"]'));
+                    for (const s of spans) {
+                        const t = s.innerText && s.innerText.trim();
+                        if (t && t.toLowerCase().includes('ise')) return t;
+                    }
+                    return null;
+                }""")
+                if _inst_val:
+                    log(f"Instance dropdown auto-populated: {_inst_val!r} ✓")
+                    _dropdown_populated = True
+                    break
+
+            if not _dropdown_populated:
+                # Dropdown is empty — open it and click the ISE-POD option
+                log("Dropdown still empty — opening manually to select instance")
+                try:
+                    # Click the dropdown trigger (chevron / select container)
+                    for _dd_sel in [
+                        '[placeholder="Select instance"]',
+                        'input[role="combobox"]',
+                        '[class*="select"] [class*="control"]',
+                        '[class*="dropdown"] [class*="control"]',
+                        ':text("Select instance")',
+                    ]:
+                        try:
+                            _dd = page.locator(_dd_sel).first
+                            if await _dd.is_visible(timeout=2000):
+                                await _dd.click()
+                                log(f"Opened dropdown via {_dd_sel!r}")
+                                await page.wait_for_timeout(1500)
+                                break
+                        except Exception:
+                            continue
+                    # Click the first option containing "ISE"
+                    _opt_clicked = False
+                    for _opt_sel in [
+                        '[class*="option"]:has-text("ISE")',
+                        '[role="option"]:has-text("ISE")',
+                        'li:has-text("ISE")',
+                    ]:
+                        try:
+                            _opt = page.locator(_opt_sel).first
+                            if await _opt.is_visible(timeout=3000):
+                                await _opt.click()
+                                log(f"Selected instance option via {_opt_sel!r}")
+                                _opt_clicked = True
+                                await page.wait_for_timeout(1000)
+                                break
+                        except Exception:
+                            continue
+                    if not _opt_clicked:
+                        # JS fallback: find option with ISE text and click it
+                        _js_opt = await page.evaluate("""() => {
+                            const opts = Array.from(document.querySelectorAll(
+                                '[class*="option"], [role="option"], li'));
+                            const o = opts.find(e => e.innerText &&
+                                                     e.innerText.toUpperCase().includes('ISE'));
+                            if (o) { o.click(); return o.innerText.trim().slice(0, 60); }
+                            return null;
+                        }""")
+                        if _js_opt:
+                            log(f"JS option fallback selected: {_js_opt!r}")
+                        else:
+                            log("WARNING: could not select instance from dropdown — Activate may fail")
+                except Exception as _dd_err:
+                    log(f"WARNING: dropdown interaction error: {_dd_err}")
+
+            await page.wait_for_timeout(500)
+
+            # ── Scroll to bottom and click Activate ───────────────────────────
+            # The blue Activate button is at the very bottom of the page.
+            log("Scrolling to bottom to find Activate button")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1000)
+
+            log("Clicking Activate")
             reactivated = False
-            for ra_sel in ['button:has-text("Activate")', 'button:has-text("Reactivate")', 'a:has-text("Activate")']:
+            for ra_sel in [
+                'button:has-text("Activate")',
+                'button:has-text("Reactivate")',
+                'a:has-text("Activate")',
+                '[role="button"]:has-text("Activate")',
+            ]:
                 try:
                     ra_btn = page.locator(ra_sel).first
-                    if await ra_btn.is_visible(timeout=5000):
-                        await ra_btn.click()
+                    if await ra_btn.is_visible(timeout=10000):
+                        await ra_btn.scroll_into_view_if_needed()
+                        await ra_btn.click(force=True)
                         reactivated = True
-                        log("Clicked Activate/Reactivate")
+                        log(f"Clicked Activate via {ra_sel!r} ✓")
                         await page.wait_for_timeout(3000)
                         break
                 except Exception:
                     continue
 
             if not reactivated:
-                return False, "Activate button not found after Deactivate"
+                # JS fallback — find any non-disabled button with text "Activate"
+                _js_act = await page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const btn = btns.find(b => !b.disabled &&
+                                              b.innerText && b.innerText.trim() === 'Activate');
+                    if (btn) { btn.click(); return btn.outerHTML.slice(0, 80); }
+                    return null;
+                }""")
+                if _js_act:
+                    log(f"JS Activate fallback: {_js_act}")
+                    reactivated = True
+                    await page.wait_for_timeout(3000)
+                else:
+                    await page.screenshot(path="/pipeline/host-data/ise_reactivate_fail.png", full_page=True)
+                    return False, "Activate button not found — check ise_reactivate_fail.png"
 
-            # Check if a new OTP was generated
+            await page.screenshot(path="/pipeline/host-data/ise_scc_post_activate.png", full_page=True)
+            log("Post-activate screenshot: ise_scc_post_activate.png")
+
+            # ── Check for OTP (only if New instance path was taken) ───────────
             new_otp = await _read_otp_from_page(page, log)
             if new_otp:
-                log(f"New OTP generated during reactivation ({len(new_otp)} chars) — will update SCC")
+                log(f"New OTP generated ({len(new_otp)} chars) — submitting to SCC via IPC")
             else:
-                log("No new OTP detected — reactivation reuses existing SCC token")
+                log("No new OTP — existing instance reactivation auto-connects to SCC ✓")
 
-            # Click OK to close if present
+            # Click OK/Close/Done if a modal appeared after Activate
             for ok_sel in ['button:has-text("OK")', 'button:has-text("Close")', 'button:has-text("Done")']:
                 try:
                     ok_btn = page.locator(ok_sel).first
@@ -2350,11 +2686,47 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
                 except Exception:
                     continue
 
-            # === ISE has internet — it will connect to SCC automatically after reactivation ===
-            # No SCC UI work needed. Wait briefly for ISE→SCC handshake to initiate.
-            log("ISE reactivated — waiting 15s for ISE to connect to SCC automatically...")
-            await page.wait_for_timeout(15000)
-            return True, "ISE → SCC Deactivate+Reactivate completed — ISE is syncing with SCC (check SCC Platform Integrations for Active status)"
+            # ── Poll for Active confirmation (Deactivate button = Active) ─────
+            # After Activate, ISE shows "Activating..." spinner for ~30-60s.
+            # Do NOT reload the page during this window — reloading kills the
+            # in-flight activation.  First 6 polls (60s): check without reload.
+            # Polls 7-18: reload to force a fresh status check.
+            log("Polling for Active confirmation (up to 3 min)...")
+            _confirmed_active = False
+            for _cpoll in range(18):   # 18 × 10s = 3 min
+                await page.wait_for_timeout(10000)
+                if _cpoll >= 6:
+                    # Only reload after the initial 60s activation window
+                    try:
+                        await page.reload()
+                        await page.wait_for_timeout(3000)
+                        await _ise_dismiss_modal(page)
+                        await _ise_dismiss_session_info(page)
+                    except Exception:
+                        pass
+                _cbtns = await page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('button'))
+                      .map(b => b.innerText.trim().slice(0, 40)).filter(Boolean);
+                }""")
+                _has_deact = any("deactivate" in t.lower() for t in _cbtns)
+                log(f"  poll {_cpoll+1}/18 — buttons={_cbtns[:8]} deactivate_present={_has_deact}")
+                if _has_deact:
+                    log("Active confirmed — Deactivate button present ✓")
+                    _confirmed_active = True
+                    break
+
+            if not _confirmed_active:
+                await page.screenshot(path="/pipeline/host-data/ise_active_timeout.png", full_page=True)
+                log("WARNING: Deactivate button never appeared in 3 min — check ise_active_timeout.png")
+
+            if new_otp:
+                _ipc_ok, _ipc_msg = _scc_file_ipc(pod_id, new_otp, log)
+                if not _ipc_ok:
+                    return False, f"SCC IPC failed after reactivation: {_ipc_msg}"
+                return True, "ISE → SCC Deactivate+Reactivate + OTP submitted — integration going Active"
+            else:
+                _status = "Active" if _confirmed_active else "pending (check ise_active_timeout.png)"
+                return True, f"ISE → SCC Deactivate+Reactivate completed — ISE instance {_status}"
 
         except Exception as e:
             return False, f"Deactivate/Reactivate error: {e}"
@@ -2553,7 +2925,73 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
             # Docker routes ALL traffic through OpenConnect VPN which breaks Okta
             # silent-renew → storage_state always rejected. Hand off to the HOST
             # dashboard which runs Playwright outside the VPN container.
-            return _scc_file_ipc(pod_id, otp_token, log)
+            _ipc_ok, _ipc_msg = _scc_file_ipc(pod_id, otp_token, log)
+            if not _ipc_ok:
+                return _ipc_ok, _ipc_msg
+
+            # SCC has the OTP — now wait in the SAME browser session for ISE to
+            # confirm the handshake (Deactivate button appears = fully Active).
+            # This avoids step 3 opening a cold container and seeing Activate(disabled).
+            log("SCC confirmed — polling ISE for Active state (up to 2 min)...")
+
+            async def _ise_btns():
+                return await page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('button, a[role="button"]'))
+                      .map(b => ({txt:b.innerText.trim().slice(0,40), dis:b.disabled}))
+                      .filter(b => b.txt);
+                }""")
+
+            for _wi in range(8):  # 8 × 15s = 2 min
+                await page.wait_for_timeout(15000)
+                try:
+                    await page.reload()
+                    await page.wait_for_timeout(2000)
+                    await _ise_dismiss_modal(page)
+                    try:
+                        await page.locator('text=Configuration').first.click(timeout=8000)
+                        await page.wait_for_timeout(2000)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                _wb = await _ise_btns()
+                _has_deact = any("deactivate" in str(b.get('txt','')).lower() for b in _wb)
+                _act_enabled = any(
+                    "activate" in str(b.get('txt','')).lower() and not b.get('dis', True)
+                    for b in _wb
+                )
+                log(f"  ISE poll {_wi+1}/8 — deactivate={_has_deact} activate_enabled={_act_enabled} btns={[b['txt'] for b in _wb[:5]]}")
+                if _has_deact:
+                    log("ISE is Active (Deactivate visible) — step 2 complete")
+                    return True, _ipc_msg
+                if _act_enabled:
+                    # Click Activate to complete ISE's side, then dismiss OTP dialog
+                    log("Activate (enabled) — clicking to complete ISE handshake")
+                    try:
+                        await page.locator('button:has-text("Activate")').first.click(timeout=5000)
+                        await page.wait_for_timeout(4000)
+                        for _ok_s in ['button:has-text("Ok")', 'button:has-text("OK")',
+                                      'button:has-text("Close")', 'button:has-text("Done")']:
+                            try:
+                                _ok = page.locator(_ok_s).first
+                                if await _ok.is_visible(timeout=3000):
+                                    await _ok.click()
+                                    await page.wait_for_timeout(3000)
+                                    log(f"Dismissed OTP dialog via {_ok_s!r}")
+                                    break
+                            except Exception:
+                                continue
+                        _wb2 = await _ise_btns()
+                        _has_deact2 = any("deactivate" in str(b.get('txt','')).lower() for b in _wb2)
+                        log(f"After Activate+dismiss: deactivate={_has_deact2} btns={[b['txt'] for b in _wb2[:5]]}")
+                        if _has_deact2:
+                            log("ISE Active after Activate+Ok — step 2 complete")
+                            return True, _ipc_msg
+                    except Exception as _ae:
+                        log(f"Activate click error: {_ae}")
+
+            log("ISE Active state not confirmed within 2 min — step 3 will handle")
+            return True, _ipc_msg
             await scc_page.goto("https://security.cisco.com",
                                 wait_until="domcontentloaded", timeout=60000)
             await scc_page.wait_for_timeout(2000)
@@ -2802,6 +3240,8 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
                 ok, msg = asyncio.run(_phase_ise_cdfmc_integrate_async(pod_id, creds, session_path, _log))
             elif step == "ise_scc_deactivate_reactivate":
                 ok, msg = asyncio.run(_phase_ise_scc_deactivate_reactivate_async(pod_id, creds, session_path, _log))
+            elif step == "ise_sgt_verify":
+                ok, msg = _phase_ise_sgt_verify(pod_id, creds, _log)
             else:
                 ok, msg = False, f"Unknown step: {step}"
         except Exception as e:
@@ -2820,7 +3260,7 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
 
         if not ok:
             # Soft-fail steps: internet issues are a lab constraint — always proceed
-            if step in ("ise_cdfmc_integrate", "ise_scc_deactivate_reactivate"):
+            if step in ("ise_cdfmc_integrate", "ise_scc_deactivate_reactivate", "ise_sgt_verify"):
                 _ise_step_set(pod_id, step, "skipped", f"[soft-fail] {msg}", db_path)
                 _log(f"  [soft-fail] {ISE_STEP_LABELS[step]} — marked skipped, continuing to next step")
                 continue
