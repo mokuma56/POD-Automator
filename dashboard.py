@@ -1584,7 +1584,7 @@ def api_ise_run(pod_id):
     import threading
     _ensure_ise_table()
     data = request.get_json(silent=True) or {}
-    from_step = int(data.get("from_step", 0))
+    from_step = int(request.args.get("from_step", data.get("from_step", 0)))
 
     # Verify VPN container is running
     r = subprocess.run(
@@ -2232,6 +2232,15 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             except Exception:
                 pass
 
+            # ── Early-exit: if SCC already shows ISE as Connected on Integration Hub,
+            # the OTP was consumed and the integration is live — no Save needed. ──
+            _presave_txt = page.inner_text("body").lower()
+            _on_int_hub = "integration hub" in _presave_txt or "cisco integrations" in _presave_txt
+            _ise_connected = "connected" in _presave_txt and "identity services engine" in _presave_txt
+            if _on_int_hub and _ise_connected:
+                log_fn("[scc-nav] Integration Hub shows ISE Connected — integration already live, no Save needed")
+                return True, "ISE → SCC integration complete (Connected)"
+
             log_fn("[scc-nav] Clicking Save button")
             _saved = False
 
@@ -2512,11 +2521,13 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
     }"""
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-popup-blocking"])
+        browser = p.chromium.launch(headless=True,
+            args=["--disable-popup-blocking", "--no-sandbox", "--disable-dev-shm-usage"])
         try:
             _sd = json.loads(Path(session_path).read_text())
             ctx = browser.new_context(
                 storage_state=_sd, viewport={"width": 1920, "height": 1080},
+                ignore_https_errors=True,
             )
             log_fn(f"[cdfmc-nav] storage_state: {len(_sd.get('cookies',[]))} cookies")
 
@@ -2535,12 +2546,23 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             _fmc_url = (f"https://security.cisco.com/firewalls/applications/FMC/?enterpriseId={_eid}"
                         if _eid else "https://security.cisco.com/firewalls/applications/FMC/")
             log_fn(f"[cdfmc-nav] Loading FMC app page (EID={_eid or 'none'}, 15s wait)...")
-            page.goto(_fmc_url, wait_until="domcontentloaded", timeout=60000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
-            page.wait_for_timeout(15000)
+            for _nav_try in range(3):
+                if _nav_try > 0:
+                    log_fn(f"[cdfmc-nav] chrome-error on attempt {_nav_try} — retrying in 8s...")
+                    page.wait_for_timeout(8000)
+                try:
+                    page.goto(_fmc_url, wait_until="domcontentloaded", timeout=60000)
+                except Exception as _ge:
+                    log_fn(f"[cdfmc-nav] goto exception (attempt {_nav_try}): {_ge}")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(15000)
+                if "chrome-error" not in page.url:
+                    break
+                page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_chrome_error_{pod_id}_t{_nav_try}.png"))
+                log_fn(f"[cdfmc-nav] Attempt {_nav_try}: URL={page.url[:60]}")
 
             if "sign-on" in page.url.lower():
                 return False, "SCC session expired — re-run Refresh SCC Sessions"
@@ -2917,34 +2939,18 @@ threading.Thread(target=_cdfmc_otp_watcher, daemon=True, name="cdfmc-otp-watcher
 
 # ── SGT Propagation Verify (step 5) — host-side Playwright ───────────────────
 
-def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn) -> tuple:
+def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
+                     skip_wait: bool = False) -> tuple:
     """Verify Security Group Tags in Secure Access after ISE→SCC propagation.
 
-    Navigation: load SCC session → navigate directly to
-    security.cisco.com/secure-access/org/{sa_org_id}/resources/securitygrouptags
-
-    Waits 15 min first (SGTs can take up to 15 min to propagate after ISE cdFMC
-    activation). Logs a countdown every 60 s. If no SGTs at 15 min, waits 10 more
-    min with another countdown and checks again. Warns (soft-fail) if still none.
+    Checks every 5 min up to 20 min total (4 checks). Logs elapsed time.
+    If skip_wait=True, checks immediately with no propagation wait (for recheck button).
     """
-    import re as _re
+    import re as _re, time as _t
     from playwright.sync_api import sync_playwright
 
-    def _countdown(total_secs: int, label: str) -> None:
-        """Log MM:SS countdown every 60 s."""
-        import time as _t
-        deadline = _t.time() + total_secs
-        while True:
-            remaining = deadline - _t.time()
-            if remaining <= 0:
-                break
-            mins, secs = divmod(int(remaining), 60)
-            log_fn(f"[sgt-verify] {label} — {mins:02d}:{secs:02d} remaining...")
-            # sleep in 2s ticks toward the next 60s log or the deadline
-            wake = min(_t.time() + 60, deadline)
-            import time as _t2
-            while _t2.time() < wake:
-                _t2.sleep(2)
+    MAX_WAIT    = 20 * 60   # 20 min total
+    INTERVAL    = 5  * 60   # check every 5 min
 
     # Load session file — normalize to Playwright storage_state dict
     try:
@@ -2953,8 +2959,7 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn) -> 
         return False, f"Cannot read SCC session file: {_se}"
     _storage = {"cookies": _sd, "origins": []} if isinstance(_sd, list) else _sd
 
-    # Extract enterpriseId from localStorage (present when session saved by
-    # refresh_scc_sessions.py in full Playwright storage-state format)
+    # Extract enterpriseId from localStorage
     _eid = ""
     for _o in (_sd.get("origins", []) if isinstance(_sd, dict) else []):
         for _it in _o.get("localStorage", []):
@@ -2978,12 +2983,10 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn) -> 
             pass
         page.wait_for_timeout(3000)
         if "sign-on" in page.url.lower():
-            return None, 0   # session expired
+            return None, 0
         body = page.inner_text("body")
-        # Primary: "N total" text (e.g. "16 total" from the screenshot)
         m = _re.search(r'(\d+)\s+total', body, _re.IGNORECASE)
         count = int(m.group(1)) if m else 0
-        # Fallback: count table rows
         if count == 0:
             try:
                 count = page.locator("table tbody tr").count()
@@ -3002,38 +3005,52 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn) -> 
             page = ctx.new_page()
             page.set_default_timeout(30000)
 
-            # ── Wait 15 min ───────────────────────────────────────────────────
-            log_fn("[sgt-verify] Waiting 15 min for SGT propagation from ISE → Secure Access...")
-            _countdown(15 * 60, "SGT propagation wait")
+            if skip_wait:
+                # ── Immediate recheck — no propagation wait ───────────────────
+                log_fn("[sgt-verify] Immediate recheck — querying SGTs now...")
+                ok, count = _navigate_and_count(page)
+                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_recheck_{pod_id}.png"))
+                if ok is None:
+                    return False, "SCC session expired — click Refresh SCC Sessions"
+                if ok:
+                    log_fn(f"[sgt-verify] ✓ Found {count} SGTs")
+                    return True, f"SGT verify passed: {count} Security Group Tags found in Secure Access"
+                return True, f"WARN: No SGTs found — ISE→SCC integration may not be active yet"
 
-            # ── First check ──────────────────────────────────────────────────
-            log_fn("[sgt-verify] Checking Security Group Tags (check 1 of 2)...")
-            ok, count = _navigate_and_count(page)
-            page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_check1_{pod_id}.png"))
+            # ── Check every 5 min up to 20 min ───────────────────────────────
+            log_fn(f"[sgt-verify] Checking every 5 min up to 20 min (4 checks)...")
+            start = _t.time()
+            for check_num in range(1, 5):   # checks at 5, 10, 15, 20 min
+                next_check_at = check_num * INTERVAL
+                # Wait with elapsed logging every 60s
+                while True:
+                    elapsed = _t.time() - start
+                    if elapsed >= next_check_at:
+                        break
+                    e_mins, e_secs = divmod(int(elapsed), 60)
+                    log_fn(f"[sgt-verify] Elapsed {e_mins:02d}:{e_secs:02d} — next check at {check_num*5} min...")
+                    wake = min(_t.time() + 60, start + next_check_at)
+                    while _t.time() < wake:
+                        _t.sleep(2)
 
-            if ok is None:
-                return False, "SCC session expired — re-run Refresh SCC Sessions"
-            if ok:
-                log_fn(f"[sgt-verify] ✓ Found {count} SGTs after 15 min")
-                return True, f"SGT verify passed: {count} Security Group Tags found in Secure Access"
+                elapsed = _t.time() - start
+                e_mins, e_secs = divmod(int(elapsed), 60)
+                log_fn(f"[sgt-verify] Check {check_num}/4 at {e_mins:02d}:{e_secs:02d} elapsed...")
+                ok, count = _navigate_and_count(page)
+                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_check{check_num}_{pod_id}.png"))
 
-            # ── No SGTs at 15 min — wait 10 more min ─────────────────────────
-            log_fn(f"[sgt-verify] No SGTs at 15 min (count={count}) — waiting 10 more min...")
-            _countdown(10 * 60, "Additional SGT wait")
+                if ok is None:
+                    return False, "SCC session expired — click Refresh SCC Sessions"
+                if ok:
+                    log_fn(f"[sgt-verify] ✓ Found {count} SGTs at check {check_num} ({e_mins:02d}:{e_secs:02d} elapsed)")
+                    return True, f"SGT verify passed: {count} Security Group Tags found after {e_mins}m{e_secs:02d}s"
 
-            # ── Second check ─────────────────────────────────────────────────
-            log_fn("[sgt-verify] Checking Security Group Tags (check 2 of 2)...")
-            ok, count = _navigate_and_count(page)
-            page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_check2_{pod_id}.png"))
+                log_fn(f"[sgt-verify] No SGTs yet (count={count}) — next check in 5 min...")
 
-            if ok:
-                log_fn(f"[sgt-verify] ✓ Found {count} SGTs after extended wait")
-                return True, f"SGT verify passed: {count} SGTs found (propagation took >15 min)"
-
-            log_fn(f"[sgt-verify] ⚠ WARN: No SGTs after 25 min — check ISE → cdFMC integration")
+            log_fn(f"[sgt-verify] ⚠ WARN: No SGTs after 20 min — check ISE → cdFMC integration")
             return True, (
-                f"WARN: No SGTs in Secure Access after 25 min — "
-                f"check ISE→cdFMC integration (screenshot: sgt_verify_check2_{pod_id}.png)"
+                f"WARN: No SGTs in Secure Access after 20 min — "
+                f"check ISE→cdFMC integration (screenshot: sgt_verify_check4_{pod_id}.png)"
             )
 
     except Exception as _e:
@@ -3095,6 +3112,56 @@ def _sgt_verify_watcher():
 
 
 threading.Thread(target=_sgt_verify_watcher, daemon=True, name="sgt-verify-watcher").start()
+
+
+@app.route("/api/ise/sgt-recheck/<pod_id>", methods=["POST"])
+def api_ise_sgt_recheck(pod_id):
+    """Immediately recheck SGTs in Secure Access — no propagation wait."""
+    import threading as _th
+    _ensure_ise_table()
+    _session_path = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
+    if not _session_path.exists():
+        return jsonify({"status": "error", "message": "No SCC session file — Refresh SCC Sessions first"}), 400
+    _sa_org = None
+    try:
+        import re as _re
+        with sqlite3.connect(str(DATA_DIR / "data" / "pod_state.db")) as _c:
+            _row = _c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+            if _row and _row[0]:
+                _m = _re.search(r"pseudoco-(\d+)", _row[0])
+                if _m:
+                    _oc = _c.execute("SELECT sa_org_id FROM org_credentials WHERE org_number=?", (_m.group(1),)).fetchone()
+                    if _oc:
+                        _sa_org = _oc[0]
+    except Exception:
+        pass
+    if not _sa_org:
+        return jsonify({"status": "error", "message": "sa_org_id not set — check Org Credentials card"}), 400
+
+    def _run():
+        try:
+            log(pod_id, f"[sgt-recheck] Manual SGT recheck triggered for {pod_id}")
+            _ok, _msg = _host_sgt_verify(
+                pod_id, _sa_org, str(_session_path),
+                lambda m: log(pod_id, m),
+                skip_wait=True,
+            )
+            log(pod_id, f"[sgt-recheck] {'✓' if _ok else '✗'} {_msg}")
+            # Update step 5 result in DB
+            try:
+                with sqlite3.connect(str(DATA_DIR / "data" / "pod_state.db")) as _c:
+                    _status = "completed" if _ok else "failed"
+                    _c.execute(
+                        "UPDATE ise_steps SET status=?, result=?, completed_at=? WHERE pod_id=? AND step_name='ise_sgt_verify'",
+                        (_status, _msg, datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), pod_id)
+                    )
+            except Exception as _e:
+                log(pod_id, f"[sgt-recheck] DB update error: {_e}")
+        except Exception as _e:
+            log(pod_id, f"[sgt-recheck] Error: {_e}")
+
+    _th.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "pod_id": pod_id})
 
 @app.route("/api/scc/refresh-sessions", methods=["POST"])
 def api_scc_refresh_sessions():
@@ -5887,6 +5954,16 @@ async function importOrgCsv(input) {
   setTimeout(() => { statusEl.textContent = ''; }, 6000);
 }
 
+function orgCredsNew() {
+  const row = document.getElementById('org-new-row');
+  if (!row) return;
+  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
+  if (row.style.display !== 'none') {
+    const inp = document.getElementById('org-num-input');
+    if (inp) { inp.value = ''; inp.focus(); }
+  }
+}
+
 async function loadOrgCreds(orgNum) {
   if (!orgNum) return;
   window._currentEditOrg = orgNum;  // store for saveOrgCreds onclick
@@ -8149,9 +8226,10 @@ function renderIseGrid(podId, data) {
   html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
   html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">ISE Integrations</span>';
   html += '<div style="display:flex;gap:8px;">';
-  html += '<button id="ise-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u25b6 Run</button>';
-  html += '<button id="ise-reactivate-btn" title="Re-run only the ISE\u2192SCC Deactivate+Reactivate step" style="background:#f0a500;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u21ba Reactivate SCC</button>';
-  html += '<button id="ise-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;"' + (isRunning ? ' disabled' : '') + '>\u21bb Reset</button>';
+   html += '<button id="ise-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u25b6 Run</button>';
+   html += '<button id="ise-reactivate-btn" title="Re-run only the ISE\u2192SCC Deactivate+Reactivate step" style="background:#f0a500;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u21ba Reactivate SCC</button>';
+   html += '<button id="ise-sgt-recheck-btn" title="Immediately recheck SGTs in Secure Access" style="background:#00e68a;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">\U0001F50D Re-verify SGTs</button>';
+   html += '<button id="ise-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;"' + (isRunning ? ' disabled' : '') + '>\u21bb Reset</button>';
   html += '</div></div>';
   html += '<div style="margin-bottom:14px;">';
   html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
@@ -8187,10 +8265,12 @@ function renderIseGrid(podId, data) {
   setTimeout(() => {
     const runBtn        = document.getElementById('ise-run-btn');
     const reactivateBtn = document.getElementById('ise-reactivate-btn');
+    const sgtRecheckBtn = document.getElementById('ise-sgt-recheck-btn');
     const resetBtn      = document.getElementById('ise-reset-btn');
     const refreshBtn    = document.getElementById('scc-refresh-btn');
     if (runBtn)         runBtn.onclick        = () => iseRun(podId);
     if (reactivateBtn)  reactivateBtn.onclick = () => iseReactivate(podId);
+    if (sgtRecheckBtn)  sgtRecheckBtn.onclick = () => iseSgtRecheck(podId);
     if (resetBtn)       resetBtn.onclick      = () => iseReset(podId);
     if (refreshBtn)     refreshBtn.onclick    = () => iseRefreshSessions(podId);
   }, 0);
@@ -8220,6 +8300,24 @@ async function iseReactivate(podId) {
   if (!confirm('Re-run ISE\u2192SCC Deactivate+Reactivate for ' + podId + '?\\n\\nThis resets and re-runs ONLY step 4.')) return;
   _iseStartPoller(podId);
   await fetch('/api/ise/reactivate/' + podId, { method: 'POST' });
+}
+
+async function iseSgtRecheck(podId) {
+  const btn = document.getElementById('ise-sgt-recheck-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '\u23f3 Checking...'; }
+  try {
+    const res = await fetch('/api/ise/sgt-recheck/' + podId, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'started') {
+      _iseStartPoller(podId);
+    } else {
+      alert('SGT recheck error: ' + (data.message || 'unknown'));
+    }
+  } finally {
+    setTimeout(() => {
+      if (btn) { btn.disabled = false; btn.textContent = '\U0001F50D Re-verify SGTs'; }
+    }, 3000);
+  }
 }
 
 async function iseRefreshSessions(podId) {

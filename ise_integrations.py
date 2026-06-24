@@ -251,16 +251,31 @@ async def _ise_dismiss_modal(page):
 async def _ise_dismiss_session_info(page):
     """Dismiss the ISE 'Session Info' popover that blocks form interactions."""
     await page.evaluate("""
+        // Remove by known classes
         document.querySelectorAll('.popover, [class*="session-info"], [class*="sessionInfo"]')
                        .forEach(el => el.remove());
+        // Remove any floating panel that contains 'Session Info' + 'Last logged in'
+        // ISE uses different class names across versions — match by text content
+        document.querySelectorAll('div, aside, section').forEach(el => {
+            const txt = el.innerText || '';
+            if (txt.includes('Session Info') && txt.includes('Last logged in') && el.children.length < 20) {
+                el.remove();
+            }
+        });
     """)
-    # Also try clicking the × close button if still visible
-    try:
-        btn = page.locator('.popover button.close, .popover [aria-label*="close" i]').first
-        if await btn.is_visible(timeout=500):
-            await btn.click()
-    except Exception:
-        pass
+    # Try clicking the × close button by common selectors
+    for sel in [
+        'button[title*="close" i]',
+        '[aria-label*="close" i]',
+        '.popover button.close',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=400):
+                await btn.click()
+                break
+        except Exception:
+            pass
     await page.wait_for_timeout(200)
 
 
@@ -307,7 +322,7 @@ async def _ise_login(page, log) -> bool:
 
         # Click the "Login" button (ISE uses Dijit buttons; type="button" not "submit")
         clicked = False
-        for btn_sel in ['button:has-text("Login")', 'button[type="submit"]',
+        for btn_sel in ['#loginPage_loginSubmit', 'button:has-text("Login")', 'button[type="submit"]',
                         'input[type="submit"]', '#loginButton']:
             try:
                 await page.click(btn_sel, timeout=4000)
@@ -1216,6 +1231,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # ── Diagnose registration form visibility ─────────────────────────────
             # Find out if td#pxCloud_region is in DOM but hidden, and why.
             # Also detect if ISE is showing the already-registered view (Deregister visible).
+            _vis_diag = None
             _vis_diag = await page.evaluate("""() => {
                 const reg = document.getElementById('pxCloud_region');
                 const name = document.getElementById('pxCloud_deviceName');
@@ -1233,21 +1249,59 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     }
                     return null;
                 }
+                const pageTextLower = document.body.innerText.toLowerCase();
                 return {
                     region_in_dom: !!reg,
                     region_hidden_ancestor: reg ? hiddenAncestor(reg) : 'n/a',
                     name_in_dom: !!name,
                     name_hidden_ancestor: name ? hiddenAncestor(name) : 'n/a',
                     deregister_visible: !!deregBtn,
+                    pxgrid_connected: pageTextLower.includes('connected'),
                     page_text_snippet: document.body.innerText.slice(0, 300).split('\\n').join(' '),
                 };
             }""")
             log(f"Form visibility diag: {_vis_diag}")
 
-            # If ISE is already showing Deregister, it's already registered — skip
-            if _vis_diag and _vis_diag.get('deregister_visible'):
-                log("Deregister button visible — ISE is already registered to pxGrid Cloud")
+            # If ISE is already showing Deregister AND page confirms Connected,
+            # registration is complete — skip.  Deregister alone is not enough:
+            # the service can be enabled (Deregister in DOM) without the OAuth
+            # portal registration having completed (no "connected" text).
+            if _vis_diag and _vis_diag.get('deregister_visible') and _vis_diag.get('pxgrid_connected'):
+                log("Deregister button visible + Connected status confirmed — ISE is already registered to pxGrid Cloud")
                 return True, f"{_SKIP_PREFIX} pxGrid Cloud already registered (Deregister button present)"
+            if _vis_diag and _vis_diag.get('deregister_visible') and not _vis_diag.get('pxgrid_connected'):
+                log("Deregister button in DOM but NOT connected — deregistering first for a clean re-registration")
+                _dreg_result = await page.evaluate("""() => {
+                    for (const el of document.querySelectorAll('button, input[type="button"]')) {
+                        if ((el.textContent || el.value || '').trim() === 'Deregister') {
+                            el.click(); return 'clicked:' + (el.id || el.className || 'btn');
+                        }
+                    }
+                    return null;
+                }""")
+                log(f"Deregister click: {_dreg_result}")
+                await page.wait_for_timeout(2000)
+                for _csel in ['button:has-text("Yes")', 'button:has-text("OK")', 'button:has-text("Confirm")']:
+                    try:
+                        if await page.locator(_csel).first.is_visible(timeout=2000):
+                            await page.locator(_csel).first.click()
+                            log(f"Confirmed deregister dialog: {_csel}")
+                            await page.wait_for_timeout(1000)
+                            break
+                    except Exception:
+                        pass
+                _sv_dreg = await page.evaluate("""() => {
+                    if (typeof dijit !== 'undefined') {
+                        const w = dijit.registry.toArray().find(w => (w.label||'').trim()==='Save');
+                        if (w) { w.onClick(); return 'dijit:' + w.id; }
+                    }
+                    return null;
+                }""")
+                log(f"Save after deregister: {_sv_dreg}")
+                await page.wait_for_timeout(4000)
+                await page.reload()
+                await page.wait_for_timeout(5000)
+                log("Deregistered + reloaded — proceeding with fresh registration")
 
             # If region field is hidden, try to reveal it by scrolling to it directly
             if _vis_diag and _vis_diag.get('region_hidden_ancestor'):
@@ -1756,10 +1810,51 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     pass
                 return False, "ISE registration failed: Bad Request - Validation failed (region intercept did not catch the POST — check route hit count above)."
 
-            # ── Click refresh button then verify Connected status ──
-            log("Clicking pxGrid status refresh in ISE")
-            await page.wait_for_timeout(2000)
-            _refreshed = await page.evaluate("""() => {
+            # ── Save ISE node immediately to commit the registration ─────────────
+            log("Saving ISE node to commit pxGrid Cloud registration")
+            _sv = await page.evaluate("""() => {
+                try {
+                    if (typeof dijit !== 'undefined') {
+                        const w = dijit.registry.toArray().find(w =>
+                            (w.label||'').trim()==='Save' ||
+                            (w.domNode && w.domNode.textContent.trim()==='Save')
+                        );
+                        if (w) { w.onClick(); return 'dijit:' + w.id; }
+                    }
+                    for (const el of document.querySelectorAll('*')) {
+                        if (el.children.length === 0 && el.textContent.trim() === 'Save') {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0) {
+                                let t = el;
+                                for (let i = 0; i < 8; i++) {
+                                    if (!t) break;
+                                    if (t.tagName==='BUTTON' || (t.className||'').includes('dijitButtonNode')) {
+                                        t.click(); return 'walk:' + t.tagName;
+                                    }
+                                    t = t.parentElement;
+                                }
+                                el.click(); return 'leaf';
+                            }
+                        }
+                    }
+                    return null;
+                } catch(e) { return 'err:' + e.message; }
+            }""")
+            log(f"Save node result: {_sv}")
+            await page.wait_for_timeout(4000)
+
+            # ── Poll for pxGrid Cloud connected status (up to ~3 min) ────────────
+            # NOTE: "cisco dna portal account" is a STATIC form label — present even
+            # when NOT connected — do NOT use it as a success indicator.
+            _CONNECTED_INDICATORS = [
+                "pxgrid cloud is connected",
+                "connected to cisco dna",
+                "registration successful",
+                "registration complete",
+                "successfully registered",
+            ]
+            _FAIL_INDICATORS = ["could not connect", "connection failed", "unable to connect"]
+            _refresh_js = """() => {
                 const candidates = Array.from(document.querySelectorAll(
                     'button, [role="button"], .icon-refresh, [title*="refresh" i], [aria-label*="refresh" i]'
                 ));
@@ -1771,60 +1866,24 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     }
                 }
                 return null;
-            }""")
-            log(f"Refresh result: {_refreshed}")
-            await page.wait_for_timeout(4000)
-            await page.screenshot(path="/pipeline/host-data/ise_pxgrid_after_refresh.png", full_page=False)
-
-            # Check for success — only indicators that appear EXCLUSIVELY in a registered/connected state.
-            # "deregister" is NOT used here — it appears on unregistered pages too (false positive).
-            # "cisco dna portal account" appears only after successful registration.
-            _pt = (await page.inner_text("body")).lower()
-            _success_indicators = [
-                "cisco dna portal account",
-                "registration successful",
-                "registration complete",
-                "successfully registered",
-                "pxgrid cloud is connected",
-                "connected to cisco dna",
-            ]
-            if any(ind in _pt for ind in _success_indicators):
-                log("pxGrid Cloud registration confirmed — saving ISE node")
-                _sv = await page.evaluate("""() => {
-                    try {
-                        if (typeof dijit !== 'undefined') {
-                            const w = dijit.registry.toArray().find(w =>
-                                (w.label||'').trim()==='Save' ||
-                                (w.domNode && w.domNode.textContent.trim()==='Save')
-                            );
-                            if (w) { w.onClick(); return 'dijit:' + w.id; }
-                        }
-                        for (const el of document.querySelectorAll('*')) {
-                            if (el.children.length === 0 && el.textContent.trim() === 'Save') {
-                                const r = el.getBoundingClientRect();
-                                if (r.width > 0) {
-                                    let t = el;
-                                    for (let i = 0; i < 8; i++) {
-                                        if (!t) break;
-                                        if (t.tagName==='BUTTON' || (t.className||'').includes('dijitButtonNode')) {
-                                            t.click(); return 'walk:' + t.tagName;
-                                        }
-                                        t = t.parentElement;
-                                    }
-                                    el.click(); return 'leaf';
-                                }
-                            }
-                        }
-                        return null;
-                    } catch(e) { return 'err:' + e.message; }
-                }""")
-                log(f"Save node result: {_sv}")
+            }"""
+            for _attempt in range(18):  # 18 × 10s ≈ 3 min
+                await page.wait_for_timeout(10000)
+                _refreshed = await page.evaluate(_refresh_js)
                 await page.wait_for_timeout(3000)
-                return True, f"pxGrid Cloud registered and connected (PseudoCo-{org_number})"
+                _pt = (await page.inner_text("body")).lower()
+                if any(ind in _pt for ind in _CONNECTED_INDICATORS):
+                    log(f"pxGrid Cloud connected confirmed on attempt {_attempt + 1}")
+                    await page.screenshot(path="/pipeline/host-data/ise_pxgrid_connected.png", full_page=False)
+                    return True, f"pxGrid Cloud registered and connected (PseudoCo-{org_number})"
+                _still_fail = any(err in _pt for err in _FAIL_INDICATORS)
+                log(f"Refresh {_attempt + 1}/18: {'not connected' if _still_fail else 'status unclear'} (refresh={_refreshed})")
+                if _attempt % 3 == 2:
+                    await page.screenshot(path=f"/pipeline/host-data/ise_pxgrid_poll_{_attempt + 1}.png", full_page=False)
 
-            # Not confirmed yet — save a screenshot and fail
+            # Timed out after 3 min
             await page.screenshot(path="/pipeline/host-data/ise_pxgrid_register_final.png", full_page=True)
-            return False, "OAuth flow completed but ISE pxGrid status not showing Connected — check ise_pxgrid_after_refresh.png"
+            return False, "pxGrid Cloud registration saved but ISE not connected after 3 min — check ise_pxgrid_register_final.png"
 
         except Exception as e:
             try:
@@ -1889,6 +1948,8 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
             #    (catalog available section shows "All current integrations are active")
             #    In this case navigate via the table link, same as step 3 does for SCC.
             log("Opening Firewall Management Center details")
+            await page.screenshot(path=f"/pipeline/host-data/ise_cdfmc_catalog_init_{pod_id}.png", full_page=True)
+            log(f"Screenshot: /pipeline/host-data/ise_cdfmc_catalog_init_{pod_id}.png")
             more_btns = page.locator('button[data-label="More details"]')
             btn_count = await more_btns.count()
             log(f"Found {btn_count} 'More details' button(s)")
@@ -1938,10 +1999,33 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                         continue
 
                 if not _fmc_clicked:
-                    # Fallback: FMC is always nth(0) in Available integrations list
-                    log("FMC tile text search failed — falling back to nth(0)")
-                    await more_btns.nth(0).click(timeout=10000, force=True)
-                    _fmc_nav_ok = True
+                    # FMC may already be in "Activated integrations" (previous run left it there).
+                    # Check that section before falling back to nth(0).
+                    log("FMC not found in Available tiles — checking Activated integrations section...")
+                    await page.screenshot(path=f"/pipeline/host-data/ise_cdfmc_catalog_nofmc_{pod_id}.png", full_page=True)
+                    for _act_sel in [
+                        ':text("Firewall Management Center")',
+                        ':text("Cisco Secure Firewall")',
+                        ':text("Cisco Firepower")',
+                        'a:has-text("Firewall")',
+                        ':text("FMC")',
+                    ]:
+                        try:
+                            el = page.locator(_act_sel).first
+                            if await el.is_visible(timeout=3000):
+                                await el.click()
+                                log(f"Clicked FMC in Activated integrations via {_act_sel!r}")
+                                _fmc_nav_ok = True
+                                _fmc_clicked = True
+                                await page.wait_for_timeout(2000)
+                                break
+                        except Exception:
+                            continue
+                    if not _fmc_clicked:
+                        # True last-resort fallback — take screenshot first so we can diagnose
+                        log("FMC not found in Activated integrations — falling back to nth(0) (check ise_cdfmc_catalog screenshot)")
+                        await more_btns.nth(0).click(timeout=10000, force=True)
+                        _fmc_nav_ok = True
 
             elif btn_count == 1:
                 await more_btns.first.click(timeout=10000, force=True)
@@ -1994,31 +2078,6 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
             # ── Lab constraint: ISE has no internet — skip gracefully ─────────
             if "unable to reach internet" in page_text or ("please ensure ise has connectivity" in page_text):
                 return True, f"{_SKIP_PREFIX} ISE has no internet access to Integration Catalog — cdFMC integration skipped (lab environment constraint)"
-
-            # ── Idempotency: skip re-activation if FMC is already Active ────────
-            # Clicking "New instance" → "Activate" generates a fresh OTP in ISE.
-            # If that OTP is never consumed by a brand-new cdFMC Application Instance
-            # (e.g. because the instance already exists and we just select it), ISE
-            # marks the integration as Deactivated/Pending — an unintended side effect.
-            #
-            # Guard: the presence of a visible "Deactivate" button on the Configuration
-            # tab is ISE's definitive signal that the FMC integration is already Active.
-            # If found, return success immediately — no new OTP needed.
-            _deactivate_btn_visible = False
-            for _dv_sel in [
-                'button:has-text("Deactivate")',
-                'span.dijitButtonText:has-text("Deactivate")',
-                'a:has-text("Deactivate")',
-            ]:
-                try:
-                    if await page.locator(_dv_sel).first.is_visible(timeout=2000):
-                        _deactivate_btn_visible = True
-                        break
-                except Exception:
-                    pass
-            if _deactivate_btn_visible:
-                log("FMC integration already Active (Deactivate button present) — skipping re-activation ✓")
-                return True, f"{_SKIP_PREFIX} cdFMC pxGrid integration already Active on ISE — no re-activation needed"
 
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1000)
@@ -2111,7 +2170,24 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                     log(f"Dijit Activate error: {_dae}")
             if not activated:
                 return False, "Activate button not found — check /pipeline/host-data/ise_cdfmc_pre_activate.png"
-            await page.wait_for_timeout(3000)
+
+            # Wait for OTP spinner to clear (same pattern as step 2)
+            log("Waiting for OTP to appear (spinner: 'Fetching OTP...')")
+            for _sw in range(20):
+                await page.wait_for_timeout(1000)
+                _still_spin = False
+                try:
+                    if await page.locator(':text("Fetching OTP")').is_visible(timeout=500):
+                        _still_spin = True
+                except Exception:
+                    pass
+                if not _still_spin:
+                    log(f"OTP spinner gone after {_sw}s")
+                    break
+            try:
+                await page.screenshot(path=f"/pipeline/host-data/ise_cdfmc_post_activate_{pod_id}.png", full_page=True)
+            except Exception:
+                pass
 
             otp_token = await _read_otp_from_page(page, log)
             if not otp_token:
@@ -2824,43 +2900,18 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
 
             await page.screenshot(path="/pipeline/host-data/ise_scc_config_tab.png", full_page=False)
 
-            # If there is an existing Active instance from a previous session, deactivate it first.
-            # Use exact text match to avoid false positive from "Inactive" containing "Active".
-            existing_active = False
+            # If already Active (Deactivate button visible) — skip, nothing to do.
             for act_chk in [
-                'button:has-text("Deactivate")',   # most reliable — button only present when Active
-                ':text-is("Active")',              # exact-match only (not "Inactive")
+                'button:has-text("Deactivate")',
+                ':text-is("Active")',
                 ':text-is("Activated")',
             ]:
                 try:
                     if await page.locator(act_chk).first.is_visible(timeout=2000):
-                        existing_active = True
-                        break
+                        log("ISE→SCC integration already Active — skipping")
+                        return True, "ISE→SCC integration already Active (skipped)"
                 except Exception:
                     continue
-            if existing_active:
-                log("Found existing Active instance — deactivating to force fresh OTP")
-                for da_sel in ['button:has-text("Deactivate")', 'a:has-text("Deactivate")', ':text("Deactivate")']:
-                    try:
-                        da = page.locator(da_sel).first
-                        if await da.is_visible(timeout=3000):
-                            await da.click()
-                            await page.wait_for_timeout(2000)
-                            # Confirm if dialog
-                            for conf in ['button:has-text("Yes")', 'button:has-text("Confirm")', 'button:has-text("OK")']:
-                                try:
-                                    cb = page.locator(conf).first
-                                    if await cb.is_visible(timeout=2000):
-                                        await cb.click()
-                                        await page.wait_for_timeout(1000)
-                                        break
-                                except Exception:
-                                    continue
-                            log("Deactivated existing instance")
-                            break
-                    except Exception:
-                        continue
-                await page.wait_for_timeout(1000)
 
             # Scroll down and select New instance
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -2906,6 +2957,23 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
                 await page.screenshot(path="/pipeline/host-data/ise_activate_fail.png", full_page=True)
                 return False, "Could not find Activate button — check ise_activate_fail.png"
             await page.wait_for_timeout(3000)
+            # Dismiss Session Info popup — it re-appears after Activate and can overlay the OTP modal
+            await _ise_dismiss_session_info(page)
+            await page.wait_for_timeout(500)
+
+            # Wait for "Fetching OTP..." spinner to finish — ISE makes an API call to
+            # generate the token; the spinner stays until it completes (can take 5-15s).
+            log("Waiting for OTP to appear (spinner: 'Fetching OTP...')")
+            for _otp_wait in range(20):  # up to 20s
+                _body_txt = (await page.inner_text("body")).lower()
+                if "fetching otp" not in _body_txt:
+                    log(f"OTP spinner gone after {(_otp_wait) * 1}s")
+                    break
+                await page.wait_for_timeout(1000)
+            else:
+                log("WARNING: 'Fetching OTP...' still present after 20s — attempting OTP read anyway")
+            await _ise_dismiss_session_info(page)
+            await page.screenshot(path="/pipeline/host-data/ise_scc_pre_otp.png", full_page=False)
 
             otp_token = await _read_otp_from_page(page, log)
             if not otp_token:
@@ -2941,7 +3009,7 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
                       .filter(b => b.txt);
                 }""")
 
-            for _wi in range(8):  # 8 × 15s = 2 min
+            for _wi in range(3):  # 3 × 15s = 45s settle time before step 3
                 await page.wait_for_timeout(15000)
                 try:
                     await page.reload()
