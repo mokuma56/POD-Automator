@@ -5873,6 +5873,13 @@ function escHtml(s) {
 
 // Returns an inline warning banner if the enrollment blob is stale (>24h).
 // savedAt is a SQLite datetime string 'YYYY-MM-DD HH:MM:SS' (UTC) or empty.
+function closeOrgCredsForm() {
+  const formEl = document.getElementById('org-creds-form');
+  if (formEl) formEl.style.display = 'none';
+  document.querySelectorAll('.org-card').forEach(el => el.classList.remove('selected'));
+  window._currentEditOrg = null;
+}
+
 function blobAgeWarning(savedAt) {
   if (!savedAt) return '<div style="font-size:11px;color:#f59e0b;background:#2a1a00;border:1px solid #f59e0b;border-radius:4px;padding:5px 9px;margin-bottom:5px;">&#9888; No save timestamp \u2014 paste a fresh blob from Duo Admin portal before running step 5.</div>';
   const saved = new Date(savedAt.replace(' ', 'T') + 'Z');
