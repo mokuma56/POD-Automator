@@ -1890,17 +1890,92 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             _page_text = page.inner_text("body").lower()
             _ise_opened = False
 
-            # Early exit: if SCC My Integrations already lists an ISE entry in any
-            # state (Connected, Waiting for activation, Deactivated), the SCC nav
-            # step is done.  Step 4 handles the ISE-side reactivation / handshake.
+            # If ISE entry already exists and is active/connected → done.
+            # If it exists but is Deactivated/Failed → delete it and create fresh with new OTP.
             if "ise" in _page_text:
-                try:
-                    _early_screenshot = DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"
-                    page.screenshot(path=str(_early_screenshot))
-                except Exception:
-                    pass
-                log_fn("[scc-nav] ISE entry already present on SCC My Integrations — SCC nav done; step 4 will complete handshake from ISE side")
-                return True, "ISE integration already present in SCC (step 4 will complete handshake from ISE side)"
+                _is_bad = any(kw in _page_text for kw in ("deactivated", "failed", "error"))
+                if not _is_bad:
+                    try:
+                        page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"))
+                    except Exception:
+                        pass
+                    log_fn("[scc-nav] ISE integration already active in SCC — done")
+                    return True, "ISE integration already active in SCC"
+                else:
+                    log_fn("[scc-nav] ISE integration present but Deactivated/Failed — deleting and recreating with new OTP")
+                    _deleted = False
+                    try:
+                        page.screenshot(path=str(DATA_DIR / "data" / f"scc_delete_fail_{pod_id}.png"))
+                    except Exception:
+                        pass
+                    # Row has a "..." kebab as the last button — no text content, target by position
+                    # NOTE: tr.is_visible() returns False in Playwright even for visible rows;
+                    #       check the button directly instead.
+                    try:
+                        _row = page.locator('tr').filter(has_text='ISE-POD')
+                        _kebab = _row.locator('button').last
+                        if not _kebab.is_visible(timeout=3000):
+                            raise Exception("kebab button not visible")
+                        _kebab.click(timeout=5000)
+                        page.wait_for_timeout(1000)
+                        log_fn("[scc-nav] Clicked kebab (last button in ISE row)")
+                    except Exception as _ke:
+                        log_fn(f"[scc-nav] Row kebab failed ({_ke}) — trying aria-label fallbacks")
+                        for _del_sel in [
+                            'button[aria-label*="action" i]',
+                            'button[aria-label*="option" i]',
+                            '.pf-v5-c-menu-toggle',
+                            'button.pf-v5-c-menu-toggle',
+                        ]:
+                            try:
+                                btn = page.locator(_del_sel).first
+                                if btn.is_visible(timeout=2000):
+                                    btn.click()
+                                    page.wait_for_timeout(1000)
+                                    log_fn(f"[scc-nav] Opened actions menu via {_del_sel!r}")
+                                    break
+                            except Exception:
+                                continue
+                    # Click Delete / Remove from the dropdown
+                    for _del_opt in [
+                        'button:has-text("Delete")',
+                        'li:has-text("Delete")',
+                        '[role="menuitem"]:has-text("Delete")',
+                        'a:has-text("Delete")',
+                        'button:has-text("Remove")',
+                        '[role="menuitem"]:has-text("Remove")',
+                    ]:
+                        try:
+                            opt = page.locator(_del_opt).first
+                            if opt.is_visible(timeout=3000):
+                                opt.click()
+                                page.wait_for_timeout(1500)
+                                log_fn(f"[scc-nav] Clicked delete option via {_del_opt!r}")
+                                _deleted = True
+                                break
+                        except Exception:
+                            continue
+                    # Confirm delete dialog if present
+                    if _deleted:
+                        for _confirm_sel in [
+                            'button:has-text("Delete")',
+                            'button:has-text("Confirm")',
+                            'button:has-text("Yes")',
+                            'button:has-text("OK")',
+                        ]:
+                            try:
+                                cb = page.locator(_confirm_sel).first
+                                if cb.is_visible(timeout=3000):
+                                    cb.click()
+                                    page.wait_for_timeout(2000)
+                                    log_fn(f"[scc-nav] Confirmed delete via {_confirm_sel!r}")
+                                    break
+                            except Exception:
+                                continue
+                        log_fn("[scc-nav] Existing ISE integration deleted — proceeding to add fresh integration")
+                    else:
+                        log_fn("[scc-nav] WARN: Could not delete deactivated integration — proceeding to Add Integration anyway")
+                    # Fall through to Add Integration path with _ise_opened = False
 
             if not _ise_opened:
                 log_fn("[scc-nav] No ISE card found — clicking Add Integration")
@@ -1971,6 +2046,15 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                                 btn.click()
                                 page.wait_for_timeout(3000)
                                 log_fn(f"[scc-nav] Clicked Connect on detail page via {_conn_sel!r}")
+                                # Check if integration connected immediately (no form needed)
+                                _post_conn_text = page.inner_text("body").lower()
+                                if "connected" in _post_conn_text:
+                                    try:
+                                        page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"))
+                                    except Exception:
+                                        pass
+                                    log_fn("[scc-nav] Integration connected after Connect click — done")
+                                    return True, "ISE integration connected in SCC"
                                 break
                         except Exception:
                             continue
@@ -2394,7 +2478,623 @@ def _scc_otp_watcher():
 threading.Thread(target=_scc_otp_watcher, daemon=True, name="scc-otp-watcher").start()
 
 
+# ── Host-side cdFMC pxGrid integration (step 4) ──────────────────────────────
 
+def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
+                          session_path: str, log_fn) -> tuple:
+    """Run cdFMC pxGrid integration on the HOST (not Docker).
+
+    Navigation path (confirmed by diag22-25):
+    1. SCC /firewalls/applications/FMC/?enterpriseId=... (15s wait for HBR-BUTTON drawer)
+    2. expect_popup() + JS shadow-DOM click on HBR-BUTTON 'Platform Settings'
+       → authenticated cdFMC tab at /ddd/#PFSettingsPolicyList
+    3. Navigate tab directly to /ui/identity-sources/pxgrid
+    4. Click 'Create pxGrid Application Instance'
+    5. Fill input[name='name'] and input[name='otp'], click Create → Save
+    """
+    from playwright.sync_api import sync_playwright
+
+    _JS_CLICK_HBR = """(label) => {
+        function deepQueryAll(root) {
+            const found = [];
+            const all = root.querySelectorAll('*');
+            for (const el of all) {
+                if ((el.textContent||'').trim() === label) found.push(el);
+                if (el.shadowRoot) found.push(...deepQueryAll(el.shadowRoot));
+            }
+            return found;
+        }
+        const hbr = deepQueryAll(document).filter(e => e.tagName === 'HBR-BUTTON');
+        if (hbr.length > 0) { hbr[0].click(); return 'HBR-BUTTON clicked'; }
+        const any = deepQueryAll(document);
+        if (any.length > 0) { any[0].click(); return any[0].tagName + ' clicked'; }
+        return 'NOT_FOUND';
+    }"""
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--disable-popup-blocking"])
+        try:
+            _sd = json.loads(Path(session_path).read_text())
+            ctx = browser.new_context(
+                storage_state=_sd, viewport={"width": 1920, "height": 1080},
+            )
+            log_fn(f"[cdfmc-nav] storage_state: {len(_sd.get('cookies',[]))} cookies")
+
+            page = ctx.new_page()
+            page.set_default_timeout(30000)
+
+            # ── 1. Get EID from session localStorage ─────────────────────────
+            _eid = ""
+            for _o in (_sd.get("origins", []) if isinstance(_sd, dict) else []):
+                for _it in _o.get("localStorage", []):
+                    if _it.get("name") == "enterpriseId":
+                        _eid = _it["value"]
+                        break
+
+            # ── 2. Navigate to SCC FMC app page (draws HBR-BUTTON drawer) ────
+            _fmc_url = (f"https://security.cisco.com/firewalls/applications/FMC/?enterpriseId={_eid}"
+                        if _eid else "https://security.cisco.com/firewalls/applications/FMC/")
+            log_fn(f"[cdfmc-nav] Loading FMC app page (EID={_eid or 'none'}, 15s wait)...")
+            page.goto(_fmc_url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+            page.wait_for_timeout(15000)
+
+            if "sign-on" in page.url.lower():
+                return False, "SCC session expired — re-run Refresh SCC Sessions"
+            log_fn(f"[cdfmc-nav] On SCC FMC app page: {page.url[:70]}")
+            page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_fmc_app_{pod_id}.png"))
+
+            # ── 3. Open authenticated cdFMC tab via Platform Settings HBR-BUTTON ──
+            log_fn("[cdfmc-nav] Opening cdFMC tab via Platform Settings (expect_popup)...")
+            try:
+                with page.expect_popup(timeout=40000) as _popup_info:
+                    _r = page.evaluate(_JS_CLICK_HBR, "Platform Settings")
+                    log_fn(f"[cdfmc-nav] JS shadow-DOM click: {_r}")
+                _fmc_tab = _popup_info.value
+                log_fn(f"[cdfmc-nav] cdFMC tab opened: {_fmc_tab.url}")
+            except Exception as _e:
+                page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_no_popup_{pod_id}.png"))
+                return False, f"cdFMC tab did not open (Platform Settings click failed): {_e}"
+
+            try:
+                _fmc_tab.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            _fmc_tab.wait_for_timeout(5000)
+
+            # ── 4. Navigate directly to pxGrid Identity Sources ───────────────
+            _cdfmc_host = _fmc_tab.url.split("/")[2]  # e.g. cisco-pseudoco-504--....app.us.cdo.cisco.com
+            _pxgrid_url = f"https://{_cdfmc_host}/ui/identity-sources/pxgrid"
+            log_fn(f"[cdfmc-nav] Navigating to {_pxgrid_url}...")
+            _fmc_tab.goto(_pxgrid_url, wait_until="domcontentloaded", timeout=30000)
+            _fmc_tab.wait_for_timeout(6000)
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_pxgrid_page_{pod_id}.png"))
+
+            _body = _fmc_tab.inner_text("body").lower()
+            if "create pxgrid application instance" not in _body:
+                log_fn(f"[cdfmc-nav] pxGrid page body: {_body[:300]!r}")
+                return False, f"cdFMC pxGrid page not found at {_fmc_tab.url}"
+            log_fn("[cdfmc-nav] pxGrid Identity Sources page loaded ✓")
+
+            # ── 5. Click Create pxGrid Application Instance ───────────────────
+            _fmc_tab.locator('button:has-text("Create pxGrid Application Instance")').first.click(timeout=10000)
+            _fmc_tab.wait_for_timeout(4000)
+            log_fn("[cdfmc-nav] Clicked Create pxGrid Application Instance")
+
+            # ── 6. Fill name and OTP ──────────────────────────────────────────
+            _name_input = _fmc_tab.locator('input[name="name"]').first
+            _name_input.click()
+            _name_input.press_sequentially(instance_name, delay=0)
+            log_fn(f"[cdfmc-nav] Typed name: {instance_name!r}")
+
+            _otp_input = _fmc_tab.locator('input[name="otp"]').first
+            _otp_input.click()
+            _otp_input.press_sequentially(otp_token, delay=0)
+            log_fn(f"[cdfmc-nav] Typed OTP ({len(otp_token)} chars via press_sequentially)")
+            _fmc_tab.wait_for_timeout(500)
+
+            # ── 7. Submit Create dialog ───────────────────────────────────────
+            def _dialog_closed():
+                return _fmc_tab.evaluate("""() => {
+                    const portal = document.querySelector('#backdraft-fragments');
+                    if (!portal) return true;
+                    const hasOtp = !!portal.querySelector('input[name="otp"]');
+                    const hasCreate = Array.from(portal.querySelectorAll('button'))
+                        .some(b => b.innerText.trim() === 'Create');
+                    return !hasOtp && !hasCreate;
+                }""")
+
+            def _log_dialog_state(label):
+                state = _fmc_tab.evaluate("""() => {
+                    const portal = document.querySelector('#backdraft-fragments');
+                    const portalText = portal ? portal.innerText.slice(0, 500) : 'no portal';
+                    const errors = Array.from(document.querySelectorAll(
+                        '[class*="error" i],[class*="invalid" i],[role="alert"],[class*="alert" i]'))
+                        .map(e => (e.innerText||'').trim().slice(0,100)).filter(t=>t);
+                    const portalErrors = portal ? Array.from(portal.querySelectorAll(
+                        '[class*="error" i],[class*="invalid" i],[role="alert"]'))
+                        .map(e => (e.innerText||'').trim().slice(0,100)).filter(t=>t) : [];
+                    return {portalText, errors, portalErrors};
+                }""")
+                log_fn(f"[cdfmc-nav] State after {label}: portal={state['portalText'][:200]!r} errors={state['errors']} portalErrors={state['portalErrors']}")
+
+            _submitted = False
+
+            # Method 0: regular Playwright click on portal's Create button
+            log_fn("[cdfmc-nav] Method 0: Playwright click on portal Create button...")
+            try:
+                _portal_create = _fmc_tab.locator('#backdraft-fragments button').filter(has_text="Create").first
+                _portal_create.click(timeout=5000)
+                log_fn("[cdfmc-nav] Portal Create click: dispatched")
+                _fmc_tab.wait_for_timeout(4000)
+                if _dialog_closed():
+                    log_fn("[cdfmc-nav] Dialog closed after portal click ✓")
+                    _submitted = True
+                else:
+                    _log_dialog_state("portal-click")
+            except Exception as _ce:
+                log_fn(f"[cdfmc-nav] Portal Create click FAILED: {str(_ce)[:200]}")
+
+            # Method A: force=True
+            if not _submitted:
+                try:
+                    _fmc_tab.locator('#backdraft-fragments button').filter(has_text="Create").first.click(timeout=8000, force=True)
+                    _fmc_tab.wait_for_timeout(4000)
+                    if _dialog_closed():
+                        log_fn("[cdfmc-nav] Dialog closed after force click ✓")
+                        _submitted = True
+                    else:
+                        _log_dialog_state("force-click")
+                except Exception as _fe:
+                    log_fn(f"[cdfmc-nav] force click exception: {str(_fe)[:150]}")
+
+            # Method B: JS click
+            if not _submitted:
+                _js_result = _fmc_tab.evaluate("""() => {
+                    const portal = document.querySelector('#backdraft-fragments');
+                    if (!portal) return 'no portal';
+                    const btn = Array.from(portal.querySelectorAll('button'))
+                        .find(b => b.innerText.trim() === 'Create' && !b.disabled);
+                    if (!btn) return 'no Create button in portal';
+                    btn.click();
+                    return 'clicked: ' + btn.innerText.trim();
+                }""")
+                log_fn(f"[cdfmc-nav] JS portal click result: {_js_result!r}")
+                _fmc_tab.wait_for_timeout(4000)
+                if _dialog_closed():
+                    log_fn("[cdfmc-nav] Dialog closed after JS click ✓")
+                    _submitted = True
+                else:
+                    _log_dialog_state("js-click")
+
+            # Method C: focus + Enter
+            if not _submitted:
+                _focus_result = _fmc_tab.evaluate("""() => {
+                    const portal = document.querySelector('#backdraft-fragments');
+                    if (!portal) return 'no portal';
+                    const btn = Array.from(portal.querySelectorAll('button'))
+                        .find(b => b.innerText.trim() === 'Create' && !b.disabled);
+                    if (!btn) return 'no Create button';
+                    btn.focus(); return 'focused';
+                }""")
+                if _focus_result == 'focused':
+                    _fmc_tab.keyboard.press("Enter")
+                    _fmc_tab.wait_for_timeout(4000)
+                    if _dialog_closed():
+                        log_fn("[cdfmc-nav] Dialog closed after Enter ✓")
+                        _submitted = True
+                    else:
+                        _log_dialog_state("Enter")
+
+            if not _submitted:
+                log_fn("[cdfmc-nav] Waiting extra 30s for server response...")
+                for _w in range(30):
+                    _fmc_tab.wait_for_timeout(1000)
+                    if _dialog_closed():
+                        log_fn(f"[cdfmc-nav] Dialog closed after extra {_w+1}s ✓")
+                        _submitted = True
+                        break
+                    if _w % 10 == 9:
+                        _log_dialog_state(f"wait-{_w+1}s")
+
+            if not _submitted:
+                # Check if failure is "name already exists" — created by a previous run.
+                # Click Cancel and fall through to the Select step.
+                _name_exists = _fmc_tab.evaluate("""() => {
+                    const txt = document.body.innerText.toLowerCase();
+                    return txt.includes('already exists') || txt.includes('name already');
+                }""")
+                if _name_exists:
+                    log_fn(f"[cdfmc-nav] '{instance_name}' already exists — cancelling dialog, selecting existing")
+                    try:
+                        _fmc_tab.locator('button:has-text("Cancel")').first.click(timeout=5000)
+                        _fmc_tab.wait_for_timeout(2000)
+                        log_fn("[cdfmc-nav] Create dialog cancelled ✓")
+                    except Exception as _ce:
+                        log_fn(f"[cdfmc-nav] Cancel click: {_ce}")
+                else:
+                    _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_create_stuck_{pod_id}.png"))
+                    return False, "cdFMC Create dialog did not close — check cdfmc_create_stuck screenshot"
+
+            _fmc_tab.wait_for_timeout(2000)
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_after_create_{pod_id}.png"))
+            log_fn("[cdfmc-nav] Instance created ✓")
+
+            # ── 8. Select the new instance (click "Selected" column button) ────
+            # The Application Instances table is ReactVirtualized — rows are
+            # DIV.ReactVirtualized__Table__row (NOT <tr>).
+            # First rowColumn child = "Selected" column — has 1 BUTTON, 0 radios.
+            # The 4 input[type="radio"] on this page are ALL Service Type radios
+            # (None / ISE / pxGrid Cloud / Passive) — never inside an instance row.
+            log_fn(f"[cdfmc-nav] Selecting instance {instance_name!r}...")
+            _fmc_tab.wait_for_timeout(3000)
+
+            _selected = False
+            for _sel_try in range(8):
+                _fmc_tab.wait_for_timeout(1000)
+                _sel_result = _fmc_tab.evaluate(f"""() => {{
+                    // ReactVirtualized rows — DIV not <tr>
+                    const rows = Array.from(document.querySelectorAll(
+                        'div.ReactVirtualized__Table__row'
+                    ));
+                    const targetRow = rows.find(r => (r.textContent||'').includes({instance_name!r}));
+                    if (!targetRow) return 'no-row:' + rows.length;
+                    // First rowColumn = "Selected" column; contains a button (NOT a radio)
+                    const firstCol = targetRow.querySelector('div.ReactVirtualized__Table__rowColumn');
+                    if (!firstCol) return 'no-col';
+                    const btn = firstCol.querySelector('button');
+                    if (!btn) return 'no-btn';
+                    btn.click();
+                    return 'clicked';
+                }}""")
+                if _sel_result == 'clicked':
+                    log_fn(f"[cdfmc-nav] Selected {instance_name!r} via ReactVirtualized row button ✓")
+                    _selected = True
+                    break
+                log_fn(f"[cdfmc-nav] Select try {_sel_try+1}: {_sel_result}")
+
+            if not _selected:
+                _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_select_failed_{pod_id}.png"))
+                return False, f"Could not find row button for {instance_name!r} — check cdfmc_select_failed screenshot"
+            # ── Handle "Make the pxGrid Cloud application instance active?" popup ──
+            # Clicking the radio immediately triggers this confirmation dialog.
+            log_fn("[cdfmc-nav] Waiting for 'Make active' confirmation popup...")
+            _make_active_clicked = False
+            for _ma_sel in [
+                'button:has-text("Make active")',
+                'button:has-text("Make Active")',
+            ]:
+                try:
+                    _ma_btn = _fmc_tab.locator(_ma_sel).first
+                    if _ma_btn.is_visible(timeout=6000):
+                        _ma_btn.click(timeout=6000)
+                        log_fn("[cdfmc-nav] Clicked 'Make active' in popup ✓")
+                        _make_active_clicked = True
+                        _fmc_tab.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    continue
+            if not _make_active_clicked:
+                log_fn("[cdfmc-nav] WARN: 'Make active' popup not seen — proceeding anyway")
+
+            _fmc_tab.wait_for_timeout(2000)
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_after_select_{pod_id}.png"))
+
+            # ── 9. Click Save ─────────────────────────────────────────────────
+            log_fn("[cdfmc-nav] Clicking Save...")
+            _fmc_tab.locator('button:has-text("Save")').first.click(timeout=10000, force=True)
+            _fmc_tab.wait_for_timeout(4000)
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_after_save_{pod_id}.png"))
+            log_fn("[cdfmc-nav] Save clicked ✓")
+
+            # ── 10. Delete old stale instances (any row NOT matching our name) ──
+            log_fn("[cdfmc-nav] Cleaning up old instances...")
+            _fmc_tab.wait_for_timeout(2000)
+            for _del_attempt in range(5):
+                _deleted_any = False
+                try:
+                    # ReactVirtualized table — rows are DIV not <tr>
+                    _all_rows = _fmc_tab.locator('div.ReactVirtualized__Table__row').all()
+                except Exception:
+                    _all_rows = []
+                for _row in _all_rows:
+                    try:
+                        _row_txt = _row.inner_text() or ""
+                        if instance_name in _row_txt:
+                            continue  # skip our new instance
+                        if not _row_txt.strip():
+                            continue  # skip empty rows
+                        # This is an old instance row — find its trash/delete button.
+                        # Try named selectors first, then fall back to the last button
+                        # in the row (Actions column: Test link + trash icon button).
+                        _del_btn = None
+                        for _ds in [
+                            'button[aria-label*="delete" i]',
+                            'button[title*="delete" i]',
+                            'button[data-testid*="delete" i]',
+                            'button[class*="delete" i]',
+                        ]:
+                            try:
+                                _b = _row.locator(_ds).first
+                                if _b.is_visible(timeout=800):
+                                    _del_btn = _b
+                                    break
+                            except Exception:
+                                continue
+                        if _del_btn is None:
+                            # Fallback: last button in the row is the trash icon
+                            _btns = _row.locator('button').all()
+                            if _btns:
+                                _del_btn = _btns[-1]
+                        if _del_btn:
+                            log_fn(f"[cdfmc-nav] Deleting old instance: {_row_txt.strip()[:80]!r}")
+                            _del_btn.click(force=True, timeout=5000)
+                            _fmc_tab.wait_for_timeout(2000)
+                            _deleted_any = True
+                            # Confirm delete modal if it appears
+                            for _conf in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
+                                try:
+                                    _cb = _fmc_tab.locator(_conf).first
+                                    if _cb.is_visible(timeout=3000):
+                                        _cb.click(force=True)
+                                        _fmc_tab.wait_for_timeout(2000)
+                                        log_fn("[cdfmc-nav] Delete confirmed ✓")
+                                        break
+                                except Exception:
+                                    pass
+                            break  # re-scan rows after each deletion
+                    except Exception:
+                        continue
+                if not _deleted_any:
+                    break  # no more old instances
+
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_final_{pod_id}.png"))
+            log_fn("[cdfmc-nav] ✓ cdFMC pxGrid Application Instance created, selected, and saved")
+            return True, f"cdFMC pxGrid instance '{instance_name}' created and selected"
+
+        except Exception as _e:
+            log_fn(f"[cdfmc-nav] Exception: {_e}")
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_exception_{pod_id}.png"))
+            except Exception:
+                pass
+            return False, f"cdFMC nav exception: {_e}"
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+def _cdfmc_otp_watcher():
+    """Background thread: watch for ise_cdfmc_otp_*.json written by Docker step 4.
+    Runs _host_cdfmc_integrate on the host (outside Docker VPN) and writes result file.
+    """
+    import glob as _glob
+    while True:
+        try:
+            for _otp_file in _glob.glob(str(DATA_DIR / "data" / "ise_cdfmc_otp_*.json")):
+                try:
+                    _data = json.loads(Path(_otp_file).read_text())
+                    _pod_id      = _data.get("pod_id", "")
+                    _otp         = _data.get("otp_token", "")
+                    _iname       = _data.get("instance_name", f"ISE-FMC-POD-{_pod_id}")
+                    _ts          = _data.get("ts", 0)
+                    if not _pod_id or not _otp:
+                        continue
+                    if time.time() - _ts > 600:  # 10 min stale
+                        Path(_otp_file).unlink(missing_ok=True)
+                        continue
+                    Path(_otp_file).unlink(missing_ok=True)
+                    log(_pod_id, f"[cdfmc-nav] Watcher picked up OTP for {_pod_id}")
+                    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
+                    if not _session_path.exists():
+                        _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
+                    else:
+                        _ok, _msg = _host_cdfmc_integrate(
+                            _pod_id, _otp, _iname, str(_session_path),
+                            lambda m: log(_pod_id, m),
+                        )
+                        _res = {"ok": _ok, "message": _msg}
+                    log(_pod_id, f"[cdfmc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+                    _result_path = DATA_DIR / "data" / f"ise_cdfmc_result_{_pod_id}.json"
+                    _result_path.write_text(json.dumps(_res))
+                except Exception as _e:
+                    try:
+                        log("CDFMC_WATCHER", f"[cdfmc-nav] watcher error: {_e}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+threading.Thread(target=_cdfmc_otp_watcher, daemon=True, name="cdfmc-otp-watcher").start()
+
+
+# ── SGT Propagation Verify (step 5) — host-side Playwright ───────────────────
+
+def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn) -> tuple:
+    """Verify Security Group Tags in Secure Access after ISE→SCC propagation.
+
+    Navigation: load SCC session → navigate directly to
+    security.cisco.com/secure-access/org/{sa_org_id}/resources/securitygrouptags
+
+    Waits 15 min first (SGTs can take up to 15 min to propagate after ISE cdFMC
+    activation). Logs a countdown every 60 s. If no SGTs at 15 min, waits 10 more
+    min with another countdown and checks again. Warns (soft-fail) if still none.
+    """
+    import re as _re
+    from playwright.sync_api import sync_playwright
+
+    def _countdown(total_secs: int, label: str) -> None:
+        """Log MM:SS countdown every 60 s."""
+        import time as _t
+        deadline = _t.time() + total_secs
+        while True:
+            remaining = deadline - _t.time()
+            if remaining <= 0:
+                break
+            mins, secs = divmod(int(remaining), 60)
+            log_fn(f"[sgt-verify] {label} — {mins:02d}:{secs:02d} remaining...")
+            # sleep in 2s ticks toward the next 60s log or the deadline
+            wake = min(_t.time() + 60, deadline)
+            import time as _t2
+            while _t2.time() < wake:
+                _t2.sleep(2)
+
+    # Load session file — normalize to Playwright storage_state dict
+    try:
+        _sd = json.loads(Path(session_path).read_text())
+    except Exception as _se:
+        return False, f"Cannot read SCC session file: {_se}"
+    _storage = {"cookies": _sd, "origins": []} if isinstance(_sd, list) else _sd
+
+    # Extract enterpriseId from localStorage (present when session saved by
+    # refresh_scc_sessions.py in full Playwright storage-state format)
+    _eid = ""
+    for _o in (_sd.get("origins", []) if isinstance(_sd, dict) else []):
+        for _it in _o.get("localStorage", []):
+            if _it.get("name") == "enterpriseId":
+                _eid = _it["value"]
+                break
+
+    sgt_url = (
+        f"https://security.cisco.com/secure-access/org/{sa_org_id}"
+        f"/resources/securitygrouptags"
+        + (f"?enterpriseId={_eid}" if _eid else "")
+    )
+    log_fn(f"[sgt-verify] SGT URL: {sgt_url}")
+
+    def _navigate_and_count(page) -> tuple:
+        """Go to SGT page, return (ok, count).  ok=None means session expired."""
+        page.goto(sgt_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)
+        if "sign-on" in page.url.lower():
+            return None, 0   # session expired
+        body = page.inner_text("body")
+        # Primary: "N total" text (e.g. "16 total" from the screenshot)
+        m = _re.search(r'(\d+)\s+total', body, _re.IGNORECASE)
+        count = int(m.group(1)) if m else 0
+        # Fallback: count table rows
+        if count == 0:
+            try:
+                count = page.locator("table tbody tr").count()
+            except Exception:
+                pass
+        return count > 0, count
+
+    browser = None
+    page    = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx  = browser.new_context(
+                storage_state=_storage, viewport={"width": 1920, "height": 1080}
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(30000)
+
+            # ── Wait 15 min ───────────────────────────────────────────────────
+            log_fn("[sgt-verify] Waiting 15 min for SGT propagation from ISE → Secure Access...")
+            _countdown(15 * 60, "SGT propagation wait")
+
+            # ── First check ──────────────────────────────────────────────────
+            log_fn("[sgt-verify] Checking Security Group Tags (check 1 of 2)...")
+            ok, count = _navigate_and_count(page)
+            page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_check1_{pod_id}.png"))
+
+            if ok is None:
+                return False, "SCC session expired — re-run Refresh SCC Sessions"
+            if ok:
+                log_fn(f"[sgt-verify] ✓ Found {count} SGTs after 15 min")
+                return True, f"SGT verify passed: {count} Security Group Tags found in Secure Access"
+
+            # ── No SGTs at 15 min — wait 10 more min ─────────────────────────
+            log_fn(f"[sgt-verify] No SGTs at 15 min (count={count}) — waiting 10 more min...")
+            _countdown(10 * 60, "Additional SGT wait")
+
+            # ── Second check ─────────────────────────────────────────────────
+            log_fn("[sgt-verify] Checking Security Group Tags (check 2 of 2)...")
+            ok, count = _navigate_and_count(page)
+            page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_check2_{pod_id}.png"))
+
+            if ok:
+                log_fn(f"[sgt-verify] ✓ Found {count} SGTs after extended wait")
+                return True, f"SGT verify passed: {count} SGTs found (propagation took >15 min)"
+
+            log_fn(f"[sgt-verify] ⚠ WARN: No SGTs after 25 min — check ISE → cdFMC integration")
+            return True, (
+                f"WARN: No SGTs in Secure Access after 25 min — "
+                f"check ISE→cdFMC integration (screenshot: sgt_verify_check2_{pod_id}.png)"
+            )
+
+    except Exception as _e:
+        log_fn(f"[sgt-verify] Exception: {_e}")
+        if page:
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_error_{pod_id}.png"))
+            except Exception:
+                pass
+        return False, f"SGT verify exception: {_e}"
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+def _sgt_verify_watcher():
+    """Background thread: watch for ise_sgt_trigger_{pod_id}.json written by Docker step 5.
+    Calls _host_sgt_verify (with countdown + Playwright) and writes ise_sgt_result_{pod_id}.json.
+    """
+    import glob as _glob
+    while True:
+        try:
+            for _trig_file in _glob.glob(str(DATA_DIR / "data" / "ise_sgt_trigger_*.json")):
+                try:
+                    _data = json.loads(Path(_trig_file).read_text())
+                    _pod_id  = _data.get("pod_id", "")
+                    _sa_org  = _data.get("sa_org_id", "")
+                    _ts      = _data.get("ts", 0)
+                    if not _pod_id or not _sa_org:
+                        continue
+                    if time.time() - _ts > 2400:   # 40 min stale guard
+                        Path(_trig_file).unlink(missing_ok=True)
+                        continue
+                    Path(_trig_file).unlink(missing_ok=True)
+                    log(_pod_id, f"[sgt-verify] Watcher picked up SGT trigger for {_pod_id}")
+                    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
+                    if not _session_path.exists():
+                        _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
+                    else:
+                        _ok, _msg = _host_sgt_verify(
+                            _pod_id, _sa_org, str(_session_path),
+                            lambda m: log(_pod_id, m),
+                        )
+                        _res = {"ok": _ok, "message": _msg}
+                    log(_pod_id, f"[sgt-verify] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+                    _result_path = DATA_DIR / "data" / f"ise_sgt_result_{_pod_id}.json"
+                    Path(_result_path).write_text(json.dumps(_res))
+                except Exception as _e:
+                    try:
+                        log("SGT_WATCHER", f"[sgt-verify] watcher error: {_e}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+threading.Thread(target=_sgt_verify_watcher, daemon=True, name="sgt-verify-watcher").start()
 
 @app.route("/api/scc/refresh-sessions", methods=["POST"])
 def api_scc_refresh_sessions():
@@ -7363,12 +8063,13 @@ const _origSwitchTab = typeof switchTab === 'function' ? switchTab : null;
 
 // ── ISE Integration Card JS ────────────────────────────────────────────────
 
-const ISE_STEPS = ['ise_pxgrid_register', 'ise_scc_integrate', 'ise_scc_deactivate_reactivate', 'ise_cdfmc_integrate'];
+const ISE_STEPS = ['ise_pxgrid_register', 'ise_scc_integrate', 'ise_scc_deactivate_reactivate', 'ise_cdfmc_integrate', 'ise_sgt_verify'];
 const ISE_STEP_LABELS = {
   ise_pxgrid_register:            'pxGrid Cloud Register',
   ise_scc_integrate:              'ISE \u2192 Secure Access (SGTs)',
   ise_cdfmc_integrate:            'ISE \u2192 cdFMC (SGTs)',
   ise_scc_deactivate_reactivate:  'ISE\u2192SCC Deactivate + Reactivate',
+  ise_sgt_verify:                 'Secure Access SGT Verify',
 };
 
 async function loadIseStatus(podId) {
