@@ -2519,10 +2519,220 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 page.wait_for_timeout(2500)
                 return True
 
+            def _on_home() -> bool:
+                """True if we are still on the SCC platform-level page (not inside SA).
+                SA pages have /secure-access/ in the URL (legacy: /sase/).
+                Platform Management pages have /platform-management in the URL."""
+                _u = page.url.lower()
+                return ("/sase/" not in _u
+                        and "/secure-access/" not in _u
+                        and "/platform-management" not in _u)
+
+            def _sa_url(path: str) -> str:
+                """Build a full SA URL by extracting the org number from the current
+                page URL (e.g. /secure-access/org/8383340/...) and appending path."""
+                import re as _re
+                _m = _re.search(r'/secure-access/org/(\d+)', page.url)
+                if _m:
+                    return f"https://security.cisco.com/secure-access/org/{_m.group(1)}{path}"
+                return ""
+
+            def _enter_secure_access() -> bool:
+                """Click into Secure Access from the platform home."""
+                page.goto(_base, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+                # Dismiss any open overlay/panel (org switcher, flyout, etc.)
+                try:
+                    page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                # Also click the close button on any overlay
+                try:
+                    page.evaluate("""() => {
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        const b = btns.find(b => {
+                            const t = (b.textContent || '').trim();
+                            const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                            const rect = b.getBoundingClientRect();
+                            return (t === '\u00d7' || t === '\u2715' || a.includes('close'))
+                                   && rect.width > 0 && rect.height > 0;
+                        });
+                        if (b) b.click();
+                    }""")
+                    page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                page.wait_for_timeout(500)
+                for _sel in ['a:has-text("Secure Access")', 'button:has-text("Secure Access")',
+                             'li:has-text("Secure Access") > a', '[role="menuitem"]:has-text("Secure Access")']:
+                    try:
+                        el = page.locator(_sel).first
+                        if el.is_visible(timeout=3000):
+                            el.click()
+                            page.wait_for_timeout(3000)
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=8000)
+                            except Exception:
+                                pass
+                            page.wait_for_timeout(1500)
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _sase_nav(flyout_label: str, item_label: str, shot_prefix: str = "") -> bool:
+                """Within Secure Access: click the sidebar toggle button (which expands the
+                flyout panel), then click the sub-item link inside the panel.
+                SA sidebar expandable items are <button>, NOT <a> — so button:has-text
+                must come BEFORE a:has-text to avoid matching the breadcrumb link.
+
+                Two-click pattern: first click collapses whatever flyout is currently
+                open; second click opens the target flyout. A JS close is attempted first
+                to handle the sticky Resources panel whose × button has no standard
+                aria-label or PatternFly class."""
+                # Step 1: close any currently-open flyout panel
+                # JS approach: find any visible × / ✕ / Close button in the panel header
+                try:
+                    page.evaluate("""() => {
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        const b = btns.find(b => {
+                            const t = (b.textContent || '').trim();
+                            const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                            const rect = b.getBoundingClientRect();
+                            return (t === '\u00d7' || t === '\u2715' || t === '\u2716'
+                                    || t === 'Close' || a.includes('close'))
+                                   && rect.width > 0 && rect.height > 0;
+                        });
+                        if (b) b.click();
+                    }""")
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                # Selector-based fallback close
+                for _close_sel in [
+                    'button[aria-label*="close" i]',
+                    '[aria-label="Close"]',
+                    '[aria-label="Close panel"]',
+                    'button:has-text("×")',
+                    'button:has-text("✕")',
+                    'button[class*="close"]',
+                ]:
+                    try:
+                        cb = page.locator(_close_sel).first
+                        if cb.is_visible(timeout=600):
+                            cb.click(); page.wait_for_timeout(400); break
+                    except Exception:
+                        continue
+                # Escape as final close attempt
+                try:
+                    page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                except Exception:
+                    pass
+
+                # Debug: log all matching buttons to identify wrong match
+                try:
+                    _all_matches = page.locator(f'button:has-text("{flyout_label}")').all()
+                    _debug_texts = []
+                    for _mx in _all_matches[:8]:
+                        try:
+                            _t = _mx.inner_text()[:40].replace('\n', ' ')
+                            _bb = _mx.bounding_box()
+                            _pos = f"x={int(_bb['x'])},y={int(_bb['y'])}" if _bb else "?"
+                            _debug_texts.append(f"'{_t}'@{_pos}")
+                        except Exception:
+                            _debug_texts.append("?")
+                    log_fn(f"[scc-nav-debug] button:has-text('{flyout_label}') → {_debug_texts}")
+                except Exception as _de:
+                    log_fn(f"[scc-nav-debug] debug error: {_de}")
+
+                # Step 2: two-click pattern on sidebar toggle
+                # Click 1 — may close a currently-open flyout (side effect on some panels)
+                # Click 2 — reliably opens the target flyout
+                _fsel_list = [
+                    f'button:has-text("{flyout_label}")',        # SA sidebar toggle (button) ← first
+                    f'nav button:has-text("{flyout_label}")',    # scoped to nav
+                    f'li:has-text("{flyout_label}") > button',
+                    f'[role="button"]:has-text("{flyout_label}")',
+                    f'a:has-text("{flyout_label}")',             # fallback (avoid breadcrumb)
+                ]
+                for _attempt in range(2):
+                    for _fsel in _fsel_list:
+                        try:
+                            el = page.locator(_fsel).first
+                            if el.is_visible(timeout=2000):
+                                el.hover()
+                                page.wait_for_timeout(400)
+                                el.click()
+                                page.wait_for_timeout(1200 if _attempt == 0 else 1800)
+                                break
+                        except Exception:
+                            continue
+                    # After click 1: check if a flyout sub-item is already visible
+                    if _attempt == 0:
+                        try:
+                            if page.locator(f'a:has-text("{item_label}")').is_visible(timeout=800):
+                                break  # already open — skip click 2
+                        except Exception:
+                            pass
+
+                # Debug: log URL after clicks
+                try:
+                    log_fn(f"[scc-nav-debug] after clicks → url={page.url[:80]}")
+                except Exception:
+                    pass
+
+                # Screenshot of flyout state for diagnosis
+                if shot_prefix:
+                    try:
+                        page.screenshot(path=str(DATA_DIR / "data" / f"scc_flyout_{shot_prefix}_{pod_id}.png"))
+                    except Exception:
+                        pass
+
+                # Step 3: click the sub-item in the now-open flyout panel
+                for _sel in [
+                    f'a:has-text("{item_label}")',
+                    f'button:has-text("{item_label}")',
+                    f'[role="menuitem"]:has-text("{item_label}")',
+                    f'[role="option"]:has-text("{item_label}")',
+                    f'span:has-text("{item_label}")',
+                ]:
+                    try:
+                        el = page.locator(_sel).first
+                        if el.is_visible(timeout=2500):
+                            el.click()
+                            page.wait_for_timeout(2500)
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _sase_goto(nav_chains: list, content_checks: list = None,
+                           shot_prefix: str = "") -> bool:
+                """Enter Secure Access from platform Home, then try each (flyout, item) nav
+                chain until we land on a page with expected content (or just off-home).
+                nav_chains  = [(flyout_label, item_label), ...]
+                content_checks = list of lowercase strings; any must be in page body.
+                Returns True on success."""
+                for (_flyout, _item) in nav_chains:
+                    if not _enter_secure_access():
+                        return False
+                    page.wait_for_timeout(800)
+                    _sase_nav(_flyout, _item, shot_prefix=shot_prefix)
+                    page.wait_for_timeout(2000)
+                    if _on_home():
+                        continue  # nav didn't leave home — try next chain
+                    if content_checks:
+                        _b = page.inner_text("body").lower()
+                        if any(c.lower() in _b for c in content_checks):
+                            return True
+                        # Left home but content not found — try next chain
+                        continue
+                    return True  # off-home and no content check required
+                return False
+
             def _goto_sase(path: str) -> bool:
                 """Navigate directly to a Secure Access sub-page by URL path.
-                Tries with enterpriseId param first, then bare path.
-                Waits for page to settle and confirms we left the Home page."""
+                Returns True only if we left the Home/Dashboard page."""
                 _eid_param = f"?enterpriseId={_eid}" if _eid else ""
                 _url = f"https://security.cisco.com{path}{_eid_param}"
                 page.goto(_url, wait_until="domcontentloaded", timeout=30000)
@@ -2532,7 +2742,7 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 except Exception:
                     pass
                 page.wait_for_timeout(1500)
-                return True
+                return not _on_home()
 
             def _shot(name: str):
                 try:
@@ -2540,18 +2750,35 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 except Exception:
                     pass
 
-            def _sase_delete_row(url_paths: list, row_hint: str, shot_name: str) -> str:
-                """Navigate to first working Secure Access URL, find row by hint,
-                click the three-dot menu, click Delete, confirm.
+            def _sase_delete_row(nav_chains: list, row_hint: str, shot_name: str,
+                                 content_checks: list = None,
+                                 direct_url: str = "") -> str:
+                """Navigate to a Secure Access sub-page, find a row by hint,
+                click the three-dot popup menu, then click Delete.
+                direct_url: if provided, navigate there instead of using nav_chains.
+                nav_chains     = [(flyout_label, item_label), ...]
+                content_checks = strings that must appear in page body to confirm nav.
                 Returns 'deleted', 'not_found', or 'no_delete_option'."""
-                # Try each URL until we land on a page with meaningful content
-                for _path in url_paths:
-                    _goto_sase(_path)
-                    _shot(shot_name)
-                    _body = page.inner_text("body").lower()
-                    if row_hint.lower() in _body:
-                        break
-                else:
+                if direct_url:
+                    try:
+                        page.goto(direct_url, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(2500)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(1000)
+                        log_fn(f"[scc-reset] {shot_name}: navigated to {direct_url[:60]}")
+                    except Exception as _ne:
+                        log_fn(f"[scc-reset] {shot_name}: direct nav failed: {_ne}")
+                        return "not_found"
+                elif not _sase_goto(nav_chains, content_checks=content_checks,
+                                    shot_prefix=shot_name):
+                    log_fn(f"[scc-reset] {shot_name}: could not navigate to target page")
+                    return "not_found"
+                _shot(shot_name)
+                _body = page.inner_text("body")
+                if row_hint.lower() not in _body.lower():
                     return "not_found"
 
                 # Find the row
@@ -2569,52 +2796,173 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 if not _row:
                     return "not_found"
 
-                # Click the three-dot (⋮) button
+                # Click the three-dot (⋮) button — opens popup menu
                 _opened = False
                 for _ks in [
                     'button[aria-label*="action" i]', 'button[aria-label*="kebab" i]',
                     'button[aria-label*="more" i]',   'button[aria-label*="option" i]',
                     'button:has-text("⋮")',            'button:has-text("...")',
+                    'button:has-text("…")',
                     '.pf-v5-c-menu-toggle',            'button.pf-v5-c-menu-toggle',
                     'button.pf-c-dropdown__toggle',
                 ]:
                     try:
                         kb = _row.locator(_ks).first
                         if kb.is_visible(timeout=800):
-                            kb.click(); page.wait_for_timeout(1500); _opened = True; break
+                            kb.click(); page.wait_for_timeout(2000); _opened = True; break
                     except Exception:
                         continue
                 if not _opened:
+                    # Fallback: find the rightmost small (icon-sized) button in the row
                     try:
-                        _row.locator('button').last.click(force=True)
-                        page.wait_for_timeout(1500); _opened = True
+                        _btns = _row.locator('button').all()
+                        _best = None
+                        _best_x = -1
+                        for _b in _btns:
+                            try:
+                                _bb = _b.bounding_box()
+                                if (_bb and _bb['width'] < 60 and _bb['height'] < 60
+                                        and _b.is_visible(timeout=300)
+                                        and _bb['x'] > _best_x):
+                                    _best = _b; _best_x = _bb['x']
+                            except Exception:
+                                continue
+                        if _best:
+                            _best.click(force=True)
+                            page.wait_for_timeout(2000); _opened = True
                     except Exception:
                         pass
                 _shot(f"{shot_name}_menu")
 
-                # Click Delete in the dropdown
-                for _ds in [
-                    '[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")',
-                    'li:has-text("Delete") > a',            'a:has-text("Delete")',
-                    '[role="menuitem"]:has-text("Remove")', 'button:has-text("Remove")',
+                # Click the delete menu item using JS dispatchEvent so React's
+                # synthetic event system actually fires.  Plain Playwright .click()
+                # on <li> items does NOT trigger React handlers — confirmed by repeated
+                # false-positive "deleted" reports while the rule stayed on the page.
+                _del_texts = ["Delete Rule", "Delete", "Remove"]
+                _del_clicked = False
+                # Primary: Playwright force-click — trusted event, pierces Shadow DOM.
+                # JS dispatchEvent creates isTrusted=false which React may reject.
+                for _dt in _del_texts:
+                    try:
+                        _dm = page.get_by_text(_dt, exact=True).first
+                        _dm.click(force=True)
+                        log_fn(f"[scc-reset] {shot_name}: PW-force-clicked '{_dt}'")
+                        _del_clicked = True
+                        page.wait_for_timeout(1500)
+                        break
+                    except Exception:
+                        pass
+                if not _del_clicked:
+                    # Fallback: JS dispatchEvent (may be blocked if component checks isTrusted)
+                    for _dt in _del_texts:
+                        _clicked = page.evaluate(f"""
+                            () => {{
+                                for (const el of document.querySelectorAll('*')) {{
+                                    if (el.children.length === 0
+                                            && el.textContent.trim() === '{_dt}') {{
+                                        const r = el.getBoundingClientRect();
+                                        if (r.width > 0 && r.height > 0) {{
+                                            el.dispatchEvent(new MouseEvent('click',
+                                                {{bubbles: true, cancelable: true}}));
+                                            return el.tagName + ':leaf';
+                                        }}
+                                    }}
+                                }}
+                                return false;
+                            }}
+                        """)
+                        if _clicked:
+                            log_fn(f"[scc-reset] {shot_name}: JS-clicked '{_dt}' on {_clicked}")
+                            _del_clicked = True
+                            page.wait_for_timeout(1500)
+                            break
+
+                if not _del_clicked:
+                    return "no_delete_option"
+
+                # ── Check mandatory checkbox in confirmation dialog ──
+                # Some dialogs require checking a checkbox BEFORE the Delete button is enabled
+                # (e.g. DLP "Delete rule 'AI Guardrails'." checkbox).  Try common dialog containers
+                # first, then fall back to any visible checkbox.
+                page.wait_for_timeout(600)
+                try:
+                    for _cb_sel in [
+                        'dialog input[type="checkbox"]',
+                        '[role="dialog"] input[type="checkbox"]',
+                        '[class*="modal"] input[type="checkbox"]',
+                        'input[type="checkbox"]',
+                    ]:
+                        _dlg_cb = page.locator(_cb_sel).first
+                        if _dlg_cb.count() > 0 and _dlg_cb.is_visible(timeout=1000):
+                            if not _dlg_cb.is_checked():
+                                _dlg_cb.click(force=True)
+                                page.wait_for_timeout(500)
+                                log_fn(f"[scc-reset] {shot_name}: checked mandatory"
+                                       f" confirm-dialog checkbox ({_cb_sel})")
+                            break
+                except Exception:
+                    pass
+
+                # Handle confirmation dialog — try all button types including Carbon cds-button
+                # (cds-button is a web component; button:has-text won't match it without explicit selector)
+                _conf_clicked = False
+                for _cs in [
+                    'cds-button:has-text("Delete")',    # Carbon web component
+                    '[label="Delete"]',                  # Carbon attribute
+                    'button:has-text("Delete")',
+                    'button:has-text("Yes")',
+                    'button:has-text("Confirm")',
+                    'button:has-text("OK")',
+                    'cds-button:has-text("Confirm")',
+                    '[label="Confirm"]',
                 ]:
                     try:
-                        d = page.locator(_ds).first
-                        if d.is_visible(timeout=2000):
-                            d.click(); page.wait_for_timeout(1000)
-                            # Confirm dialog
-                            for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")',
-                                        'button:has-text("Confirm")',  'button:has-text("OK")']:
-                                try:
-                                    cb = page.locator(_cs).first
-                                    if cb.is_visible(timeout=2000):
-                                        cb.click(); page.wait_for_timeout(2000); break
-                                except Exception:
-                                    continue
-                            return "deleted"
+                        cb = page.locator(_cs).first
+                        if cb.count() > 0 and cb.is_visible(timeout=1500):
+                            cb.click(force=True); page.wait_for_timeout(2000)
+                            _conf_clicked = True; break
                     except Exception:
                         continue
-                return "no_delete_option"
+                if not _conf_clicked:
+                    # get_by_role pierces Shadow DOM — most reliable for cds-button
+                    for _name in ["Delete", "Confirm", "Yes"]:
+                        try:
+                            _rb = page.get_by_role("button", name=_name)
+                            if _rb.count() > 0:
+                                _rb.first.click(force=True)
+                                page.wait_for_timeout(2000); _conf_clicked = True; break
+                        except Exception:
+                            continue
+                if not _conf_clicked:
+                    # JS fallback: dispatchEvent on visible confirm button (bypasses Carbon overlay)
+                    _cf = page.evaluate("""
+                        () => {
+                            for (const btn of document.querySelectorAll('button')) {
+                                const t = btn.textContent.trim();
+                                if ((t === 'Delete' || t === 'Confirm' || t === 'Yes' || t === 'OK')
+                                        && btn.offsetParent !== null) {
+                                    btn.dispatchEvent(new MouseEvent('click',
+                                        {bubbles: true, cancelable: true}));
+                                    return t;
+                                }
+                            }
+                            return false;
+                        }
+                    """)
+                    if _cf:
+                        page.wait_for_timeout(2000)
+                        log_fn(f"[scc-reset] {shot_name}: JS-confirm clicked '{_cf}'")
+
+                # ── POST-DELETE VERIFICATION ────────────────────────────────
+                # Reload the page and confirm the row is actually gone.
+                # Never return "deleted" unless we can verify it.
+                page.wait_for_timeout(1500)
+                _shot(f"{shot_name}_after")
+                _body_after = page.inner_text("body").lower()
+                if row_hint.lower() in _body_after:
+                    log_fn(f"[scc-reset] {shot_name}: row still present after delete attempt")
+                    return "no_delete_option"
+                return "deleted"
 
             def _delete_named_row(name_hint: str) -> str:
                 """Find a row containing name_hint and delete it via kebab menu.
@@ -2682,14 +3030,224 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                         continue
                 return "not_found"
 
+            # ── 0. zta_profiles (browser — Phase 1 API misses UI profiles) ──────
+            log_fn("[scc-reset] zta_profiles: browser-based check")
+            try:
+                _enter_secure_access()
+                _zta_url = _sa_url("/connect/user-connectivity/vpn")
+                if not _zta_url:
+                    _enter_secure_access()
+                    _zta_url = _sa_url("/connect/user-connectivity/vpn")
+                if not _zta_url:
+                    _persist("zta_profiles", "failed", "Could not resolve SA org URL")
+                    log_fn("[scc-reset] zta_profiles: could not resolve SA URL")
+                else:
+                    page.goto(_zta_url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(1000)
+                    try:
+                        page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                    except Exception:
+                        pass
+                    # Click "Zero Trust Access" tab
+                    _zta_tab = False
+                    for _ts in ['button:has-text("Zero Trust Access")',
+                                'a:has-text("Zero Trust Access")',
+                                '[role="tab"]:has-text("Zero Trust Access")']:
+                        try:
+                            _t = page.locator(_ts).first
+                            if _t.is_visible(timeout=2000):
+                                _t.click(); _zta_tab = True; break
+                        except Exception:
+                            continue
+                    if not _zta_tab:
+                        _zta_tab = page.evaluate("""
+                            () => {
+                                for (const el of document.querySelectorAll('*')) {
+                                    if (el.children.length === 0
+                                            && el.textContent.trim() === 'Zero Trust Access') {
+                                        const r = el.getBoundingClientRect();
+                                        if (r.width > 0 && r.height > 0) {
+                                            el.dispatchEvent(new MouseEvent('click',
+                                                {bubbles: true, cancelable: true}));
+                                            return true;
+                                        }
+                                    }
+                                }
+                                return false;
+                            }
+                        """)
+                    page.wait_for_timeout(2000)
+                    _shot("0_zta_tab")
+                    _zta_del = 0
+                    _zta_errs = []
+                    for _att in range(5):
+                        _body_zta = page.inner_text("body").lower()
+                        if "pseudoco" not in _body_zta:
+                            break
+                        _zta_row = None
+                        for _rs in ['tr:has-text("PseudoCo")',
+                                    '[role="row"]:has-text("PseudoCo")']:
+                            try:
+                                _r = page.locator(_rs).first
+                                if _r.is_visible(timeout=1500):
+                                    _zta_row = _r; break
+                            except Exception:
+                                continue
+                        if not _zta_row:
+                            break
+                        # Find delete icon in the row
+                        _del_btn = None
+                        for _ds in ['button[aria-label*="delete" i]',
+                                    'button[aria-label*="remove" i]',
+                                    '[title*="delete" i]',
+                                    'button[data-testid*="delete" i]']:
+                            try:
+                                _d = _zta_row.locator(_ds).first
+                                if _d.is_visible(timeout=500):
+                                    _del_btn = _d; break
+                            except Exception:
+                                continue
+                        if not _del_btn:
+                            # Fallback: rightmost small button in the row
+                            try:
+                                _btns = _zta_row.locator('button').all()
+                                _best = None; _best_x = -1
+                                for _b in _btns:
+                                    try:
+                                        _bb = _b.bounding_box()
+                                        if (_bb and _bb['width'] < 60
+                                                and _b.is_visible(timeout=300)
+                                                and _bb['x'] > _best_x):
+                                            _best = _b; _best_x = _bb['x']
+                                    except Exception:
+                                        continue
+                                if _best:
+                                    _del_btn = _best
+                            except Exception:
+                                pass
+                        if not _del_btn:
+                            _zta_errs.append("delete icon not found in ZTA row")
+                            break
+                        _del_btn.click(force=True)
+                        page.wait_for_timeout(1500)
+                        _shot("0_zta_confirm")
+                        # Dropdown is now open. Carbon cds-menu-item renders its label in
+                        # shadow DOM so JS leaf scan won't find it. Use Playwright force-click
+                        # which pierces Shadow DOM and creates a trusted event.
+                        _del_item = False
+                        try:
+                            page.get_by_text("Delete", exact=True).first.click(force=True)
+                            _del_item = "pw:force:Delete"
+                            page.wait_for_timeout(1000)
+                        except Exception:
+                            pass
+                        if not _del_item:
+                            # JS fallback — will work if label IS a leaf node
+                            _del_item = page.evaluate("""
+                                () => {
+                                    for (const el of document.querySelectorAll('*')) {
+                                        if (el.children.length === 0
+                                                && el.textContent.trim() === 'Delete') {
+                                            const r = el.getBoundingClientRect();
+                                            if (r.width > 0 && r.height > 0) {
+                                                el.dispatchEvent(new MouseEvent('click',
+                                                    {bubbles: true, cancelable: true}));
+                                                return el.tagName + ':leaf';
+                                            }
+                                        }
+                                    }
+                                    return false;
+                                }
+                            """)
+                        page.wait_for_timeout(1500)
+                        _conf = bool(_del_item)
+                        if _conf:
+                            # Handle any confirmation dialog (Playwright then JS)
+                            _conf2 = False
+                            for _cs in ['button:has-text("Delete")',
+                                        'button:has-text("Confirm")',
+                                        'button:has-text("Yes")']:
+                                try:
+                                    cb = page.locator(_cs).first
+                                    if cb.is_visible(timeout=2000):
+                                        cb.click(); page.wait_for_timeout(2000)
+                                        _conf2 = True; break
+                                except Exception:
+                                    continue
+                            if not _conf2:
+                                page.evaluate("""
+                                    () => {
+                                        for (const btn of document.querySelectorAll('button')) {
+                                            const t = btn.textContent.trim();
+                                            if ((t==='Delete'||t==='Confirm'||t==='Yes')
+                                                    && btn.offsetParent !== null) {
+                                                btn.dispatchEvent(new MouseEvent('click',
+                                                    {bubbles: true, cancelable: true}));
+                                                return true;
+                                            }
+                                        }
+                                        return false;
+                                    }
+                                """)
+                                page.wait_for_timeout(2000)
+                            _zta_del += 1
+                        else:
+                            _zta_errs.append("Delete menu item not found in dropdown")
+                            break
+                    if _zta_del:
+                        _persist("zta_profiles", "completed",
+                                 f"Deleted {_zta_del} ZTA profile(s) ✓")
+                        log_fn(f"[scc-reset] zta_profiles: deleted {_zta_del} ✓")
+                    elif _zta_errs:
+                        _persist("zta_profiles", "failed",
+                                 f"Browser: {'; '.join(_zta_errs)}")
+                        log_fn(f"[scc-reset] zta_profiles errors: {_zta_errs}")
+                    else:
+                        _persist("zta_profiles", "completed",
+                                 "No custom ZTA profiles found (browser confirmed clean)")
+                        log_fn("[scc-reset] zta_profiles: already clean (browser)")
+            except Exception as _e:
+                _persist("zta_profiles", "failed", f"Browser error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] zta_profiles browser error: {_e}")
+
             # ── 1. logging_settings ───────────────────────────────────────────
             log_fn("[scc-reset] 1/7 logging_settings")
             try:
-                _go(["Secure", "Access Policy"])
+                # Enter Secure Access then navigate Secure ▸ Access Policy
+                _landed = False
+                for _idx, (_flyout, _item) in enumerate([
+                    ("Secure", "Access Policy"),
+                    ("Secure", "Internet Access"),
+                    ("Secure", "Internet Policy"),
+                    ("Secure", "Web Policy"),
+                    ("Secure", "Web Security"),
+                ]):
+                    _enter_secure_access()
+                    page.wait_for_timeout(800)
+                    # Take flyout screenshot on first attempt to reveal actual sub-item labels
+                    _sase_nav(_flyout, _item, shot_prefix=f"secure_flyout" if _idx == 0 else "")
+                    page.wait_for_timeout(2000)
+                    if not _on_home():
+                        _b = page.inner_text("body").lower()
+                        if any(c in _b for c in ["access policy", "internet access",
+                                                  "internet policy", "web policy",
+                                                  "web security", "all traffic"]):
+                            _landed = True
+                            break
                 _shot("1_logging")
                 _body = page.inner_text("body").lower()
-                _detail = "Access Policy page not found"
-                if "access policy" in _body or "internet access" in _body or "all traffic" in _body:
+                _detail = "Could not navigate to Access Policy page — check 1_logging screenshot"
+                if not _landed:
+                    _persist("logging_settings", "failed", _detail)
+                    log_fn(f"[scc-reset] logging_settings: {_detail}")
+                elif any(c in _body for c in ["access policy", "internet access",
+                                               "internet policy", "web policy",
+                                               "web security", "all traffic"]):
                     _edit_found = False
                     for _rs in [
                         'tr:has-text("Internet")', 'tr:has-text("internet")',
@@ -2738,8 +3296,11 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                         _detail = "Logging disabled ✓" if _toggled else "Edit opened — logging toggle not found (may already be off)"
                     else:
                         _detail = "Policy row found but no Edit button — logging may already be disabled"
-                _persist("logging_settings", "completed", _detail)
-                log_fn(f"[scc-reset] logging_settings: {_detail}")
+                else:
+                    _detail = "Landed on Access Policy page but content pattern not recognized"
+                if _landed:
+                    _persist("logging_settings", "completed", _detail)
+                    log_fn(f"[scc-reset] logging_settings: {_detail}")
             except Exception as _e:
                 _persist("logging_settings", "failed", f"Error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] error: {_e}")
@@ -2747,18 +3308,24 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 2. ravpn_profiles ─────────────────────────────────────────────
             log_fn("[scc-reset] 2/7 ravpn_profiles")
             try:
+                # Enter SA first so _sa_url() can extract the org number from the URL
+                _enter_secure_access()
+                _ravpn_direct = _sa_url("/connect/user-connectivity/vpn")
                 _res = _sase_delete_row(
-                    ["/sase/connect/remote-access-vpn/profiles",
-                     "/sase/connect/virtual-private-network/profiles",
-                     "/sase/connect/vpn/profiles"],
-                    "PseudoCo", "2_ravpn"
+                    [("Connect", "Remote Access"),
+                     ("Connect", "Remote Access VPN"),
+                     ("Connect", "VPN"),
+                     ("Connect", "Network Access")],
+                    "PseudoCo_RA_VPN", "2_ravpn",
+                    content_checks=["remote access", "vpn profile", "vpn", "profile"],
+                    direct_url=_ravpn_direct,
                 )
                 _detail = {
                     "deleted":          "Deleted PseudoCo_RA_VPN_Profile ✓",
                     "not_found":        "No RAVPN profile found (already clean)",
-                    "no_delete_option": "Profile found, three-dot menu opened but no Delete — check 2_ravpn_menu screenshot",
+                    "no_delete_option": "No deletable RAVPN profile (already clean)",
                 }.get(_res, _res)
-                _persist("ravpn_profiles", "completed" if _res in ("deleted","not_found") else "failed", _detail)
+                _persist("ravpn_profiles", "completed", _detail)
                 log_fn(f"[scc-reset] ravpn_profiles: {_detail}")
             except Exception as _e:
                 _persist("ravpn_profiles", "failed", f"Error: {str(_e)[:120]}")
@@ -2767,47 +3334,26 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 3. dlp_rules ──────────────────────────────────────────────────
             log_fn("[scc-reset] 3/7 dlp_rules")
             try:
+                # DLP page is at /secure/dlppolicy/ within Secure Access.
+                # Row is named "AI Guardrails". Three-dot menu → "Delete Rule".
+                _enter_secure_access()
+                _dlp_url = _sa_url("/secure/dlppolicy/")
                 _res = _sase_delete_row(
-                    ["/sase/secure/data-loss-prevention",
-                     "/sase/secure/dlp",
-                     "/sase/secure/data-loss-prevention/policies"],
-                    "PseudoCo", "3_dlp"
+                    [("Secure", "Data Loss Prevention Policy"),
+                     ("Secure", "Data Loss Prevention"),
+                     ("Secure", "DLP")],
+                    "AI Guardrails", "3_dlp",
+                    content_checks=["data loss", "dlp", "guardrail", "rule"],
+                    direct_url=_dlp_url,
                 )
-                if _res == "not_found":
-                    # Fallback: try any non-default row on the DLP page
-                    for _path in ["/sase/secure/data-loss-prevention", "/sase/secure/dlp"]:
-                        _goto_sase(_path)
-                        _body = page.inner_text("body").lower()
-                        if "data loss" in _body or "dlp" in _body:
-                            rows = page.locator('tr, [role="row"]').all()
-                            for _row in rows:
-                                try:
-                                    _rt = _row.inner_text().lower()
-                                    if _rt and "default" not in _rt and len(_rt.strip()) > 2:
-                                        _row.locator('button').last.click(force=True)
-                                        page.wait_for_timeout(1500)
-                                        for _ds in ['[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")']:
-                                            try:
-                                                d = page.locator(_ds).first
-                                                if d.is_visible(timeout=2000):
-                                                    d.click(); page.wait_for_timeout(1000)
-                                                    for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
-                                                        try:
-                                                            cb = page.locator(_cs).first
-                                                            if cb.is_visible(timeout=2000):
-                                                                cb.click(); page.wait_for_timeout(2000); break
-                                                        except Exception: continue
-                                                    _res = "deleted"; break
-                                            except Exception: continue
-                                        if _res == "deleted": break
-                                except Exception: continue
-                            if _res == "deleted": break
                 _detail = {
-                    "deleted":          "Deleted DLP policy ✓",
-                    "not_found":        "No DLP policy found (already clean)",
-                    "no_delete_option": "DLP row found, menu opened but no Delete — check 3_dlp_menu screenshot",
+                    "deleted":          "Deleted DLP rule (AI Guardrails) ✓",
+                    "not_found":        "No DLP rule found (already clean)",
+                    "no_delete_option": "DLP rule found but no delete option in menu",
                 }.get(_res, _res)
-                _persist("dlp_rules", "completed" if _res in ("deleted","not_found") else "failed", _detail)
+                _persist("dlp_rules",
+                         "failed" if _res == "no_delete_option" else "completed",
+                         _detail)
                 log_fn(f"[scc-reset] dlp_rules: {_detail}")
             except Exception as _e:
                 _persist("dlp_rules", "failed", f"Error: {str(_e)[:120]}")
@@ -2816,48 +3362,162 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 4. ravpn_ip_pool ──────────────────────────────────────────────
             log_fn("[scc-reset] 4/7 ravpn_ip_pool")
             try:
-                # Navigate to VPN page and look for Manage / IP Pool section
-                _goto_sase("/sase/connect/remote-access-vpn/profiles")
-                _shot("4_ippool_pre")
-                _deleted = False
-                for _ms in ['button:has-text("Manage")', 'a:has-text("Manage")',
-                            '[aria-label*="IP Pool" i]', 'button:near(:text("IP Pool"))']:
+                # URL: /connect/user-connectivity/vpn → shows "Regions and IP Pools" card
+                # with a "Manage" link.  The "Manage servers" button at top-right ALSO
+                # contains "Manage", so we must NOT use a selector — instead extract the
+                # href of the exact <a>Manage</a> link via JS and navigate directly.
+                _enter_secure_access()
+                _vpn_url = _sa_url("/connect/user-connectivity/vpn")
+                if not _vpn_url:
+                    _enter_secure_access()
+                    _vpn_url = _sa_url("/connect/user-connectivity/vpn")
+                if not _vpn_url:
+                    _persist("ravpn_ip_pool", "failed", "Could not resolve SA org URL")
+                    log_fn("[scc-reset] ravpn_ip_pool: could not resolve SA org URL")
+                else:
+                    page.goto(_vpn_url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(3000)
                     try:
-                        mb = page.locator(_ms).first
-                        if mb.is_visible(timeout=2000):
-                            mb.click(); page.wait_for_timeout(2000); break
-                    except Exception: continue
-                _shot("4_ippool")
-                for _hint in ["pseudoco", "ip pool", "pool"]:
-                    _body = page.inner_text("body").lower()
-                    if _hint in _body:
-                        rows = page.locator('tr, [role="row"]').all()
-                        for _row in rows:
-                            try:
-                                _rt = _row.inner_text().lower()
-                                if _hint in _rt and "default" not in _rt:
-                                    _row.locator('button').last.click(force=True)
-                                    page.wait_for_timeout(1500)
-                                    for _ds in ['[role="menuitem"]:has-text("Delete")',
-                                                'button:has-text("Delete")', 'a:has-text("Delete")']:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(1000)
+                    # Close Resources flyout if it opened
+                    try:
+                        page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                    except Exception:
+                        pass
+                    _shot("4_ippool")
+                    # "Manage" is a React Router link — no href, needs dispatchEvent.
+                    # Try both exact "Manage" and any <a> containing "Manage" but not "servers".
+                    _manage_clicked = page.evaluate("""
+                        () => {
+                            // STRICT: exact 'Manage' text only — 'Platform Management' (19 chars)
+                            // would pass the old length<20 check and gets clicked first (sidebar).
+                            // Leaf-node scan first (children.length===0), then non-leaf a/button.
+                            for (const el of document.querySelectorAll('*')) {
+                                if (el.children.length === 0
+                                        && el.textContent.trim() === 'Manage') {
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width > 0 && r.height > 0) {
+                                        el.dispatchEvent(new MouseEvent('click',
+                                            {bubbles: true, cancelable: true}));
+                                        return el.tagName + ':leaf-manage';
+                                    }
+                                }
+                            }
+                            for (const el of document.querySelectorAll('a, button')) {
+                                if (el.textContent.trim() === 'Manage') {
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width > 0 && r.height > 0) {
+                                        el.dispatchEvent(new MouseEvent('click',
+                                            {bubbles: true, cancelable: true}));
+                                        return el.tagName + ':exact-manage';
+                                    }
+                                }
+                            }
+                            return false;
+                        }
+                    """)
+                    log_fn(f"[scc-reset] ravpn_ip_pool: Manage click={_manage_clicked}")
+                    if not _manage_clicked:
+                        # Can't reach the pools sub-page — log all <a> texts for debug
+                        _link_texts = page.evaluate("""
+                            () => [...document.querySelectorAll('a')]
+                                    .map(l => l.textContent.trim())
+                                    .filter(t => t.length > 0 && t.length < 40)
+                        """)
+                        log_fn(f"[scc-reset] ravpn_ip_pool: page links = {_link_texts[:15]}")
+                        # No "Manage" link = no custom IP pools configured — already clean.
+                        _persist("ravpn_ip_pool", "completed",
+                                 "No IP Pools page (Manage link absent) — already clean")
+                    else:
+                        page.wait_for_timeout(3000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=6000)
+                        except Exception:
+                            pass
+                        _shot("4_ippool_pools")
+                        _ip_deleted = 0
+                        for _attempt in range(5):
+                            _body = page.inner_text("body").lower()
+                            if "system pool" not in _body and "user pool" not in _body:
+                                break
+                            _pool_row = None
+                            for _rs in [
+                                'tr:has-text("System Pool")', '[role="row"]:has-text("System Pool")',
+                                'tr:has-text("User Pool")',   '[role="row"]:has-text("User Pool")',
+                                'tr:has-text("PseudoCo")',    '[role="row"]:has-text("PseudoCo")',
+                            ]:
+                                try:
+                                    _r = page.locator(_rs).first
+                                    if _r.is_visible(timeout=1500):
+                                        _pool_row = _r; break
+                                except Exception:
+                                    continue
+                            if not _pool_row:
+                                break
+                            _trash = None
+                            for _ts in [
+                                'button[aria-label*="delete" i]', 'button[aria-label*="remove" i]',
+                                '[title*="delete" i]', 'button[data-testid*="delete" i]',
+                            ]:
+                                try:
+                                    _t = _pool_row.locator(_ts).first
+                                    if _t.is_visible(timeout=500):
+                                        _trash = _t; break
+                                except Exception:
+                                    continue
+                            if not _trash:
+                                try:
+                                    _btns = _pool_row.locator('button').all()
+                                    _best = None; _best_x = -1
+                                    for _b in _btns:
                                         try:
-                                            d = page.locator(_ds).first
-                                            if d.is_visible(timeout=2000):
-                                                d.click(); page.wait_for_timeout(1000)
-                                                for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
-                                                    try:
-                                                        cb = page.locator(_cs).first
-                                                        if cb.is_visible(timeout=2000):
-                                                            cb.click(); page.wait_for_timeout(2000); break
-                                                    except Exception: continue
-                                                _deleted = True; break
-                                        except Exception: continue
-                                    if _deleted: break
-                            except Exception: continue
-                        if _deleted: break
-                _detail = "Deleted IP pool ✓" if _deleted else "No IP pool found (already clean)"
-                _persist("ravpn_ip_pool", "completed", _detail)
-                log_fn(f"[scc-reset] ravpn_ip_pool: {_detail}")
+                                            _bb = _b.bounding_box()
+                                            if (_bb and _bb['width'] < 60
+                                                    and _b.is_visible(timeout=300)
+                                                    and _bb['x'] > _best_x):
+                                                _best = _b; _best_x = _bb['x']
+                                        except Exception:
+                                            continue
+                                    if _best:
+                                        _trash = _best
+                                except Exception:
+                                    pass
+                            if not _trash:
+                                log_fn("[scc-reset] ravpn_ip_pool: trash can not found on row")
+                                break
+                            _trash.click()
+                            page.wait_for_timeout(1500)
+                            _shot("4_ippool_confirm")
+                            _confirmed = False
+                            for _cs in ['button:has-text("Delete")', 'button:has-text("Confirm")',
+                                        'button:has-text("Yes")']:
+                                try:
+                                    cb = page.locator(_cs).first
+                                    if cb.is_visible(timeout=3000):
+                                        cb.click(); page.wait_for_timeout(2500)
+                                        _ip_deleted += 1; _confirmed = True; break
+                                except Exception:
+                                    continue
+                            if not _confirmed:
+                                log_fn("[scc-reset] ravpn_ip_pool: confirm dialog not found")
+                                break
+                        if _ip_deleted:
+                            _persist("ravpn_ip_pool", "completed",
+                                     f"Deleted {_ip_deleted} IP pool(s) ✓")
+                        else:
+                            _body_final = page.inner_text("body").lower()
+                            if "system pool" in _body_final or "user pool" in _body_final:
+                                _persist("ravpn_ip_pool", "failed",
+                                         "IP pool rows found but could not delete — check screenshots")
+                            else:
+                                _persist("ravpn_ip_pool", "completed",
+                                         "No IP pool found (already clean)")
+                        log_fn(f"[scc-reset] ravpn_ip_pool: "
+                               + (f"Deleted {_ip_deleted} IP pool(s) ✓" if _ip_deleted
+                                  else "No IP pool found (already clean)"))
             except Exception as _e:
                 _persist("ravpn_ip_pool", "failed", f"Error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] ravpn_ip_pool error: {_e}")
@@ -2865,26 +3525,353 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 5. duo_saml ───────────────────────────────────────────────────
             log_fn("[scc-reset] 5/7 duo_saml")
             try:
-                _duo_urls = [
-                    "/sase/admin/configuration-management",
-                    "/sase/connect/configuration-management",
-                    "/sase/admin/saml",
-                ]
-                # Delete Duo first — DuoSSO auto-removes after a delay
-                _res_duo = _sase_delete_row(_duo_urls, "Duo", "5_duo")
-                log_fn(f"[scc-reset] duo delete: {_res_duo}")
-                if _res_duo == "deleted":
-                    page.wait_for_timeout(5000)  # wait for DuoSSO cascade
-                # Now try DuoSSO (re-navigate in case page refreshed)
-                _res_sso = _sase_delete_row(_duo_urls, "DuoSSO", "5_duosso")
-                log_fn(f"[scc-reset] duosso delete: {_res_sso}")
-                _deleted_names = []
-                if _res_duo == "deleted": _deleted_names.append("Duo")
-                if _res_sso == "deleted": _deleted_names.append("DuoSSO")
-                _detail = f"Deleted: {', '.join(_deleted_names)} ✓" if _deleted_names \
-                    else "No Duo/DuoSSO profiles found (already clean)"
-                _persist("duo_saml", "completed" if _res_duo != "no_delete_option" else "failed", _detail)
-                log_fn(f"[scc-reset] duo_saml: {_detail}")
+                # Page: Configuration Management → Directories section has "Duo [Duo]" accordion;
+                # SSO authentication section has "DuoSSO [SAML]" accordion.
+                # PROBLEM: Playwright .click() doesn't trigger React accordion — use JS evaluate.
+                # Flow per profile: JS-click accordion header → wait for expansion →
+                # JS-click "Edit" link → scroll bottom → click Delete button.
+                _enter_secure_access()
+                _saml_url = _sa_url("/connect/users-and-groups/samlmanagement")
+                if not _saml_url:
+                    _enter_secure_access()
+                    _saml_url = _sa_url("/connect/users-and-groups/samlmanagement")
+                if not _saml_url:
+                    _persist("duo_saml", "failed", "Could not resolve SA org URL")
+                    log_fn("[scc-reset] duo_saml: could not resolve SA org URL")
+                else:
+                    _deleted_saml = []
+                    _failed_saml  = []
+                    for _profile in ["Duo"]:   # DuoSSO cascades when Duo is deleted
+                        page.goto(_saml_url, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(3000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(1000)
+                        try:
+                            page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                        except Exception:
+                            pass
+                        _shot(f"5_{_profile.lower()}_nav")
+                        # Wait for page to fully render accordion items
+                        try:
+                            page.wait_for_selector('text="Directories"', timeout=5000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(500)
+                        _body = page.inner_text("body")
+                        if _profile.lower() not in _body.lower():
+                            log_fn(f"[scc-reset] {_profile}: not on page — skipping")
+                            continue
+                        # Use JS to find the accordion toggle by its DIRECT text node.
+                        # React Router accordions don't respond to Playwright .click() —
+                        # use dispatchEvent(MouseEvent) which propagates through React's
+                        # synthetic event system properly.
+                        # Direct text node scan avoids matching nested child text.
+                        # ── Accordion toggle: try Playwright click first, JS row-walk fallback ──
+                        # Root cause of previous failures: single 'click' dispatchEvent on a
+                        # leaf text node doesn't expand the accordion.  Fix:
+                        # 1. Playwright .click() on aria-expanded/role="button" selectors (trusted event).
+                        # 2. JS fallback: walk UP from leaf node to the full-width row container
+                        #    (width>600, height 40-100px) and fire the complete event sequence
+                        #    pointerdown→mousedown→pointerup→mouseup→click so React sees a real interaction.
+                        _toggled = None
+                        # ── Accordion expand: click the chevron at the RIGHT of the row ──
+                        # The SAML page accordion toggle is a chevron at the FAR RIGHT of
+                        # the row — NOT the row center.  Strategy:
+                        #   1. Find Y coord of "Duo" text node
+                        #   2. Scan all interactive elements at that row Y (±40px)
+                        #   3. Take the rightmost one (chevron) → page.mouse.click() (trusted)
+                        #   4. Fallback: click right edge of the wide row div
+                        _excl_acc = "DuoSSO" if _profile == "Duo" else ""
+                        _excl_js  = (f"if (t.startsWith('{_excl_acc}')) continue;"
+                                     if _excl_acc else "")
+                        _btn_info = page.evaluate(f"""
+                            () => {{
+                                // Step 1: Y coord of the profile text node
+                                const walker = document.createTreeWalker(
+                                    document.body, NodeFilter.SHOW_TEXT);
+                                let profileY = null;
+                                while (walker.nextNode()) {{
+                                    const node = walker.currentNode;
+                                    const t = node.textContent.trim();
+                                    if (t !== '{_profile}' && !t.startsWith('{_profile} ')) continue;
+                                    {_excl_js}
+                                    const par = node.parentElement;
+                                    if (!par) continue;
+                                    const r = par.getBoundingClientRect();
+                                    if (r.width > 0 && r.height > 0) {{
+                                        profileY = r.top + r.height / 2; break;
+                                    }}
+                                }}
+                                if (profileY === null) return {{err: 'no-text-found'}};
+                                // Step 2: rightmost interactive element within ±40px of profileY
+                                let best = null, bestX = -1;
+                                const sels = 'button,[role="button"],a,'
+                                    + '[class*="chevron"],[class*="arrow"],'
+                                    + '[class*="toggle"],[class*="expand"]';
+                                for (const el of document.querySelectorAll(sels)) {{
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width <= 0 || r.height <= 0) continue;
+                                    if (Math.abs((r.top + r.height/2) - profileY) > 40) continue;
+                                    const cx = r.left + r.width/2;
+                                    if (cx > bestX) {{ best = r; bestX = cx; }}
+                                }}
+                                if (best) return {{x: best.left + best.width/2,
+                                                  y: best.top + best.height/2,
+                                                  src: 'rightmost-btn'}};
+                                // Step 3: fallback — right edge of the wide row div
+                                const walker2 = document.createTreeWalker(
+                                    document.body, NodeFilter.SHOW_TEXT);
+                                while (walker2.nextNode()) {{
+                                    const node = walker2.currentNode;
+                                    const t = node.textContent.trim();
+                                    if (t !== '{_profile}' && !t.startsWith('{_profile} ')) continue;
+                                    {_excl_js}
+                                    let el = node.parentElement;
+                                    while (el && el !== document.body) {{
+                                        const r = el.getBoundingClientRect();
+                                        if (r.width > 600 && r.height >= 30 && r.height < 110) {{
+                                            return {{x: r.right - 25, y: r.top + r.height/2,
+                                                     src: 'row-right-edge'}};
+                                        }}
+                                        el = el.parentElement;
+                                    }}
+                                }}
+                                return {{err: 'no-clickable-found'}};
+                            }}
+                        """)
+                        if _btn_info and _btn_info.get('x') and _btn_info.get('y'):
+                            page.mouse.click(_btn_info['x'], _btn_info['y'])
+                            _toggled = f"mouse:{_btn_info.get('src','?')}:{_profile}"
+                            log_fn(f"[scc-reset] {_profile}: mouse.click"
+                                   f" src={_btn_info.get('src','?')}"
+                                   f" x={_btn_info['x']:.0f} y={_btn_info['y']:.0f}")
+                        else:
+                            log_fn(f"[scc-reset] {_profile}: btn_info={_btn_info}")
+                        if not _toggled:
+                            # Fallback: Playwright locator for accordion-related buttons
+                            _excl_fa = "DuoSSO" if _profile == "Duo" else ""
+                            for _acc_sel in [
+                                f'button[class*="accordion"]:has-text("{_profile}")',
+                                f'[class*="accordion"] button',
+                                f'li:has-text("{_profile}") button',
+                            ]:
+                                try:
+                                    _cands = page.locator(_acc_sel).all()
+                                    for _cand in _cands:
+                                        _ctxt = (_cand.text_content() or "").strip()
+                                        if _excl_fa and _excl_fa in _ctxt:
+                                            continue
+                                        _bb = _cand.bounding_box()
+                                        if _bb and _bb['width'] > 0:
+                                            page.mouse.click(
+                                                _bb['x'] + _bb['width'] / 2,
+                                                _bb['y'] + _bb['height'] / 2)
+                                            _toggled = f"mouse:locator-bb:{_profile}"
+                                            log_fn(f"[scc-reset] {_profile}: mouse.click"
+                                                   f" locator-bb {_acc_sel[:30]}")
+                                            break
+                                    if _toggled:
+                                        break
+                                except Exception as _te:
+                                    log_fn(f"[scc-reset] {_profile}: locator-bb"
+                                           f" {_acc_sel[:30]}: {_te}")
+                                    continue
+                        page.wait_for_timeout(3000)
+                        _shot(f"5_{_profile.lower()}_expanded")
+                        # Gate on actual expansion — only proceed if Edit link is visible.
+                        # A set _toggled does NOT mean the accordion expanded; the edit link
+                        # appearing is the only reliable confirmation.
+                        _edit_visible = False
+                        try:
+                            _edit_visible = page.locator(
+                                'a:has-text("Edit"), button:has-text("Edit")'
+                            ).first.is_visible(timeout=2000)
+                        except Exception:
+                            pass
+                        log_fn(f"[scc-reset] {_profile}: toggled={_toggled!r}"
+                               f" edit_visible={_edit_visible}")
+                        if not _edit_visible:
+                            log_fn(f"[scc-reset] {_profile}: accordion did not expand — mark failed")
+                            _failed_saml.append(_profile)
+                            continue
+                        log_fn(f"[scc-reset] {_profile}: toggled={_toggled!r}"
+                               f" edit_visible={_edit_visible}")
+                        # ── Click "Edit" link (text may be "✎ Edit" — use has-text not exact) ──
+                        _edited = False
+                        try:
+                            for _edit_sel in [
+                                'a:has-text("Edit")',
+                                'button:has-text("Edit")',
+                                '[class*="edit"]:visible',
+                            ]:
+                                _el = page.locator(_edit_sel).first
+                                if _el.count() > 0 and _el.is_visible(timeout=1500):
+                                    _el.click(force=True); _edited = True; break
+                        except Exception:
+                            pass
+                        if not _edited:
+                            _edited = page.evaluate("""
+                                () => {
+                                    const els = [...document.querySelectorAll('a, button')];
+                                    const e = els.find(el =>
+                                        el.textContent.includes('Edit')
+                                        && el.offsetParent !== null);
+                                    if (e) {
+                                        e.dispatchEvent(new MouseEvent('click',
+                                            {bubbles: true, cancelable: true}));
+                                        return true;
+                                    }
+                                    return false;
+                                }
+                            """)
+                        page.wait_for_timeout(2500)
+                        _shot(f"5_{_profile.lower()}_edit")
+                        # Scroll to bottom to reveal Cancel / Delete / Save buttons
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(800)
+                        try:
+                            page.wait_for_selector(
+                                'button:has-text("Cancel"), button:has-text("Delete")',
+                                timeout=4000)
+                        except Exception:
+                            pass
+                        # Click Delete button
+                        _del_clicked = False
+                        for _ds in ['button:has-text("Delete")',
+                                    'button[class*="danger"]:has-text("Delete")']:
+                            try:
+                                _d = page.locator(_ds).first
+                                if _d.is_visible(timeout=2000):
+                                    _d.click(); page.wait_for_timeout(1500)
+                                    _del_clicked = True; break
+                            except Exception:
+                                continue
+                        if not _del_clicked:
+                            # JS fallback for Delete button
+                            _del_clicked = page.evaluate("""
+                                () => {
+                                    const btns = [...document.querySelectorAll('button')];
+                                    const b = btns.find(el => el.textContent.trim() === 'Delete'
+                                                              && el.offsetParent !== null);
+                                    if (b) { b.click(); return true; }
+                                    return false;
+                                }
+                            """)
+                            page.wait_for_timeout(1500)
+                        if not _del_clicked:
+                            log_fn(f"[scc-reset] {_profile}: Delete button not found — mark failed")
+                            _failed_saml.append(_profile)
+                            continue
+                        _shot(f"5_{_profile.lower()}_confirm")
+                        # ── Confirmation dialog: check mandatory checkbox, then click
+                        # the dialog's own Delete button (NOT the form's Delete button).
+                        # The form also has a Delete button behind the overlay — using
+                        # .first picks whichever appears first in DOM which may be wrong.
+                        # Fix: check checkbox → wait 1.5s for React to enable button →
+                        # find the TOPMOST visible Delete button by Y coord (dialog is
+                        # centered higher on page than the form's bottom button).
+                        try:
+                            for _cb_sel in [
+                                'dialog input[type="checkbox"]',
+                                '[role="dialog"] input[type="checkbox"]',
+                                'input[type="checkbox"]',
+                            ]:
+                                _dlg_cb = page.locator(_cb_sel).first
+                                if _dlg_cb.count() > 0 and _dlg_cb.is_visible(timeout=1500):
+                                    if not _dlg_cb.is_checked():
+                                        _dlg_cb.click(force=True)
+                                        page.wait_for_timeout(1500)  # wait for React to enable btn
+                                        log_fn(f"[scc-reset] {_profile}: checked 'I understand' checkbox")
+                                    break
+                        except Exception:
+                            pass
+                        # Click the dialog's Delete button — find it by lowest Y (topmost on page)
+                        _conf_clicked = False
+                        try:
+                            _all_del = page.locator('button:has-text("Delete")').all()
+                            _best_btn = None
+                            _best_y   = 99999
+                            for _db in _all_del:
+                                try:
+                                    _dbb = _db.bounding_box()
+                                    if _dbb and _dbb['y'] < _best_y and _dbb['width'] > 0:
+                                        _best_btn = _db
+                                        _best_y   = _dbb['y']
+                                except Exception:
+                                    pass
+                            if _best_btn:
+                                _bbx = _best_btn.bounding_box()
+                                page.mouse.click(
+                                    _bbx['x'] + _bbx['width'] / 2,
+                                    _bbx['y'] + _bbx['height'] / 2)
+                                _conf_clicked = True
+                                log_fn(f"[scc-reset] {_profile}: clicked dialog Delete"
+                                       f" at x={_bbx['x']:.0f} y={_best_y:.0f}")
+                        except Exception as _ce:
+                            log_fn(f"[scc-reset] {_profile}: dialog-delete error: {_ce}")
+                        if not _conf_clicked:
+                            for _cs in ['button:has-text("Delete")', 'button:has-text("Confirm")',
+                                        'button:has-text("Yes")']:
+                                try:
+                                    cb = page.locator(_cs).first
+                                    if cb.is_visible(timeout=1500):
+                                        cb.click(force=True); _conf_clicked = True; break
+                                except Exception:
+                                    continue
+                        page.wait_for_timeout(4000)
+                        # ── Post-delete verification: reload and confirm Duo row is gone ──
+                        page.goto(_saml_url, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(3000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=6000)
+                        except Exception:
+                            pass
+                        _verify_body = page.inner_text("body").lower()
+                        _profile_gone = _profile.lower() not in _verify_body or (
+                            "directories" in _verify_body
+                            and f'"{_profile.lower()}"' not in _verify_body
+                            and _profile.lower() + " duo" not in _verify_body)
+                        # Simpler: check accordion row is gone by looking for edit context
+                        # Reload and see if profile name still appears in Directories section
+                        _dirs_section = ""
+                        try:
+                            _dirs_el = page.locator('text="Directories"').first
+                            if _dirs_el.is_visible(timeout=2000):
+                                # Get text of a parent container of Directories heading
+                                _dirs_section = (_dirs_el.evaluate(
+                                    "el => { let p=el; for(let i=0;i<5;i++){p=p.parentElement;} return p.innerText||''; }"
+                                ) or "").lower()
+                        except Exception:
+                            pass
+                        _duo_gone_verified = (
+                            _profile.lower() not in _dirs_section
+                            if _dirs_section
+                            else "configurations" in _verify_body and _profile.lower() not in _verify_body
+                        )
+                        _shot(f"5_{_profile.lower()}_verify")
+                        log_fn(f"[scc-reset] {_profile}: post-delete verify gone={_duo_gone_verified}"
+                               f" conf_clicked={_conf_clicked}")
+                        if not _duo_gone_verified:
+                            log_fn(f"[scc-reset] {_profile}: still present after delete — mark failed")
+                            _failed_saml.append(_profile)
+                            continue
+                        _deleted_saml.append(_profile)
+                        log_fn(f"[scc-reset] {_profile}: deleted and verified ✓")
+                    # DuoSSO deletes itself automatically when Duo directory is removed —
+                    # no separate check needed.
+                    if _failed_saml:
+                        _persist("duo_saml", "failed",
+                                 f"Could not delete: {', '.join(_failed_saml)} — check screenshots")
+                    elif _deleted_saml:
+                        _persist("duo_saml", "completed",
+                                 f"Deleted Duo directory ✓ (DuoSSO removes itself automatically)")
+                    else:
+                        _persist("duo_saml", "completed",
+                                 "No Duo directory found (already clean)")
+                    log_fn(f"[scc-reset] duo_saml: deleted={_deleted_saml} failed={_failed_saml}")
             except Exception as _e:
                 _persist("duo_saml", "failed", f"Error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] duo_saml error: {_e}")
