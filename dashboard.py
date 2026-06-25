@@ -3015,17 +3015,30 @@ threading.Thread(target=_scc_otp_watcher, daemon=True, name="scc-otp-watcher").s
 
 @app.route("/api/scc/manual-reset/<pod_id>", methods=["POST"])
 def api_scc_manual_reset(pod_id):
-    """Run _scc_auto_reset_manual in a background thread for the given POD."""
-    _state = {"running": True}
+    """Run API-based SCC reset (6 items) then Playwright automation (7 items) in a background thread."""
 
     def _run():
+        # ── Phase 1: API-based checks (access policy, NTGs, ZTA, private resources, DNS, EPP) ──
+        try:
+            import sys, os as _os, importlib
+            log(pod_id, "[scc-reset] Phase 1: running API-based checks (6 items)...")
+            sys.path.insert(0, str(Path(__file__).parent))
+            _os.environ["POD_ID"] = pod_id
+            _os.environ["DB_PATH"] = str(Path(__file__).parent / "data" / "pod_state.db")
+            _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
+            import onboard_router
+            importlib.reload(onboard_router)
+            ok, result = onboard_router.phase_scc_reset_check()
+            log(pod_id, f"[scc-reset] API checks done: {result}")
+        except Exception as _e:
+            log(pod_id, f"[scc-reset] API checks error: {_e}")
+
+        # ── Phase 2: Playwright automation (logging, RAVPN, DLP, IP pool, Duo, ISE, TE) ──
         try:
             ok, msg = _scc_auto_reset_manual(pod_id, lambda m: log(pod_id, m))
             log(pod_id, f"[scc-reset] Done: {msg}")
         except Exception as _e:
             log(pod_id, f"[scc-reset] Uncaught error: {_e}")
-        finally:
-            _state["running"] = False
 
     threading.Thread(target=_run, daemon=True, name=f"scc-manual-reset-{pod_id}").start()
     return jsonify({"status": "started", "pod_id": pod_id})
