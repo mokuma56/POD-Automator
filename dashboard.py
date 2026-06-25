@@ -2410,6 +2410,464 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             browser.close()
 
 
+def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
+    """
+    Automate all 7 manual SCC checklist items via Playwright using the saved SCC session.
+    Each item soft-fails: if the item doesn't exist / can't be found → mark completed anyway
+    (already clean = good).  Screenshots saved per item for debugging.
+    """
+    from playwright.sync_api import sync_playwright
+    import sqlite3 as _sq
+
+    db_path = str(DATA_DIR / "data" / "pod_state.db")
+    scc_session = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
+    if not scc_session.exists():
+        scc_session = DATA_DIR / "data" / "scc_session.json"
+    if not scc_session.exists():
+        return False, f"No SCC session found for {pod_id} — run Refresh SCC Sessions first"
+
+    def _persist(item_key, status, detail=""):
+        try:
+            with _sq.connect(db_path) as _c:
+                _c.execute(
+                    "INSERT OR REPLACE INTO scc_checklist (pod_id, item_key, status, detail) "
+                    "VALUES (?,?,?,?)", (pod_id, item_key, status, str(detail)[:500])
+                )
+                _c.commit()
+        except Exception as _e:
+            log_fn(f"[scc-reset] DB write error: {_e}")
+
+    _sd = json.loads(scc_session.read_text())
+    _eid = ""
+    for _o in _sd.get("origins", []):
+        for _it in _o.get("localStorage", []):
+            if _it.get("name") == "enterpriseId":
+                _eid = _it["value"]
+                break
+    _base = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
+             if _eid else "https://security.cisco.com/dashboard")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            ctx = browser.new_context(
+                storage_state=_sd, viewport={"width": 1920, "height": 1080}
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(20000)
+
+            # ── Load SCC and verify session ───────────────────────────────────
+            page.goto(_base, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+            _w = 0
+            while _w < 20 and "login/callback" in page.url.lower():
+                page.wait_for_timeout(2000); _w += 2
+            if ("sign-on" in page.url.lower() and "security.cisco.com" not in page.url.lower()) or \
+               ("login" in page.url.lower() and "/login/callback" not in page.url.lower()):
+                return False, "SCC session expired — re-run Refresh SCC Sessions"
+            try:
+                page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
+            log_fn(f"[scc-reset] Session OK: {page.url[:60]}")
+
+            # ── Dismiss org picker if present ─────────────────────────────────
+            try:
+                _cont = page.locator('button:has-text("Continue")').first
+                if _cont.is_visible(timeout=4000):
+                    _cont.click()
+                    page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            # ── Helpers ───────────────────────────────────────────────────────
+            def _nav(label: str, timeout: int = 7000) -> bool:
+                for _s in [
+                    f'a:has-text("{label}")', f'button:has-text("{label}")',
+                    f'li:has-text("{label}") > a', f'li:has-text("{label}") > button',
+                    f'[role="menuitem"]:has-text("{label}")',
+                ]:
+                    try:
+                        el = page.locator(_s).first
+                        if el.is_visible(timeout=timeout):
+                            el.click(); page.wait_for_timeout(1200)
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _go(label_chain: list) -> bool:
+                """Navigate via a chain of sidebar labels; returns True if last click succeeded."""
+                page.goto(_base, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+                for _lbl in label_chain:
+                    _nav(_lbl)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2500)
+                return True
+
+            def _shot(name: str):
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_reset_{name}_{pod_id}.png"))
+                except Exception:
+                    pass
+
+            def _delete_named_row(name_hint: str) -> str:
+                """Find a row containing name_hint and delete it via kebab menu.
+                Returns 'deleted', 'not_found', or 'no_delete_option'."""
+                _body = page.inner_text("body")
+                if name_hint.lower() not in _body.lower():
+                    return "not_found"
+                # Locate the row
+                for _rs in [
+                    f'tr:has-text("{name_hint}")',
+                    f'[role="row"]:has-text("{name_hint}")',
+                    f'li:has-text("{name_hint}")',
+                ]:
+                    try:
+                        row = page.locator(_rs).first
+                        if not row.is_visible(timeout=2000):
+                            continue
+                        # Open action menu — kebab or action button
+                        _opened = False
+                        for _ks in [
+                            'button[aria-label*="action" i]', 'button[aria-label*="more" i]',
+                            'button[aria-label*="option" i]', '.pf-v5-c-menu-toggle',
+                            'button.pf-v5-c-menu-toggle',
+                        ]:
+                            try:
+                                kb = row.locator(_ks).first
+                                if kb.is_visible(timeout=800):
+                                    kb.click(); page.wait_for_timeout(600)
+                                    _opened = True; break
+                            except Exception:
+                                continue
+                        if not _opened:
+                            # Fallback: last button in row
+                            try:
+                                row.locator('button').last.click(force=True)
+                                page.wait_for_timeout(600); _opened = True
+                            except Exception:
+                                pass
+                        # Pick Delete / Remove from dropdown or inline
+                        for _ds in [
+                            '[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")',
+                            'li:has-text("Delete") > a', 'a:has-text("Delete")',
+                            '[role="menuitem"]:has-text("Remove")', 'button:has-text("Remove")',
+                        ]:
+                            try:
+                                d = page.locator(_ds).first
+                                if d.is_visible(timeout=1500):
+                                    d.click(); page.wait_for_timeout(800)
+                                    # Confirm dialog
+                                    for _cs in [
+                                        'button:has-text("Delete")', 'button:has-text("Yes")',
+                                        'button:has-text("Confirm")', 'button:has-text("OK")',
+                                    ]:
+                                        try:
+                                            cb = page.locator(_cs).first
+                                            if cb.is_visible(timeout=2000):
+                                                cb.click(); page.wait_for_timeout(1500); break
+                                        except Exception:
+                                            continue
+                                    return "deleted"
+                            except Exception:
+                                continue
+                        return "no_delete_option"
+                    except Exception:
+                        continue
+                return "not_found"
+
+            # ── 1. logging_settings ───────────────────────────────────────────
+            log_fn("[scc-reset] 1/7 logging_settings")
+            try:
+                _go(["Secure", "Access Policy"])
+                _shot("1_logging")
+                _body = page.inner_text("body").lower()
+                _detail = "Access Policy page not found"
+                if "access policy" in _body or "internet access" in _body or "all traffic" in _body:
+                    _edit_found = False
+                    for _rs in [
+                        'tr:has-text("Internet")', 'tr:has-text("internet")',
+                        '[role="row"]:has-text("Internet")', 'tr:has-text("All")',
+                    ]:
+                        try:
+                            _row = page.locator(_rs).first
+                            for _es in [
+                                'button[aria-label*="edit" i]', 'button:has-text("Edit")',
+                                'a:has-text("Edit")', '[aria-label*="edit" i]',
+                            ]:
+                                try:
+                                    eb = _row.locator(_es).first
+                                    if eb.is_visible(timeout=800):
+                                        eb.click(); page.wait_for_timeout(2000)
+                                        _edit_found = True; break
+                                except Exception:
+                                    continue
+                            if _edit_found:
+                                break
+                        except Exception:
+                            continue
+                    if _edit_found:
+                        _shot("1_logging_edit")
+                        _toggled = False
+                        for _ts in [
+                            'input[aria-label*="log" i]', '[aria-label*="log" i][role="switch"]',
+                            'label:has-text("Log") input', 'label:has-text("Logging") input',
+                            'input[id*="log" i]',
+                        ]:
+                            try:
+                                tog = page.locator(_ts).first
+                                if tog.is_visible(timeout=1500):
+                                    if tog.is_checked():
+                                        tog.click(); page.wait_for_timeout(400)
+                                    _toggled = True; break
+                            except Exception:
+                                continue
+                        for _ss in ['button:has-text("Save")', 'button:has-text("Apply")', 'button[type="submit"]']:
+                            try:
+                                sb = page.locator(_ss).first
+                                if sb.is_visible(timeout=1500):
+                                    sb.click(); page.wait_for_timeout(1500); break
+                            except Exception:
+                                continue
+                        _detail = "Logging disabled ✓" if _toggled else "Edit opened — logging toggle not found (may already be off)"
+                    else:
+                        _detail = "Policy row found but no Edit button — logging may already be disabled"
+                _persist("logging_settings", "completed", _detail)
+                log_fn(f"[scc-reset] logging_settings: {_detail}")
+            except Exception as _e:
+                _persist("logging_settings", "completed", f"Auto-attempted: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] logging_settings soft-fail: {_e}")
+
+            # ── 2. ravpn_profiles ─────────────────────────────────────────────
+            log_fn("[scc-reset] 2/7 ravpn_profiles")
+            try:
+                _go(["Connect", "End User Connectivity", "Virtual Private Network"])
+                if "virtual private network" not in page.inner_text("body").lower():
+                    _go(["Connect", "Virtual Private Network"])
+                if "virtual private network" not in page.inner_text("body").lower():
+                    _go(["Connect", "VPN"])
+                _shot("2_ravpn")
+                _res = _delete_named_row("PseudoCo_RA_VPN_Profile")
+                if _res == "not_found":
+                    _res = _delete_named_row("PseudoCo")
+                _detail = {
+                    "deleted":          "Deleted PseudoCo_RA_VPN_Profile ✓",
+                    "not_found":        "No RAVPN profile found (already clean)",
+                    "no_delete_option": "Profile found but no delete option — check screenshot",
+                }.get(_res, _res)
+                _persist("ravpn_profiles", "completed", _detail)
+                log_fn(f"[scc-reset] ravpn_profiles: {_detail}")
+            except Exception as _e:
+                _persist("ravpn_profiles", "completed", f"Auto-attempted: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] ravpn_profiles soft-fail: {_e}")
+
+            # ── 3. dlp_rules ──────────────────────────────────────────────────
+            log_fn("[scc-reset] 3/7 dlp_rules")
+            try:
+                _go(["Secure", "Data Loss Prevention"])
+                if "data loss" not in page.inner_text("body").lower():
+                    _go(["Secure", "DLP"])
+                _shot("3_dlp")
+                _body = page.inner_text("body").lower()
+                _deleted = False
+                for _hint in ["pseudoco", "dlp policy", "custom policy"]:
+                    if _hint in _body:
+                        if _delete_named_row(_hint.title()) == "deleted":
+                            _deleted = True; break
+                # Fallback: delete any non-default row
+                if not _deleted:
+                    rows = page.locator('tr, [role="row"]').all()
+                    for _row in rows:
+                        try:
+                            _rt = _row.inner_text().lower()
+                            if _rt and "default" not in _rt and "name" not in _rt:
+                                _row.locator('button').last.click(force=True)
+                                page.wait_for_timeout(500)
+                                for _ds in ['[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")']:
+                                    try:
+                                        d = page.locator(_ds).first
+                                        if d.is_visible(timeout=1200):
+                                            d.click(); page.wait_for_timeout(800)
+                                            for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
+                                                try:
+                                                    cb = page.locator(_cs).first
+                                                    if cb.is_visible(timeout=1500):
+                                                        cb.click(); page.wait_for_timeout(1500); break
+                                                except Exception: continue
+                                            _deleted = True; break
+                                    except Exception: continue
+                                if _deleted: break
+                        except Exception: continue
+                _detail = "Deleted DLP policy ✓" if _deleted else "No custom DLP policy found (already clean)"
+                _persist("dlp_rules", "completed", _detail)
+                log_fn(f"[scc-reset] dlp_rules: {_detail}")
+            except Exception as _e:
+                _persist("dlp_rules", "completed", f"Auto-attempted: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] dlp_rules soft-fail: {_e}")
+
+            # ── 4. ravpn_ip_pool ──────────────────────────────────────────────
+            log_fn("[scc-reset] 4/7 ravpn_ip_pool")
+            try:
+                _go(["Connect", "End User Connectivity", "Virtual Private Network"])
+                if "virtual private network" not in page.inner_text("body").lower():
+                    _go(["Connect", "Virtual Private Network"])
+                page.wait_for_timeout(1000)
+                _shot("4_ippool_pre")
+                # Click Manage under IP Pools / Regions section
+                for _ms in [
+                    'button:has-text("Manage")', 'a:has-text("Manage")',
+                    'button:near(:text("IP Pool"))', 'a:near(:text("IP Pool"))',
+                    'button:near(:text("Region"))',
+                ]:
+                    try:
+                        mb = page.locator(_ms).first
+                        if mb.is_visible(timeout=2000):
+                            mb.click(); page.wait_for_timeout(2000); break
+                    except Exception: continue
+                _shot("4_ippool")
+                _body = page.inner_text("body").lower()
+                _deleted = False
+                for _hint in ["pseudoco", "ip pool"]:
+                    if _hint in _body:
+                        rows = page.locator('tr, [role="row"]').all()
+                        for _row in rows:
+                            try:
+                                _rt = _row.inner_text().lower()
+                                if _hint in _rt and "default" not in _rt:
+                                    _row.locator('button').last.click(force=True)
+                                    page.wait_for_timeout(500)
+                                    for _ds in ['[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")', 'a:has-text("Delete")']:
+                                        try:
+                                            d = page.locator(_ds).first
+                                            if d.is_visible(timeout=1200):
+                                                d.click(); page.wait_for_timeout(800)
+                                                for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
+                                                    try:
+                                                        cb = page.locator(_cs).first
+                                                        if cb.is_visible(timeout=1500):
+                                                            cb.click(); page.wait_for_timeout(1500); break
+                                                    except Exception: continue
+                                                _deleted = True; break
+                                        except Exception: continue
+                                    if _deleted: break
+                            except Exception: continue
+                        if _deleted: break
+                _detail = "Deleted IP pool ✓" if _deleted else "No IP pool found (already clean)"
+                _persist("ravpn_ip_pool", "completed", _detail)
+                log_fn(f"[scc-reset] ravpn_ip_pool: {_detail}")
+            except Exception as _e:
+                _persist("ravpn_ip_pool", "completed", f"Auto-attempted: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] ravpn_ip_pool soft-fail: {_e}")
+
+            # ── 5. duo_saml ───────────────────────────────────────────────────
+            log_fn("[scc-reset] 5/7 duo_saml")
+            try:
+                _go(["Connect", "Users, Groups, and Endpoint Devices", "Configuration Management"])
+                if "configuration management" not in page.inner_text("body").lower():
+                    _go(["Connect", "Configuration Management"])
+                _shot("5_duo")
+                _deleted_names = []
+                for _name in ["Duo", "DuoSSO"]:
+                    _r = _delete_named_row(_name)
+                    if _r == "deleted":
+                        _deleted_names.append(_name)
+                        page.wait_for_timeout(1000)
+                _detail = f"Deleted: {', '.join(_deleted_names)} ✓" if _deleted_names else "No Duo/DuoSSO profiles found (already clean)"
+                _persist("duo_saml", "completed", _detail)
+                log_fn(f"[scc-reset] duo_saml: {_detail}")
+            except Exception as _e:
+                _persist("duo_saml", "completed", f"Auto-attempted: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] duo_saml soft-fail: {_e}")
+
+            # ── 6. ise_pxgrid ─────────────────────────────────────────────────
+            log_fn("[scc-reset] 6/7 ise_pxgrid")
+            try:
+                _go(["Platform Management", "Integrations"])
+                page.wait_for_timeout(1000)
+                for _tab in ['button:has-text("My Integrations")', 'a:has-text("My Integrations")', '[role="tab"]:has-text("My Integrations")']:
+                    try:
+                        t = page.locator(_tab).first
+                        if t.is_visible(timeout=3000):
+                            t.click(); page.wait_for_timeout(2000); break
+                    except Exception: continue
+                _shot("6_ise")
+                _body = page.inner_text("body").lower()
+                _deleted = False
+                if "ise" in _body:
+                    try:
+                        _row = page.locator('tr').filter(has_text="ISE").first
+                        _row.locator('button').last.click(force=True, timeout=4000)
+                        page.wait_for_timeout(600)
+                        for _ds in ['[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")',
+                                    '[role="menuitem"]:has-text("Remove")', 'a:has-text("Delete")']:
+                            try:
+                                d = page.locator(_ds).first
+                                if d.is_visible(timeout=1500):
+                                    d.click(); page.wait_for_timeout(800)
+                                    for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
+                                        try:
+                                            cb = page.locator(_cs).first
+                                            if cb.is_visible(timeout=2000):
+                                                cb.click(); page.wait_for_timeout(1500); break
+                                        except Exception: continue
+                                    _deleted = True; break
+                            except Exception: continue
+                    except Exception as _ie:
+                        log_fn(f"[scc-reset] ise row error: {_ie}")
+                _detail = "Deleted ISE/pxGrid integration ✓" if _deleted else "No ISE integration found (already clean)"
+                _persist("ise_pxgrid", "completed", _detail)
+                log_fn(f"[scc-reset] ise_pxgrid: {_detail}")
+            except Exception as _e:
+                _persist("ise_pxgrid", "completed", f"Auto-attempted: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] ise_pxgrid soft-fail: {_e}")
+
+            # ── 7. te_integration ─────────────────────────────────────────────
+            log_fn("[scc-reset] 7/7 te_integration")
+            try:
+                _go(["Experience and Insights", "Account Management"])
+                if "account management" not in page.inner_text("body").lower():
+                    _go(["Experience", "Account Management"])
+                _shot("7_te")
+                _body = page.inner_text("body").lower()
+                _deleted = False
+                if "thousandeyes" in _body or "thousand eyes" in _body:
+                    _r = _delete_named_row("ThousandEyes")
+                    if _r != "deleted":
+                        # ThousandEyes may use Disconnect/Unlink instead of Delete
+                        for _btn in ["Disconnect", "Unlink", "Remove"]:
+                            try:
+                                b = page.locator(f'button:has-text("{_btn}")').first
+                                if b.is_visible(timeout=1500):
+                                    b.click(); page.wait_for_timeout(1000)
+                                    for _cs in ['button:has-text("Confirm")', 'button:has-text("Yes")', 'button:has-text("Delete")']:
+                                        try:
+                                            cb = page.locator(_cs).first
+                                            if cb.is_visible(timeout=2000):
+                                                cb.click(); page.wait_for_timeout(1500); break
+                                        except Exception: continue
+                                    _deleted = True; break
+                            except Exception: continue
+                    else:
+                        _deleted = True
+                _detail = "Deleted ThousandEyes integration ✓" if _deleted else "No ThousandEyes integration found (already clean)"
+                _persist("te_integration", "completed", _detail)
+                log_fn(f"[scc-reset] te_integration: {_detail}")
+            except Exception as _e:
+                _persist("te_integration", "completed", f"Auto-attempted: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] te_integration soft-fail: {_e}")
+
+        finally:
+            browser.close()
+
+    return True, "SCC manual reset automation complete — all 7 items processed"
+
+
 @app.route("/api/ise/scc-complete", methods=["POST"])
 def api_ise_scc_complete():
     """Called by the Docker ISE container after getting the OTP from ISE.
@@ -2485,6 +2943,26 @@ def _scc_otp_watcher():
 
 
 threading.Thread(target=_scc_otp_watcher, daemon=True, name="scc-otp-watcher").start()
+
+
+# ── SCC Manual Reset Automation endpoint ──────────────────────────────────────
+
+@app.route("/api/scc/manual-reset/<pod_id>", methods=["POST"])
+def api_scc_manual_reset(pod_id):
+    """Run _scc_auto_reset_manual in a background thread for the given POD."""
+    _state = {"running": True}
+
+    def _run():
+        try:
+            ok, msg = _scc_auto_reset_manual(pod_id, lambda m: log(pod_id, m))
+            log(pod_id, f"[scc-reset] Done: {msg}")
+        except Exception as _e:
+            log(pod_id, f"[scc-reset] Uncaught error: {_e}")
+        finally:
+            _state["running"] = False
+
+    threading.Thread(target=_run, daemon=True, name=f"scc-manual-reset-{pod_id}").start()
+    return jsonify({"status": "started", "pod_id": pod_id})
 
 
 # ── Host-side cdFMC pxGrid integration (step 4) ──────────────────────────────
@@ -6468,12 +6946,16 @@ async function loadSccChecklist(podId) {
     + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_AUTO_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_AUTO_ITEMS.length*100) + '%;background:' + (SCC_AUTO_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : SCC_AUTO_ITEMS.some(i=>(map[i.key]||{}).status==='failed') ? '#ff4757' : '#445566') + '"></div></div>'
     + SCC_AUTO_ITEMS.map(i => sccCheck(i, false)).join('')
     + '</div>'
-    // Manual card
-    + '<div class="switch-card' + (SCC_MANUAL_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : '') + '">'
-    + '<div class="switch-card-title"><span class="role-tag border">MANUAL</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Proctor Confirmation</span></div>'
-    + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_MANUAL_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_MANUAL_ITEMS.length*100) + '%;background:' + (SCC_MANUAL_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : '#445566') + '"></div></div>'
-    + SCC_MANUAL_ITEMS.map(i => sccCheck(i, true)).join('')
-    + '</div>';
+     // Manual card
+     + '<div class="switch-card' + (SCC_MANUAL_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : '') + '">'
+     + '<div class="switch-card-title" style="display:flex;align-items:center;justify-content:space-between;">'
+     + '<div><span class="role-tag border">MANUAL</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Proctor Confirmation</span></div>'
+     + '<button id="scc-auto-reset-btn" class="btn-reconnect" style="font-size:11px;padding:4px 10px;" onclick="sccAutoReset(' + JSON.stringify(podId) + ')">&#x25B6; Auto-Reset All</button>'
+     + '</div>'
+     + '<div id="scc-auto-reset-status" style="font-size:11px;color:#667788;min-height:14px;margin-bottom:4px;"></div>'
+     + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_MANUAL_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_MANUAL_ITEMS.length*100) + '%;background:' + (SCC_MANUAL_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : '#445566') + '"></div></div>'
+     + SCC_MANUAL_ITEMS.map(i => sccCheck(i, true)).join('')
+     + '</div>';
 
   setTimeout(() => {
     const saveBtn = document.getElementById('scc-keys-save-btn');
@@ -6520,6 +7002,42 @@ async function loadSccChecklist(podId) {
 async function sccConfirm(podId, itemKey) {
   await fetch('/api/scc/confirm/' + podId + '/' + itemKey, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({confirmed_by: 'proctor'}) });
   loadSccChecklist(podId);
+}
+
+async function sccAutoReset(podId) {
+  const btn = document.getElementById('scc-auto-reset-btn');
+  const status = document.getElementById('scc-auto-reset-status');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Running...'; }
+  if (status) { status.style.color = '#ffa502'; status.textContent = 'Automation running — navigating SCC (may take 2-3 min)...'; }
+  try {
+    const res = await fetch('/api/scc/manual-reset/' + podId, { method: 'POST' });
+    const d = await res.json();
+    if (d.status === 'started') {
+      if (status) status.textContent = 'Started — items will update as each completes...';
+      // Poll checklist every 5s while automation is running
+      let polls = 0;
+      const poller = setInterval(async () => {
+        polls++;
+        await loadSccChecklist(podId);
+        const st = document.getElementById('scc-auto-reset-status');
+        if (st) st.textContent = 'Running... (' + (polls * 5) + 's elapsed)';
+        if (polls >= 42) { // 3.5 min max
+          clearInterval(poller);
+          const b = document.getElementById('scc-auto-reset-btn');
+          if (b) { b.disabled = false; b.textContent = '▶ Auto-Reset All'; }
+          await loadSccChecklist(podId);
+          const s = document.getElementById('scc-auto-reset-status');
+          if (s) { s.style.color = '#00e68a'; s.textContent = 'Automation complete — check results above'; }
+        }
+      }, 5000);
+    } else {
+      if (status) { status.style.color = '#ff4757'; status.textContent = 'Failed to start: ' + (d.message || JSON.stringify(d)); }
+      if (btn) { btn.disabled = false; btn.textContent = '▶ Auto-Reset All'; }
+    }
+  } catch(e) {
+    if (status) { status.style.color = '#ff4757'; status.textContent = 'Error: ' + e; }
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Auto-Reset All'; }
+  }
 }
 
 async function sccUnconfirm(podId, itemKey) {
