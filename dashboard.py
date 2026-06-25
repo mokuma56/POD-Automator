@@ -1199,6 +1199,15 @@ def api_scc_unconfirm(pod_id, item_key):
     return jsonify({"status": "ok", "item_key": item_key})
 
 
+@app.route("/api/scc/clear/<pod_id>", methods=["POST"])
+def api_scc_clear(pod_id):
+    """Delete all SCC checklist results for a POD (reset to blank slate)."""
+    c = _db()
+    c.execute("DELETE FROM scc_checklist WHERE pod_id=?", (pod_id,))
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "pod_id": pod_id})
+
+
 # ── EVPN Fabric endpoints ─────────────────────────────────────────────────────
 
 @app.route("/api/fabric/status/<pod_id>")
@@ -7001,6 +7010,7 @@ async function loadSccChecklist(podId) {
     + '<div class="switch-card-title" style="display:flex;align-items:center;justify-content:space-between;">'
     + '<div><span class="role-tag cc">AUTO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automated Checks</span></div>'
     + '<button id="scc-auto-reset-btn" class="btn-reconnect" style="font-size:11px;padding:4px 10px;">&#x25B6; Auto-Reset All</button>'
+    + '<button id="scc-clear-btn" class="btn-reconnect" style="font-size:11px;padding:4px 10px;background:#1a1a2e;border-color:#445566;color:#8899aa;">&#x2715; Clear Results</button>'
     + '</div>'
     + '<div id="scc-auto-reset-status" style="font-size:11px;color:#667788;min-height:14px;margin-bottom:4px;"></div>'
     + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_AUTO_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_AUTO_ITEMS.length*100) + '%;background:' + (SCC_AUTO_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : SCC_AUTO_ITEMS.some(i=>(map[i.key]||{}).status==='failed') ? '#ff4757' : '#445566') + '"></div></div>'
@@ -7010,6 +7020,12 @@ async function loadSccChecklist(podId) {
   setTimeout(() => {
     const autoResetBtn = document.getElementById('scc-auto-reset-btn');
     if (autoResetBtn) autoResetBtn.onclick = () => sccAutoReset(podId);
+    const clearBtn = document.getElementById('scc-clear-btn');
+    if (clearBtn) clearBtn.onclick = async () => {
+      if (!confirm('Clear all SCC checklist results for ' + podId + '?')) return;
+      await fetch('/api/scc/clear/' + podId, { method: 'POST' });
+      loadSccChecklist(podId);
+    };
     const saveBtn = document.getElementById('scc-keys-save-btn');
     if (saveBtn) saveBtn.onclick = async () => {
       const key = document.getElementById('scc-key-input').value.trim();
