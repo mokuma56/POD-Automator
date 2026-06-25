@@ -6943,7 +6943,7 @@ async function loadSccChecklist(podId) {
     + '<div class="switch-card' + (SCC_AUTO_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : SCC_AUTO_ITEMS.some(i => (map[i.key]||{}).status==='failed') ? ' fail' : '') + '">'
     + '<div class="switch-card-title" style="display:flex;align-items:center;justify-content:space-between;">'
     + '<div><span class="role-tag cc">AUTO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automated Checks</span></div>'
-    + '<button id="scc-auto-reset-btn" class="btn-reconnect" style="font-size:11px;padding:4px 10px;" onclick="sccAutoReset(' + JSON.stringify(podId) + ')">&#x25B6; Auto-Reset All</button>'
+    + '<button id="scc-auto-reset-btn" class="btn-reconnect" style="font-size:11px;padding:4px 10px;">&#x25B6; Auto-Reset All</button>'
     + '</div>'
     + '<div id="scc-auto-reset-status" style="font-size:11px;color:#667788;min-height:14px;margin-bottom:4px;"></div>'
     + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_AUTO_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_AUTO_ITEMS.length*100) + '%;background:' + (SCC_AUTO_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : SCC_AUTO_ITEMS.some(i=>(map[i.key]||{}).status==='failed') ? '#ff4757' : '#445566') + '"></div></div>'
@@ -6951,6 +6951,8 @@ async function loadSccChecklist(podId) {
     + '</div>';
 
   setTimeout(() => {
+    const autoResetBtn = document.getElementById('scc-auto-reset-btn');
+    if (autoResetBtn) autoResetBtn.onclick = () => sccAutoReset(podId);
     const saveBtn = document.getElementById('scc-keys-save-btn');
     if (saveBtn) saveBtn.onclick = async () => {
       const key = document.getElementById('scc-key-input').value.trim();
