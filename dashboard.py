@@ -2519,11 +2519,102 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 page.wait_for_timeout(2500)
                 return True
 
+            def _goto_sase(path: str) -> bool:
+                """Navigate directly to a Secure Access sub-page by URL path.
+                Tries with enterpriseId param first, then bare path.
+                Waits for page to settle and confirms we left the Home page."""
+                _eid_param = f"?enterpriseId={_eid}" if _eid else ""
+                _url = f"https://security.cisco.com{path}{_eid_param}"
+                page.goto(_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(1500)
+                return True
+
             def _shot(name: str):
                 try:
                     page.screenshot(path=str(DATA_DIR / "data" / f"scc_reset_{name}_{pod_id}.png"))
                 except Exception:
                     pass
+
+            def _sase_delete_row(url_paths: list, row_hint: str, shot_name: str) -> str:
+                """Navigate to first working Secure Access URL, find row by hint,
+                click the three-dot menu, click Delete, confirm.
+                Returns 'deleted', 'not_found', or 'no_delete_option'."""
+                # Try each URL until we land on a page with meaningful content
+                for _path in url_paths:
+                    _goto_sase(_path)
+                    _shot(shot_name)
+                    _body = page.inner_text("body").lower()
+                    if row_hint.lower() in _body:
+                        break
+                else:
+                    return "not_found"
+
+                # Find the row
+                _row = None
+                for _rs in [f'tr:has-text("{row_hint}")',
+                            f'[role="row"]:has-text("{row_hint}")',
+                            f'li:has-text("{row_hint}")',
+                            f'div[class*="row"]:has-text("{row_hint}")']:
+                    try:
+                        _r = page.locator(_rs).first
+                        if _r.is_visible(timeout=2000):
+                            _row = _r; break
+                    except Exception:
+                        continue
+                if not _row:
+                    return "not_found"
+
+                # Click the three-dot (⋮) button
+                _opened = False
+                for _ks in [
+                    'button[aria-label*="action" i]', 'button[aria-label*="kebab" i]',
+                    'button[aria-label*="more" i]',   'button[aria-label*="option" i]',
+                    'button:has-text("⋮")',            'button:has-text("...")',
+                    '.pf-v5-c-menu-toggle',            'button.pf-v5-c-menu-toggle',
+                    'button.pf-c-dropdown__toggle',
+                ]:
+                    try:
+                        kb = _row.locator(_ks).first
+                        if kb.is_visible(timeout=800):
+                            kb.click(); page.wait_for_timeout(1500); _opened = True; break
+                    except Exception:
+                        continue
+                if not _opened:
+                    try:
+                        _row.locator('button').last.click(force=True)
+                        page.wait_for_timeout(1500); _opened = True
+                    except Exception:
+                        pass
+                _shot(f"{shot_name}_menu")
+
+                # Click Delete in the dropdown
+                for _ds in [
+                    '[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")',
+                    'li:has-text("Delete") > a',            'a:has-text("Delete")',
+                    '[role="menuitem"]:has-text("Remove")', 'button:has-text("Remove")',
+                ]:
+                    try:
+                        d = page.locator(_ds).first
+                        if d.is_visible(timeout=2000):
+                            d.click(); page.wait_for_timeout(1000)
+                            # Confirm dialog
+                            for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")',
+                                        'button:has-text("Confirm")',  'button:has-text("OK")']:
+                                try:
+                                    cb = page.locator(_cs).first
+                                    if cb.is_visible(timeout=2000):
+                                        cb.click(); page.wait_for_timeout(2000); break
+                                except Exception:
+                                    continue
+                            return "deleted"
+                    except Exception:
+                        continue
+                return "no_delete_option"
 
             def _delete_named_row(name_hint: str) -> str:
                 """Find a row containing name_hint and delete it via kebab menu.
@@ -2656,78 +2747,18 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 2. ravpn_profiles ─────────────────────────────────────────────
             log_fn("[scc-reset] 2/7 ravpn_profiles")
             try:
-                _go(["Connect", "End User Connectivity", "Virtual Private Network"])
-                if "virtual private network" not in page.inner_text("body").lower():
-                    _go(["Connect", "Virtual Private Network"])
-                if "virtual private network" not in page.inner_text("body").lower():
-                    _go(["Connect", "VPN"])
-                _shot("2_ravpn")
-                _deleted = False
-                for _hint in ["PseudoCo_RA_VPN_Profile", "PseudoCo"]:
-                    if _hint.lower() not in page.inner_text("body").lower():
-                        continue
-                    # Find the row
-                    _row = None
-                    for _rs in [f'tr:has-text("{_hint}")', f'[role="row"]:has-text("{_hint}")',
-                                f'li:has-text("{_hint}")', f'div:has-text("{_hint}")']:
-                        try:
-                            _r = page.locator(_rs).first
-                            if _r.is_visible(timeout=2000):
-                                _row = _r; break
-                        except Exception:
-                            continue
-                    if not _row:
-                        continue
-                    # Click the three-dot (⋮) button at end of row
-                    _opened = False
-                    for _ks in [
-                        'button[aria-label*="action" i]', 'button[aria-label*="kebab" i]',
-                        'button[aria-label*="more" i]', 'button[aria-label*="option" i]',
-                        'button:has-text("⋮")', 'button:has-text("...")',
-                        '.pf-v5-c-menu-toggle', 'button.pf-v5-c-menu-toggle',
-                        'button.pf-c-dropdown__toggle',
-                    ]:
-                        try:
-                            kb = _row.locator(_ks).first
-                            if kb.is_visible(timeout=800):
-                                kb.click(); page.wait_for_timeout(1500); _opened = True; break
-                        except Exception:
-                            continue
-                    if not _opened:
-                        # Fallback: last button in row
-                        try:
-                            _row.locator('button').last.click(force=True)
-                            page.wait_for_timeout(1500); _opened = True
-                        except Exception:
-                            pass
-                    _shot("2_ravpn_menu")
-                    # Find and click Delete in the opened menu
-                    for _ds in [
-                        '[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")',
-                        'li:has-text("Delete") > a', 'a:has-text("Delete")',
-                        '[role="menuitem"]:has-text("Remove")', 'button:has-text("Remove")',
-                        'li:has-text("Remove") > a',
-                    ]:
-                        try:
-                            d = page.locator(_ds).first
-                            if d.is_visible(timeout=2000):
-                                d.click(); page.wait_for_timeout(1000)
-                                # Confirm dialog
-                                for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")',
-                                            'button:has-text("Confirm")', 'button:has-text("OK")']:
-                                    try:
-                                        cb = page.locator(_cs).first
-                                        if cb.is_visible(timeout=2000):
-                                            cb.click(); page.wait_for_timeout(1500); break
-                                    except Exception:
-                                        continue
-                                _deleted = True; break
-                        except Exception:
-                            continue
-                    if _deleted:
-                        break
-                _detail = "Deleted PseudoCo_RA_VPN_Profile ✓" if _deleted else "No RAVPN profile found (already clean)"
-                _persist("ravpn_profiles", "completed", _detail)
+                _res = _sase_delete_row(
+                    ["/sase/connect/remote-access-vpn/profiles",
+                     "/sase/connect/virtual-private-network/profiles",
+                     "/sase/connect/vpn/profiles"],
+                    "PseudoCo", "2_ravpn"
+                )
+                _detail = {
+                    "deleted":          "Deleted PseudoCo_RA_VPN_Profile ✓",
+                    "not_found":        "No RAVPN profile found (already clean)",
+                    "no_delete_option": "Profile found, three-dot menu opened but no Delete — check 2_ravpn_menu screenshot",
+                }.get(_res, _res)
+                _persist("ravpn_profiles", "completed" if _res in ("deleted","not_found") else "failed", _detail)
                 log_fn(f"[scc-reset] ravpn_profiles: {_detail}")
             except Exception as _e:
                 _persist("ravpn_profiles", "failed", f"Error: {str(_e)[:120]}")
@@ -2736,42 +2767,47 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 3. dlp_rules ──────────────────────────────────────────────────
             log_fn("[scc-reset] 3/7 dlp_rules")
             try:
-                _go(["Secure", "Data Loss Prevention"])
-                if "data loss" not in page.inner_text("body").lower():
-                    _go(["Secure", "DLP"])
-                _shot("3_dlp")
-                _body = page.inner_text("body").lower()
-                _deleted = False
-                for _hint in ["pseudoco", "dlp policy", "custom policy"]:
-                    if _hint in _body:
-                        if _delete_named_row(_hint.title()) == "deleted":
-                            _deleted = True; break
-                # Fallback: delete any non-default row
-                if not _deleted:
-                    rows = page.locator('tr, [role="row"]').all()
-                    for _row in rows:
-                        try:
-                            _rt = _row.inner_text().lower()
-                            if _rt and "default" not in _rt and "name" not in _rt:
-                                _row.locator('button').last.click(force=True)
-                                page.wait_for_timeout(500)
-                                for _ds in ['[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")']:
-                                    try:
-                                        d = page.locator(_ds).first
-                                        if d.is_visible(timeout=1500):
-                                            d.click(); page.wait_for_timeout(800)
-                                            for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
-                                                try:
-                                                    cb = page.locator(_cs).first
-                                                    if cb.is_visible(timeout=1500):
-                                                        cb.click(); page.wait_for_timeout(1500); break
-                                                except Exception: continue
-                                            _deleted = True; break
-                                    except Exception: continue
-                                if _deleted: break
-                        except Exception: continue
-                _detail = "Deleted DLP policy ✓" if _deleted else "No custom DLP policy found (already clean)"
-                _persist("dlp_rules", "completed", _detail)
+                _res = _sase_delete_row(
+                    ["/sase/secure/data-loss-prevention",
+                     "/sase/secure/dlp",
+                     "/sase/secure/data-loss-prevention/policies"],
+                    "PseudoCo", "3_dlp"
+                )
+                if _res == "not_found":
+                    # Fallback: try any non-default row on the DLP page
+                    for _path in ["/sase/secure/data-loss-prevention", "/sase/secure/dlp"]:
+                        _goto_sase(_path)
+                        _body = page.inner_text("body").lower()
+                        if "data loss" in _body or "dlp" in _body:
+                            rows = page.locator('tr, [role="row"]').all()
+                            for _row in rows:
+                                try:
+                                    _rt = _row.inner_text().lower()
+                                    if _rt and "default" not in _rt and len(_rt.strip()) > 2:
+                                        _row.locator('button').last.click(force=True)
+                                        page.wait_for_timeout(1500)
+                                        for _ds in ['[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")']:
+                                            try:
+                                                d = page.locator(_ds).first
+                                                if d.is_visible(timeout=2000):
+                                                    d.click(); page.wait_for_timeout(1000)
+                                                    for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
+                                                        try:
+                                                            cb = page.locator(_cs).first
+                                                            if cb.is_visible(timeout=2000):
+                                                                cb.click(); page.wait_for_timeout(2000); break
+                                                        except Exception: continue
+                                                    _res = "deleted"; break
+                                            except Exception: continue
+                                        if _res == "deleted": break
+                                except Exception: continue
+                            if _res == "deleted": break
+                _detail = {
+                    "deleted":          "Deleted DLP policy ✓",
+                    "not_found":        "No DLP policy found (already clean)",
+                    "no_delete_option": "DLP row found, menu opened but no Delete — check 3_dlp_menu screenshot",
+                }.get(_res, _res)
+                _persist("dlp_rules", "completed" if _res in ("deleted","not_found") else "failed", _detail)
                 log_fn(f"[scc-reset] dlp_rules: {_detail}")
             except Exception as _e:
                 _persist("dlp_rules", "failed", f"Error: {str(_e)[:120]}")
@@ -2780,26 +2816,20 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 4. ravpn_ip_pool ──────────────────────────────────────────────
             log_fn("[scc-reset] 4/7 ravpn_ip_pool")
             try:
-                _go(["Connect", "End User Connectivity", "Virtual Private Network"])
-                if "virtual private network" not in page.inner_text("body").lower():
-                    _go(["Connect", "Virtual Private Network"])
-                page.wait_for_timeout(1000)
+                # Navigate to VPN page and look for Manage / IP Pool section
+                _goto_sase("/sase/connect/remote-access-vpn/profiles")
                 _shot("4_ippool_pre")
-                # Click Manage under IP Pools / Regions section
-                for _ms in [
-                    'button:has-text("Manage")', 'a:has-text("Manage")',
-                    'button:near(:text("IP Pool"))', 'a:near(:text("IP Pool"))',
-                    'button:near(:text("Region"))',
-                ]:
+                _deleted = False
+                for _ms in ['button:has-text("Manage")', 'a:has-text("Manage")',
+                            '[aria-label*="IP Pool" i]', 'button:near(:text("IP Pool"))']:
                     try:
                         mb = page.locator(_ms).first
                         if mb.is_visible(timeout=2000):
                             mb.click(); page.wait_for_timeout(2000); break
                     except Exception: continue
                 _shot("4_ippool")
-                _body = page.inner_text("body").lower()
-                _deleted = False
-                for _hint in ["pseudoco", "ip pool"]:
+                for _hint in ["pseudoco", "ip pool", "pool"]:
+                    _body = page.inner_text("body").lower()
                     if _hint in _body:
                         rows = page.locator('tr, [role="row"]').all()
                         for _row in rows:
@@ -2807,17 +2837,18 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                                 _rt = _row.inner_text().lower()
                                 if _hint in _rt and "default" not in _rt:
                                     _row.locator('button').last.click(force=True)
-                                    page.wait_for_timeout(500)
-                                    for _ds in ['[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")', 'a:has-text("Delete")']:
+                                    page.wait_for_timeout(1500)
+                                    for _ds in ['[role="menuitem"]:has-text("Delete")',
+                                                'button:has-text("Delete")', 'a:has-text("Delete")']:
                                         try:
                                             d = page.locator(_ds).first
-                                            if d.is_visible(timeout=1200):
-                                                d.click(); page.wait_for_timeout(800)
+                                            if d.is_visible(timeout=2000):
+                                                d.click(); page.wait_for_timeout(1000)
                                                 for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
                                                     try:
                                                         cb = page.locator(_cs).first
-                                                        if cb.is_visible(timeout=1500):
-                                                            cb.click(); page.wait_for_timeout(1500); break
+                                                        if cb.is_visible(timeout=2000):
+                                                            cb.click(); page.wait_for_timeout(2000); break
                                                     except Exception: continue
                                                 _deleted = True; break
                                         except Exception: continue
@@ -2834,18 +2865,25 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 5. duo_saml ───────────────────────────────────────────────────
             log_fn("[scc-reset] 5/7 duo_saml")
             try:
-                _go(["Connect", "Users, Groups, and Endpoint Devices", "Configuration Management"])
-                if "configuration management" not in page.inner_text("body").lower():
-                    _go(["Connect", "Configuration Management"])
-                _shot("5_duo")
+                _duo_urls = [
+                    "/sase/admin/configuration-management",
+                    "/sase/connect/configuration-management",
+                    "/sase/admin/saml",
+                ]
+                # Delete Duo first — DuoSSO auto-removes after a delay
+                _res_duo = _sase_delete_row(_duo_urls, "Duo", "5_duo")
+                log_fn(f"[scc-reset] duo delete: {_res_duo}")
+                if _res_duo == "deleted":
+                    page.wait_for_timeout(5000)  # wait for DuoSSO cascade
+                # Now try DuoSSO (re-navigate in case page refreshed)
+                _res_sso = _sase_delete_row(_duo_urls, "DuoSSO", "5_duosso")
+                log_fn(f"[scc-reset] duosso delete: {_res_sso}")
                 _deleted_names = []
-                for _name in ["Duo", "DuoSSO"]:
-                    _r = _delete_named_row(_name)
-                    if _r == "deleted":
-                        _deleted_names.append(_name)
-                        page.wait_for_timeout(1000)
-                _detail = f"Deleted: {', '.join(_deleted_names)} ✓" if _deleted_names else "No Duo/DuoSSO profiles found (already clean)"
-                _persist("duo_saml", "completed", _detail)
+                if _res_duo == "deleted": _deleted_names.append("Duo")
+                if _res_sso == "deleted": _deleted_names.append("DuoSSO")
+                _detail = f"Deleted: {', '.join(_deleted_names)} ✓" if _deleted_names \
+                    else "No Duo/DuoSSO profiles found (already clean)"
+                _persist("duo_saml", "completed" if _res_duo != "no_delete_option" else "failed", _detail)
                 log_fn(f"[scc-reset] duo_saml: {_detail}")
             except Exception as _e:
                 _persist("duo_saml", "failed", f"Error: {str(_e)[:120]}")
