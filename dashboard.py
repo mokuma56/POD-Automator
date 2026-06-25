@@ -1163,17 +1163,17 @@ def api_duo_ext_dir_setup_sync(pod_id):
 
 @app.route("/api/scc/confirm/<pod_id>/<item_key>", methods=["POST"])
 def api_scc_confirm(pod_id, item_key):
-    """Mark a manual SCC checklist item as confirmed by proctor."""
+    """Mark any SCC checklist item as confirmed (fallback/override for automation failures)."""
     data = request.get_json(silent=True) or {}
     confirmed_by = data.get("confirmed_by", "proctor")
-    MANUAL_ITEMS = {
-        "logging_settings", "ravpn_profiles",
-        "dlp_rules", "private_resources", "dns_servers",
-        "ravpn_ip_pool", "ise_pxgrid", "epp_manual",
-        "duo_saml", "te_integration",
+    ALL_ITEMS = {
+        "access_policy_rules", "network_tunnel_groups", "zta_profiles",
+        "private_resources", "dns_servers", "epp_posture_profiles",
+        "logging_settings", "ravpn_profiles", "dlp_rules",
+        "ravpn_ip_pool", "ise_pxgrid", "duo_saml", "te_integration",
     }
-    if item_key not in MANUAL_ITEMS:
-        return jsonify({"status": "error", "message": f"Unknown manual item: {item_key}"}), 400
+    if item_key not in ALL_ITEMS:
+        return jsonify({"status": "error", "message": f"Unknown item: {item_key}"}), 400
     c = _db()
     c.execute(
         "INSERT OR REPLACE INTO scc_checklist "
@@ -6638,23 +6638,22 @@ const SCC_AUTO_ITEMS = [
     desc: 'Secure Access → Resources → DNS Servers. Delete PseudoCo DNS.' },
   { key: 'epp_posture_profiles', label: 'EPP Posture Profile deleted',
     desc: 'Secure Access → Secure → Endpoint Posture Profile. Delete PseudoCo Windows profile.' },
-];
-const SCC_MANUAL_ITEMS = [
-  { key: 'logging_settings',  label: 'Logging disabled',
+  { key: 'logging_settings',     label: 'Logging disabled',
     desc: 'Secure Access → Secure → Access Policy. Edit "For all Internet access" — disable Logging.' },
-  { key: 'ravpn_profiles',    label: 'RAVPN Profile deleted',
+  { key: 'ravpn_profiles',       label: 'RAVPN Profile deleted',
     desc: 'Secure Access → Connect → End User Connectivity → Virtual Private Network. Delete PseudoCo_RA_VPN_Profile.' },
-  { key: 'dlp_rules',     label: 'DLP Policy cleared',
+  { key: 'dlp_rules',            label: 'DLP Policy cleared',
     desc: 'Secure Access → Secure → Data Loss Prevention Policy. Delete configured policy.' },
-  { key: 'ravpn_ip_pool', label: 'RAVPN IP Pool deleted',
+  { key: 'ravpn_ip_pool',        label: 'RAVPN IP Pool deleted',
     desc: 'Secure Access → Connect → End User Connectivity → Virtual Private Network. Click Manage under Regions and IP Pools — delete the configured IP Pool.' },
-  { key: 'duo_saml',      label: 'Duo / DuoSSO SAML profiles removed',
+  { key: 'duo_saml',             label: 'Duo / DuoSSO SAML profiles removed',
     desc: 'Secure Access → Connect → Users, Groups, and Endpoint Devices → Configuration Management. Click Edit then Delete on both Duo and DuoSSO profiles (delete Duo first, DuoSSO should follow).' },
-  { key: 'ise_pxgrid',    label: 'ISE / pxGrid integration removed',
+  { key: 'ise_pxgrid',           label: 'ISE / pxGrid integration removed',
     desc: 'SCC Platform Management → Platform Integrations. Delete the ISE/pxGrid integration.' },
-  { key: 'te_integration',label: 'ThousandEyes integration removed',
+  { key: 'te_integration',       label: 'ThousandEyes integration removed',
     desc: 'Secure Access → Experience and Insights → Account Management. Delete ThousandEyes integration.' },
 ];
+const SCC_MANUAL_ITEMS = [];
 
 // ── Duo Setup Panel ──────────────────────────────────────────────────────────
 async function loadDuoPanel(podId) {
@@ -6940,22 +6939,16 @@ async function loadSccChecklist(podId) {
     + '<div style="font-size:11px;color:#667788;white-space:nowrap;">' + completedCount + '/' + allItems.length + '</div>'
     + '</div>'
     + (allDone ? '<div style="padding:8px 12px;background:#00e68a22;border:1px solid #00e68a;border-radius:6px;color:#00e68a;font-size:13px;margin-bottom:12px;">&#x2713; All 13 items confirmed — POD cleared</div>' : '')
-    // Auto card
-    + '<div class="switch-card' + (SCC_AUTO_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : SCC_AUTO_ITEMS.some(i => (map[i.key]||{}).status==='failed') ? ' fail' : '') + '" style="margin-bottom:10px;">'
-    + '<div class="switch-card-title"><span class="role-tag cc">AUTO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automated API Checks</span></div>'
+    // Unified auto card (all 13 items automated)
+    + '<div class="switch-card' + (SCC_AUTO_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : SCC_AUTO_ITEMS.some(i => (map[i.key]||{}).status==='failed') ? ' fail' : '') + '">'
+    + '<div class="switch-card-title" style="display:flex;align-items:center;justify-content:space-between;">'
+    + '<div><span class="role-tag cc">AUTO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automated Checks</span></div>'
+    + '<button id="scc-auto-reset-btn" class="btn-reconnect" style="font-size:11px;padding:4px 10px;" onclick="sccAutoReset(' + JSON.stringify(podId) + ')">&#x25B6; Auto-Reset All</button>'
+    + '</div>'
+    + '<div id="scc-auto-reset-status" style="font-size:11px;color:#667788;min-height:14px;margin-bottom:4px;"></div>'
     + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_AUTO_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_AUTO_ITEMS.length*100) + '%;background:' + (SCC_AUTO_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : SCC_AUTO_ITEMS.some(i=>(map[i.key]||{}).status==='failed') ? '#ff4757' : '#445566') + '"></div></div>'
     + SCC_AUTO_ITEMS.map(i => sccCheck(i, false)).join('')
-    + '</div>'
-     // Manual card
-     + '<div class="switch-card' + (SCC_MANUAL_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : '') + '">'
-     + '<div class="switch-card-title" style="display:flex;align-items:center;justify-content:space-between;">'
-     + '<div><span class="role-tag border">MANUAL</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Proctor Confirmation</span></div>'
-     + '<button id="scc-auto-reset-btn" class="btn-reconnect" style="font-size:11px;padding:4px 10px;" onclick="sccAutoReset(' + JSON.stringify(podId) + ')">&#x25B6; Auto-Reset All</button>'
-     + '</div>'
-     + '<div id="scc-auto-reset-status" style="font-size:11px;color:#667788;min-height:14px;margin-bottom:4px;"></div>'
-     + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_MANUAL_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_MANUAL_ITEMS.length*100) + '%;background:' + (SCC_MANUAL_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : '#445566') + '"></div></div>'
-     + SCC_MANUAL_ITEMS.map(i => sccCheck(i, true)).join('')
-     + '</div>';
+    + '</div>';
 
   setTimeout(() => {
     const saveBtn = document.getElementById('scc-keys-save-btn');
