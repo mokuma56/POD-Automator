@@ -2576,6 +2576,7 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                     _r = page.evaluate(_JS_CLICK_HBR, "Platform Settings")
                     log_fn(f"[cdfmc-nav] JS shadow-DOM click: {_r}")
                 _fmc_tab = _popup_info.value
+                _cdfmc_host = _fmc_tab.url.split("/")[2]  # capture immediately — tab may redirect away after wait
                 log_fn(f"[cdfmc-nav] cdFMC tab opened: {_fmc_tab.url}")
             except Exception as _e:
                 page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_no_popup_{pod_id}.png"))
@@ -2588,7 +2589,7 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             _fmc_tab.wait_for_timeout(5000)
 
             # ── 4. Navigate directly to pxGrid Identity Sources ───────────────
-            _cdfmc_host = _fmc_tab.url.split("/")[2]  # e.g. cisco-pseudoco-504--....app.us.cdo.cisco.com
+            # _cdfmc_host captured at popup-open time (before any post-open redirects)
             _pxgrid_url = f"https://{_cdfmc_host}/ui/identity-sources/pxgrid"
             log_fn(f"[cdfmc-nav] Navigating to {_pxgrid_url}...")
             _fmc_tab.goto(_pxgrid_url, wait_until="domcontentloaded", timeout=30000)
@@ -2723,23 +2724,8 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                         _log_dialog_state(f"wait-{_w+1}s")
 
             if not _submitted:
-                # Check if failure is "name already exists" — created by a previous run.
-                # Click Cancel and fall through to the Select step.
-                _name_exists = _fmc_tab.evaluate("""() => {
-                    const txt = document.body.innerText.toLowerCase();
-                    return txt.includes('already exists') || txt.includes('name already');
-                }""")
-                if _name_exists:
-                    log_fn(f"[cdfmc-nav] '{instance_name}' already exists — cancelling dialog, selecting existing")
-                    try:
-                        _fmc_tab.locator('button:has-text("Cancel")').first.click(timeout=5000)
-                        _fmc_tab.wait_for_timeout(2000)
-                        log_fn("[cdfmc-nav] Create dialog cancelled ✓")
-                    except Exception as _ce:
-                        log_fn(f"[cdfmc-nav] Cancel click: {_ce}")
-                else:
-                    _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_create_stuck_{pod_id}.png"))
-                    return False, "cdFMC Create dialog did not close — check cdfmc_create_stuck screenshot"
+                _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_create_stuck_{pod_id}.png"))
+                return False, "cdFMC Create dialog did not close — check cdfmc_create_stuck screenshot"
 
             _fmc_tab.wait_for_timeout(2000)
             _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_after_create_{pod_id}.png"))
