@@ -4076,15 +4076,30 @@ def pod_assigned(pod_id):
 
 @app.route("/api/pod-scc-keys/<pod_id>", methods=["GET"])
 def get_scc_keys(pod_id):
-    """Return SCC API key/secret for a POD (masked secret)."""
+    """Return SCC API key/secret for a POD.
+    Priority: pods table override → org_credentials fallback (same as _scc_load_keys)."""
+    import re as _re
     conn = _db()
     row = conn.execute(
-        "SELECT scc_api_key, scc_api_secret FROM pods WHERE pod_id=?", (pod_id,)
+        "SELECT scc_api_key, scc_api_secret, scc_org FROM pods WHERE pod_id=?", (pod_id,)
     ).fetchone()
     conn.close()
     if not row:
         return jsonify({"scc_api_key": "", "scc_api_secret": ""})
-    return jsonify({"scc_api_key": row["scc_api_key"] or "", "scc_api_secret": row["scc_api_secret"] or ""})
+    # 1. POD-level override
+    if row["scc_api_key"] and row["scc_api_secret"]:
+        return jsonify({"scc_api_key": row["scc_api_key"], "scc_api_secret": row["scc_api_secret"]})
+    # 2. Fallback: org_credentials table
+    m = _re.search(r"pseudoco-(\d+)", row["scc_org"] or "")
+    if m:
+        conn2 = _db()
+        oc = conn2.execute(
+            "SELECT scc_api_key, scc_api_secret FROM org_credentials WHERE org_number=?", (m.group(1),)
+        ).fetchone()
+        conn2.close()
+        if oc and oc["scc_api_key"] and oc["scc_api_secret"]:
+            return jsonify({"scc_api_key": oc["scc_api_key"], "scc_api_secret": oc["scc_api_secret"]})
+    return jsonify({"scc_api_key": "", "scc_api_secret": ""})
 
 
 @app.route("/api/pod-scc-keys/<pod_id>", methods=["POST"])
