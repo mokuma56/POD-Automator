@@ -2413,8 +2413,8 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
 def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
     """
     Automate all 7 manual SCC checklist items via Playwright using the saved SCC session.
-    Each item soft-fails: if the item doesn't exist / can't be found → mark completed anyway
-    (already clean = good).  Screenshots saved per item for debugging.
+    Each item: not_found → completed (already clean); exception → failed (red).
+    Screenshots saved per item for debugging.
     """
     from playwright.sync_api import sync_playwright
     import sqlite3 as _sq
@@ -2641,8 +2641,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("logging_settings", "completed", _detail)
                 log_fn(f"[scc-reset] logging_settings: {_detail}")
             except Exception as _e:
-                _persist("logging_settings", "completed", f"Auto-attempted: {str(_e)[:120]}")
-                log_fn(f"[scc-reset] logging_settings soft-fail: {_e}")
+                _persist("logging_settings", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] error: {_e}")
 
             # ── 2. ravpn_profiles ─────────────────────────────────────────────
             log_fn("[scc-reset] 2/7 ravpn_profiles")
@@ -2664,8 +2664,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("ravpn_profiles", "completed", _detail)
                 log_fn(f"[scc-reset] ravpn_profiles: {_detail}")
             except Exception as _e:
-                _persist("ravpn_profiles", "completed", f"Auto-attempted: {str(_e)[:120]}")
-                log_fn(f"[scc-reset] ravpn_profiles soft-fail: {_e}")
+                _persist("ravpn_profiles", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] ravpn_profiles error: {_e}")
 
             # ── 3. dlp_rules ──────────────────────────────────────────────────
             log_fn("[scc-reset] 3/7 dlp_rules")
@@ -2708,8 +2708,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("dlp_rules", "completed", _detail)
                 log_fn(f"[scc-reset] dlp_rules: {_detail}")
             except Exception as _e:
-                _persist("dlp_rules", "completed", f"Auto-attempted: {str(_e)[:120]}")
-                log_fn(f"[scc-reset] dlp_rules soft-fail: {_e}")
+                _persist("dlp_rules", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] dlp_rules error: {_e}")
 
             # ── 4. ravpn_ip_pool ──────────────────────────────────────────────
             log_fn("[scc-reset] 4/7 ravpn_ip_pool")
@@ -2762,8 +2762,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("ravpn_ip_pool", "completed", _detail)
                 log_fn(f"[scc-reset] ravpn_ip_pool: {_detail}")
             except Exception as _e:
-                _persist("ravpn_ip_pool", "completed", f"Auto-attempted: {str(_e)[:120]}")
-                log_fn(f"[scc-reset] ravpn_ip_pool soft-fail: {_e}")
+                _persist("ravpn_ip_pool", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] ravpn_ip_pool error: {_e}")
 
             # ── 5. duo_saml ───────────────────────────────────────────────────
             log_fn("[scc-reset] 5/7 duo_saml")
@@ -2782,8 +2782,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("duo_saml", "completed", _detail)
                 log_fn(f"[scc-reset] duo_saml: {_detail}")
             except Exception as _e:
-                _persist("duo_saml", "completed", f"Auto-attempted: {str(_e)[:120]}")
-                log_fn(f"[scc-reset] duo_saml soft-fail: {_e}")
+                _persist("duo_saml", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] duo_saml error: {_e}")
 
             # ── 6. ise_pxgrid ─────────────────────────────────────────────────
             log_fn("[scc-reset] 6/7 ise_pxgrid")
@@ -2824,8 +2824,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("ise_pxgrid", "completed", _detail)
                 log_fn(f"[scc-reset] ise_pxgrid: {_detail}")
             except Exception as _e:
-                _persist("ise_pxgrid", "completed", f"Auto-attempted: {str(_e)[:120]}")
-                log_fn(f"[scc-reset] ise_pxgrid soft-fail: {_e}")
+                _persist("ise_pxgrid", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] ise_pxgrid error: {_e}")
 
             # ── 7. te_integration ─────────────────────────────────────────────
             log_fn("[scc-reset] 7/7 te_integration")
@@ -2859,8 +2859,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("te_integration", "completed", _detail)
                 log_fn(f"[scc-reset] te_integration: {_detail}")
             except Exception as _e:
-                _persist("te_integration", "completed", f"Auto-attempted: {str(_e)[:120]}")
-                log_fn(f"[scc-reset] te_integration soft-fail: {_e}")
+                _persist("te_integration", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] te_integration error: {_e}")
 
         finally:
             browser.close()
