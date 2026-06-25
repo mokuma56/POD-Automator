@@ -2548,10 +2548,10 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                                 continue
                         if not _opened:
                             # Fallback: last button in row
-                        try:
+                            try:
                                 row.locator('button').last.click(force=True)
                                 page.wait_for_timeout(1500); _opened = True
-                        except Exception:
+                            except Exception:
                                 pass
                         # Pick Delete / Remove from dropdown or inline
                         for _ds in [
@@ -2747,10 +2747,10 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                                 _row.locator('button').last.click(force=True)
                                 page.wait_for_timeout(500)
                                 for _ds in ['[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")']:
-                            try:
-                                d = page.locator(_ds).first
-                                if d.is_visible(timeout=2000):
-                                    d.click(); page.wait_for_timeout(800)
+                                    try:
+                                        d = page.locator(_ds).first
+                                        if d.is_visible(timeout=1500):
+                                            d.click(); page.wait_for_timeout(800)
                                             for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
                                                 try:
                                                     cb = page.locator(_cs).first
