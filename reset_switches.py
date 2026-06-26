@@ -123,6 +123,23 @@ def _telnet_reset(host, local_config_path, log_fn):
     _send_cmd(tn, "terminal length 0", wait=0.5)
     _send_cmd(tn, "no ip domain lookup", wait=0.5)
 
+    # ── Step 0: Erase NVRAM so conf t push is the ONLY config on reload ───────
+    # Without this, conf t MERGES with existing config — CatC AAA/dot1x/RADIUS
+    # commands survive because they are never explicitly removed.
+    log_fn(f"  Erasing NVRAM (write erase)...")
+    tn.write(b"write erase\n")
+    out = tn.read_until(b"?", timeout=10).decode("utf-8", errors="replace")
+    tn.write(b"\n")  # confirm
+    deadline = time.time() + 15
+    erase_buf = ""
+    while time.time() < deadline:
+        chunk = tn.read_very_eager().decode("utf-8", errors="replace")
+        erase_buf += chunk
+        if "erase" in erase_buf.lower() and "#" in erase_buf:
+            break
+        time.sleep(0.5)
+    log_fn(f"  NVRAM erased")
+
     # ── Step 1: Push base config ──────────────────────────────────────────────
     log_fn(f"  Reading base config from {local_config_path}...")
     with open(local_config_path) as f:
