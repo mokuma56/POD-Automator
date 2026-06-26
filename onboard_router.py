@@ -1454,7 +1454,6 @@ def phase_baseconfig_verify(switch_key, log_fn=print):
 
         # No EVPN NVE interface (should be gone after reset)
         out = switch_cmd(shell, "show run | include ^interface nve", timeout=8)
-        # Check for the actual interface line — avoid false positives from banner/echo noise
         nve_present = any(
             line.strip().lower().startswith("interface nve")
             for line in out.splitlines()
@@ -1465,6 +1464,38 @@ def phase_baseconfig_verify(switch_key, log_fn=print):
         out = switch_cmd(shell, "show vrf", timeout=8)
         fabric_vrfs = [v for v in ["Main", "IOT", "PROD"] if v in out]
         checks["no_fabric_vrfs"] = f"STILL_PRESENT:{','.join(fabric_vrfs)}" if fabric_vrfs else "OK"
+
+        # VLAN check — only base VLANs expected after reset
+        out_vlan = switch_cmd(shell, "show vlan brief", timeout=10)
+        vlan_lines = [l for l in out_vlan.splitlines() if l.strip() and l[0].isdigit()]
+        allowed_vlans = {1, 5} if switch_key == "border_spine" else {1}
+        extra_vlans = []
+        for l in vlan_lines:
+            try:
+                vid = int(l.split()[0])
+            except ValueError:
+                continue
+            if vid not in allowed_vlans and not (1002 <= vid <= 1005):
+                extra_vlans.append(str(vid))
+        checks["vlans"] = f"FAIL extra:{','.join(extra_vlans[:8])}" if extra_vlans else "OK"
+
+        # AAA check — only base-config AAA lines allowed; any RADIUS/dot1x lines = CatC leftover
+        out_aaa = switch_cmd(shell, "show run | include ^aaa", timeout=10)
+        ALLOWED_AAA = {
+            "aaa new-model",
+            "aaa session-id common",
+            "aaa authentication login default local",
+            "aaa authorization exec default local",
+            "aaa authorization network default local",
+        }
+        aaa_lines = [l.strip() for l in out_aaa.splitlines() if l.strip().startswith("aaa")]
+        extra_aaa = [l for l in aaa_lines if l not in ALLOWED_AAA]
+        checks["aaa"] = f"FAIL extra:{'; '.join(extra_aaa[:3])}" if extra_aaa else "OK"
+
+        # dot1x check — dot1x system-auth-control should not be present
+        out_dot1x = switch_cmd(shell, "show run | include dot1x system-auth-control", timeout=8)
+        dot1x_present = "dot1x system-auth-control" in out_dot1x
+        checks["no_dot1x"] = "STILL_PRESENT" if dot1x_present else "OK"
 
         client.close()
     except Exception as e:
