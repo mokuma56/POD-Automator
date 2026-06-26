@@ -6350,6 +6350,7 @@ DASHBOARD_HTML = """
   .progress-label { font-size: 12px; color: #8899aa; margin-bottom: 6px; }
 
   .switch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+  .switch-card.cedge-full { grid-column: 1 / -1; }
   .switch-card { background: #0a1628; border-radius: 8px; padding: 12px; border: 1px solid #1a2d4a; display: flex; flex-direction: column; }
   .switch-card.fail { border-color: #3d0000; }
   .switch-card.pass { border-color: #003d2a; }
@@ -7200,13 +7201,14 @@ async function loadSwitches(podId) {
     const rawRoutesHtml = (isRouteCard && sw.raw_routes)
       ? '<div style="margin-top:10px;font-size:10px;color:#7899aa;font-family:monospace;margin-bottom:4px;">show ip route vrf 10</div>'
           + '<pre style="margin:0;padding:10px;background:#0a1520;border:1px solid #1a2d4a;'
-          + 'border-radius:4px;font-size:10px;color:#c8d8e8;overflow-x:auto;white-space:pre;'
+          + 'border-radius:4px;font-size:10px;color:#c8d8e8;white-space:pre-wrap;word-break:break-all;'
           + 'overflow-y:visible;">'
           + escHtml(sw.raw_routes)
           + '</pre>'
       : '';
 
-    return '<div class="switch-card ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
+    const cardExtraClass = isRouteCard ? ' cedge-full' : '';
+    return '<div class="switch-card' + cardExtraClass + ' ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
       '<div class="switch-card-title">' +
         '<span class="role-tag ' + roleClass(sw.name) + '">' + roleLabel + '</span>' +
         '<span class="device-name"' + (sw.ip ? ' data-pod-id="' + escHtml(podId) + '" data-ip="' + escHtml(sw.ip) + '"' : '') + ' title="' + (sw.ip ? 'Click to open SSH terminal' : '') + '">' + escHtml(sw.name) + '</span>' +
