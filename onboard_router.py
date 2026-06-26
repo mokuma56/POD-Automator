@@ -1689,7 +1689,7 @@ def phase_catc_cleanup(log_fn=print):
 
             # Retry loop — CatC refuses deletion while a provisioning task is in flight.
             # Wait for the provisioning to finish, then retry the delete.
-            MAX_DELETE_RETRIES = 20   # 20 × 30s = up to 10 min
+            MAX_DELETE_RETRIES = 6   # 6 × 30s = up to 3 min per device (3 devices ≈ 9 min max)
             deleted_this = False
             for attempt in range(1, MAX_DELETE_RETRIES + 1):
                 try:

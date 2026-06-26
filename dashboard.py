@@ -5224,7 +5224,7 @@ def api_baseconfig_reset(pod_id, switch_key):
                     "--network", f"container:vpn-{pod_id}",
                     "--entrypoint", "python3",
                     "pod-automator:latest", "-c", script
-                ], capture_output=True, text=True, timeout=720)  # up to 12 min for 'being provisioned' wait
+                ], capture_output=True, text=True, timeout=900)  # up to 15 min: 6 retries × 3 devices
                 stdout = result.stdout.strip()
                 last_line = stdout.splitlines()[-1] if stdout else ""
                 try:
@@ -5232,7 +5232,7 @@ def api_baseconfig_reset(pod_id, switch_key):
                 except Exception:
                     ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
             except subprocess.TimeoutExpired:
-                ok_val, detail_val = False, "timed out after 720s"
+                ok_val, detail_val = False, "timed out after 900s"
             except Exception as e:
                 ok_val, detail_val = False, str(e)
             status_str = "OK" if ok_val else "FAILED"
@@ -9312,8 +9312,8 @@ function _bcStatusBadge(line) {
   }
   // Extract text after the closing bracket tag
   const afterTag = line.replace(/^\[.*?\]\s*/, '');
-  if (line.includes('FAILED')) return { color: '#e74c3c', text: '&#10007; FAILED', short: afterTag.replace(/^FAILED:\s*/i, '').substring(0, 120).trim(), running: false, startedAt: null };
-  return { color: '#00e68a', text: '&#10003; OK', short: afterTag.replace(/^OK:\s*/i, '').substring(0, 120).trim(), running: false, startedAt: null };
+  if (line.includes('FAILED')) return { color: '#e74c3c', text: '&#10007; FAILED', short: afterTag.replace(/^FAILED:\s*/i, '').substring(0, 500).trim(), running: false, startedAt: null };
+  return { color: '#00e68a', text: '&#10003; OK', short: afterTag.replace(/^OK:\s*/i, '').substring(0, 500).trim(), running: false, startedAt: null };
 }
 
 function renderBaseConfigGrid(podId, statusData) {
@@ -9357,18 +9357,26 @@ function renderBaseConfigGrid(podId, statusData) {
     h += '<span style="color:' + resetBadge.color + ';font-weight:600;">' + resetBadge.text + '</span>';
     h += '</div>';
     // Detail / progress under reset
+    const isSwitch = ['border_spine', 'leaf1', 'leaf2'].includes(key);
     if (resetBadge.running && resetBadge.startedAt) {
       const ts = new Date(resetBadge.startedAt).getTime();
       const elapsed = isNaN(ts) ? 0 : Math.floor((Date.now() - ts) / 1000);
       const elStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
-      const phase = elapsed < 20  ? '① Connecting via Telnet...'
-                  : elapsed < 50  ? '② Pushing config lines...'
-                  : elapsed < 70  ? '③ Saving + reloading...'
-                  : elapsed < 310 ? '④ Waiting for reboot... (' + Math.max(0, 310-elapsed) + 's left)'
-                  : elapsed < 370 ? '⑤ Reconnecting via SSH...'
-                  : '⑥ RSA keys + final save...';
-      h += '<div id="bc-timer-' + key + '" style="' + detailStyle + 'color:#f39c12;"></div>';
-      h += '<div class="switch-bar" style="margin-bottom:4px;"><div id="bc-bar-' + key + '" class="switch-bar-fill" style="width:0%;background:#f39c12;"></div></div>';
+      if (isSwitch) {
+        const phase = elapsed < 20  ? '① Connecting via Telnet...'
+                    : elapsed < 50  ? '② Pushing config lines...'
+                    : elapsed < 70  ? '③ Saving + reloading...'
+                    : elapsed < 310 ? '④ Waiting for reboot... (' + Math.max(0, 310-elapsed) + 's left)'
+                    : elapsed < 370 ? '⑤ Reconnecting via SSH...'
+                    : '⑥ RSA keys + final save...';
+        h += '<div id="bc-timer-' + key + '" style="' + detailStyle + 'color:#f39c12;"></div>';
+        h += '<div class="switch-bar" style="margin-bottom:4px;"><div id="bc-bar-' + key + '" class="switch-bar-fill" style="width:0%;background:#f39c12;"></div></div>';
+      } else {
+        // ISE / CatC: elapsed + short message only — no switch-specific phase labels
+        const shortMsg = (resetBadge.short || 'working...').substring(0, 80);
+        h += '<div style="' + detailStyle + 'color:#f39c12;white-space:normal;">' + elStr + ' — ' + shortMsg + '</div>';
+        h += '<div style="height:4px;margin-bottom:4px;"></div>';
+      }
     } else {
       const txt = (resetBadge.short || '').substring(0, 60);
       h += '<div style="' + detailStyle + '" title="' + (resetBadge.short||'').replace(/"/g,'&quot;') + '">' + (txt || '&nbsp;') + '</div>';
@@ -9380,19 +9388,25 @@ function renderBaseConfigGrid(podId, statusData) {
       h += '<span style="color:#8899aa;">Verify</span>';
       h += '<span style="color:' + verifyBadge.color + ';font-weight:600;">' + verifyBadge.text + '</span>';
       h += '</div>';
-      // Parse pipe-separated check items and render each on its own line with colour coding
+      // Parse semicolon-separated check items (format: key=OK or key=FAIL extra:... or key=STILL_PRESENT)
       const vShort = verifyBadge.short || '';
       if (vShort) {
         const _esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        const parts = vShort.split(' | ');
+        const parts = vShort.split(';').map(p => p.trim()).filter(p => p);
         let vHtml = '<div style="font-size:10px;line-height:1.6;border-top:1px solid #1e2e3e;padding-top:4px;margin-top:2px;">';
         for (const part of parts) {
-          if (part.startsWith('MODEL:')) {
-            vHtml += '<div style="color:#556677;">' + _esc(part) + '</div>';
-          } else if (part.startsWith('FAIL:')) {
-            vHtml += '<div style="color:#e74c3c;font-weight:600;">&#10007; ' + _esc(part.replace(/^FAIL:\s*/,'')) + '</div>';
-          } else if (part.startsWith('PASS:')) {
-            vHtml += '<div style="color:#00e68a;">&#10003; ' + _esc(part.replace(/^PASS:\s*/,'')) + '</div>';
+          const eqIdx = part.indexOf('=');
+          if (eqIdx === -1) {
+            vHtml += '<div style="color:#8899aa;">' + _esc(part) + '</div>';
+            continue;
+          }
+          const key = part.substring(0, eqIdx).trim();
+          const val = part.substring(eqIdx + 1).trim();
+          if (val === 'OK') {
+            vHtml += '<div style="color:#00e68a;">&#10003; ' + _esc(key) + '</div>';
+          } else if (val.startsWith('FAIL') || val === 'STILL_PRESENT' || val === 'MISSING') {
+            const detail = val.replace(/^FAIL extra:/i,'').replace(/^FAIL/i,'').trim();
+            vHtml += '<div style="color:#e74c3c;font-weight:600;">&#10007; ' + _esc(key) + (detail ? ': ' + _esc(detail) : '') + '</div>';
           } else {
             vHtml += '<div style="color:#8899aa;">' + _esc(part) + '</div>';
           }
