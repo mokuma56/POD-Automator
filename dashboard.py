@@ -9373,12 +9373,32 @@ function renderBaseConfigGrid(podId, statusData) {
     }
     // Verify row — always rendered for uniform height
     if (verifyBadge !== null) {
-      h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:2px;">';
+      h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:4px;">';
       h += '<span style="color:#8899aa;">Verify</span>';
       h += '<span style="color:' + verifyBadge.color + ';font-weight:600;">' + verifyBadge.text + '</span>';
       h += '</div>';
-      const vtxt = (verifyBadge.short || '').substring(0, 60);
-      h += '<div style="' + detailStyle + '" title="' + (verifyBadge.short||'').replace(/"/g,'&quot;') + '">' + (vtxt || '&nbsp;') + '</div>';
+      // Parse pipe-separated check items and render each on its own line with colour coding
+      const vShort = verifyBadge.short || '';
+      if (vShort) {
+        const _esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        const parts = vShort.split(' | ');
+        let vHtml = '<div style="font-size:10px;line-height:1.6;border-top:1px solid #1e2e3e;padding-top:4px;margin-top:2px;">';
+        for (const part of parts) {
+          if (part.startsWith('MODEL:')) {
+            vHtml += '<div style="color:#556677;">' + _esc(part) + '</div>';
+          } else if (part.startsWith('FAIL:')) {
+            vHtml += '<div style="color:#e74c3c;font-weight:600;">&#10007; ' + _esc(part.replace(/^FAIL:\s*/,'')) + '</div>';
+          } else if (part.startsWith('PASS:')) {
+            vHtml += '<div style="color:#00e68a;">&#10003; ' + _esc(part.replace(/^PASS:\s*/,'')) + '</div>';
+          } else {
+            vHtml += '<div style="color:#8899aa;">' + _esc(part) + '</div>';
+          }
+        }
+        vHtml += '</div>';
+        h += vHtml;
+      } else {
+        h += '<div style="' + detailStyle + '">&nbsp;</div>';
+      }
     } else {
       h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:2px;">';
       h += '<span style="color:#8899aa;">Verify</span>';
