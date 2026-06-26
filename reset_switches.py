@@ -78,6 +78,12 @@ CATC_TEARDOWN_LINES = [
     "no vrf definition PROD",
     # Remove CatC VLANs (SVIs removed above so VLAN DB entries can be purged)
     "no vlan 10,101,102,1010,1101,1102",
+    # Remove CatC NETCONF-pushed accounting/radius commands.
+    # These are pushed *after* reload via NETCONF so they are NOT caught by the pre-reload
+    # conf t teardown above.  They are idempotent — safe to run on clean switches.
+    "no aaa accounting update newinfo",
+    "no aaa accounting identity default start-stop group dnac-client-radius-group",
+    "no aaa server radius dynamic-author",
 ]
 
 
@@ -299,6 +305,17 @@ def _post_reload(host, log_fn):
         read_timeout=60,
     )
     log_fn(f"  RSA: {out[:80].strip()}")
+
+    # Remove any CatC NETCONF-pushed config that arrived during the 300s reload window.
+    # CatC reconnects via NETCONF after reload and re-pushes AAA/accounting/dot1x even
+    # when the device was deleted from inventory.  Run the full teardown set again here
+    # (all commands are idempotent — harmless on a clean switch).
+    log_fn(f"  Post-reload CatC teardown (removes NETCONF-pushed AAA/dot1x)...")
+    try:
+        conn.send_config_set(CATC_TEARDOWN_LINES)
+        log_fn(f"  Post-reload teardown complete")
+    except Exception as e:
+        log_fn(f"  Warning: post-reload teardown error (non-fatal): {e}")
 
     log_fn(f"  Final write memory...")
     out = conn.send_command("write memory", expect_string=r"\[OK\]|#", read_timeout=20)
