@@ -1552,7 +1552,8 @@ ISE_SWITCH_NAD_IPS = {"172.30.255.3", "172.30.255.1", "172.30.255.2"}
 def phase_ise_cleanup(log_fn=print):
     """
     Delete the 3 switch NADs from ISE that Catalyst Center adds during discovery.
-    Catalyst Center will re-add them on next discovery/provisioning run.
+    Matches by IP (loopback OR management) rather than name — name format varies
+    depending on which domain CatC uses when registering the NAD.
     Returns (ok, detail).
     """
     import ssl, urllib.request, urllib.error, base64, json
@@ -1578,48 +1579,54 @@ def phase_ise_cleanup(log_fn=print):
                 return None  # already gone
             raise
 
+    # All known switch IPs — both loopback and management
+    # CatC may register NADs with either IP depending on discovery settings
+    ALL_SWITCH_IPS = ISE_SWITCH_NAD_IPS | {info["mgmt"] for info in CATC_DISCOVERY_IPS.values()}
+
+    # Fetch all NADs with pagination
     log_fn("  Fetching ISE network device list...")
+    all_resources = []
     try:
-        data = _get("/ers/config/networkdevice?size=100")
+        page = 1
+        while True:
+            data = _get(f"/ers/config/networkdevice?size=100&page={page}")
+            resources = data.get("SearchResult", {}).get("resources", [])
+            all_resources.extend(resources)
+            total = int(data.get("SearchResult", {}).get("total", 0))
+            if len(all_resources) >= total or not resources:
+                break
+            page += 1
     except Exception as e:
         return False, f"ISE unreachable: {e}"
 
-    resources = data.get("SearchResult", {}).get("resources", [])
-    # Build name→id map
-    nad_map = {r["name"]: r["id"] for r in resources}
+    log_fn(f"  Found {len(all_resources)} total NADs in ISE")
 
+    # For each NAD, fetch detail and check if IP matches any switch IP
     deleted, skipped, errors = [], [], []
-    for name in ISE_SWITCH_NAD_NAMES:
-        if name not in nad_map:
-            log_fn(f"  {name}: not found (already removed)")
-            skipped.append(name)
-            continue
-        nad_id = nad_map[name]
-        # Safety check: verify the NAD's IP is one of the known switch IPs
-        # before deleting — prevents accidentally wiping the CC NAD or others
+    for r in all_resources:
+        nad_id   = r["id"]
+        nad_name = r.get("name", nad_id)
         try:
             nad_detail = _get(f"/ers/config/networkdevice/{nad_id}")
             nad_ip = nad_detail.get("NetworkDevice", {}).get("NetworkDeviceIPList", [{}])[0].get("ipaddress", "")
-            if nad_ip not in ISE_SWITCH_NAD_IPS:
-                log_fn(f"  {name}: SKIPPED — IP {nad_ip} not in switch IP list (safety check)")
-                skipped.append(name)
-                continue
         except Exception as e:
-            log_fn(f"  {name}: could not verify IP — {e}, skipping for safety")
-            skipped.append(name)
-            continue
-        log_fn(f"  Deleting {name} ({nad_id}, IP {nad_ip})...")
+            continue  # skip unreadable NADs quietly
+
+        if nad_ip not in ALL_SWITCH_IPS:
+            continue  # not one of our switches
+
+        log_fn(f"  Deleting NAD '{nad_name}' (IP {nad_ip}, id {nad_id})...")
         try:
             result = _delete(f"/ers/config/networkdevice/{nad_id}")
             if result is None:
-                log_fn(f"  {name}: already gone (404)")
-                skipped.append(name)
+                log_fn(f"  '{nad_name}': already gone (404)")
+                skipped.append(nad_name)
             else:
-                log_fn(f"  {name}: deleted")
-                deleted.append(name)
+                log_fn(f"  '{nad_name}': deleted")
+                deleted.append(nad_name)
         except Exception as e:
-            log_fn(f"  {name}: ERROR — {e}")
-            errors.append(f"{name}: {e}")
+            log_fn(f"  '{nad_name}': ERROR — {e}")
+            errors.append(f"{nad_name}: {e}")
 
     if errors:
         return False, f"Errors: {'; '.join(errors)}"
@@ -1629,16 +1636,18 @@ def phase_ise_cleanup(log_fn=print):
         parts.append(f"deleted {len(deleted)}: {', '.join(n.split('.')[0] for n in deleted)}")
     if skipped:
         parts.append(f"already gone: {len(skipped)}")
-    return True, "; ".join(parts) if parts else "nothing to do"
+    return True, "; ".join(parts) if parts else "nothing to do (no switch NADs found by IP)"
 
 
 def phase_catc_cleanup(log_fn=print):
     """
     Delete the 3 switches from Catalyst Center inventory.
-    Catalyst Center will re-discover and provision them on the next run.
+    Searches by both management IPs (198.18.128.x) AND loopback IPs (172.30.255.x)
+    because CatC may store either as the managementIpAddress depending on discovery.
+    Polls the deletion task to confirm actual removal.
     Returns (ok, detail).
     """
-    import requests, urllib3
+    import requests, urllib3, time
     urllib3.disable_warnings()
 
     log_fn("  Getting Catalyst Center auth token...")
@@ -1647,19 +1656,26 @@ def phase_catc_cleanup(log_fn=print):
     except Exception as e:
         return False, f"CC auth failed: {e}"
 
-    # Get all network devices and find the 3 switch IPs
-    switch_ips = {info["mgmt"] for info in CATC_DISCOVERY_IPS.values()}
+    # Search by both mgmt IPs and loopback IPs
+    all_switch_ips = (
+        {info["mgmt"]     for info in CATC_DISCOVERY_IPS.values()} |
+        {info["loopback"] for info in CATC_DISCOVERY_IPS.values()}
+    )
+
     log_fn("  Fetching device inventory from Catalyst Center...")
     try:
-        r = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
-                         headers=headers, verify=False, timeout=15)
+        r = requests.get(
+            f"{CATC_BASE}/dna/intent/api/v1/network-device?limit=500",
+            headers=headers, verify=False, timeout=15
+        )
         r.raise_for_status()
         devices = r.json().get("response", [])
     except Exception as e:
         return False, f"CC inventory fetch failed: {e}"
 
-    # Match by management IP
-    to_delete = [d for d in devices if d.get("managementIpAddress") in switch_ips]
+    to_delete = [d for d in devices if d.get("managementIpAddress") in all_switch_ips]
+    log_fn(f"  Found {len(to_delete)} switch(es) in CC inventory (searched {len(devices)} devices)")
+
     if not to_delete:
         log_fn("  No switch devices found in CC inventory (already removed)")
         return True, "nothing to do — devices not in inventory"
@@ -1668,19 +1684,50 @@ def phase_catc_cleanup(log_fn=print):
     for dev in to_delete:
         dev_id = dev["id"]
         name   = dev.get("hostname", dev.get("managementIpAddress", dev_id))
-        log_fn(f"  Deleting {name} ({dev.get('managementIpAddress')}) from CC...")
+        mgmt   = dev.get("managementIpAddress", "?")
+        log_fn(f"  Deleting {name} ({mgmt}) from CC...")
         try:
             r = requests.delete(
                 f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}",
                 headers=headers, verify=False, timeout=30
             )
-            if r.status_code in (200, 202, 204):
-                log_fn(f"  {name}: deleted")
-                deleted.append(name)
-            else:
+            if r.status_code not in (200, 202, 204):
                 msg = f"{name}: unexpected status {r.status_code} — {r.text[:100]}"
                 log_fn(f"  {msg}")
                 errors.append(msg)
+                continue
+
+            # Poll task to confirm deletion completed
+            try:
+                task_id = r.json().get("response", {}).get("taskId", "")
+            except Exception:
+                task_id = ""
+
+            if task_id:
+                for _ in range(12):  # up to 60s
+                    time.sleep(5)
+                    tr = requests.get(
+                        f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
+                        headers=headers, verify=False, timeout=10
+                    )
+                    if tr.status_code == 200:
+                        tdata = tr.json().get("response", {})
+                        if tdata.get("isError"):
+                            msg = f"{name}: task failed — {tdata.get('failureReason','unknown')}"
+                            log_fn(f"  {msg}")
+                            errors.append(msg)
+                            break
+                        if tdata.get("endTime"):
+                            log_fn(f"  {name}: deletion confirmed")
+                            deleted.append(name)
+                            break
+                else:
+                    log_fn(f"  {name}: deletion task did not confirm in 60s — treating as OK")
+                    deleted.append(name)
+            else:
+                log_fn(f"  {name}: deleted (no task ID returned)")
+                deleted.append(name)
+
         except Exception as e:
             msg = f"{name}: {e}"
             log_fn(f"  ERROR: {msg}")
