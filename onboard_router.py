@@ -1682,56 +1682,82 @@ def phase_catc_cleanup(log_fn=print):
 
     deleted, errors = [], []
     for dev in to_delete:
-        dev_id = dev["id"]
-        name   = dev.get("hostname", dev.get("managementIpAddress", dev_id))
-        mgmt   = dev.get("managementIpAddress", "?")
-        log_fn(f"  Deleting {name} ({mgmt}) from CC...")
-        try:
-            r = requests.delete(
-                f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}",
-                headers=headers, verify=False, timeout=30
-            )
-            if r.status_code not in (200, 202, 204):
-                msg = f"{name}: unexpected status {r.status_code} — {r.text[:100]}"
+            dev_id = dev["id"]
+            name   = dev.get("hostname", dev.get("managementIpAddress", dev_id))
+            mgmt   = dev.get("managementIpAddress", "?")
+            log_fn(f"  Deleting {name} ({mgmt}) from CC...")
+
+            # Retry loop — CatC refuses deletion while a provisioning task is in flight.
+            # Wait for the provisioning to finish, then retry the delete.
+            MAX_DELETE_RETRIES = 20   # 20 × 30s = up to 10 min
+            deleted_this = False
+            for attempt in range(1, MAX_DELETE_RETRIES + 1):
+                try:
+                    r = requests.delete(
+                        f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}",
+                        headers=headers, verify=False, timeout=30
+                    )
+                    if r.status_code not in (200, 202, 204):
+                        msg = f"{name}: unexpected status {r.status_code} — {r.text[:100]}"
+                        log_fn(f"  {msg}")
+                        errors.append(msg)
+                        break
+
+                    # Poll task to confirm deletion completed
+                    try:
+                        task_id = r.json().get("response", {}).get("taskId", "")
+                    except Exception:
+                        task_id = ""
+
+                    if task_id:
+                        provisioning = False
+                        for _ in range(12):  # up to 60s
+                            time.sleep(5)
+                            tr = requests.get(
+                                f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
+                                headers=headers, verify=False, timeout=10
+                            )
+                            if tr.status_code == 200:
+                                tdata = tr.json().get("response", {})
+                                if tdata.get("isError"):
+                                    reason = tdata.get("failureReason", "unknown")
+                                    if "being provisioned" in reason.lower() or "provision" in reason.lower():
+                                        log_fn(f"  {name}: still being provisioned — waiting 30s (attempt {attempt}/{MAX_DELETE_RETRIES})...")
+                                        provisioning = True
+                                        break
+                                    msg = f"{name}: task failed — {reason}"
+                                    log_fn(f"  {msg}")
+                                    errors.append(msg)
+                                    break
+                                if tdata.get("endTime"):
+                                    log_fn(f"  {name}: deletion confirmed")
+                                    deleted.append(name)
+                                    deleted_this = True
+                                    break
+                        else:
+                            log_fn(f"  {name}: deletion task did not confirm in 60s — treating as OK")
+                            deleted.append(name)
+                            deleted_this = True
+
+                        if provisioning:
+                            time.sleep(30)
+                            continue  # retry the DELETE
+                    else:
+                        log_fn(f"  {name}: deleted (no task ID returned)")
+                        deleted.append(name)
+                        deleted_this = True
+
+                except Exception as e:
+                    msg = f"{name}: {e}"
+                    log_fn(f"  ERROR: {msg}")
+                    errors.append(msg)
+
+                break  # success or non-retryable error
+
+            if not deleted_this and name not in [e.split(":")[0] for e in errors]:
+                msg = f"{name}: gave up after {MAX_DELETE_RETRIES} attempts (still being provisioned)"
                 log_fn(f"  {msg}")
                 errors.append(msg)
-                continue
-
-            # Poll task to confirm deletion completed
-            try:
-                task_id = r.json().get("response", {}).get("taskId", "")
-            except Exception:
-                task_id = ""
-
-            if task_id:
-                for _ in range(12):  # up to 60s
-                    time.sleep(5)
-                    tr = requests.get(
-                        f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
-                        headers=headers, verify=False, timeout=10
-                    )
-                    if tr.status_code == 200:
-                        tdata = tr.json().get("response", {})
-                        if tdata.get("isError"):
-                            msg = f"{name}: task failed — {tdata.get('failureReason','unknown')}"
-                            log_fn(f"  {msg}")
-                            errors.append(msg)
-                            break
-                        if tdata.get("endTime"):
-                            log_fn(f"  {name}: deletion confirmed")
-                            deleted.append(name)
-                            break
-                else:
-                    log_fn(f"  {name}: deletion task did not confirm in 60s — treating as OK")
-                    deleted.append(name)
-            else:
-                log_fn(f"  {name}: deleted (no task ID returned)")
-                deleted.append(name)
-
-        except Exception as e:
-            msg = f"{name}: {e}"
-            log_fn(f"  ERROR: {msg}")
-            errors.append(msg)
 
     if errors:
         return False, f"Errors: {'; '.join(errors)}"
