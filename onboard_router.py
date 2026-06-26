@@ -3423,6 +3423,9 @@ def _wait_cedge_online(timeout=300):
     return False
 
 
+_ROUTE_SEP = "\n---ROUTES---\n"
+
+
 def _phase_route_verification_impl(expected_prefixes):
     """
     Core route-verification logic (shared by pipeline + test paths).
@@ -3431,8 +3434,11 @@ def _phase_route_verification_impl(expected_prefixes):
     Always returns (True, result_str) — soft-fail only, never blocks pipeline.
 
     result_str format:
-      PASS|found=N/T|reloaded=no
-      WARN|found=N/T|missing=p1,p2|reloaded=yes
+      PASS|found=N/T|reloaded=no\n---ROUTES---\n<raw route table>
+      WARN|found=N/T|missing=p1,p2|reloaded=yes\n---ROUTES---\n<raw route table>
+
+    The raw route table is the post-reload table when a reload occurred, otherwise
+    the initial table.  Error paths omit the separator (no table available).
     """
     total = len(expected_prefixes)
     print(f"  [route_verification] SSH to {HQ_CEDGE_IP} — checking {total} prefixes in VRF 10...")
@@ -3447,8 +3453,8 @@ def _phase_route_verification_impl(expected_prefixes):
     found   = total - len(missing)
 
     if not missing:
-        msg = f"PASS|found={found}/{total}|reloaded=no"
-        print(f"  [route_verification] {msg}")
+        msg = f"PASS|found={found}/{total}|reloaded=no{_ROUTE_SEP}{output}"
+        print(f"  [route_verification] PASS|found={found}/{total}|reloaded=no")
         return True, msg
 
     print(f"  [route_verification] {len(missing)} prefixes missing: {missing}")
@@ -3483,12 +3489,12 @@ def _phase_route_verification_impl(expected_prefixes):
     found2   = total - len(missing2)
 
     if not missing2:
-        msg = f"PASS|found={found2}/{total}|reloaded=yes"
-        print(f"  [route_verification] {msg}")
+        msg = f"PASS|found={found2}/{total}|reloaded=yes{_ROUTE_SEP}{output2}"
+        print(f"  [route_verification] PASS|found={found2}/{total}|reloaded=yes")
         return True, msg
 
-    msg = f"WARN|found={found2}/{total}|missing={','.join(missing2)}|reloaded=yes"
-    print(f"  [route_verification] {msg}")
+    msg = f"WARN|found={found2}/{total}|missing={','.join(missing2)}|reloaded=yes{_ROUTE_SEP}{output2}"
+    print(f"  [route_verification] WARN|found={found2}/{total}|missing={','.join(missing2)}|reloaded=yes")
     return True, msg
 
 

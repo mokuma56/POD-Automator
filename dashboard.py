@@ -498,9 +498,18 @@ def api_switches(pod_id):
     # ── Route Verification card ──
     rv_step   = results.get("route_verification", {})
     rv_status = rv_step.get("status", "pending")
-    rv_result = rv_step.get("parts", [""])[0] if rv_step.get("parts") else ""
+    rv_full   = rv_step.get("parts", [""])[0] if rv_step.get("parts") else ""
 
-    # Parse pipe-delimited result: PASS|found=13/13|reloaded=no
+    # Split raw route table from summary (separator injected by onboard_router)
+    _ROUTE_SEP = "\n---ROUTES---\n"
+    if _ROUTE_SEP in rv_full:
+        rv_result, rv_raw_routes = rv_full.split(_ROUTE_SEP, 1)
+        rv_raw_routes = rv_raw_routes.strip()
+    else:
+        rv_result    = rv_full
+        rv_raw_routes = ""
+
+    # Parse pipe-delimited summary: PASS|found=13/13|reloaded=no
     rv_parts_map = {}
     for _p in rv_result.split("|"):
         if "=" in _p:
@@ -545,6 +554,7 @@ def api_switches(pod_id):
         "total":       len(rv_checks),
         "step_status": rv_status,
         "reloaded":    rv_reloaded,
+        "raw_routes":  rv_raw_routes,
     })
 
     return jsonify(switch_data)
@@ -662,7 +672,7 @@ def api_switches_recheck(pod_id):
                     (pod_id, step_name, status, started_at, completed_at, result)
                     VALUES (?, ?, ?, COALESCE((SELECT started_at FROM pipeline_steps WHERE pod_id=? AND step_name=?), datetime('now')),
                             datetime('now'), ?)""",
-                    (pod_id, step_name, status, pod_id, step_name, str(result_val)[:500]))
+                    (pod_id, step_name, status, pod_id, step_name, str(result_val)[:8000]))
                 conn2.execute("UPDATE pods SET updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
                 conn2.commit()
                 conn2.close()
@@ -706,12 +716,12 @@ def api_switches_recheck(pod_id):
     return jsonify({"status": "ok", "message": "Switch re-check started for " + pod_id})
 
 
-@app.route("/api/routes/test-fail/<pod_id>", methods=["POST"])
-def api_routes_test_fail(pod_id):
+@app.route("/api/routes/manual-retest/<pod_id>", methods=["POST"])
+def api_routes_manual_retest(pod_id):
     """
-    Test endpoint: runs route_verification with an injected fake prefix (192.0.2.254)
-    that can never appear in a real routing table.  Forces the reload→re-verify path
-    so the full flow can be validated without waiting for a real route miss.
+    Manual Reboot / Re-test: forces a CEDGE reload by injecting 192.0.2.254
+    (RFC 5737 — never a real route), then re-verifies all VRF 10 routes after
+    the router comes back online.  Always soft-fails (WARN) and proceeds.
     """
     import threading
 
@@ -735,7 +745,7 @@ def api_routes_test_fail(pod_id):
     _c.execute(
         "INSERT OR REPLACE INTO pipeline_steps "
         "(pod_id, step_name, status, started_at, completed_at, result) "
-        "VALUES (?, 'route_verification', 'running', datetime('now'), NULL, 'Test-fail run in progress...')",
+        "VALUES (?, 'route_verification', 'running', datetime('now'), NULL, 'Manual reboot / re-test in progress...')",
         (pod_id,)
     )
     _c.commit(); _c.close()
@@ -767,14 +777,14 @@ def api_routes_test_fail(pod_id):
             "VALUES (?, 'route_verification', ?, "
             "COALESCE((SELECT started_at FROM pipeline_steps WHERE pod_id=? AND step_name='route_verification'), datetime('now')), "
             "datetime('now'), ?)",
-            (pod_id, status, pod_id, str(result_val)[:500])
+            (pod_id, status, pod_id, str(result_val)[:8000])
         )
         _c2.commit(); _c2.close()
-        log(pod_id, f"[route-test-fail] {status}: {result_val}")
+        log(pod_id, f"[route-manual-retest] {status}: {result_val}")
 
     threading.Thread(target=_run_test, daemon=True).start()
     return jsonify({"status": "started",
-                    "message": "Route verification test-fail run started — injected 192.0.2.254"})
+                    "message": "Manual reboot / re-test started — CEDGE will be reloaded"})
 
 
 @app.route("/api/cdfmc/<pod_id>", methods=["GET"])
@@ -7173,10 +7183,22 @@ async function loadSwitches(podId) {
     const isRouteCard = sw.host === 'route_verification';
     const warnBadge = sw.step_status === 'completed' && sw.failed === 0 && sw.reloaded === 'yes'
       ? '<span class="badge warn" style="margin-left:8px">RELOADED</span>' : '';
-    const testFailBtn = isRouteCard
+    const manualRebootBtn = isRouteCard
       ? '<button class="btn-reconnect" id="route-test-btn-' + escHtml(podId) + '" '
           + 'style="margin-left:auto;font-size:10px;padding:2px 8px;" '
-          + 'title="Inject fake prefix to force reload+re-verify flow">Test Fail</button>'
+          + 'title="Reboot CEDGE and re-verify VRF 10 routes">Manual Reboot / Re-test</button>'
+      : '';
+
+    // Raw route table block — only shown on the CEDGE card when output is available
+    const rawRoutesHtml = (isRouteCard && sw.raw_routes)
+      ? '<details style="margin-top:8px;">'
+          + '<summary style="font-size:11px;color:#7899aa;cursor:pointer;user-select:none;">'
+          + 'show ip route vrf 10</summary>'
+          + '<pre style="margin:6px 0 0;padding:8px;background:#0a1520;border:1px solid #1a2d4a;'
+          + 'border-radius:4px;font-size:10px;color:#c8d8e8;overflow-x:auto;white-space:pre;'
+          + 'max-height:300px;overflow-y:auto;">'
+          + escHtml(sw.raw_routes)
+          + '</pre></details>'
       : '';
 
     return '<div class="switch-card ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
@@ -7186,11 +7208,12 @@ async function loadSwitches(podId) {
         '<span class="device-model">' + escHtml(sw.model || '') + '</span>' +
         (sw.step_status === 'running' ? '<span class="badge" style="margin-left:auto;background:#02c8ff22;color:#02c8ff;border:1px solid #02c8ff55;">⟳ checking</span>' : '') +
         (sw.step_status === 'skipped' ? '<span class="badge warn" style="margin-left:auto">WARN</span>' : '') +
-        warnBadge + testFailBtn +
+        warnBadge + manualRebootBtn +
       '</div>' +
       (sw.step_status === 'skipped' ? '<div style="font-size:11px;color:#ffa502;margin-bottom:6px;">⚠ Verification skipped — switch unreachable during pipeline. Click Re-check Switches to retry.</div>' : '') +
       '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + devicePct + '%;background:' + barColor + '"></div></div>' +
       checksHtml +
+      rawRoutesHtml +
       '</div>';
   }).join('');
 
@@ -7199,22 +7222,22 @@ async function loadSwitches(podId) {
     el.addEventListener('click', () => openTerminal(el.dataset.podId, el.dataset.ip));
   });
 
-  // Wire Test Fail button for route verification card
+  // Wire Manual Reboot / Re-test button for route verification card
   const testBtn = document.getElementById('route-test-btn-' + podId);
   if (testBtn) {
     testBtn.addEventListener('click', async () => {
       testBtn.disabled = true;
-      testBtn.textContent = 'Running...';
+      testBtn.textContent = 'Rebooting...';
       try {
-        const resp = await fetch('/api/routes/test-fail/' + podId, { method: 'POST' });
+        const resp = await fetch('/api/routes/manual-retest/' + podId, { method: 'POST' });
         const j = await resp.json();
         if (j.status !== 'started') {
-          alert('Test fail error: ' + (j.message || JSON.stringify(j)));
-          testBtn.disabled = false; testBtn.textContent = 'Test Fail'; return;
+          alert('Manual reboot error: ' + (j.message || JSON.stringify(j)));
+          testBtn.disabled = false; testBtn.textContent = 'Manual Reboot / Re-test'; return;
         }
       } catch(e) {
-        alert('Test fail request failed: ' + e);
-        testBtn.disabled = false; testBtn.textContent = 'Test Fail'; return;
+        alert('Manual reboot request failed: ' + e);
+        testBtn.disabled = false; testBtn.textContent = 'Manual Reboot / Re-test'; return;
       }
       // Poll until route_verification is no longer running
       let polls = 0;
@@ -7227,7 +7250,7 @@ async function loadSwitches(podId) {
         if (rv && rv.status === 'running' && polls < 120) {
           setTimeout(pollRoute, 5000);
         } else {
-          testBtn.disabled = false; testBtn.textContent = 'Test Fail';
+          testBtn.disabled = false; testBtn.textContent = 'Manual Reboot / Re-test';
         }
       }
       setTimeout(pollRoute, 3000);
