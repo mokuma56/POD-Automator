@@ -399,7 +399,7 @@ SWITCH_CHECKS = {
 def api_switches(pod_id):
     conn = _db()
     steps = conn.execute(
-        "SELECT * FROM pipeline_steps WHERE pod_id = ? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test') ORDER BY rowid",
+        "SELECT * FROM pipeline_steps WHERE pod_id = ? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','route_verification') ORDER BY rowid",
         (pod_id,)
     ).fetchall()
     conn.close()
@@ -495,6 +495,58 @@ def api_switches(pod_id):
         "step_status": ct_status,
     })
 
+    # ── Route Verification card ──
+    rv_step   = results.get("route_verification", {})
+    rv_status = rv_step.get("status", "pending")
+    rv_result = rv_step.get("parts", [""])[0] if rv_step.get("parts") else ""
+
+    # Parse pipe-delimited result: PASS|found=13/13|reloaded=no
+    rv_parts_map = {}
+    for _p in rv_result.split("|"):
+        if "=" in _p:
+            k, v = _p.split("=", 1)
+            rv_parts_map[k.strip()] = v.strip()
+    rv_overall   = rv_result.split("|")[0].strip() if rv_result else ""  # "PASS" or "WARN"
+    rv_missing   = set(rv_parts_map.get("missing", "").split(",")) - {""}
+    rv_reloaded  = rv_parts_map.get("reloaded", "no")
+
+    from onboard_router import ROUTE_VRF10_CHECKS
+    rv_checks = []
+    for label, prefixes in ROUTE_VRF10_CHECKS:
+        if rv_status in ("completed", "failed"):
+            grp_missing = [p for p in prefixes if p in rv_missing]
+            if rv_overall == "WARN" and grp_missing:
+                rv_checks.append({"label": label, "status": "fail",
+                                  "result": f"MISSING: {', '.join(grp_missing)}"})
+            else:
+                rv_checks.append({"label": label, "status": "pass", "result": "found"})
+        elif rv_status == "running":
+            rv_checks.append({"label": label, "status": "na", "result": "checking..."})
+        else:
+            rv_checks.append({"label": label, "status": "na", "result": "pending"})
+
+    if rv_reloaded == "yes" and rv_status in ("completed", "failed"):
+        rv_checks.append({"label": "Router reloaded during verification",
+                          "status": "pass" if rv_overall == "PASS" else "fail",
+                          "result": "reloaded — routes re-verified after reload"
+                                    if rv_overall == "PASS"
+                                    else "reloaded but routes still missing"})
+
+    rv_passed = sum(1 for c in rv_checks if c["status"] == "pass")
+    rv_failed = sum(1 for c in rv_checks if c["status"] == "fail")
+    switch_data.append({
+        "name":        "HQ CEDGE Route Verification",
+        "model":       "IOS XE SD-WAN",
+        "ip":          "198.18.133.13",
+        "host":        "route_verification",
+        "checks":      rv_checks,
+        "passed":      rv_passed,
+        "failed":      rv_failed,
+        "total":       len(rv_checks),
+        "step_status": rv_status,
+        "reloaded":    rv_reloaded,
+    })
+
     return jsonify(switch_data)
 
 
@@ -562,8 +614,8 @@ def api_switches_recheck(pod_id):
 
     def _recheck():
         try:
-            switches = ["verify_border_spine", "verify_leaf1", "verify_leaf2", "connectivity_test"]
-            # Mark ALL steps as running upfront so UI shows spinner with 0/4 done
+            switches = ["verify_border_spine", "verify_leaf1", "verify_leaf2", "connectivity_test", "route_verification"]
+            # Mark ALL steps as running upfront so UI shows spinner with 0/5 done
             _c = _db()
             for step_name in switches:
                 _c.execute("INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, completed_at, result) VALUES (?, ?, 'running', datetime('now'), NULL, '')", (pod_id, step_name))
@@ -574,6 +626,8 @@ def api_switches_recheck(pod_id):
             for step_name in switches:
                 if step_name == "connectivity_test":
                     func_call = "onboard_router.phase_connectivity_test()"
+                elif step_name == "route_verification":
+                    func_call = "onboard_router.phase_route_verification()"
                 else:
                     func_call = f"onboard_router.run_switch_checks('{step_name}')"
                 script = (
@@ -616,7 +670,7 @@ def api_switches_recheck(pod_id):
             # Update notes if all switches passed
             conn3 = _db()
             steps = conn3.execute(
-                "SELECT step_name, status FROM pipeline_steps WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test')",
+                "SELECT step_name, status FROM pipeline_steps WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','route_verification')",
                 (pod_id,)
             ).fetchall()
             switch_statuses = {s["step_name"]: s["status"] for s in steps}
@@ -641,7 +695,7 @@ def api_switches_recheck(pod_id):
             # Reset any steps stuck in 'running' back to 'failed' so UI doesn't loop forever
             _c = _db()
             _c.execute(
-                "UPDATE pipeline_steps SET status='failed', result='Re-check error: ' || ? WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test') AND status='running'",
+                "UPDATE pipeline_steps SET status='failed', result='Re-check error: ' || ? WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','route_verification') AND status='running'",
                 (str(e)[:200], pod_id)
             )
             _c.commit()
@@ -650,6 +704,77 @@ def api_switches_recheck(pod_id):
     t = threading.Thread(target=_recheck, daemon=True)
     t.start()
     return jsonify({"status": "ok", "message": "Switch re-check started for " + pod_id})
+
+
+@app.route("/api/routes/test-fail/<pod_id>", methods=["POST"])
+def api_routes_test_fail(pod_id):
+    """
+    Test endpoint: runs route_verification with an injected fake prefix (192.0.2.254)
+    that can never appear in a real routing table.  Forces the reload→re-verify path
+    so the full flow can be validated without waiting for a real route miss.
+    """
+    import threading
+
+    conn = _db()
+    row = conn.execute("SELECT router_ip FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"status": "error", "message": "POD not found"}), 404
+
+    # Verify VPN container is running
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error",
+                        "message": f"VPN container vpn-{pod_id} not running"}), 400
+
+    # Mark as running immediately
+    _c = _db()
+    _c.execute(
+        "INSERT OR REPLACE INTO pipeline_steps "
+        "(pod_id, step_name, status, started_at, completed_at, result) "
+        "VALUES (?, 'route_verification', 'running', datetime('now'), NULL, 'Test-fail run in progress...')",
+        (pod_id,)
+    )
+    _c.commit(); _c.close()
+
+    def _run_test():
+        script = (
+            "import sys; sys.path.insert(0, '.'); import onboard_router; "
+            f"onboard_router.ROUTER_IP = '{row['router_ip']}'; "
+            "ok, result = onboard_router.phase_route_verification_test(); "
+            "print(repr((ok, result)))"
+        )
+        res = subprocess.run([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-c", script
+        ], capture_output=True, text=True, timeout=600)
+        stdout = res.stdout.strip()
+        last_line = stdout.splitlines()[-1] if stdout else ""
+        try:
+            ok_val, result_val = eval(last_line)
+        except Exception as e:
+            ok_val, result_val = False, f"parse error: {e} | raw: {stdout[:200]}"
+        status = "completed" if ok_val else "failed"
+        _c2 = _db()
+        _c2.execute(
+            "INSERT OR REPLACE INTO pipeline_steps "
+            "(pod_id, step_name, status, started_at, completed_at, result) "
+            "VALUES (?, 'route_verification', ?, "
+            "COALESCE((SELECT started_at FROM pipeline_steps WHERE pod_id=? AND step_name='route_verification'), datetime('now')), "
+            "datetime('now'), ?)",
+            (pod_id, status, pod_id, str(result_val)[:500])
+        )
+        _c2.commit(); _c2.close()
+        log(pod_id, f"[route-test-fail] {status}: {result_val}")
+
+    threading.Thread(target=_run_test, daemon=True).start()
+    return jsonify({"status": "started",
+                    "message": "Route verification test-fail run started — injected 192.0.2.254"})
 
 
 @app.route("/api/cdfmc/<pod_id>", methods=["GET"])
@@ -6218,6 +6343,7 @@ DASHBOARD_HTML = """
   .switch-card-title .role-tag.border { background: #1a0a3d; color: #a855f7; }
   .switch-card-title .role-tag.leaf { background: #0a2a1a; color: #22c55e; }
   .switch-card-title .role-tag.cc { background: #0a1a3d; color: #3b82f6; }
+  .switch-card-title .role-tag.cedge { background: #1a1a0a; color: #f59e0b; }
   .switch-card-title .device-name { color: #e0e6ed; font-size: 13px; font-weight: 600; cursor: pointer; }
   .switch-card-title .device-name:hover { color: #60a5fa; text-decoration: underline; }
   .toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #1a2332; color: #e0e6ed; padding: 10px 20px; border-radius: 8px; border: 1px solid #2a3a4a; font-size: 12px; z-index: 9999; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
@@ -6391,7 +6517,7 @@ DASHBOARD_HTML = """
      <div class="detail-tabs">
        <button class="tab-btn active" onclick="switchTab(this, 'steps')">Pipeline Steps</button>
        <button class="tab-btn" onclick="switchTab(this, 'logs')">Live Logs</button>
-       <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches</button>
+       <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches / Routes</button>
        <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
        <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
        <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
@@ -6985,6 +7111,7 @@ function roleClass(name) {
   if (name.includes('Leaf')) return 'leaf';
   if (name.includes('Catalyst')) return 'cc';
   if (name === 'Switch Connectivity') return 'cc';
+  if (name.includes('CEDGE') || name.includes('Route')) return 'cedge';
   return '';
 }
 
@@ -7037,8 +7164,19 @@ async function loadSwitches(podId) {
       </div>`;
     }).join('');
 
-    const roleLabel = sw.name === 'Catalyst Center' ? 'CC' : sw.name === 'Switch Connectivity' ? 'TEST' : sw.name.includes('Border') ? 'Spine' : 'Leaf';
+    const roleLabel = sw.name === 'Catalyst Center' ? 'CC'
+      : sw.name === 'Switch Connectivity' ? 'TEST'
+      : (sw.name.includes('CEDGE') || sw.name.includes('Route')) ? 'CEDGE'
+      : sw.name.includes('Border') ? 'Spine' : 'Leaf';
 
+    const isRouteCard = sw.host === 'route_verification';
+    const warnBadge = sw.step_status === 'completed' && sw.failed === 0 && sw.reloaded === 'yes'
+      ? '<span class="badge warn" style="margin-left:8px">RELOADED</span>' : '';
+    const testFailBtn = isRouteCard
+      ? '<button class="btn-reconnect" id="route-test-btn-' + escHtml(podId) + '" '
+          + 'style="margin-left:auto;font-size:10px;padding:2px 8px;" '
+          + 'title="Inject fake prefix to force reload+re-verify flow">Test Fail</button>'
+      : '';
 
     return '<div class="switch-card ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
       '<div class="switch-card-title">' +
@@ -7047,6 +7185,7 @@ async function loadSwitches(podId) {
         '<span class="device-model">' + escHtml(sw.model || '') + '</span>' +
         (sw.step_status === 'running' ? '<span class="badge" style="margin-left:auto;background:#02c8ff22;color:#02c8ff;border:1px solid #02c8ff55;">⟳ checking</span>' : '') +
         (sw.step_status === 'skipped' ? '<span class="badge warn" style="margin-left:auto">WARN</span>' : '') +
+        warnBadge + testFailBtn +
       '</div>' +
       (sw.step_status === 'skipped' ? '<div style="font-size:11px;color:#ffa502;margin-bottom:6px;">⚠ Verification skipped — switch unreachable during pipeline. Click Re-check Switches to retry.</div>' : '') +
       '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + devicePct + '%;background:' + barColor + '"></div></div>' +
@@ -7058,6 +7197,41 @@ async function loadSwitches(podId) {
   grid.querySelectorAll('.device-name[data-ip]').forEach(el => {
     el.addEventListener('click', () => openTerminal(el.dataset.podId, el.dataset.ip));
   });
+
+  // Wire Test Fail button for route verification card
+  const testBtn = document.getElementById('route-test-btn-' + podId);
+  if (testBtn) {
+    testBtn.addEventListener('click', async () => {
+      testBtn.disabled = true;
+      testBtn.textContent = 'Running...';
+      try {
+        const resp = await fetch('/api/routes/test-fail/' + podId, { method: 'POST' });
+        const j = await resp.json();
+        if (j.status !== 'started') {
+          alert('Test fail error: ' + (j.message || JSON.stringify(j)));
+          testBtn.disabled = false; testBtn.textContent = 'Test Fail'; return;
+        }
+      } catch(e) {
+        alert('Test fail request failed: ' + e);
+        testBtn.disabled = false; testBtn.textContent = 'Test Fail'; return;
+      }
+      // Poll until route_verification is no longer running
+      let polls = 0;
+      async function pollRoute() {
+        polls++;
+        const r2 = await fetch('/api/pipeline/' + podId);
+        const steps = await r2.json();
+        const rv = steps.find(s => s.step_name === 'route_verification');
+        await loadSwitches(podId);
+        if (rv && rv.status === 'running' && polls < 120) {
+          setTimeout(pollRoute, 5000);
+        } else {
+          testBtn.disabled = false; testBtn.textContent = 'Test Fail';
+        }
+      }
+      setTimeout(pollRoute, 3000);
+    });
+  }
 }
 
 async function openTerminal(podId, ip) {
@@ -7077,7 +7251,7 @@ async function recheckSwitches(podId) {
   async function doPoll() {
     attempts++;
     try {
-      const switchNames = ['verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test'];
+      const switchNames = ['verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','route_verification'];
       const r2 = await fetch('/api/pipeline/' + podId);
       const steps = await r2.json();
       const switchSteps = steps.filter(s => switchNames.includes(s.step_name));

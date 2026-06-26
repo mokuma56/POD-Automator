@@ -3280,3 +3280,231 @@ conn.commit()"""], timeout=5)
     print(f"\n{'='*40}")
     print(f"Pipeline complete for {pod_id}")
     print("Router in SD-WAN mode, switches verified, connectivity tested.")
+
+
+# ---------------------------------------------------------------------------
+# Route Verification — HQ-Site10-CEDGE8Kv
+# ---------------------------------------------------------------------------
+
+HQ_CEDGE_IP   = "198.18.133.13"
+HQ_CEDGE_USER = "admin"
+HQ_CEDGE_PASS = "C1sco12345"
+
+# All prefixes expected in 'show ip route vrf 10' after a successful SITE_105 onboard.
+# Prefixes via 100.100.100.105 are POD-specific (Site_105 SDWAN routes).
+ROUTE_VRF10_EXPECTED = [
+    "0.0.0.0",          # default via Null0
+    "10.10.252.0",      # HQ SDWAN via 2.2.2.2
+    "100.100.10.10",    # Loopback10 — directly connected
+    "100.100.10.11",    # HQ SDWAN via 2.2.2.2
+    "100.100.10.105",   # SITE_105 system-ip via 100.100.100.105  ← POD-specific
+    "172.30.254.0",     # SITE_105 network via 100.100.100.105    ← POD-specific
+    "172.30.255.0",     # SITE_105 network via 100.100.100.105    ← POD-specific
+    "192.168.252.12",   # HQ SDWAN via 2.2.2.2
+    "192.168.255.0",    # SITE_105 network via 100.100.100.105    ← POD-specific
+    "192.168.255.6",    # SITE_105 network via 100.100.100.105    ← POD-specific
+    "198.18.5.0",       # static via 198.18.8.1
+    "198.18.8.0",       # directly connected GigabitEthernet4
+    "198.18.9.0",       # static via 198.18.8.1
+]
+
+# Human-readable check groups shown in the UI card (label, [prefixes in group])
+ROUTE_VRF10_CHECKS = [
+    ("Default route (0.0.0.0/0)",           ["0.0.0.0"]),
+    ("HQ SDWAN: 10.10.252.0",               ["10.10.252.0"]),
+    ("Loopback10 (100.100.10.10)",           ["100.100.10.10"]),
+    ("HQ SDWAN: 100.100.10.11",             ["100.100.10.11"]),
+    ("SITE_105: 100.100.10.105",            ["100.100.10.105"]),
+    ("SITE_105: 172.30.254.0",              ["172.30.254.0"]),
+    ("SITE_105: 172.30.255.0",              ["172.30.255.0"]),
+    ("HQ SDWAN: 192.168.252.12",            ["192.168.252.12"]),
+    ("SITE_105: 192.168.255.0",             ["192.168.255.0"]),
+    ("SITE_105: 192.168.255.6",             ["192.168.255.6"]),
+    ("Static: 198.18.5.0 + 198.18.9.0",    ["198.18.5.0", "198.18.9.0"]),
+    ("Direct: 198.18.8.0 (GigE4)",          ["198.18.8.0"]),
+]
+
+
+def cedge_shell():
+    """Open an interactive SSH shell to HQ-CEDGE, drain banner, disable paging."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(HQ_CEDGE_IP, username=HQ_CEDGE_USER, password=HQ_CEDGE_PASS,
+                   look_for_keys=False, allow_agent=False, timeout=15)
+    shell = client.invoke_shell(width=200, height=50)
+    time.sleep(2)
+    if shell.recv_ready():
+        shell.recv(65535)
+    shell.send("terminal length 0\n")
+    time.sleep(1)
+    if shell.recv_ready():
+        shell.recv(65535)
+    return client, shell
+
+
+def _get_vrf10_routes():
+    """Return raw output of 'show ip route vrf 10' from HQ-CEDGE."""
+    client, shell = cedge_shell()
+    try:
+        out = switch_cmd(shell, "show ip route vrf 10", timeout=20)
+    finally:
+        client.close()
+    return out
+
+
+def _reload_cedge():
+    """Send 'reload' to HQ-CEDGE and handle IOS XE save/confirm prompts."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(HQ_CEDGE_IP, username=HQ_CEDGE_USER, password=HQ_CEDGE_PASS,
+                       look_for_keys=False, allow_agent=False, timeout=15)
+        shell = client.invoke_shell(width=200, height=50)
+        time.sleep(2)
+        if shell.recv_ready():
+            shell.recv(65535)
+        shell.send("reload\n")
+        time.sleep(2)
+        accumulated = ""
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if shell.recv_ready():
+                chunk = shell.recv(4096).decode("utf-8", errors="replace")
+                accumulated += chunk
+                low = accumulated.lower()
+                if "yes/no" in low or "save?" in low:
+                    shell.send("no\n")
+                    time.sleep(1)
+                    accumulated = ""
+                elif "confirm" in low:
+                    shell.send("\n")
+                    time.sleep(2)
+                    break
+            else:
+                time.sleep(0.5)
+    except Exception:
+        pass  # connection drops when router actually reboots — that's expected
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _wait_cedge_offline(timeout=90):
+    """Poll until HQ-CEDGE stops accepting SSH. Returns True when offline."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            c = paramiko.SSHClient()
+            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c.connect(HQ_CEDGE_IP, username=HQ_CEDGE_USER, password=HQ_CEDGE_PASS,
+                      look_for_keys=False, allow_agent=False, timeout=5)
+            c.close()
+            time.sleep(5)  # still up — keep polling
+        except Exception:
+            return True  # SSH failed — router is offline
+    return False
+
+
+def _wait_cedge_online(timeout=300):
+    """Poll until HQ-CEDGE accepts SSH again. Returns True when online."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            c = paramiko.SSHClient()
+            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c.connect(HQ_CEDGE_IP, username=HQ_CEDGE_USER, password=HQ_CEDGE_PASS,
+                      look_for_keys=False, allow_agent=False, timeout=10)
+            c.close()
+            return True
+        except Exception:
+            time.sleep(10)
+    return False
+
+
+def _phase_route_verification_impl(expected_prefixes):
+    """
+    Core route-verification logic (shared by pipeline + test paths).
+    Checks expected_prefixes against 'show ip route vrf 10' on HQ-CEDGE.
+    If any are missing → reload router → wait for it to come back → re-check.
+    Always returns (True, result_str) — soft-fail only, never blocks pipeline.
+
+    result_str format:
+      PASS|found=N/T|reloaded=no
+      WARN|found=N/T|missing=p1,p2|reloaded=yes
+    """
+    total = len(expected_prefixes)
+    print(f"  [route_verification] SSH to {HQ_CEDGE_IP} — checking {total} prefixes in VRF 10...")
+    try:
+        output = _get_vrf10_routes()
+    except Exception as e:
+        msg = f"WARN|found=0/{total}|missing=ssh_error|reloaded=no|err={str(e)[:80]}"
+        print(f"  [route_verification] {msg}")
+        return True, msg
+
+    missing = [p for p in expected_prefixes if p not in output]
+    found   = total - len(missing)
+
+    if not missing:
+        msg = f"PASS|found={found}/{total}|reloaded=no"
+        print(f"  [route_verification] {msg}")
+        return True, msg
+
+    print(f"  [route_verification] {len(missing)} prefixes missing: {missing}")
+    print(f"  [route_verification] Reloading {HQ_CEDGE_IP}...")
+    _reload_cedge()
+
+    print(f"  [route_verification] Waiting for {HQ_CEDGE_IP} to go offline...")
+    went_down = _wait_cedge_offline(timeout=90)
+    if not went_down:
+        print(f"  [route_verification] Warning: router did not appear to go offline")
+
+    print(f"  [route_verification] Waiting for {HQ_CEDGE_IP} to come back online (up to 5 min)...")
+    came_up = _wait_cedge_online(timeout=300)
+    if not came_up:
+        msg = (f"WARN|found={found}/{total}|missing={','.join(missing)}"
+               f"|reloaded=yes|err=did_not_come_back_online")
+        print(f"  [route_verification] {msg}")
+        return True, msg
+
+    print(f"  [route_verification] {HQ_CEDGE_IP} online — waiting 30 s for routes to converge...")
+    time.sleep(30)
+
+    try:
+        output2 = _get_vrf10_routes()
+    except Exception as e:
+        msg = (f"WARN|found={found}/{total}|missing={','.join(missing)}"
+               f"|reloaded=yes|err=post_reload_ssh:{str(e)[:60]}")
+        print(f"  [route_verification] {msg}")
+        return True, msg
+
+    missing2 = [p for p in expected_prefixes if p not in output2]
+    found2   = total - len(missing2)
+
+    if not missing2:
+        msg = f"PASS|found={found2}/{total}|reloaded=yes"
+        print(f"  [route_verification] {msg}")
+        return True, msg
+
+    msg = f"WARN|found={found2}/{total}|missing={','.join(missing2)}|reloaded=yes"
+    print(f"  [route_verification] {msg}")
+    return True, msg
+
+
+def phase_route_verification():
+    """
+    Pipeline step: verify VRF 10 routes on HQ-Site10-CEDGE8Kv (198.18.133.13).
+    Missing routes → reload router → re-verify.
+    Soft-fail (WARN) if still missing after reload — pipeline proceeds.
+    """
+    return _phase_route_verification_impl(ROUTE_VRF10_EXPECTED)
+
+
+def phase_route_verification_test():
+    """
+    Test variant: injects 192.0.2.254 (RFC 5737 — never a real route) to force
+    a guaranteed first-pass failure and exercise the full reload → re-verify flow.
+    """
+    test_prefixes = ROUTE_VRF10_EXPECTED + ["192.0.2.254"]
+    return _phase_route_verification_impl(test_prefixes)
