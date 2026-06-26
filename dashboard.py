@@ -6631,6 +6631,7 @@ const PIPELINE_ORDER = [
   "verify_leaf1",
   "verify_leaf2",
   "connectivity_test",
+  "route_verification",
   "cdfmc_check",
   "ad_verify",
   "scc_reset_check",
