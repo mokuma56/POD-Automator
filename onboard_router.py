@@ -1492,9 +1492,15 @@ def phase_baseconfig_verify(switch_key, log_fn=print):
         extra_aaa = [l for l in aaa_lines if l not in ALLOWED_AAA]
         checks["aaa"] = f"FAIL extra:{'; '.join(extra_aaa[:3])}" if extra_aaa else "OK"
 
-        # dot1x check — dot1x system-auth-control should not be present
+        # dot1x check — dot1x system-auth-control should not be present.
+        # strip command echo and prompt lines before checking — the raw output includes
+        # the sent command itself which would cause a false-positive match.
         out_dot1x = switch_cmd(shell, "show run | include dot1x system-auth-control", timeout=8)
-        dot1x_present = "dot1x system-auth-control" in out_dot1x
+        clean_dot1x = "\n".join(
+            l for l in out_dot1x.splitlines()
+            if "show run" not in l and not l.strip().endswith("#")
+        )
+        dot1x_present = "dot1x system-auth-control" in clean_dot1x
         checks["no_dot1x"] = "STILL_PRESENT" if dot1x_present else "OK"
 
         client.close()
