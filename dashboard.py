@@ -7198,14 +7198,12 @@ async function loadSwitches(podId) {
 
     // Raw route table block — only shown on the CEDGE card when output is available
     const rawRoutesHtml = (isRouteCard && sw.raw_routes)
-      ? '<details style="margin-top:8px;">'
-          + '<summary style="font-size:11px;color:#7899aa;cursor:pointer;user-select:none;">'
-          + 'show ip route vrf 10</summary>'
-          + '<pre style="margin:6px 0 0;padding:8px;background:#0a1520;border:1px solid #1a2d4a;'
+      ? '<div style="margin-top:10px;font-size:10px;color:#7899aa;font-family:monospace;margin-bottom:4px;">show ip route vrf 10</div>'
+          + '<pre style="margin:0;padding:10px;background:#0a1520;border:1px solid #1a2d4a;'
           + 'border-radius:4px;font-size:10px;color:#c8d8e8;overflow-x:auto;white-space:pre;'
-          + 'max-height:300px;overflow-y:auto;">'
+          + 'overflow-y:visible;">'
           + escHtml(sw.raw_routes)
-          + '</pre></details>'
+          + '</pre>'
       : '';
 
     return '<div class="switch-card ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
