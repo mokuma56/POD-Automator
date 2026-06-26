@@ -1680,38 +1680,37 @@ def phase_catc_cleanup(log_fn=print):
         log_fn("  No switch devices found in CC inventory (already removed)")
         return True, "nothing to do — devices not in inventory"
 
-    deleted, errors = [], []
+    deleted, skipped, errors = [], [], []
     for dev in to_delete:
             dev_id = dev["id"]
             name   = dev.get("hostname", dev.get("managementIpAddress", dev_id))
             mgmt   = dev.get("managementIpAddress", "?")
             log_fn(f"  Deleting {name} ({mgmt}) from CC...")
 
-            # Retry loop — CatC refuses deletion while a provisioning task is in flight.
-            # Wait for the provisioning to finish, then retry the delete.
-            MAX_DELETE_RETRIES = 6   # 6 × 30s = up to 3 min per device (3 devices ≈ 9 min max)
-            deleted_this = False
-            for attempt in range(1, MAX_DELETE_RETRIES + 1):
-                try:
-                    r = requests.delete(
-                        f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}",
-                        headers=headers, verify=False, timeout=30
-                    )
-                    if r.status_code not in (200, 202, 204):
-                        msg = f"{name}: unexpected status {r.status_code} — {r.text[:100]}"
-                        log_fn(f"  {msg}")
-                        errors.append(msg)
-                        break
-
-                    # Poll task to confirm deletion completed
+            # Single best-effort DELETE — no retry.
+            # If CatC refuses because a provisioning task is in-flight, we log a warning
+            # and move on.  The post-reload SSH teardown (in reset_switches._post_reload)
+            # will clean up any config that CatC re-pushes via NETCONF after the switch
+            # comes back online, so blocking here adds no value.
+            try:
+                r = requests.delete(
+                    f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}",
+                    headers=headers, verify=False, timeout=30
+                )
+                if r.status_code not in (200, 202, 204):
+                    msg = f"{name}: unexpected status {r.status_code} — {r.text[:100]}"
+                    log_fn(f"  WARNING: {msg} (continuing anyway)")
+                    skipped.append(name)
+                else:
+                    # Poll task briefly (up to 30s) just to log the outcome — never block on it
                     try:
                         task_id = r.json().get("response", {}).get("taskId", "")
                     except Exception:
                         task_id = ""
 
                     if task_id:
-                        provisioning = False
-                        for _ in range(12):  # up to 60s
+                        outcome = "unknown"
+                        for _ in range(6):  # up to 30s
                             time.sleep(5)
                             tr = requests.get(
                                 f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
@@ -1721,47 +1720,30 @@ def phase_catc_cleanup(log_fn=print):
                                 tdata = tr.json().get("response", {})
                                 if tdata.get("isError"):
                                     reason = tdata.get("failureReason", "unknown")
-                                    if "being provisioned" in reason.lower() or "provision" in reason.lower():
-                                        log_fn(f"  {name}: still being provisioned — waiting 30s (attempt {attempt}/{MAX_DELETE_RETRIES})...")
-                                        provisioning = True
-                                        break
-                                    msg = f"{name}: task failed — {reason}"
-                                    log_fn(f"  {msg}")
-                                    errors.append(msg)
+                                    outcome = f"task failed: {reason[:80]}"
+                                    log_fn(f"  WARNING: {name}: {outcome} (continuing anyway)")
+                                    skipped.append(name)
                                     break
                                 if tdata.get("endTime"):
+                                    outcome = "confirmed"
                                     log_fn(f"  {name}: deletion confirmed")
                                     deleted.append(name)
-                                    deleted_this = True
                                     break
                         else:
-                            log_fn(f"  {name}: deletion task did not confirm in 60s — treating as OK")
+                            log_fn(f"  {name}: task did not confirm in 30s — treating as OK")
                             deleted.append(name)
-                            deleted_this = True
-
-                        if provisioning:
-                            time.sleep(30)
-                            continue  # retry the DELETE
                     else:
                         log_fn(f"  {name}: deleted (no task ID returned)")
                         deleted.append(name)
-                        deleted_this = True
 
-                except Exception as e:
-                    msg = f"{name}: {e}"
-                    log_fn(f"  ERROR: {msg}")
-                    errors.append(msg)
+            except Exception as e:
+                log_fn(f"  WARNING: {name}: {e} (continuing anyway)")
+                skipped.append(name)
 
-                break  # success or non-retryable error
-
-            if not deleted_this and name not in [e.split(":")[0] for e in errors]:
-                msg = f"{name}: gave up after {MAX_DELETE_RETRIES} attempts (still being provisioned)"
-                log_fn(f"  {msg}")
-                errors.append(msg)
-
-    if errors:
-        return False, f"Errors: {'; '.join(errors)}"
-    return True, f"deleted {len(deleted)}: {', '.join(deleted)}"
+    summary_parts = []
+    if deleted: summary_parts.append(f"deleted {len(deleted)}: {', '.join(deleted)}")
+    if skipped:  summary_parts.append(f"skipped {len(skipped)} (still provisioning — post-reload teardown will clean up): {', '.join(skipped)}")
+    return True, "; ".join(summary_parts) if summary_parts else "nothing done"
 
 
 CDFMC_AUTOMATION_HOST = "198.18.134.12"

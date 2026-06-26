@@ -5224,7 +5224,7 @@ def api_baseconfig_reset(pod_id, switch_key):
                     "--network", f"container:vpn-{pod_id}",
                     "--entrypoint", "python3",
                     "pod-automator:latest", "-c", script
-                ], capture_output=True, text=True, timeout=900)  # up to 15 min: 6 retries × 3 devices
+                ], capture_output=True, text=True, timeout=120)  # best-effort delete, ~30s task poll per device
                 stdout = result.stdout.strip()
                 last_line = stdout.splitlines()[-1] if stdout else ""
                 try:
@@ -5232,7 +5232,7 @@ def api_baseconfig_reset(pod_id, switch_key):
                 except Exception:
                     ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
             except subprocess.TimeoutExpired:
-                ok_val, detail_val = False, "timed out after 900s"
+                ok_val, detail_val = False, "timed out after 120s"
             except Exception as e:
                 ok_val, detail_val = False, str(e)
             status_str = "OK" if ok_val else "FAILED"
