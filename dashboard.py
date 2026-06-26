@@ -5180,6 +5180,65 @@ def api_baseconfig_reset(pod_id, switch_key):
         """Collapse multiline error strings to a single line for clean card display."""
         return " | ".join(line.strip() for line in str(s).splitlines() if line.strip())[:300]
     def _run():
+        # ── Step 1: ISE cleanup (before switch resets so NADs are gone before fabric tear-down) ──
+        if switch_key == "all":
+            import datetime as _dt
+            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            log(pod_id, f"[baseconfig/ise] RUNNING started_at={ts}: removing switch NADs from ISE...")
+            script = (
+                "import sys; sys.path.insert(0, '.'); import onboard_router; "
+                "ok, detail = onboard_router.phase_ise_cleanup(); "
+                "print(repr((ok, detail)))"
+            )
+            try:
+                result = subprocess.run([
+                    "docker", "run", "--rm",
+                    "--network", f"container:vpn-{pod_id}",
+                    "--entrypoint", "python3",
+                    "pod-automator:latest", "-c", script
+                ], capture_output=True, text=True, timeout=90)
+                stdout = result.stdout.strip()
+                last_line = stdout.splitlines()[-1] if stdout else ""
+                try:
+                    ok_val, detail_val = eval(last_line)
+                except Exception:
+                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
+            except subprocess.TimeoutExpired:
+                ok_val, detail_val = False, "timed out after 90s"
+            except Exception as e:
+                ok_val, detail_val = False, str(e)
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[baseconfig/ise] {status_str}: {_sanitize(detail_val)}")
+
+            # ── Step 2: CatC cleanup (before switch resets — retries internally on 'being provisioned') ──
+            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            log(pod_id, f"[baseconfig/catc] RUNNING started_at={ts}: removing switches from Catalyst Center...")
+            script = (
+                "import sys; sys.path.insert(0, '.'); import onboard_router; "
+                "ok, detail = onboard_router.phase_catc_cleanup(); "
+                "print(repr((ok, detail)))"
+            )
+            try:
+                result = subprocess.run([
+                    "docker", "run", "--rm",
+                    "--network", f"container:vpn-{pod_id}",
+                    "--entrypoint", "python3",
+                    "pod-automator:latest", "-c", script
+                ], capture_output=True, text=True, timeout=720)  # up to 12 min for 'being provisioned' wait
+                stdout = result.stdout.strip()
+                last_line = stdout.splitlines()[-1] if stdout else ""
+                try:
+                    ok_val, detail_val = eval(last_line)
+                except Exception:
+                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
+            except subprocess.TimeoutExpired:
+                ok_val, detail_val = False, "timed out after 720s"
+            except Exception as e:
+                ok_val, detail_val = False, str(e)
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[baseconfig/catc] {status_str}: {_sanitize(detail_val)}")
+
+        # ── Step 3: Switch resets (leaves first, then Border Spine) ──
         for key in keys:
             import datetime as _dt
             ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -5229,75 +5288,19 @@ def api_baseconfig_reset(pod_id, switch_key):
                         "-e", "BASE_CONFIGS_DIR=/pipeline/base_configs",
                         "--entrypoint", "python3",
                         "pod-automator:latest", "-c", vscript
-                    ], capture_output=True, text=True, timeout=60)
+                    ], capture_output=True, text=True, timeout=150)
                     vout = vresult.stdout.strip()
                     vlast = vout.splitlines()[-1] if vout else ""
                     try:
                         vok, vdetail = eval(vlast)
                     except Exception:
-                        vok, vdetail = False, f"parse error: {vout[:200]}"
+                        vok, vdetail = False, f"parse error: {vout[:200]} stderr: {vresult.stderr[:100]}"
+                except subprocess.TimeoutExpired:
+                    vok, vdetail = False, "verify timed out after 150s"
                 except Exception as ve:
                     vok, vdetail = False, str(ve)
                 vstatus = "OK" if vok else "FAILED"
                 log(pod_id, f"[verify/{key}] {vstatus}: {_sanitize(vdetail)}")
-
-        # After all switches, clean up ISE NADs (only when resetting all)
-        if switch_key == "all":
-            import datetime as _dt
-            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            log(pod_id, f"[baseconfig/ise] RUNNING started_at={ts}: removing switch NADs from ISE...")
-            script = (
-                "import sys; sys.path.insert(0, '.'); import onboard_router; "
-                "ok, detail = onboard_router.phase_ise_cleanup(); "
-                "print(repr((ok, detail)))"
-            )
-            try:
-                result = subprocess.run([
-                    "docker", "run", "--rm",
-                    "--network", f"container:vpn-{pod_id}",
-                    "--entrypoint", "python3",
-                    "pod-automator:latest", "-c", script
-                ], capture_output=True, text=True, timeout=60)
-                stdout = result.stdout.strip()
-                last_line = stdout.splitlines()[-1] if stdout else ""
-                try:
-                    ok_val, detail_val = eval(last_line)
-                except Exception:
-                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
-            except subprocess.TimeoutExpired:
-                ok_val, detail_val = False, "timed out after 60s"
-            except Exception as e:
-                ok_val, detail_val = False, str(e)
-            status_str = "OK" if ok_val else "FAILED"
-            log(pod_id, f"[baseconfig/ise] {status_str}: {_sanitize(detail_val)}")
-
-            # Catalyst Center — delete the 3 switches from inventory
-            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            log(pod_id, f"[baseconfig/catc] RUNNING started_at={ts}: removing switches from Catalyst Center...")
-            script = (
-                "import sys; sys.path.insert(0, '.'); import onboard_router; "
-                "ok, detail = onboard_router.phase_catc_cleanup(); "
-                "print(repr((ok, detail)))"
-            )
-            try:
-                result = subprocess.run([
-                    "docker", "run", "--rm",
-                    "--network", f"container:vpn-{pod_id}",
-                    "--entrypoint", "python3",
-                    "pod-automator:latest", "-c", script
-                ], capture_output=True, text=True, timeout=60)
-                stdout = result.stdout.strip()
-                last_line = stdout.splitlines()[-1] if stdout else ""
-                try:
-                    ok_val, detail_val = eval(last_line)
-                except Exception:
-                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
-            except subprocess.TimeoutExpired:
-                ok_val, detail_val = False, "timed out after 60s"
-            except Exception as e:
-                ok_val, detail_val = False, str(e)
-            status_str = "OK" if ok_val else "FAILED"
-            log(pod_id, f"[baseconfig/catc] {status_str}: {_sanitize(detail_val)}")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "message": f"Base config reset started for {switch_key} on {pod_id}"})
