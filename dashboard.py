@@ -6982,6 +6982,7 @@ async function showPipeline(podId) {
   if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
   if (window._duoPoller)    { clearInterval(window._duoPoller);    window._duoPoller    = null; }
   if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
+  if (window._switchRecheckPoller) { clearTimeout(window._switchRecheckPoller); window._switchRecheckPoller = null; }
   // Reset CatC tile so it re-initialises for the new POD
   const _ct = document.getElementById('catc-tile-container');
   if (_ct) { _ct._initialized = false; _ct._podId = null; }
@@ -7198,14 +7199,24 @@ async function loadSwitches(podId) {
       : '';
 
     // Raw route table block — only shown on the CEDGE card when output is available
-    const rawRoutesHtml = (isRouteCard && sw.raw_routes)
-      ? '<div style="margin-top:10px;font-size:10px;color:#7899aa;font-family:monospace;margin-bottom:4px;">show ip route vrf 10</div>'
+    let rawRoutesHtml = '';
+    if (isRouteCard) {
+      if (sw.raw_routes) {
+        rawRoutesHtml = '<div style="margin-top:10px;font-size:10px;color:#7899aa;font-family:monospace;margin-bottom:4px;">show ip route vrf 10</div>'
           + '<pre style="margin:0;padding:10px;background:#0a1520;border:1px solid #1a2d4a;'
           + 'border-radius:4px;font-size:10px;color:#c8d8e8;white-space:pre-wrap;word-break:break-all;'
           + 'overflow-y:visible;">'
           + escHtml(sw.raw_routes)
-          + '</pre>'
-      : '';
+          + '</pre>';
+      } else if (sw.step_status === 'completed' || sw.step_status === 'failed') {
+        // Route check ran but SSH to HQ CEDGE failed — show the raw result string as error
+        const errText = (sw.checks || []).map(c => c.result).find(r => r && r !== 'pending' && r !== 'checking...') || 'SSH to HQ CEDGE failed — no route table captured';
+        rawRoutesHtml = '<div style="margin-top:10px;padding:8px 10px;background:#1a0a0a;border:1px solid #3d0000;'
+          + 'border-radius:4px;font-size:10px;color:#ff6b6b;">'
+          + '⚠ show ip route vrf 10 unavailable — ' + escHtml(errText)
+          + '</div>';
+      }
+    }
 
     const cardExtraClass = isRouteCard ? ' cedge-full' : '';
     return '<div class="switch-card' + cardExtraClass + ' ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
@@ -7275,11 +7286,21 @@ async function openTerminal(podId, ip) {
 }
 
 async function recheckSwitches(podId) {
-  await fetch('/api/switches/recheck/' + podId, { method: 'POST' });
+  // Cancel any in-progress recheck poller (possibly for a different POD)
+  if (window._switchRecheckPoller) { clearTimeout(window._switchRecheckPoller); window._switchRecheckPoller = null; }
+
+  const resp = await fetch('/api/switches/recheck/' + podId, { method: 'POST' });
+  const respJson = await resp.json().catch(() => ({}));
+  if (!resp.ok || respJson.status === 'error') {
+    alert('Re-check error: ' + (respJson.message || 'Unknown error'));
+    return;
+  }
+
   let attempts = 0;
-  const maxAttempts = 40;
+  const maxAttempts = 50;  // 200s max
 
   async function doPoll() {
+    window._switchRecheckPoller = null;
     attempts++;
     try {
       const switchNames = ['verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','route_verification'];
@@ -7287,18 +7308,17 @@ async function recheckSwitches(podId) {
       const steps = await r2.json();
       const switchSteps = steps.filter(s => switchNames.includes(s.step_name));
       const anyRunning = switchSteps.some(s => s.status === 'running');
-      // Always reload the cards so user sees live updates
       await loadSwitches(podId);
       loadSteps(podId);
       if (anyRunning && attempts < maxAttempts) {
-        setTimeout(doPoll, 4000);
+        window._switchRecheckPoller = setTimeout(doPoll, 4000);
       }
     } catch(e) {
       loadSwitches(podId);
     }
   }
 
-  setTimeout(doPoll, 2000);
+  window._switchRecheckPoller = setTimeout(doPoll, 2000);
 }
 
 async function loadCdfmc(podId) {
