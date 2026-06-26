@@ -410,7 +410,7 @@ def api_switches(pod_id):
         result_text = s["result"] or ""
         status = s["status"]
         parts = [p.strip() for p in result_text.split("|")]
-        results[name] = {"status": status, "parts": parts}
+        results[name] = {"status": status, "parts": parts, "result_text": result_text}
 
     switch_data = []
     for key, info in SWITCH_CHECKS.items():
@@ -424,9 +424,18 @@ def api_switches(pod_id):
             model = check_parts[0].replace("MODEL: ", "")
             check_parts = check_parts[1:]  # remove MODEL prefix, shift indices
 
+        # Detect top-level SSH/connection failure: single error string, not per-check results
+        error_msg = ""
+        if (step.get("status") == "failed"
+                and len(check_parts) == 1
+                and not check_parts[0].startswith(("PASS", "FAIL", "MODEL:"))):
+            error_msg = check_parts[0]  # e.g. "SSH FAILED: timed out"
+
         checks = []
         for i, label in enumerate(info["checks"]):
-            if step.get("status") in ("completed", "failed") and i < len(check_parts):
+            if error_msg:
+                checks.append({"label": label, "status": "fail", "result": error_msg})
+            elif step.get("status") in ("completed", "failed") and i < len(check_parts):
                 part = check_parts[i]
                 if part.startswith("PASS"):
                     checks.append({"label": label, "status": "pass", "result": part.replace("PASS: ", "")})
@@ -438,8 +447,6 @@ def api_switches(pod_id):
                 checks.append({"label": label, "status": "na", "result": "no data"})
             elif step.get("status") == "running":
                 checks.append({"label": label, "status": "na", "result": "checking..."})
-            elif step.get("status") == "failed":
-                checks.append({"label": label, "status": "fail", "result": "verification failed"})
             else:
                 checks.append({"label": label, "status": "na", "result": "pending"})
 
@@ -498,7 +505,7 @@ def api_switches(pod_id):
     # ── Route Verification card ──
     rv_step   = results.get("route_verification", {})
     rv_status = rv_step.get("status", "pending")
-    rv_full   = rv_step.get("parts", [""])[0] if rv_step.get("parts") else ""
+    rv_full   = rv_step.get("result_text", "")
 
     # Split raw route table from summary (separator injected by onboard_router)
     _ROUTE_SEP = "\n---ROUTES---\n"
