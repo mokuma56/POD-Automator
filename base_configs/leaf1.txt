@@ -139,7 +139,7 @@ interface GigabitEthernet1/0/10
 interface GigabitEthernet1/0/11
  shutdown
 !
-no vlan 10,101,102
+no vlan 10,101,102,1010,1101,1102
 !
 no vrf definition Main
 no vrf definition IOT
