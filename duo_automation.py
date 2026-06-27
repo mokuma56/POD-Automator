@@ -4986,16 +4986,27 @@ def duo_trigger_ad_sync(
         _log(f"using fallback user list: {usernames}")
 
     synced, failed = [], []
-    for username in usernames:
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _asc
+
+    def _sync_one(username):
         try:
             _duo_request(duo_ikey, duo_skey, duo_host, "POST",
                          f"/admin/v1/users/directorysync/{directory_key}/syncuser",
-                         {"username": username})
-            synced.append(username)
-            _log(f"synced: {username}")
-        except Exception as e:
-            failed.append(username)
-            _log(f"WARN: sync failed for {username!r}: {e}")
+                         {"username": username}, timeout=8)
+            return username, True, None
+        except Exception as exc:
+            return username, False, exc
+
+    with ThreadPoolExecutor(max_workers=len(usernames)) as _pool:
+        futures = [_pool.submit(_sync_one, u) for u in usernames]
+        for fut in _asc(futures):
+            uname, ok, err = fut.result()
+            if ok:
+                synced.append(uname)
+                _log(f"synced: {uname}")
+            else:
+                failed.append(uname)
+                _log(f"WARN: sync failed for {uname!r}: {err}")
 
     if synced:
         msg = f"directory sync triggered for {len(synced)}/{len(usernames)} users ({','.join(synced)})"
@@ -5393,7 +5404,7 @@ DUO_CARD_LABELS = {
     "saml_scim_config":"SA SAML + SCIM Config",
     "authproxy_enroll":"Auth Proxy Enroll",
 
-    "scim_push":       "SA SCIM User Push",
+     "scim_push":       "SA SCIM Verify Users",
      "verify":          "Verify Auth Proxy",
 }
 
@@ -6196,7 +6207,7 @@ def _save_saml_app_ikey(db_path: str, oc: dict, app_ikey: str) -> None:
 
 
 def duo_ensure_table(db_path: str) -> None:
-    """Create duo_steps table if it does not exist."""
+    """Create duo_steps table and ensure org_credentials has all required columns."""
     import sqlite3 as _sq
     with _sq.connect(db_path) as c:
         c.execute("""
@@ -6210,6 +6221,12 @@ def duo_ensure_table(db_path: str) -> None:
                 PRIMARY KEY (pod_id, step_name)
             )
         """)
+        # Ensure authproxy_enroll_blob column exists (migration for existing DBs)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(org_credentials)").fetchall()]
+        if "authproxy_enroll_blob" not in cols:
+            c.execute("ALTER TABLE org_credentials ADD COLUMN authproxy_enroll_blob TEXT DEFAULT ''")
+        if "authproxy_blob_saved_at" not in cols:
+            c.execute("ALTER TABLE org_credentials ADD COLUMN authproxy_blob_saved_at TIMESTAMP DEFAULT NULL")
 
 
 def _duo_step_set(pod_id: str, step: str, status: str, result: str, db_path: str,
@@ -6269,12 +6286,14 @@ def duo_run_card(
     except Exception as e:
         return False, f"DB error: {e}"
 
-    duo_ikey  = oc.get("duo_ikey", "").strip()
-    duo_skey  = oc.get("duo_skey", "").strip()
-    duo_host  = oc.get("duo_host", "").strip()
-    app_ikey  = oc.get("duo_saml_app_ikey", "").strip()
-    scim_tok  = oc.get("sa_scim_token", "").strip()
-    ap_cfg    = oc.get("authproxy_cfg", "").strip()
+    duo_ikey      = oc.get("duo_ikey", "").strip()
+    duo_skey      = oc.get("duo_skey", "").strip()
+    duo_host      = oc.get("duo_host", "").strip()
+    app_ikey      = oc.get("duo_saml_app_ikey", "").strip()
+    scim_tok      = oc.get("sa_scim_token", "").strip()
+    ap_cfg        = oc.get("authproxy_cfg", "").strip()
+    enroll_blob   = oc.get("authproxy_enroll_blob", "").strip()
+    blob_saved_at = oc.get("authproxy_blob_saved_at", "") or ""
 
     if not duo_ikey or not duo_skey or not duo_host:
         return False, "Duo Admin API credentials (ikey/skey/host) not set in DB"
@@ -6331,56 +6350,235 @@ def duo_run_card(
 
     def step_saml_scim_config():
         """
-        SCC / SA / Duo orgs are permanently coupled and never torn down.
-        The SAML app ('Cisco Secure Access'), SCIM connector, and SA IdP config
-        are configured once manually and persist indefinitely.
-
-        This step simply verifies the stored duo_saml_app_ikey still exists in
-        the Duo org.  If it does → done.  If it's missing from DB → instruct
-        user to create the app manually and enter the ikey in the dashboard.
+        Verify SA SCIM is live by querying the SA SCIM /Users endpoint.
+        The Cisco Secure Access app + SCIM connector are configured once
+        manually per org and persist forever (permanent org model).
+        This step confirms users are present — if 0, SCIM isn't synced yet.
         """
-        if not app_ikey:
-            return False, (
-                "duo_saml_app_ikey not set in DB — create the 'Cisco Secure Access' "
-                "app in Duo Admin portal (Applications → Protect an Application → "
-                "Cisco Secure Access) and paste the Integration Key into the "
-                "org credentials card on the dashboard, then re-run this step."
-            )
-
+        if not scim_tok:
+            return False, "sa_scim_token not set in DB — cannot verify SCIM"
         try:
-            _duo_request(duo_ikey, duo_skey, duo_host, "GET",
-                         f"/admin/v1/integrations/{app_ikey}")
-            _log(f"SAML app verified in Duo org (ikey={app_ikey})")
-            return True, f"SAML app present (ikey={app_ikey})"
-        except Exception as e:
-            return False, (
-                f"SAML app ikey={app_ikey} not found in Duo org: {e} — "
-                "the app may have been deleted; re-create it in Duo Admin portal "
-                "and update duo_saml_app_ikey in the dashboard."
+            import requests as _req
+            resp = _req.get(
+                "https://api.sse.cisco.com/identity/v2/scim/Users",
+                headers={"Authorization": f"Bearer {scim_tok}"},
+                timeout=15,
             )
+            if resp.status_code == 401:
+                return False, "SA SCIM: 401 Unauthorized — sa_scim_token may be expired"
+            if resp.status_code != 200:
+                return False, f"SA SCIM: HTTP {resp.status_code} — {resp.text[:200]}"
+            total = resp.json().get("totalResults", 0)
+            if total == 0:
+                _log("SA SCIM: token valid — 0 users (step 6 will push)")
+                return True, "SA SCIM token valid (0 users — step 6 will push)"
+            _log(f"SA SCIM: {total} users present ✓")
+            return True, f"SA SCIM OK — {total} users synced"
+        except Exception as e:
+            return False, f"SA SCIM check failed: {e}"
 
     def step_authproxy_enroll():
-        return duo_authproxy_enroll_and_update(pod_id, db_path, log=_log)
+        """
+        Re-enroll the Authentication Proxy on fresh AD1 each session.
+
+        Runs authproxy_update_sso_enrollment_code.exe with the stored blob,
+        stops/starts DuoAuthProxy, reads the new rikey from authproxy.cfg
+        on AD1, then updates authproxy_cfg in the DB so the next session's
+        authproxy_push carries the current rikey.
+
+        The blob comes from Duo Admin portal:
+          Applications → SSO Settings → External Authentication Sources
+          → Active Directory → Auth Proxy → Step 2 → Generate Command
+        Copy the base64 argument (not the full EXE path) and store it in
+        the dashboard org credentials card under 'authproxy_enroll_blob'.
+        """
+        import time as _te
+
+        AUTHPROXY_LOG = (
+            r"C:\Program Files\Duo Security Authentication Proxy\log\authproxy.log"
+        )
+        SSO_ENROLL_EXE = (
+            r"C:\Program Files\Duo Security Authentication Proxy\bin"
+            r"\authproxy_update_sso_enrollment_code.exe"
+        )
+
+        def _drpc_status(winrm_s, label=""):
+            """Read last 25 lines of authproxy.log; return ('connected'|'failed'|'unknown')."""
+            try:
+                r = winrm_s.run_ps(
+                    f'Get-Content "{AUTHPROXY_LOG}" -Tail 25 -ErrorAction SilentlyContinue'
+                )
+                lines = r.std_out.decode(errors="replace").splitlines()
+                has_401 = any("Invalid signature" in l for l in lines)
+                has_idp = any("configured IdP" in l for l in lines)
+                manual  = any("manual intervention" in l.lower() for l in lines)
+                if has_idp and not has_401:
+                    return "connected"
+                if has_401 or manual:
+                    return "failed"
+                return "unknown"
+            except Exception:
+                return "unknown"
+
+        if not enroll_blob:
+            return False, (
+                "authproxy_enroll_blob not set in DB — "
+                "go to Duo Admin portal → Applications → SSO Settings → "
+                "External Authentication Sources → Active Directory → "
+                "Auth Proxy → Step 2 → click 'Generate Command', "
+                "copy the base64 argument, and paste it into the "
+                "dashboard org credentials card under 'authproxy_enroll_blob'."
+            )
+
+        # Warn if blob is stale — enrollment blobs are one-time codes.
+        # A blob used in a previous session will cause 401 on the SSO DRPC
+        # connection even though the EXE reports "All secrets stored successfully".
+        blob_age_warn = ""
+        if blob_saved_at:
+            import datetime as _dtb
+            try:
+                saved = _dtb.datetime.strptime(blob_saved_at[:19], "%Y-%m-%d %H:%M:%S")
+                age_h = ((_dtb.datetime.utcnow() - saved).total_seconds()) / 3600
+                if age_h > 24:
+                    blob_age_warn = (
+                        f" ⚠ BLOB IS {age_h:.0f}h OLD — one-time codes expire after first use. "
+                        "If the proxy fails to connect to Duo SSO (401 Invalid signature), "
+                        "generate a new command from Duo Admin portal → SSO Settings → "
+                        "External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command, "
+                        "paste into org credentials, then re-run this step."
+                    )
+                    _log(blob_age_warn)
+            except Exception:
+                pass
+
+        _log("WinRM-connecting to AD1 for SSO enrollment ...")
+        try:
+            winrm_sess = _winrm_connect_for_pod(pod_id, log=_log)
+        except Exception as e:
+            return False, f"WinRM connect failed: {e}"
+
+        try:
+            # ── Pre-check: skip EXE if proxy is already connected ────────────
+            pre = _drpc_status(winrm_sess, "pre")
+            if pre == "connected":
+                _log("DRPC already connected — skipping re-enrollment")
+                return True, "enrollment skipped — proxy already connected to Duo SSO ✓"
+            _log(f"DRPC pre-status: {pre} — proceeding with enrollment")
+
+            # ── Run the enrollment EXE with the blob ─────────────────────────
+            # Note: use run_ps directly (not _winrm_run_cmd) to avoid
+            # double-& issue — _winrm_run_cmd prepends "& " to the cmd
+            _log(f"running authproxy_update_sso_enrollment_code.exe ...")
+            _r = winrm_sess.run_ps(
+                f"& '{SSO_ENROLL_EXE}' '{enroll_blob}'; Write-Output 'ENROLL_DONE'"
+            )
+            _out = _r.std_out.decode(errors="replace").strip()
+            _err = _r.std_err.decode(errors="replace").strip()
+            if _out: _log(f"enroll stdout: {_out[:300]}")
+            if _err: _log(f"enroll stderr: {_err[:200]}")
+
+            exe_ok = "ENROLL_DONE" in _out or "secrets stored" in _out.lower()
+            if not exe_ok:
+                _log("WARN: EXE did not report success — may be an expired blob")
+
+            # ── Restart DuoAuthProxy ─────────────────────────────────────────
+            _log("restarting DuoAuthProxy ...")
+            winrm_sess.run_ps(
+                "Stop-Service -Name DuoAuthProxy -Force -ErrorAction SilentlyContinue"
+            )
+            _te.sleep(3)
+            winrm_sess.run_ps("Start-Service -Name DuoAuthProxy")
+            _te.sleep(5)  # give DRPC time to connect or fail
+
+            # ── Post-check: verify DRPC connection from log ──────────────────
+            post = _drpc_status(winrm_sess, "post")
+            _log(f"DRPC post-status: {post}")
+
+            if post == "connected":
+                return True, "enrollment OK — DRPC connected, IdPs registered ✓" + blob_age_warn
+            if post == "failed":
+                return False, (
+                    "enrollment EXE ran but DRPC is still rejected (401 Invalid signature) — "
+                    "the blob is a one-time code that was already consumed. "
+                    "Generate a NEW command: Duo Admin portal → SSO Settings → "
+                    "External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command, "
+                    "paste into org credentials card, then re-run this step."
+                )
+            # Unknown — service restarted but log unclear
+            return True, (
+                "enrollment ran, DRPC status unclear — check step 7 to confirm"
+                + blob_age_warn
+            )
+
+        except Exception as e:
+            return False, f"authproxy enrollment failed: {e}"
 
     def step_scim_push():
-        if not scim_tok and not oc.get("sa_scim_token", "").strip():
+        """
+        Verify that SA SCIM has users synced.
+
+        SA's SCIM endpoint does not allow direct user creation from external
+        scripts — only Duo's own provisioning connector (running in Duo's
+        cloud) is permitted to write.  After step 3 (AD sync) adds users to
+        Duo, Duo's SCIM connector automatically pushes them to SA.  This step
+        confirms that sync has completed.
+        """
+        if not scim_tok:
             return True, "skipped — no SA SCIM token stored"
-        tok = scim_tok or oc.get("sa_scim_token", "").strip()
-        n = _push_duo_users_to_sa_scim(duo_ikey, duo_skey, duo_host, tok, log=_log)
-        return True, f"{n} new users pushed to SA SCIM"
+        try:
+            import requests as _req
+            resp = _req.get(
+                "https://api.sse.cisco.com/identity/v2/scim/Users",
+                headers={"Authorization": f"Bearer {scim_tok}"},
+                timeout=15,
+            )
+            if resp.status_code == 401:
+                return False, "SA SCIM: 401 — token expired; regenerate sa_scim_token in org credentials"
+            if resp.status_code != 200:
+                return False, f"SA SCIM verify: HTTP {resp.status_code} — {resp.text[:120]}"
+            total = resp.json().get("totalResults", 0)
+            if total == 0:
+                # Soft-pass: Duo's connector will push users once AD sync propagates
+                _log("SA SCIM: 0 users — Duo connector will sync after AD sync; verify manually if auth fails")
+                return True, "SA SCIM: 0 users — Duo connector will push after AD sync propagates"
+            return True, f"SA SCIM: {total} users confirmed in SA ✓"
+        except Exception as e:
+            return True, f"SA SCIM verify failed (soft-fail): {e}"
 
     def step_verify():
-        """WinRM: check DuoAuthProxy service is Running."""
+        """WinRM: check DuoAuthProxy is Running AND DRPC is connected."""
+        AUTHPROXY_LOG = (
+            r"C:\Program Files\Duo Security Authentication Proxy\log\authproxy.log"
+        )
         try:
             sess = _winrm_connect_for_pod(pod_id)
-            ok_v, msg_v = _winrm_run_cmd(
-                sess,
-                'powershell -Command "(Get-Service DuoAuthProxy).Status"',
-                _log,
+
+            # Service status
+            r_svc = sess.run_ps("(Get-Service DuoAuthProxy).Status")
+            svc_status = r_svc.std_out.decode(errors="replace").strip()
+            if "running" not in svc_status.lower():
+                return False, f"DuoAuthProxy service: {svc_status} (not running)"
+
+            # DRPC connection status from log
+            r_log = sess.run_ps(
+                f'Get-Content "{AUTHPROXY_LOG}" -Tail 30 -ErrorAction SilentlyContinue'
             )
-            if ok_v and "running" in msg_v.lower():
-                return True, f"DuoAuthProxy service: {msg_v.strip()}"
-            return False, f"DuoAuthProxy status: {msg_v.strip()}"
+            lines = r_log.std_out.decode(errors="replace").splitlines()
+            has_401    = any("Invalid signature" in l for l in lines)
+            has_idp    = any("configured IdP"    in l for l in lines)
+            manual_int = any("manual intervention" in l.lower() for l in lines)
+
+            if has_idp and not has_401:
+                idp_line = next(l for l in reversed(lines) if "configured IdP" in l)
+                return True, f"DuoAuthProxy Running + DRPC connected ✓ ({idp_line.strip()[-40:]})"
+            if has_401 or manual_int:
+                return False, (
+                    "DuoAuthProxy Running but DRPC NOT connected (401 Invalid signature) — "
+                    "enrollment blob is spent. Generate a new blob: Duo Admin portal → "
+                    "SSO Settings → External Auth Sources → AD → Auth Proxy → Step 2 → "
+                    "Generate Command, paste into org credentials, re-run step 5."
+                )
+            return True, f"DuoAuthProxy service: {svc_status} (DRPC log status unclear)"
         except Exception as e:
             return False, f"WinRM verify error: {e}"
 

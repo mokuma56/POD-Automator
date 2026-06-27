@@ -6,3 +6,4 @@ ldap3>=2.9
 pywinrm>=0.4
 netmiko>=4.3
 ncclient>=0.6
+playwright>=1.40
