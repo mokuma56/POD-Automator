@@ -1186,11 +1186,14 @@ def api_scc_run_check_sync(pod_id):
     Phase 1: 6 API-based items via phase_scc_reset_check().
     Phase 2: 7 browser-based items via _scc_auto_reset_manual().
     Both phases run to completion before returning so the pipeline step is only
-    marked Done after all 13 checklist items are persisted."""
-    import sys, os as _os, importlib
+    marked Done after all 13 checklist items are persisted.
+    Returns ok=False and includes FAIL in result if any checklist item failed,
+    so the pipeline badge shows orange Warn instead of green Done."""
+    import sys, os as _os, importlib, sqlite3 as _sq3
     sys.path.insert(0, str(Path(__file__).parent))
     _os.environ["POD_ID"] = pod_id
-    _os.environ["DB_PATH"] = str(Path(__file__).parent / "data" / "pod_state.db")
+    db_path = str(Path(__file__).parent / "data" / "pod_state.db")
+    _os.environ["DB_PATH"] = db_path
     _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
 
     # Phase 1 — 6 API items
@@ -1213,8 +1216,27 @@ def api_scc_run_check_sync(pod_id):
         browser_ok, browser_result = False, str(e)
         log(pod_id, f"[scc-reset] Browser reset error: {e}")
 
-    overall_ok = api_ok and browser_ok
-    combined = f"API: {api_result} | Browser: {browser_result}"
+    # Check scc_checklist for any failed items — surface as FAIL in result
+    # so the pipeline badge shows orange Warn rather than green Done.
+    failed_items = []
+    try:
+        with _sq3.connect(db_path) as _c:
+            _rows = _c.execute(
+                "SELECT item_key FROM scc_checklist WHERE pod_id=? AND status='failed'",
+                (pod_id,)
+            ).fetchall()
+            failed_items = [r[0] for r in _rows]
+    except Exception:
+        pass
+
+    if failed_items:
+        overall_ok = False
+        combined = (f"FAIL: {len(failed_items)} item(s) need attention: "
+                    f"{', '.join(failed_items)} | API: {api_result} | Browser: {browser_result}")
+    else:
+        overall_ok = api_ok and browser_ok
+        combined = f"API: {api_result} | Browser: {browser_result}"
+
     return jsonify({"ok": overall_ok, "result": combined})
 
 
@@ -2619,9 +2641,11 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
     _base = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
              if _eid else "https://security.cisco.com/dashboard")
 
-    # Look up sa_org_id from DB so _sa_url() can build direct SA URLs even
-    # when _enter_secure_access() fails to navigate the browser into SA.
+    # Look up sa_org_id and derive org name from DB so _sa_url() / _enter_secure_access()
+    # can build direct SA URLs and interact with the org-picker modal.
     _sa_org_id_db = ""
+    _scc_org_name = ""   # e.g. "PseudoCo-535" — used to select org in the picker modal
+    _pod_eid       = ""  # enterprise UUID for POD org (discovered via org-picker)
     try:
         import re as _re_org
         with _sq.connect(db_path) as _c_org:
@@ -2631,6 +2655,7 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             if _row_org and _row_org[0]:
                 _m_org = _re_org.search(r"pseudoco-(\d+)", _row_org[0])
                 if _m_org:
+                    _scc_org_name = f"PseudoCo-{_m_org.group(1)}"
                     _oc_row = _c_org.execute(
                         "SELECT sa_org_id FROM org_credentials WHERE org_number=?",
                         (_m_org.group(1),)
@@ -2713,29 +2738,185 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                         and "/platform-management" not in _u)
 
             def _sa_url(path: str) -> str:
-                """Build a full SA URL by extracting the org number from the current
-                page URL (e.g. /secure-access/org/8383340/...) and appending path.
-                Falls back to sa_org_id from DB when the page URL doesn't contain
-                /secure-access/org/ (e.g. when _enter_secure_access() navigation
-                didn't fully land on an SA page)."""
+                """Build a full SA URL for the POD org.
+                Appends ?enterpriseId={_pod_eid} when the enterprise UUID has been
+                discovered via the org-picker so the SCC SPA lands in the POD org
+                context rather than being redirected to the manager org home."""
                 import re as _re
+                _sep = "&" if "?" in path else "?"
+                _eid_param = f"{_sep}enterpriseId={_pod_eid}" if _pod_eid else ""
                 _m = _re.search(r'/secure-access/org/(\d+)', page.url)
                 if _m:
-                    return f"https://security.cisco.com/secure-access/org/{_m.group(1)}{path}"
+                    return f"https://security.cisco.com/secure-access/org/{_m.group(1)}{path}{_eid_param}"
                 if _sa_org_id_db:
-                    return f"https://security.cisco.com/secure-access/org/{_sa_org_id_db}{path}"
+                    return f"https://security.cisco.com/secure-access/org/{_sa_org_id_db}{path}{_eid_param}"
                 return ""
 
             def _enter_secure_access() -> bool:
-                """Click into Secure Access from the platform home."""
+                """Navigate into the POD's Secure Access org.
+
+                Strategy (in order):
+                1. Direct URL with ?enterpriseId= if _pod_eid already discovered → fast.
+                2. Direct URL without ?enterpriseId= (may still work if session context
+                   already matches the POD org from a previous call).
+                3. Org-picker: navigate to root, select POD org from the dropdown,
+                   click Continue, capture the new enterpriseId from localStorage,
+                   then retry direct URL with the discovered UUID.
+                4. Legacy click-through: click "Secure Access" link from platform home.
+                """
+                nonlocal _pod_eid
+
+                def _try_sa_direct(with_eid: bool) -> bool:
+                    if not _sa_org_id_db:
+                        return False
+                    _eid_p = f"?enterpriseId={_pod_eid}" if (with_eid and _pod_eid) else ""
+                    _url = f"https://security.cisco.com/secure-access/org/{_sa_org_id_db}/{_eid_p}"
+                    try:
+                        page.goto(_url, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(2000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
+                        return "/secure-access/org/" in page.url
+                    except Exception:
+                        return False
+
+                # Step 1 — direct URL with known enterprise UUID
+                if _pod_eid and _try_sa_direct(with_eid=True):
+                    return True
+
+                # Step 2 — direct URL without enterprise UUID (session may already match)
+                if _try_sa_direct(with_eid=False):
+                    return True
+
+                # Step 3 — org-picker modal: switch context from manager org → POD org
+                if _scc_org_name:
+                    import re as _re_ep
+                    _m_ep = _re_ep.search(r"(\d+)", _scc_org_name)
+                    _org_num = _m_ep.group(1) if _m_ep else ""
+                    try:
+                        page.goto("https://security.cisco.com",
+                                  wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(2500)
+
+                        # ── Try to select the correct org in the picker dropdown ──────
+                        _switched = False
+                        _try_labels = [
+                            _scc_org_name,                    # "PseudoCo-535"
+                            f"pseudoco{_org_num}",            # "pseudoco535"
+                            f"pseudoco-{_org_num}",           # "pseudoco-535"
+                        ]
+
+                        # Option A: native <select>
+                        if not _switched:
+                            for _lbl in _try_labels:
+                                try:
+                                    page.select_option("select", label=_lbl, timeout=1500)
+                                    _switched = True
+                                    log_fn(f"[scc-reset] org-picker: <select> label='{_lbl}'")
+                                    break
+                                except Exception:
+                                    pass
+
+                        # Option B: React combobox / listbox — open it then pick option
+                        if not _switched:
+                            for _csel in [
+                                '[role="combobox"]',
+                                '[aria-haspopup="listbox"]',
+                                '[aria-haspopup="true"][aria-expanded]',
+                            ]:
+                                try:
+                                    _cb = page.locator(_csel).first
+                                    if _cb.is_visible(timeout=1500):
+                                        _cb.click()
+                                        page.wait_for_timeout(600)
+                                        for _lbl in _try_labels:
+                                            for _osel in [
+                                                f'[role="option"]:has-text("{_lbl}")',
+                                                f'li[role="option"]:has-text("{_lbl}")',
+                                                f'li:has-text("{_lbl}")',
+                                                f'div[role="option"]:has-text("{_lbl}")',
+                                            ]:
+                                                try:
+                                                    _oel = page.locator(_osel).first
+                                                    if _oel.is_visible(timeout=800):
+                                                        _oel.click()
+                                                        page.wait_for_timeout(500)
+                                                        _switched = True
+                                                        log_fn(f"[scc-reset] org-picker: combobox '{_lbl}'")
+                                                        break
+                                                except Exception:
+                                                    pass
+                                            if _switched:
+                                                break
+                                        break
+                                except Exception:
+                                    continue
+
+                        # Option C: JS scan over all option-like elements
+                        if not _switched and _org_num:
+                            for _lbl in [l.lower() for l in _try_labels]:
+                                try:
+                                    _ok = page.evaluate(f"""() => {{
+                                        const els = Array.from(document.querySelectorAll(
+                                            '[role="option"], li, option'));
+                                        const el = els.find(e =>
+                                            (e.textContent || '').toLowerCase().includes('{_lbl}'));
+                                        if (el && el.getBoundingClientRect().width > 0) {{
+                                            el.click(); return true;
+                                        }}
+                                        return false;
+                                    }}""")
+                                    if _ok:
+                                        page.wait_for_timeout(500)
+                                        _switched = True
+                                        log_fn(f"[scc-reset] org-picker: JS click '{_lbl}'")
+                                        break
+                                except Exception:
+                                    pass
+
+                        log_fn(f"[scc-reset] org-picker: switched={_switched}, clicking Continue...")
+
+                        # Click Continue (dismisses org picker and navigates to selected org)
+                        for _csel in [
+                            'button:has-text("Continue")',
+                            'button[type="submit"]:has-text("Continue")',
+                        ]:
+                            try:
+                                _cont = page.locator(_csel).first
+                                if _cont.is_visible(timeout=5000):
+                                    _cont.click()
+                                    page.wait_for_timeout(3000)
+                                    log_fn(f"[scc-reset] org-picker: dismissed → {page.url[:60]}")
+                                    break
+                            except Exception:
+                                pass
+
+                        # Capture enterpriseId from localStorage — may have changed
+                        try:
+                            _new_eid = page.evaluate(
+                                "() => localStorage.getItem('enterpriseId') || ''")
+                            if _new_eid and _new_eid != _eid:
+                                _pod_eid = _new_eid
+                                log_fn(f"[scc-reset] POD enterpriseId discovered: {_pod_eid[:12]}...")
+                        except Exception:
+                            pass
+
+                        # Retry SA with discovered enterprise UUID
+                        if _try_sa_direct(with_eid=True):
+                            return True
+
+                    except Exception as _ep_err:
+                        log_fn(f"[scc-reset] org-picker error: {_ep_err}")
+
+                # Step 4 — legacy: navigate to platform home and click "Secure Access" link
                 page.goto(_base, wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(1500)
-                # Dismiss any open overlay/panel (org switcher, flyout, etc.)
                 try:
                     page.keyboard.press("Escape"); page.wait_for_timeout(400)
                 except Exception:
                     pass
-                # Also click the close button on any overlay
                 try:
                     page.evaluate("""() => {
                         const btns = Array.from(document.querySelectorAll('button'));
@@ -2752,8 +2933,11 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 except Exception:
                     pass
                 page.wait_for_timeout(500)
-                for _sel in ['a:has-text("Secure Access")', 'button:has-text("Secure Access")',
-                             'li:has-text("Secure Access") > a', '[role="menuitem"]:has-text("Secure Access")']:
+                for _sel in [
+                    'a:has-text("Secure Access")', 'button:has-text("Secure Access")',
+                    'li:has-text("Secure Access") > a',
+                    '[role="menuitem"]:has-text("Secure Access")',
+                ]:
                     try:
                         el = page.locator(_sel).first
                         if el.is_visible(timeout=3000):
@@ -3407,92 +3591,160 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 1. logging_settings ───────────────────────────────────────────
             log_fn("[scc-reset] 1/7 logging_settings")
             try:
-                # Enter Secure Access then navigate Secure ▸ Access Policy
-                _landed = False
-                for _idx, (_flyout, _item) in enumerate([
-                    ("Secure", "Access Policy"),
-                    ("Secure", "Internet Access"),
-                    ("Secure", "Internet Policy"),
-                    ("Secure", "Web Policy"),
-                    ("Secure", "Web Security"),
-                ]):
-                    _enter_secure_access()
-                    page.wait_for_timeout(800)
-                    # Take flyout screenshot on first attempt to reveal actual sub-item labels
-                    _sase_nav(_flyout, _item, shot_prefix=f"secure_flyout" if _idx == 0 else "")
+                # Navigate directly to Access Policy page
+                _policy_url = _sa_url("/secure/policy/")
+                if not _policy_url:
+                    _persist("logging_settings", "failed", "Could not resolve SA policy URL")
+                    log_fn("[scc-reset] logging_settings: no SA URL")
+                else:
+                    page.goto(_policy_url, wait_until="domcontentloaded", timeout=30000)
                     page.wait_for_timeout(2000)
-                    if not _on_home():
-                        _b = page.inner_text("body").lower()
-                        if any(c in _b for c in ["access policy", "internet access",
-                                                  "internet policy", "web policy",
-                                                  "web security", "all traffic"]):
-                            _landed = True
-                            break
-                _shot("1_logging")
-                _body = page.inner_text("body").lower()
-                _detail = "Could not navigate to Access Policy page — check 1_logging screenshot"
-                if not _landed:
-                    _persist("logging_settings", "failed", _detail)
-                    log_fn(f"[scc-reset] logging_settings: {_detail}")
-                elif any(c in _body for c in ["access policy", "internet access",
-                                               "internet policy", "web policy",
-                                               "web security", "all traffic"]):
-                    _edit_found = False
-                    for _rs in [
-                        'tr:has-text("Internet")', 'tr:has-text("internet")',
-                        '[role="row"]:has-text("Internet")', 'tr:has-text("All")',
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(1000)
+                    _shot("1_logging")
+
+                    # Find "For all Internet access" row and click its three-dot menu.
+                    # The row is in the Default rules section at the bottom of the page.
+                    _three_dot_clicked = False
+                    for _row_sel in [
+                        'tr:has-text("For all Internet access")',
+                        '[role="row"]:has-text("For all Internet access")',
+                        'tr:has-text("internet access")',
+                        '[role="row"]:has-text("internet access")',
                     ]:
                         try:
-                            _row = page.locator(_rs).first
-                            for _es in [
-                                'button[aria-label*="edit" i]', 'button:has-text("Edit")',
-                                'a:has-text("Edit")', '[aria-label*="edit" i]',
+                            _row = page.locator(_row_sel).first
+                            if not _row.is_visible(timeout=3000):
+                                continue
+                            # Try named selectors first
+                            for _dot_sel in [
+                                'button[aria-label*="more" i]',
+                                'button[aria-label*="action" i]',
+                                'button[aria-label*="option" i]',
+                                'button:has-text("...")',
                             ]:
                                 try:
-                                    eb = _row.locator(_es).first
-                                    if eb.is_visible(timeout=800):
-                                        eb.click(); page.wait_for_timeout(2000)
-                                        _edit_found = True; break
+                                    dot_btn = _row.locator(_dot_sel).first
+                                    if dot_btn.is_visible(timeout=800):
+                                        dot_btn.click()
+                                        page.wait_for_timeout(1000)
+                                        _three_dot_clicked = True
+                                        break
                                 except Exception:
                                     continue
-                            if _edit_found:
+                            if not _three_dot_clicked:
+                                # JS fallback: click the rightmost visible button in the row
+                                _three_dot_clicked = page.evaluate("""(sel) => {
+                                    const row = document.querySelector(sel);
+                                    if (!row) return false;
+                                    const btns = Array.from(row.querySelectorAll('button'));
+                                    const visible = btns.filter(b => {
+                                        const r = b.getBoundingClientRect();
+                                        return r.width > 0 && r.height > 0;
+                                    });
+                                    if (!visible.length) return false;
+                                    const btn = visible.reduce((a, b) =>
+                                        b.getBoundingClientRect().x > a.getBoundingClientRect().x ? b : a);
+                                    btn.click();
+                                    return true;
+                                }""", _row_sel)
+                                if _three_dot_clicked:
+                                    page.wait_for_timeout(1000)
+                            if _three_dot_clicked:
                                 break
                         except Exception:
                             continue
-                    if _edit_found:
-                        _shot("1_logging_edit")
-                        _toggled = False
-                        for _ts in [
-                            'input[aria-label*="log" i]', '[aria-label*="log" i][role="switch"]',
-                            'label:has-text("Log") input', 'label:has-text("Logging") input',
-                            'input[id*="log" i]',
+
+                    if not _three_dot_clicked:
+                        _persist("logging_settings", "failed",
+                                 "Could not find three-dot menu on 'For all Internet access' row")
+                        log_fn("[scc-reset] logging_settings: three-dot menu not found")
+                    else:
+                        # Click "Edit" from the dropdown
+                        _edit_clicked = False
+                        for _es in [
+                            '[role="menuitem"]:has-text("Edit")',
+                            'button:has-text("Edit")',
+                            'a:has-text("Edit")',
+                            'li:has-text("Edit")',
                         ]:
                             try:
-                                tog = page.locator(_ts).first
-                                if tog.is_visible(timeout=1500):
-                                    if tog.is_checked():
-                                        tog.click(); page.wait_for_timeout(400)
-                                    _toggled = True; break
+                                eb = page.locator(_es).first
+                                if eb.is_visible(timeout=2000):
+                                    eb.click()
+                                    page.wait_for_timeout(2000)
+                                    _edit_clicked = True
+                                    break
                             except Exception:
                                 continue
-                        for _ss in ['button:has-text("Save")', 'button:has-text("Apply")', 'button[type="submit"]']:
-                            try:
-                                sb = page.locator(_ss).first
-                                if sb.is_visible(timeout=1500):
-                                    sb.click(); page.wait_for_timeout(1500); break
-                            except Exception:
-                                continue
-                        _detail = "Logging disabled ✓" if _toggled else "Edit opened — logging toggle not found (may already be off)"
-                    else:
-                        _detail = "Policy row found but no Edit button — logging may already be disabled"
-                else:
-                    _detail = "Landed on Access Policy page but content pattern not recognized"
-                if _landed:
-                    _persist("logging_settings", "completed", _detail)
-                    log_fn(f"[scc-reset] logging_settings: {_detail}")
+
+                        if not _edit_clicked:
+                            _persist("logging_settings", "failed",
+                                     "Edit option not found in three-dot dropdown")
+                            log_fn("[scc-reset] logging_settings: Edit not found in dropdown")
+                        else:
+                            _shot("1_logging_edit")
+                            # Check toggle state: text "Logging is disabled" means already off
+                            _body_text = page.inner_text("body").lower()
+                            if "logging is disabled" in _body_text:
+                                # Already disabled — cancel out
+                                for _cs in ['button:has-text("Cancel")',
+                                            'button[aria-label*="cancel" i]']:
+                                    try:
+                                        cb = page.locator(_cs).first
+                                        if cb.is_visible(timeout=1500):
+                                            cb.click(); page.wait_for_timeout(500); break
+                                    except Exception:
+                                        continue
+                                _persist("logging_settings", "completed",
+                                         "Logging already disabled ✓")
+                                log_fn("[scc-reset] logging_settings: already disabled ✓")
+                            else:
+                                # Logging is enabled — click the toggle to disable it.
+                                # Primary selector: [role="switch"] with aria-checked="true"
+                                _toggled = False
+                                for _ts in [
+                                    '[role="switch"][aria-checked="true"]',
+                                    '[role="switch"]',
+                                    'input[type="checkbox"][aria-label*="log" i]',
+                                    'input[type="checkbox"]',
+                                    'label:has-text("Log") input',
+                                ]:
+                                    try:
+                                        tog = page.locator(_ts).first
+                                        if tog.is_visible(timeout=1500):
+                                            tog.click()
+                                            page.wait_for_timeout(800)
+                                            # Verify toggle is now off
+                                            _after = page.inner_text("body").lower()
+                                            if "logging is disabled" in _after:
+                                                _toggled = True
+                                            else:
+                                                # Click again if it went wrong direction
+                                                tog.click()
+                                                page.wait_for_timeout(600)
+                                            break
+                                    except Exception:
+                                        continue
+                                # Save
+                                for _ss in ['button:has-text("Save")',
+                                            'button[type="submit"]']:
+                                    try:
+                                        sb = page.locator(_ss).first
+                                        if sb.is_visible(timeout=1500):
+                                            sb.click(); page.wait_for_timeout(1500); break
+                                    except Exception:
+                                        continue
+                                _detail = ("Logging disabled ✓" if _toggled
+                                           else "Save clicked — toggle state uncertain")
+                                _persist("logging_settings", "completed", _detail)
+                                log_fn(f"[scc-reset] logging_settings: {_detail}")
             except Exception as _e:
                 _persist("logging_settings", "failed", f"Error: {str(_e)[:120]}")
-                log_fn(f"[scc-reset] error: {_e}")
+                log_fn(f"[scc-reset] logging_settings error: {_e}")
 
             # ── 2. ravpn_profiles ─────────────────────────────────────────────
             log_fn("[scc-reset] 2/7 ravpn_profiles")
