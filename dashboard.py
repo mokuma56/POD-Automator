@@ -2619,6 +2619,27 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
     _base = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
              if _eid else "https://security.cisco.com/dashboard")
 
+    # Look up sa_org_id from DB so _sa_url() can build direct SA URLs even
+    # when _enter_secure_access() fails to navigate the browser into SA.
+    _sa_org_id_db = ""
+    try:
+        import re as _re_org
+        with _sq.connect(db_path) as _c_org:
+            _row_org = _c_org.execute(
+                "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
+            ).fetchone()
+            if _row_org and _row_org[0]:
+                _m_org = _re_org.search(r"pseudoco-(\d+)", _row_org[0])
+                if _m_org:
+                    _oc_row = _c_org.execute(
+                        "SELECT sa_org_id FROM org_credentials WHERE org_number=?",
+                        (_m_org.group(1),)
+                    ).fetchone()
+                    if _oc_row and _oc_row[0]:
+                        _sa_org_id_db = _oc_row[0].strip()
+    except Exception:
+        pass
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
@@ -2693,11 +2714,16 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
 
             def _sa_url(path: str) -> str:
                 """Build a full SA URL by extracting the org number from the current
-                page URL (e.g. /secure-access/org/8383340/...) and appending path."""
+                page URL (e.g. /secure-access/org/8383340/...) and appending path.
+                Falls back to sa_org_id from DB when the page URL doesn't contain
+                /secure-access/org/ (e.g. when _enter_secure_access() navigation
+                didn't fully land on an SA page)."""
                 import re as _re
                 _m = _re.search(r'/secure-access/org/(\d+)', page.url)
                 if _m:
                     return f"https://security.cisco.com/secure-access/org/{_m.group(1)}{path}"
+                if _sa_org_id_db:
+                    return f"https://security.cisco.com/secure-access/org/{_sa_org_id_db}{path}"
                 return ""
 
             def _enter_secure_access() -> bool:
