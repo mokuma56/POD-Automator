@@ -2998,7 +2998,7 @@ def phase_scc_reset_check():
                 headers={"Content-Type": "application/json"},
                 data=b"{}",
             )
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            with urllib.request.urlopen(req, timeout=600) as resp:
                 data = _json.loads(resp.read())
             return data.get("ok", False), data.get("result", "no result from host")
         except Exception as e:

@@ -1181,37 +1181,41 @@ def api_scc_recheck_timeout(pod_id):
 
 @app.route("/api/scc/run-check-sync/<pod_id>", methods=["POST"])
 def api_scc_run_check_sync(pod_id):
-    """Run phase_scc_reset_check directly on the host (public internet access for api.sse.cisco.com).
+    """Run the full SCC reset (all 13 items) synchronously on the host.
     Called by the pipeline container via host.docker.internal when inside Docker.
-    Also kicks off the 7 browser-based checklist items in a background thread so all
-    13 items are persisted to scc_checklist by the time the operator views the dashboard."""
-    import sys, os as _os, threading, importlib
+    Phase 1: 6 API-based items via phase_scc_reset_check().
+    Phase 2: 7 browser-based items via _scc_auto_reset_manual().
+    Both phases run to completion before returning so the pipeline step is only
+    marked Done after all 13 checklist items are persisted."""
+    import sys, os as _os, importlib
     sys.path.insert(0, str(Path(__file__).parent))
     _os.environ["POD_ID"] = pod_id
     _os.environ["DB_PATH"] = str(Path(__file__).parent / "data" / "pod_state.db")
     _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
+
+    # Phase 1 — 6 API items
     try:
         import onboard_router
         importlib.reload(onboard_router)
-        ok, result = onboard_router.phase_scc_reset_check()
+        api_ok, api_result = onboard_router.phase_scc_reset_check()
+        log(pod_id, f"[scc-reset] API checks done: {api_result}")
     except Exception as e:
-        return jsonify({"ok": False, "result": str(e)}), 500
+        api_ok, api_result = False, str(e)
+        log(pod_id, f"[scc-reset] API checks error: {e}")
 
-    # Kick off the 7 browser-based checklist items in the background.
-    # The pipeline step doesn't wait for this — it will complete asynchronously
-    # and persist results to scc_checklist so they appear in the dashboard.
-    def _run_browser_reset():
-        try:
-            log(pod_id, "[scc-reset] Background browser reset starting (7 manual items)...")
-            _ok, _msg = _scc_auto_reset_manual(pod_id, lambda m: log(pod_id, m))
-            log(pod_id, f"[scc-reset] Background browser reset done: {_msg}")
-        except Exception as _e:
-            log(pod_id, f"[scc-reset] Background browser reset error: {_e}")
+    # Phase 2 — 7 browser-based items (runs synchronously so step stays "running"
+    # until all 13 items are persisted)
+    try:
+        log(pod_id, "[scc-reset] Starting browser reset (7 manual items)...")
+        browser_ok, browser_result = _scc_auto_reset_manual(pod_id, lambda m: log(pod_id, m))
+        log(pod_id, f"[scc-reset] Browser reset done: {browser_result}")
+    except Exception as e:
+        browser_ok, browser_result = False, str(e)
+        log(pod_id, f"[scc-reset] Browser reset error: {e}")
 
-    threading.Thread(target=_run_browser_reset, daemon=True,
-                     name=f"scc-browser-reset-{pod_id}").start()
-
-    return jsonify({"ok": ok, "result": result})
+    overall_ok = api_ok and browser_ok
+    combined = f"API: {api_result} | Browser: {browser_result}"
+    return jsonify({"ok": overall_ok, "result": combined})
 
 
 @app.route("/api/duo-saml-setup/<pod_id>", methods=["POST"])
