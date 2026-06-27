@@ -52,6 +52,40 @@ FLASH_CLEANUP = [
     "flash:dnac_evpn.cfg",
 ]
 
+# Teardown block injected at the START of every conf t push (before base config lines).
+# Order matters: SVIs first (so VRFs/VLANs can be deleted), then AAA refs, then group,
+# then VRF definitions, then VLANs.  All commands are idempotent — safe on clean switches.
+CATC_TEARDOWN_LINES = [
+    # Remove CatC-pushed SVI interfaces so VRFs and VLANs can be deleted
+    "no interface Vlan10",
+    "no interface Vlan101",
+    "no interface Vlan102",
+    "no interface Vlan1010",
+    "no interface Vlan1101",
+    "no interface Vlan1102",
+    # Remove dot1x
+    "no dot1x system-auth-control",
+    # Remove AAA list references to dnac group before removing the group itself
+    "no aaa authentication login dnac-cts-list group dnac-client-radius-group local",
+    "no aaa authentication dot1x default group dnac-client-radius-group",
+    "no aaa authorization network default group dnac-client-radius-group local",
+    "no aaa authorization network dnac-cts-list group dnac-client-radius-group local",
+    # Remove the CatC RADIUS server group (safe now that all AAA refs are gone)
+    "no aaa group server radius dnac-client-radius-group",
+    # Remove CatC VRF definitions (SVIs removed above)
+    "no vrf definition Main",
+    "no vrf definition IOT",
+    "no vrf definition PROD",
+    # Remove CatC VLANs (SVIs removed above so VLAN DB entries can be purged)
+    "no vlan 10,101,102,1010,1101,1102",
+    # Remove CatC NETCONF-pushed accounting/radius commands.
+    # These are pushed *after* reload via NETCONF so they are NOT caught by the pre-reload
+    # conf t teardown above.  They are idempotent — safe to run on clean switches.
+    "no aaa accounting update newinfo",
+    "no aaa accounting identity default start-stop group dnac-client-radius-group",
+    "no aaa server radius dynamic-author",
+]
+
 
 def _wait_for_enable(tn, log_fn, timeout=15):
     """
@@ -123,10 +157,32 @@ def _telnet_reset(host, local_config_path, log_fn):
     _send_cmd(tn, "terminal length 0", wait=0.5)
     _send_cmd(tn, "no ip domain lookup", wait=0.5)
 
+    # ── Step 0: Erase NVRAM so conf t push is the ONLY config on reload ───────
+    # Without this, conf t MERGES with existing config — CatC AAA/dot1x/RADIUS
+    # commands survive because they are never explicitly removed.
+    log_fn(f"  Erasing NVRAM (write erase)...")
+    tn.write(b"write erase\n")
+    out = tn.read_until(b"?", timeout=10).decode("utf-8", errors="replace")
+    tn.write(b"\n")  # confirm
+    deadline = time.time() + 15
+    erase_buf = ""
+    while time.time() < deadline:
+        chunk = tn.read_very_eager().decode("utf-8", errors="replace")
+        erase_buf += chunk
+        if "erase" in erase_buf.lower() and "#" in erase_buf:
+            break
+        time.sleep(0.5)
+    log_fn(f"  NVRAM erased")
+
     # ── Step 1: Push base config ──────────────────────────────────────────────
     log_fn(f"  Reading base config from {local_config_path}...")
     with open(local_config_path) as f:
-        config_lines = [l.rstrip() for l in f if l.strip() and not l.strip().startswith("!")]
+        base_lines = [l.rstrip() for l in f if l.strip() and not l.strip().startswith("!")]
+
+    # Build final config_lines: teardown first, then base config
+    # Teardown removes CatC SVIs/AAA/VRFs/VLANs from running-config so write memory
+    # saves a clean state — without this, conf t merges and CatC remnants survive.
+    config_lines = list(CATC_TEARDOWN_LINES) + base_lines
 
     if "no ip domain lookup" not in config_lines:
         config_lines.insert(0, "no ip domain lookup")
@@ -134,7 +190,7 @@ def _telnet_reset(host, local_config_path, log_fn):
         config_lines.append("config-register 0x2102")
     config_lines.append("end")
 
-    log_fn(f"  Entering config mode, pushing {len(config_lines)} lines...")
+    log_fn(f"  Entering config mode, pushing {len(config_lines)} lines (incl. {len(CATC_TEARDOWN_LINES)}-line CatC teardown)...")
     tn.write(b"conf t\n")
     tn.read_until(b"(config)#", timeout=10)
 
@@ -249,6 +305,17 @@ def _post_reload(host, log_fn):
         read_timeout=60,
     )
     log_fn(f"  RSA: {out[:80].strip()}")
+
+    # Remove any CatC NETCONF-pushed config that arrived during the 300s reload window.
+    # CatC reconnects via NETCONF after reload and re-pushes AAA/accounting/dot1x even
+    # when the device was deleted from inventory.  Run the full teardown set again here
+    # (all commands are idempotent — harmless on a clean switch).
+    log_fn(f"  Post-reload CatC teardown (removes NETCONF-pushed AAA/dot1x)...")
+    try:
+        conn.send_config_set(CATC_TEARDOWN_LINES)
+        log_fn(f"  Post-reload teardown complete")
+    except Exception as e:
+        log_fn(f"  Warning: post-reload teardown error (non-fatal): {e}")
 
     log_fn(f"  Final write memory...")
     out = conn.send_command("write memory", expect_string=r"\[OK\]|#", read_timeout=20)

@@ -162,7 +162,8 @@ def _migrate():
     for _col in ("authproxy_ikey", "authproxy_skey",
                  "duo_saml_app_ikey", "sa_saml_profile_id",
                  "scc_password", "scc_email", "authproxy_cfg",
-                 "sa_scim_token"):
+                 "sa_scim_token", "authproxy_enroll_blob",
+                 "authproxy_blob_saved_at"):
         try:
             conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
         except Exception:
@@ -236,6 +237,12 @@ def _ensure_duo_table():
     _da_init.duo_ensure_table(str(DB_PATH))
 
 _ensure_duo_table()
+
+def _ensure_ise_table():
+    import ise_integrations as _ise_init
+    _ise_init.ise_ensure_table(str(DB_PATH))
+
+_ensure_ise_table()
 
 # ---- Log helpers ----
 def log(pod_id, msg):
@@ -392,7 +399,7 @@ SWITCH_CHECKS = {
 def api_switches(pod_id):
     conn = _db()
     steps = conn.execute(
-        "SELECT * FROM pipeline_steps WHERE pod_id = ? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test') ORDER BY rowid",
+        "SELECT * FROM pipeline_steps WHERE pod_id = ? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','route_verification') ORDER BY rowid",
         (pod_id,)
     ).fetchall()
     conn.close()
@@ -403,7 +410,7 @@ def api_switches(pod_id):
         result_text = s["result"] or ""
         status = s["status"]
         parts = [p.strip() for p in result_text.split("|")]
-        results[name] = {"status": status, "parts": parts}
+        results[name] = {"status": status, "parts": parts, "result_text": result_text}
 
     switch_data = []
     for key, info in SWITCH_CHECKS.items():
@@ -417,9 +424,18 @@ def api_switches(pod_id):
             model = check_parts[0].replace("MODEL: ", "")
             check_parts = check_parts[1:]  # remove MODEL prefix, shift indices
 
+        # Detect top-level SSH/connection failure: single error string, not per-check results
+        error_msg = ""
+        if (step.get("status") == "failed"
+                and len(check_parts) == 1
+                and not check_parts[0].startswith(("PASS", "FAIL", "MODEL:"))):
+            error_msg = check_parts[0]  # e.g. "SSH FAILED: timed out"
+
         checks = []
         for i, label in enumerate(info["checks"]):
-            if step.get("status") in ("completed", "failed") and i < len(check_parts):
+            if error_msg:
+                checks.append({"label": label, "status": "fail", "result": error_msg})
+            elif step.get("status") in ("completed", "failed") and i < len(check_parts):
                 part = check_parts[i]
                 if part.startswith("PASS"):
                     checks.append({"label": label, "status": "pass", "result": part.replace("PASS: ", "")})
@@ -431,8 +447,6 @@ def api_switches(pod_id):
                 checks.append({"label": label, "status": "na", "result": "no data"})
             elif step.get("status") == "running":
                 checks.append({"label": label, "status": "na", "result": "checking..."})
-            elif step.get("status") == "failed":
-                checks.append({"label": label, "status": "fail", "result": "verification failed"})
             else:
                 checks.append({"label": label, "status": "na", "result": "pending"})
 
@@ -486,6 +500,68 @@ def api_switches(pod_id):
         "failed": ct_failed,
         "total": len(ct_checks),
         "step_status": ct_status,
+    })
+
+    # ── Route Verification card ──
+    rv_step   = results.get("route_verification", {})
+    rv_status = rv_step.get("status", "pending")
+    rv_full   = rv_step.get("result_text", "")
+
+    # Split raw route table from summary (separator injected by onboard_router)
+    _ROUTE_SEP = "\n---ROUTES---\n"
+    if _ROUTE_SEP in rv_full:
+        rv_result, rv_raw_routes = rv_full.split(_ROUTE_SEP, 1)
+        rv_raw_routes = rv_raw_routes.strip()
+    else:
+        rv_result    = rv_full
+        rv_raw_routes = ""
+
+    # Parse pipe-delimited summary: PASS|found=13/13|reloaded=no
+    rv_parts_map = {}
+    for _p in rv_result.split("|"):
+        if "=" in _p:
+            k, v = _p.split("=", 1)
+            rv_parts_map[k.strip()] = v.strip()
+    rv_overall   = rv_result.split("|")[0].strip() if rv_result else ""  # "PASS" or "WARN"
+    rv_missing   = set(rv_parts_map.get("missing", "").split(",")) - {""}
+    rv_reloaded  = rv_parts_map.get("reloaded", "no")
+
+    from onboard_router import ROUTE_VRF10_CHECKS
+    rv_checks = []
+    for label, prefixes in ROUTE_VRF10_CHECKS:
+        if rv_status in ("completed", "failed"):
+            grp_missing = [p for p in prefixes if p in rv_missing]
+            if rv_overall == "WARN" and grp_missing:
+                rv_checks.append({"label": label, "status": "fail",
+                                  "result": f"MISSING: {', '.join(grp_missing)}"})
+            else:
+                rv_checks.append({"label": label, "status": "pass", "result": "found"})
+        elif rv_status == "running":
+            rv_checks.append({"label": label, "status": "na", "result": "checking..."})
+        else:
+            rv_checks.append({"label": label, "status": "na", "result": "pending"})
+
+    if rv_reloaded == "yes" and rv_status in ("completed", "failed"):
+        rv_checks.append({"label": "Router reloaded during verification",
+                          "status": "pass" if rv_overall == "PASS" else "fail",
+                          "result": "reloaded — routes re-verified after reload"
+                                    if rv_overall == "PASS"
+                                    else "reloaded but routes still missing"})
+
+    rv_passed = sum(1 for c in rv_checks if c["status"] == "pass")
+    rv_failed = sum(1 for c in rv_checks if c["status"] == "fail")
+    switch_data.append({
+        "name":        "HQ CEDGE Route Verification",
+        "model":       "IOS XE SD-WAN",
+        "ip":          "198.18.133.13",
+        "host":        "route_verification",
+        "checks":      rv_checks,
+        "passed":      rv_passed,
+        "failed":      rv_failed,
+        "total":       len(rv_checks),
+        "step_status": rv_status,
+        "reloaded":    rv_reloaded,
+        "raw_routes":  rv_raw_routes,
     })
 
     return jsonify(switch_data)
@@ -555,8 +631,8 @@ def api_switches_recheck(pod_id):
 
     def _recheck():
         try:
-            switches = ["verify_border_spine", "verify_leaf1", "verify_leaf2", "connectivity_test"]
-            # Mark ALL steps as running upfront so UI shows spinner with 0/4 done
+            switches = ["verify_border_spine", "verify_leaf1", "verify_leaf2", "connectivity_test", "route_verification"]
+            # Mark ALL steps as running upfront so UI shows spinner with 0/5 done
             _c = _db()
             for step_name in switches:
                 _c.execute("INSERT OR REPLACE INTO pipeline_steps (pod_id, step_name, status, started_at, completed_at, result) VALUES (?, ?, 'running', datetime('now'), NULL, '')", (pod_id, step_name))
@@ -567,6 +643,8 @@ def api_switches_recheck(pod_id):
             for step_name in switches:
                 if step_name == "connectivity_test":
                     func_call = "onboard_router.phase_connectivity_test()"
+                elif step_name == "route_verification":
+                    func_call = "onboard_router.phase_route_verification()"
                 else:
                     func_call = f"onboard_router.run_switch_checks('{step_name}')"
                 script = (
@@ -601,7 +679,7 @@ def api_switches_recheck(pod_id):
                     (pod_id, step_name, status, started_at, completed_at, result)
                     VALUES (?, ?, ?, COALESCE((SELECT started_at FROM pipeline_steps WHERE pod_id=? AND step_name=?), datetime('now')),
                             datetime('now'), ?)""",
-                    (pod_id, step_name, status, pod_id, step_name, str(result_val)[:500]))
+                    (pod_id, step_name, status, pod_id, step_name, str(result_val)[:8000]))
                 conn2.execute("UPDATE pods SET updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
                 conn2.commit()
                 conn2.close()
@@ -609,7 +687,7 @@ def api_switches_recheck(pod_id):
             # Update notes if all switches passed
             conn3 = _db()
             steps = conn3.execute(
-                "SELECT step_name, status FROM pipeline_steps WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test')",
+                "SELECT step_name, status FROM pipeline_steps WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','route_verification')",
                 (pod_id,)
             ).fetchall()
             switch_statuses = {s["step_name"]: s["status"] for s in steps}
@@ -634,7 +712,7 @@ def api_switches_recheck(pod_id):
             # Reset any steps stuck in 'running' back to 'failed' so UI doesn't loop forever
             _c = _db()
             _c.execute(
-                "UPDATE pipeline_steps SET status='failed', result='Re-check error: ' || ? WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test') AND status='running'",
+                "UPDATE pipeline_steps SET status='failed', result='Re-check error: ' || ? WHERE pod_id=? AND step_name IN ('verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','route_verification') AND status='running'",
                 (str(e)[:200], pod_id)
             )
             _c.commit()
@@ -643,6 +721,77 @@ def api_switches_recheck(pod_id):
     t = threading.Thread(target=_recheck, daemon=True)
     t.start()
     return jsonify({"status": "ok", "message": "Switch re-check started for " + pod_id})
+
+
+@app.route("/api/routes/manual-retest/<pod_id>", methods=["POST"])
+def api_routes_manual_retest(pod_id):
+    """
+    Manual Reboot / Re-test: forces a CEDGE reload by injecting 192.0.2.254
+    (RFC 5737 — never a real route), then re-verifies all VRF 10 routes after
+    the router comes back online.  Always soft-fails (WARN) and proceeds.
+    """
+    import threading
+
+    conn = _db()
+    row = conn.execute("SELECT router_ip FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"status": "error", "message": "POD not found"}), 404
+
+    # Verify VPN container is running
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error",
+                        "message": f"VPN container vpn-{pod_id} not running"}), 400
+
+    # Mark as running immediately
+    _c = _db()
+    _c.execute(
+        "INSERT OR REPLACE INTO pipeline_steps "
+        "(pod_id, step_name, status, started_at, completed_at, result) "
+        "VALUES (?, 'route_verification', 'running', datetime('now'), NULL, 'Manual reboot / re-test in progress...')",
+        (pod_id,)
+    )
+    _c.commit(); _c.close()
+
+    def _run_test():
+        script = (
+            "import sys; sys.path.insert(0, '.'); import onboard_router; "
+            f"onboard_router.ROUTER_IP = '{row['router_ip']}'; "
+            "ok, result = onboard_router.phase_route_verification_test(); "
+            "print(repr((ok, result)))"
+        )
+        res = subprocess.run([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-c", script
+        ], capture_output=True, text=True, timeout=600)
+        stdout = res.stdout.strip()
+        last_line = stdout.splitlines()[-1] if stdout else ""
+        try:
+            ok_val, result_val = eval(last_line)
+        except Exception as e:
+            ok_val, result_val = False, f"parse error: {e} | raw: {stdout[:200]}"
+        status = "completed" if ok_val else "failed"
+        _c2 = _db()
+        _c2.execute(
+            "INSERT OR REPLACE INTO pipeline_steps "
+            "(pod_id, step_name, status, started_at, completed_at, result) "
+            "VALUES (?, 'route_verification', ?, "
+            "COALESCE((SELECT started_at FROM pipeline_steps WHERE pod_id=? AND step_name='route_verification'), datetime('now')), "
+            "datetime('now'), ?)",
+            (pod_id, status, pod_id, str(result_val)[:8000])
+        )
+        _c2.commit(); _c2.close()
+        log(pod_id, f"[route-manual-retest] {status}: {result_val}")
+
+    threading.Thread(target=_run_test, daemon=True).start()
+    return jsonify({"status": "started",
+                    "message": "Manual reboot / re-test started — CEDGE will be reloaded"})
 
 
 @app.route("/api/cdfmc/<pod_id>", methods=["GET"])
@@ -1156,17 +1305,17 @@ def api_duo_ext_dir_setup_sync(pod_id):
 
 @app.route("/api/scc/confirm/<pod_id>/<item_key>", methods=["POST"])
 def api_scc_confirm(pod_id, item_key):
-    """Mark a manual SCC checklist item as confirmed by proctor."""
+    """Mark any SCC checklist item as confirmed (fallback/override for automation failures)."""
     data = request.get_json(silent=True) or {}
     confirmed_by = data.get("confirmed_by", "proctor")
-    MANUAL_ITEMS = {
-        "logging_settings", "ravpn_profiles",
-        "dlp_rules", "private_resources", "dns_servers",
-        "ravpn_ip_pool", "ise_pxgrid", "epp_manual",
-        "duo_saml", "te_integration",
+    ALL_ITEMS = {
+        "access_policy_rules", "network_tunnel_groups", "zta_profiles",
+        "private_resources", "dns_servers", "epp_posture_profiles",
+        "logging_settings", "ravpn_profiles", "dlp_rules",
+        "ravpn_ip_pool", "ise_pxgrid", "duo_saml", "te_integration",
     }
-    if item_key not in MANUAL_ITEMS:
-        return jsonify({"status": "error", "message": f"Unknown manual item: {item_key}"}), 400
+    if item_key not in ALL_ITEMS:
+        return jsonify({"status": "error", "message": f"Unknown item: {item_key}"}), 400
     c = _db()
     c.execute(
         "INSERT OR REPLACE INTO scc_checklist "
@@ -1190,6 +1339,15 @@ def api_scc_unconfirm(pod_id, item_key):
     )
     c.commit(); c.close()
     return jsonify({"status": "ok", "item_key": item_key})
+
+
+@app.route("/api/scc/clear/<pod_id>", methods=["POST"])
+def api_scc_clear(pod_id):
+    """Delete all SCC checklist results for a POD (reset to blank slate)."""
+    c = _db()
+    c.execute("DELETE FROM scc_checklist WHERE pod_id=?", (pod_id,))
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "pod_id": pod_id})
 
 
 # ── EVPN Fabric endpoints ─────────────────────────────────────────────────────
@@ -1555,6 +1713,3258 @@ def api_duo_reset(pod_id):
     return jsonify({"status": "ok", "message": f"Duo state cleared for {pod_id}"})
 
 
+# ── ISE Integration Card API ──────────────────────────────────────────────────
+
+@app.route("/api/ise/status/<pod_id>")
+def api_ise_status(pod_id):
+    """Return ISE card step status for a POD."""
+    _ensure_ise_table()
+    c = _db()
+    rows = c.execute(
+        "SELECT step_name, status, result, started_at, completed_at "
+        "FROM ise_steps WHERE pod_id=?", (pod_id,)
+    ).fetchall()
+    c.close()
+    steps = {r["step_name"]: dict(r) for r in rows}
+    return jsonify({"steps": steps})
+
+
+@app.route("/api/ise/run/<pod_id>", methods=["POST"])
+def api_ise_run(pod_id):
+    """Start ISE integration card via docker run inside the VPN network namespace."""
+    import threading
+    _ensure_ise_table()
+    data = request.get_json(silent=True) or {}
+    from_step = int(request.args.get("from_step", data.get("from_step", 0)))
+
+    # Verify VPN container is running
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    def _run():
+        proc = subprocess.Popen([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-u", "-c",
+            f"import sys; sys.path.insert(0,'/pipeline'); "
+            f"from ise_integrations import ise_run_card, ise_ensure_table; "
+            f"ise_ensure_table('/pipeline/host-data/pod_state.db'); "
+            f"ok, r = ise_run_card('{pod_id}', '/pipeline/host-data/pod_state.db', "
+            f"    log=print, from_step={from_step}); "
+            f"print(('OK' if ok else 'FAIL') + ': ' + str(r))"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, f"[ise] {line}")
+
+        proc.wait()
+        _clear_stuck_running(pod_id, "ise_steps")
+        log(pod_id, f"[ise] container exited (rc={proc.returncode})")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "pod_id": pod_id, "from_step": from_step})
+
+
+@app.route("/api/ise/reset/<pod_id>", methods=["POST"])
+def api_ise_reset(pod_id):
+    """Clear all ISE card step rows for a POD."""
+    _ensure_ise_table()
+    c = _db()
+    c.execute("DELETE FROM ise_steps WHERE pod_id=?", (pod_id,))
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "message": f"ISE state cleared for {pod_id}"})
+
+
+@app.route("/api/ise/reactivate/<pod_id>", methods=["POST"])
+def api_ise_reactivate(pod_id):
+    """Run ONLY the ISE→SCC deactivate+reactivate step (step 3) independently.
+
+    Resets step 3 to pending so the skip-check doesn't skip it, then launches
+    ise_run_card with from_step=2 inside the VPN network namespace.
+    """
+    import threading
+    _ensure_ise_table()
+
+    # Reset step 3 to pending so the skip check runs it
+    c = _db()
+    c.execute(
+        "UPDATE ise_steps SET status='pending', result='', started_at=NULL, completed_at=NULL "
+        "WHERE pod_id=? AND step_name='ise_scc_deactivate_reactivate'",
+        (pod_id,)
+    )
+    c.commit(); c.close()
+
+    # Verify VPN container is running
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    def _run():
+        proc = subprocess.Popen([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-u", "-c",
+            f"import sys; sys.path.insert(0,'/pipeline'); "
+            f"from ise_integrations import ise_run_card, ise_ensure_table; "
+            f"ise_ensure_table('/pipeline/host-data/pod_state.db'); "
+            f"ok, r = ise_run_card('{pod_id}', '/pipeline/host-data/pod_state.db', "
+            f"    log=print, from_step=2); "
+            f"print(('OK' if ok else 'FAIL') + ': ' + str(r))"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, f"[ise] {line}")
+
+        proc.wait()
+        _clear_stuck_running(pod_id, "ise_steps")
+        log(pod_id, f"[ise] container exited (rc={proc.returncode})")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "pod_id": pod_id, "step": "ise_scc_deactivate_reactivate"})
+
+
+def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) -> tuple:
+    """Run SCC Platform Integrations on the HOST (not Docker).
+    Docker routes all traffic through OpenConnect VPN which breaks Okta silent-renew.
+    On the host, storage_state → security.cisco.com works correctly.
+    Called by /api/ise/scc-complete which the Docker ISE container POSTs to.
+    """
+    import time as _time
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            _sd = json.loads(Path(session_path).read_text())
+            if isinstance(_sd, dict) and "cookies" in _sd:
+                log_fn(f"[scc-nav] storage_state: {len(_sd.get('cookies',[]))} cookies, "
+                       f"{len(_sd.get('origins', []))} origins")
+                scc_ctx = browser.new_context(
+                    storage_state=_sd,
+                    viewport={"width": 1920, "height": 1080},
+                )
+            else:
+                log_fn("[scc-nav] legacy cookie session")
+                scc_ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
+                scc_ctx.add_cookies(_sd)
+            page = scc_ctx.new_page()
+            page.set_default_timeout(30000)
+
+            # Intercept SCC API responses so we can detect OTP rejection (400)
+            # without relying on page-content heuristics.
+            _scc_api_resp: dict = {}
+            def _on_scc_response(resp) -> None:
+                if "/v1/ise" in resp.url and resp.request.method == "POST":
+                    _scc_api_resp["status"] = resp.status
+                    try:
+                        _scc_api_resp["body"] = resp.text()
+                    except Exception:
+                        pass
+            page.on("response", _on_scc_response)
+
+            _eid = ""
+            for _o in _sd.get("origins", []):
+                for _it in _o.get("localStorage", []):
+                    if _it.get("name") == "enterpriseId":
+                        _eid = _it["value"]
+                        break
+            _url = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
+                    if _eid else "https://security.cisco.com/dashboard")
+            log_fn(f"[scc-nav] Navigating to SCC dashboard...")
+            page.goto(_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+
+            # /login/callback is the OAuth2 callback URL — the SPA is processing a
+            # silent token renewal, not a login failure. Wait up to 20s for it to
+            # complete and land on the actual dashboard.
+            _wait = 0
+            while _wait < 20 and "login/callback" in page.url.lower():
+                page.wait_for_timeout(2000)
+                _wait += 2
+                log_fn(f"[scc-nav] Waiting for OAuth callback to complete ({_wait}s)... {page.url[:60]}")
+
+            # Only fail if still stuck on Okta sign-on (truly expired session)
+            if "sign-on" in page.url.lower() and "security.cisco.com" not in page.url.lower():
+                return False, f"SCC session expired (URL: {page.url}) — re-run Refresh SCC Sessions"
+            if "login" in page.url.lower() and "/login/callback" not in page.url.lower():
+                return False, f"SCC session expired (URL: {page.url}) — re-run Refresh SCC Sessions"
+            log_fn(f"[scc-nav] On dashboard: {page.url[:70]}")
+
+            # Wait for SPA to fully render (sidebar needs time after OAuth callback)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(3000)
+
+            # Dump ALL nav links (including those below fold) for debugging
+            try:
+                _nav_links = page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('a, [role="link"]'))
+                        .map(a => ({href: a.href || '', text: (a.textContent || '').trim().slice(0, 60)}))
+                        .filter(a => a.href || a.text)
+                        .slice(0, 50);
+                }""")
+                log_fn("[scc-nav] ALL links: " +
+                       " | ".join(f"{l['text']!r}" for l in _nav_links if l['text'])[:300])
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_dashboard_{pod_id}.png"))
+            except Exception as _de:
+                log_fn(f"[scc-nav] link dump failed: {_de}")
+
+            # Dismiss org picker
+            try:
+                cont = page.locator('button:has-text("Continue")').first
+                cont.wait_for(state="visible", timeout=6000)
+                cont.click()
+                log_fn("[scc-nav] Dismissed org picker")
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+                page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            # ── Navigate via Platform Management → Integrations in sidebar ─────────
+            # The direct /ise-integration URL renders a blank SPA page (content area
+            # never mounts). Navigate through the sidebar instead:
+            # Platform Management → Integrations → My Integrations → ISE form
+            _nav_clicked = False
+
+            # Step 1: Click Platform Management in sidebar to expand it
+            log_fn("[scc-nav] Clicking Platform Management in sidebar")
+            _pm_clicked = False
+            for _pm_sel in [
+                'a:has-text("Platform Management")',
+                'button:has-text("Platform Management")',
+                'li:has-text("Platform Management") a',
+                'li:has-text("Platform Management") button',
+            ]:
+                try:
+                    el = page.locator(_pm_sel).first
+                    if el.is_visible(timeout=5000):
+                        el.click()
+                        page.wait_for_timeout(2000)
+                        log_fn(f"[scc-nav] Clicked Platform Management via {_pm_sel!r}")
+                        _pm_clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not _pm_clicked:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_pm_fail_{pod_id}.png"))
+                    log_fn("[scc-nav] WARN: Platform Management not found — saved scc_pm_fail screenshot")
+                except Exception:
+                    pass
+                return False, "Could not find Platform Management in SCC sidebar — check scc_pm_fail screenshot"
+
+            # Step 2: Click Integrations in the expanded submenu
+            page.wait_for_timeout(1000)
+            _int_clicked = False
+            for _int_sel in [
+                'a:has-text("Integrations"):not(:has-text("Platform"))',
+                'li:has-text("Integrations") > a',
+                'a[href*="integrations"]',
+                'a:has-text("Integrations")',
+            ]:
+                try:
+                    el = page.locator(_int_sel).first
+                    if el.is_visible(timeout=5000):
+                        el.click()
+                        page.wait_for_load_state("domcontentloaded", timeout=20000)
+                        page.wait_for_timeout(3000)
+                        log_fn(f"[scc-nav] Clicked Integrations via {_int_sel!r} → {page.url[:80]}")
+                        _int_clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not _int_clicked:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_int_fail_{pod_id}.png"))
+                    log_fn("[scc-nav] WARN: Integrations link not found — saved scc_int_fail screenshot")
+                except Exception:
+                    pass
+                return False, "Could not navigate to Integrations under Platform Management — check scc_int_fail screenshot"
+
+            log_fn(f"[scc-nav] Integrations page URL: {page.url[:80]}")
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_int_page_{pod_id}.png"))
+            except Exception:
+                pass
+
+            # Step 3: Click My Integrations tab if present
+            page.wait_for_timeout(1000)
+            for _tab_sel in [
+                'button:has-text("My Integrations")',
+                'a:has-text("My Integrations")',
+                '[role="tab"]:has-text("My Integrations")',
+            ]:
+                try:
+                    tab = page.locator(_tab_sel).first
+                    if tab.is_visible(timeout=3000):
+                        tab.click()
+                        page.wait_for_timeout(2000)
+                        log_fn("[scc-nav] Clicked My Integrations tab")
+                        break
+                except Exception:
+                    continue
+
+            # Dump page state for diagnostics
+            try:
+                _btns_on_page = page.evaluate("""() => Array.from(document.querySelectorAll(
+                    'button, a[role="button"], [role="button"]'))
+                    .map(b => b.textContent.trim().slice(0,40)).filter(t => t).slice(0,20)""")
+                log_fn("[scc-nav] Buttons on integrations page: " + " | ".join(_btns_on_page))
+            except Exception:
+                pass
+
+            # Step 4: Find ISE integration card or Add Integration button
+            page.wait_for_timeout(1000)
+            _page_text = page.inner_text("body").lower()
+            _ise_opened = False
+
+            # If ISE entry already exists and is active/connected → done.
+            # If it exists but is Deactivated/Failed → delete it and create fresh with new OTP.
+            if "ise" in _page_text:
+                _is_bad = any(kw in _page_text for kw in ("deactivated", "failed", "error"))
+                if not _is_bad:
+                    try:
+                        page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"))
+                    except Exception:
+                        pass
+                    log_fn("[scc-nav] ISE integration already active in SCC — done")
+                    return True, "ISE integration already active in SCC"
+                else:
+                    log_fn("[scc-nav] ISE integration present but Deactivated/Failed — deleting and recreating with new OTP")
+                    _deleted = False
+                    try:
+                        page.screenshot(path=str(DATA_DIR / "data" / f"scc_delete_fail_{pod_id}.png"))
+                    except Exception:
+                        pass
+                    # Row has a "..." kebab as the last button — no text content, target by position
+                    # NOTE: tr.is_visible() returns False in Playwright even for visible rows;
+                    #       check the button directly instead.
+                    try:
+                        _row = page.locator('tr').filter(has_text='ISE-POD')
+                        _kebab = _row.locator('button').last
+                        if not _kebab.is_visible(timeout=3000):
+                            raise Exception("kebab button not visible")
+                        _kebab.click(timeout=5000)
+                        page.wait_for_timeout(1000)
+                        log_fn("[scc-nav] Clicked kebab (last button in ISE row)")
+                    except Exception as _ke:
+                        log_fn(f"[scc-nav] Row kebab failed ({_ke}) — trying aria-label fallbacks")
+                        for _del_sel in [
+                            'button[aria-label*="action" i]',
+                            'button[aria-label*="option" i]',
+                            '.pf-v5-c-menu-toggle',
+                            'button.pf-v5-c-menu-toggle',
+                        ]:
+                            try:
+                                btn = page.locator(_del_sel).first
+                                if btn.is_visible(timeout=2000):
+                                    btn.click()
+                                    page.wait_for_timeout(1000)
+                                    log_fn(f"[scc-nav] Opened actions menu via {_del_sel!r}")
+                                    break
+                            except Exception:
+                                continue
+                    # Click Delete / Remove from the dropdown
+                    for _del_opt in [
+                        'button:has-text("Delete")',
+                        'li:has-text("Delete")',
+                        '[role="menuitem"]:has-text("Delete")',
+                        'a:has-text("Delete")',
+                        'button:has-text("Remove")',
+                        '[role="menuitem"]:has-text("Remove")',
+                    ]:
+                        try:
+                            opt = page.locator(_del_opt).first
+                            if opt.is_visible(timeout=3000):
+                                opt.click()
+                                page.wait_for_timeout(1500)
+                                log_fn(f"[scc-nav] Clicked delete option via {_del_opt!r}")
+                                _deleted = True
+                                break
+                        except Exception:
+                            continue
+                    # Confirm delete dialog if present
+                    if _deleted:
+                        for _confirm_sel in [
+                            'button:has-text("Delete")',
+                            'button:has-text("Confirm")',
+                            'button:has-text("Yes")',
+                            'button:has-text("OK")',
+                        ]:
+                            try:
+                                cb = page.locator(_confirm_sel).first
+                                if cb.is_visible(timeout=3000):
+                                    cb.click()
+                                    page.wait_for_timeout(2000)
+                                    log_fn(f"[scc-nav] Confirmed delete via {_confirm_sel!r}")
+                                    break
+                            except Exception:
+                                continue
+                        log_fn("[scc-nav] Existing ISE integration deleted — proceeding to add fresh integration")
+                    else:
+                        log_fn("[scc-nav] WARN: Could not delete deactivated integration — proceeding to Add Integration anyway")
+                    # Fall through to Add Integration path with _ise_opened = False
+
+            if not _ise_opened:
+                log_fn("[scc-nav] No ISE card found — clicking Add Integration")
+                for _add_lbl in ["Add Integration", "Add", "New Integration"]:
+                    try:
+                        btn = page.locator(
+                            f'button:has-text("{_add_lbl}"), a:has-text("{_add_lbl}")'
+                        ).first
+                        if btn.is_visible(timeout=5000):
+                            btn.click()
+                            page.wait_for_timeout(2000)
+                            log_fn(f"[scc-nav] Clicked '{_add_lbl}'")
+                            _ise_opened = True
+                            break
+                    except Exception:
+                        continue
+
+            if not _ise_opened:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_add_fail_{pod_id}.png"))
+                    log_fn("[scc-nav] WARN: No Add Integration or ISE card found — saved scc_add_fail screenshot")
+                except Exception:
+                    pass
+                return False, ("No Add Integration button or ISE card found on "
+                               "Platform Management → Integrations — check scc_add_fail screenshot")
+
+            # After Add Integration, we may need to select ISE from a type list
+            page.wait_for_timeout(1500)
+            _page_text2 = page.inner_text("body").lower()
+            if "ise" in _page_text2 and "token" not in _page_text2 and "otp" not in _page_text2:
+                for _ise_type_sel in [
+                    'button:has-text("ISE")',
+                    'a:has-text("ISE")',
+                    '[class*="card"]:has-text("ISE") button',
+                    '[class*="tile"]:has-text("ISE") button',
+                    'td:has-text("ISE")',
+                ]:
+                    try:
+                        el = page.locator(_ise_type_sel).first
+                        if el.is_visible(timeout=3000):
+                            el.click()
+                            page.wait_for_timeout(2000)
+                            log_fn(f"[scc-nav] Selected ISE type via {_ise_type_sel!r}")
+                            break
+                    except Exception:
+                        continue
+
+            # If we landed on an ISE detail/info page (instructions + Connect button),
+            # we need to click "Connect" in the page content to open the actual form.
+            # On this page the sidebar has NO "Connect" nav item (we're in Platform
+            # Management context, not Secure Access), so the selector is unambiguous.
+            page.wait_for_timeout(2000)
+            try:
+                _pre_inputs = page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('input, textarea'))
+                    .filter(i => i.placeholder !== "Type 'Ctrl' + '/' to search"
+                               && i.type !== 'hidden')
+                    .map(i => i.placeholder || i.type)""")
+                if not _pre_inputs:
+                    log_fn("[scc-nav] No form inputs yet — on ISE detail page, clicking Connect")
+                    for _conn_sel in [
+                        'button:has-text("Connect")',
+                        'a:has-text("Connect")',
+                    ]:
+                        try:
+                            btn = page.locator(_conn_sel).first
+                            if btn.is_visible(timeout=5000):
+                                btn.click()
+                                page.wait_for_timeout(3000)
+                                log_fn(f"[scc-nav] Clicked Connect on detail page via {_conn_sel!r}")
+                                # Check if integration connected immediately (no form needed)
+                                _post_conn_text = page.inner_text("body").lower()
+                                if "connected" in _post_conn_text:
+                                    try:
+                                        page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"))
+                                    except Exception:
+                                        pass
+                                    log_fn("[scc-nav] Integration connected after Connect click — done")
+                                    return True, "ISE integration connected in SCC"
+                                break
+                        except Exception:
+                            continue
+            except Exception as _pie:
+                log_fn(f"[scc-nav] pre-input check error: {_pie}")
+
+            log_fn("[scc-nav] Filling integration name and OTP token")
+
+            # Screenshot + button/input dump so we know what the form looks like
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_connect_form_{pod_id}.png"))
+                _form_info = page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a[class*="btn"]'))
+                        .map(b => (b.textContent || b.value || '').trim().slice(0, 40))
+                        .filter(t => t).slice(0, 15);
+                    const inputs = Array.from(document.querySelectorAll('input, textarea'))
+                        .map(i => ({type: i.type, id: i.id, name: i.name, ph: i.placeholder, dt: (i.dataset && i.dataset.testid) || ''}))
+                        .slice(0, 10);
+                    return {btns, inputs};
+                }""")
+                log_fn(f"[scc-nav] Form buttons: " + " | ".join(_form_info.get('btns', [])))
+                log_fn(f"[scc-nav] Form inputs: " + str(_form_info.get('inputs', [])))
+            except Exception as _fe:
+                log_fn(f"[scc-nav] form dump error: {_fe}")
+
+            _name = f"ISE-POD-{pod_id}-{int(_time.time()) % 10000}"
+
+            # Fill the form using Playwright's locator.fill(), which correctly
+            # triggers React's onChange and enables the Save button.
+            # IMPORTANT: do NOT click the "Show" button between fill and Save —
+            # that re-renders the OTP field and resets React state.
+            # The data-testid attributes on the fields make targeting precise.
+            log_fn(f"[scc-nav] Filling form: name={_name!r}, otp len={len(otp_token)}")
+            # Strategy A: press_sequentially — fires real keydown/keyup/input/change
+            # events per character, the most reliable trigger for React controlled inputs.
+            # NOTE: page.keyboard.press() only affects the main frame.
+            #       If the form is in a child iframe, use locator.evaluate() for blur.
+            _fill_ok = False
+            try:
+                _name_loc = page.locator('[data-testid*="integrationName"]').first
+                _otp_loc  = page.locator('[data-testid*="-otp"]').first
+                _name_loc.click(timeout=5000)
+                _name_loc.select_text(timeout=3000)     # select-all via locator (works in iframes)
+                _name_loc.press_sequentially(_name, delay=30)
+                page.wait_for_timeout(300)
+                _otp_loc.click(timeout=5000)            # blurs name → name.touched=True
+                _otp_loc.select_text(timeout=3000)
+                _otp_loc.press_sequentially(otp_token, delay=8)
+                page.wait_for_timeout(300)
+                _otp_loc.evaluate("el => el.blur()")    # blur OTP directly (works in iframes)
+                page.wait_for_timeout(600)              # allow React validation to run
+                log_fn(f"[scc-nav] Typed via press_sequentially (name={len(_name)} otp={len(otp_token)} chars) + blur")
+                _fill_ok = True
+            except Exception as _fe:
+                log_fn(f"[scc-nav] press_sequentially failed ({_fe})")
+
+            # Strategy B: React-native-setter via locator.evaluate() — runs in the
+            # element's own frame (works for iframes). Fires input/change/blur events.
+            if not _fill_ok:
+                try:
+                    _name_loc.evaluate("""
+                        (el, v) => {
+                            const setter = Object.getOwnPropertyDescriptor(
+                                HTMLInputElement.prototype, 'value').set;
+                            setter.call(el, v);
+                            el.dispatchEvent(new Event('input',  {bubbles:true}));
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                            el.dispatchEvent(new Event('blur',   {bubbles:true}));
+                        }
+                    """, _name)
+                    _otp_loc.evaluate("""
+                        (el, v) => {
+                            const setter = Object.getOwnPropertyDescriptor(
+                                HTMLInputElement.prototype, 'value').set;
+                            setter.call(el, v);
+                            el.dispatchEvent(new Event('input',  {bubbles:true}));
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                            el.dispatchEvent(new Event('blur',   {bubbles:true}));
+                        }
+                    """, otp_token)
+                    page.wait_for_timeout(600)
+                    log_fn("[scc-nav] Filled via React-native-setter locator.evaluate()")
+                    _fill_ok = True
+                except Exception as _fe2:
+                    log_fn(f"[scc-nav] React-native-setter failed ({_fe2})")
+
+            # Strategy C: plain fill() + blur as last resort
+            if not _fill_ok:
+                try:
+                    _name_loc.fill(_name, timeout=5000)
+                    _otp_loc.fill(otp_token, timeout=5000)
+                    _name_loc.evaluate("el => el.blur()")
+                    _otp_loc.evaluate("el => el.blur()")
+                    page.wait_for_timeout(600)
+                    log_fn("[scc-nav] Filled via fill() + blur last-resort")
+                except Exception as _fe3:
+                    log_fn(f"[scc-nav] All fill strategies failed: {_fe3}")
+
+            # Wait for Save to enable — React enables Save after both fields are filled
+            # AND both have been blurred (touched). Tab press above triggers onBlur for OTP.
+            log_fn("[scc-nav] Waiting up to 10s for Save button to enable...")
+            try:
+                page.wait_for_function(
+                    """() => {
+                        const allBtns = Array.from(document.querySelectorAll('button'));
+                        const saveBtn = allBtns.find(b => b.textContent.trim() === 'Save');
+                        return saveBtn && !saveBtn.disabled;
+                    }""",
+                    timeout=10000
+                )
+                log_fn("[scc-nav] Save button is enabled!")
+            except Exception as _we:
+                log_fn(f"[scc-nav] Save enable-wait timed out — checking field state...")
+                try:
+                    _dbg = page.evaluate("""() => {
+                        const nameEl = document.querySelector('[data-testid*="integrationName"]')
+                                    || Array.from(document.querySelectorAll('input[type="text"]'))
+                                       .find(i => !i.placeholder.toLowerCase().includes('search'));
+                        const otpEl  = document.querySelector('[data-testid*="-otp"]')
+                                    || document.querySelector('input[type="password"]');
+                        const saveBtn = Array.from(document.querySelectorAll('button'))
+                            .find(b => b.textContent.trim() === 'Save');
+                        return {
+                            nameLen: nameEl ? nameEl.value.length : -1,
+                            otpLen:  otpEl  ? otpEl.value.length  : -1,
+                            saveDisabled: saveBtn ? saveBtn.disabled : null
+                         };
+                    }""")
+                    log_fn(f"[scc-nav] Fields at timeout: nameLen={_dbg.get('nameLen')} "
+                           f"otpLen={_dbg.get('otpLen')} saveDisabled={_dbg.get('saveDisabled')}")
+                except Exception:
+                    pass
+
+                # React fiber diagnostic — inspect what React "thinks" the OTP value is
+                try:
+                    _react_dbg = _otp_loc.evaluate("""el => {
+                        const k = Object.keys(el).find(k =>
+                            k.startsWith('__reactFiber') || k.startsWith('__reactInternals'));
+                        if (!k) return {found: false};
+                        let fiber = el[k];
+                        let depth = 0;
+                        while (fiber && depth < 30) {
+                            const p = fiber.pendingProps || fiber.memoizedProps;
+                            if (p && (p.onChange || p.value !== undefined)) {
+                                return {found: true, value: p.value, hasOnChange: !!p.onChange,
+                                        depth, tag: fiber.tag};
+                            }
+                            fiber = fiber.return;
+                            depth++;
+                        }
+                        return {found: true, noProps: true};
+                    }""")
+                    log_fn(f"[scc-nav] React fiber OTP: {_react_dbg}")
+                except Exception as _rf_e:
+                    log_fn(f"[scc-nav] React fiber check failed: {_rf_e}")
+
+            # Show OTP for debug screenshot (AFTER the wait, so it doesn't interfere)
+            try:
+                _show_btn = page.locator('button:has-text("Show")').first
+                if _show_btn.is_visible(timeout=1500):
+                    _show_btn.click()
+                    page.wait_for_timeout(400)
+                    _otp_vis = page.evaluate("""() => {
+                        const inp = document.querySelector('input[type="text"]:not([placeholder*="search" i]):not([placeholder*="Ctrl" i])') ||
+                                    document.querySelector('input[placeholder=""]');
+                        return inp ? inp.value : '';
+                    }""")
+                    log_fn(f"[scc-nav] OTP field value (post-wait Show): len={len(_otp_vis)} first20={_otp_vis[:20]!r}")
+            except Exception as _show_e:
+                log_fn(f"[scc-nav] post-wait Show debug: {_show_e}")
+
+            # Take a pre-save screenshot so we can see the form state
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_presave_{pod_id}.png"))
+            except Exception:
+                pass
+
+            # ── Early-exit: if SCC already shows ISE as Connected on Integration Hub,
+            # the OTP was consumed and the integration is live — no Save needed. ──
+            _presave_txt = page.inner_text("body").lower()
+            _on_int_hub = "integration hub" in _presave_txt or "cisco integrations" in _presave_txt
+            _ise_connected = "connected" in _presave_txt and "identity services engine" in _presave_txt
+            if _on_int_hub and _ise_connected:
+                log_fn("[scc-nav] Integration Hub shows ISE Connected — integration already live, no Save needed")
+                return True, "ISE → SCC integration complete (Connected)"
+
+            log_fn("[scc-nav] Clicking Save button")
+            _saved = False
+
+            # Strategy 1: target by data-testid (specific to this CDS form)
+            try:
+                btn = page.locator('[data-testid*="save-btn"]').last
+                btn.wait_for(state="visible", timeout=5000)
+                btn.click(timeout=10000)
+                log_fn("[scc-nav] Clicked Save via data-testid")
+                _saved = True
+            except Exception as _se0:
+                log_fn(f"[scc-nav] Save data-testid attempt failed: {_se0}")
+
+            # Strategy 2: filter-based — finds the button whose trimmed text is "Save"
+            if not _saved:
+                try:
+                    btn = page.locator("button").filter(has_text="Save").last
+                    btn.wait_for(state="visible", timeout=5000)
+                    btn.click(timeout=10000)
+                    log_fn("[scc-nav] Clicked Save via filter")
+                    _saved = True
+                except Exception as _se2:
+                    log_fn(f"[scc-nav] Save filter attempt failed: {_se2}")
+
+            # Strategy 3: has-text last/first
+            if not _saved:
+                for _try_last in [True, False]:
+                    try:
+                        _loc = page.locator('button:has-text("Save")')
+                        btn = _loc.last if _try_last else _loc.first
+                        btn.wait_for(state="visible", timeout=5000)
+                        btn.click(timeout=10000)
+                        log_fn(f"[scc-nav] Clicked Save ({'last' if _try_last else 'first'})")
+                        _saved = True
+                        break
+                    except Exception as _se:
+                        log_fn(f"[scc-nav] Save attempt ({'last' if _try_last else 'first'}) failed: {_se}")
+
+            # Strategy 4: force-click — remove disabled attribute via JS then click
+            # This bypasses Playwright's enabled check entirely.
+            if not _saved:
+                log_fn("[scc-nav] Force-clicking Save (removing disabled attribute)")
+                try:
+                    _fc_result = page.evaluate("""
+                        () => {
+                            const btn = document.querySelector('[data-testid*="save-btn"]')
+                                     || Array.from(document.querySelectorAll('button'))
+                                            .find(b => b.textContent.trim() === 'Save');
+                            if (!btn) return 'no-button';
+                            btn.removeAttribute('disabled');
+                            btn.click();
+                            return 'clicked';
+                        }
+                    """)
+                    log_fn(f"[scc-nav] Force-click result: {_fc_result}")
+                    if _fc_result == 'clicked':
+                        # Wait up to 5s to see if React's onClick fires the API call.
+                        # If _scc_api_resp stays empty the DOM click bypassed React
+                        # entirely — treat as failure so a new OTP can be generated.
+                        _fc_deadline = _time.time() + 5
+                        while _time.time() < _fc_deadline and "status" not in _scc_api_resp:
+                            page.wait_for_timeout(500)
+                        if "status" in _scc_api_resp:
+                            log_fn(f"[scc-nav] Force-click triggered API (status {_scc_api_resp['status']})")
+                            _saved = True
+                        else:
+                            log_fn("[scc-nav] Force-click fired but no API call detected — React onClick not triggered")
+                            # _saved stays False; fall through to Enter-key strategy
+                except Exception as _fee:
+                    log_fn(f"[scc-nav] Force-click failed: {_fee}")
+
+            # Strategy 5: press Enter on the password field to submit the form
+            if not _saved:
+                log_fn("[scc-nav] Trying Enter key to submit form")
+                try:
+                    _pw = page.locator('input[type="password"]').first
+                    _pw.click()
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(2000)
+                    _saved = True
+                    log_fn("[scc-nav] Submitted via Enter key")
+                except Exception as _ee:
+                    log_fn(f"[scc-nav] Enter key attempt failed: {_ee}")
+
+            if not _saved:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_nosave_{pod_id}.png"))
+                except Exception:
+                    pass
+                return False, f"ISE \u2192 SCC integration FAILED: could not click Save (check scc_nosave_{pod_id}.png)"
+
+            page.wait_for_timeout(4000)
+
+            # Check the intercepted SCC API response — this is the authoritative
+            # signal. The form stays open (no navigation) on failure, so page-text
+            # alone is not sufficient to detect OTP rejection.
+            _api_status = _scc_api_resp.get("status")
+            _api_body   = _scc_api_resp.get("body", "")[:300]
+            if _api_status == 400:
+                log_fn(f"[scc-nav] SCC API returned 400: {_api_body}")
+                # Name conflict is handled by the block below; OTP rejection must
+                # be propagated back so the ISE container can generate a new OTP.
+                _name_err = any(k in _api_body.lower() for k in ("name", "already", "unique"))
+                if not _name_err:
+                    return False, f"invalid_otp: SCC API rejected OTP (400): {_api_body}"
+                log_fn("[scc-nav] 400 is name conflict — proceeding to name-conflict retry")
+            elif _api_status and _api_status not in (200, 201):
+                log_fn(f"[scc-nav] SCC API returned {_api_status}: {_api_body}")
+                return False, f"SCC API returned {_api_status}: {_api_body}"
+            elif _api_status in (200, 201):
+                log_fn(f"[scc-nav] SCC API returned {_api_status} — OTP accepted")
+
+            _txt = page.inner_text("body").lower()
+            if "unique" in _txt or "already exists" in _txt or "name is already" in _txt:
+                log_fn("[scc-nav] Name conflict — retrying with alternate name")
+                _name = f"ISE-POD-{pod_id}-{int(_time.time()) % 10000}x"
+                for _sel in ['input[placeholder*="name" i]', 'input[id*="name"]',
+                             'input[type="text"]:not([placeholder*="search" i]):not([placeholder*="Ctrl" i])']:
+                    try:
+                        inp = page.locator(_sel).first
+                        if inp.is_visible(timeout=3000):
+                            inp.click()
+                            page.keyboard.press("Control+a")
+                            inp.press_sequentially(_name, delay=30)
+                            break
+                    except Exception:
+                        continue
+                # Retry Save with the same robust approach
+                for _try_last2 in [True, False]:
+                    try:
+                        _loc2 = page.locator('button:has-text("Save")')
+                        b2 = _loc2.last if _try_last2 else _loc2.first
+                        b2.wait_for(state="visible", timeout=5000)
+                        b2.click(timeout=8000)
+                        break
+                    except Exception:
+                        continue
+                page.wait_for_timeout(5000)
+            else:
+                page.wait_for_timeout(2000)
+
+            content = page.content().lower()
+            # Take an "after-save" screenshot for verification
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"))
+                log_fn("[scc-nav] After-save screenshot saved")
+            except Exception:
+                pass
+            # Only return success if Save was actually clicked AND page shows a real result.
+            # Do NOT match broad words like "connected" that appear on the form page itself.
+            _success_signals = ["waiting for activation", "pending activation",
+                                 "activation pending", "successfully added",
+                                 "integration added", "integration created",
+                                 "my integrations"]
+            _found_signal = next((s for s in _success_signals if s in content), None)
+            if _found_signal:
+                return True, f"ISE \u2192 SCC integration submitted ({_found_signal}; token: {otp_token[:20]}...)"
+            if _saved:
+                return True, (f"ISE \u2192 SCC integration form submitted (token: {otp_token[:20]}...) "
+                              f"— check scc_after_save_{pod_id}.png to confirm activation state")
+            return True, (f"ISE \u2192 SCC integration attempted (no Save button found) "
+                          f"— check scc_after_save_{pod_id}.png")
+
+        except Exception as e:
+            return False, f"ISE \u2192 Secure Access integration error: {e}"
+        finally:
+            browser.close()
+
+
+def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
+    """
+    Automate all 7 manual SCC checklist items via Playwright using the saved SCC session.
+    Each item: not_found → completed (already clean); exception → failed (red).
+    Screenshots saved per item for debugging.
+    """
+    from playwright.sync_api import sync_playwright
+    import sqlite3 as _sq
+
+    db_path = str(DATA_DIR / "data" / "pod_state.db")
+    scc_session = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
+    if not scc_session.exists():
+        scc_session = DATA_DIR / "data" / "scc_session.json"
+    if not scc_session.exists():
+        return False, f"No SCC session found for {pod_id} — run Refresh SCC Sessions first"
+
+    def _persist(item_key, status, detail=""):
+        try:
+            with _sq.connect(db_path) as _c:
+                _c.execute(
+                    "INSERT OR REPLACE INTO scc_checklist (pod_id, item_key, status, detail) "
+                    "VALUES (?,?,?,?)", (pod_id, item_key, status, str(detail)[:500])
+                )
+                _c.commit()
+        except Exception as _e:
+            log_fn(f"[scc-reset] DB write error: {_e}")
+
+    _sd = json.loads(scc_session.read_text())
+    _eid = ""
+    for _o in _sd.get("origins", []):
+        for _it in _o.get("localStorage", []):
+            if _it.get("name") == "enterpriseId":
+                _eid = _it["value"]
+                break
+    _base = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
+             if _eid else "https://security.cisco.com/dashboard")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            ctx = browser.new_context(
+                storage_state=_sd, viewport={"width": 1920, "height": 1080}
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(20000)
+
+            # ── Load SCC and verify session ───────────────────────────────────
+            page.goto(_base, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+            _w = 0
+            while _w < 20 and "login/callback" in page.url.lower():
+                page.wait_for_timeout(2000); _w += 2
+            if ("sign-on" in page.url.lower() and "security.cisco.com" not in page.url.lower()) or \
+               ("login" in page.url.lower() and "/login/callback" not in page.url.lower()):
+                return False, "SCC session expired — re-run Refresh SCC Sessions"
+            try:
+                page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
+            log_fn(f"[scc-reset] Session OK: {page.url[:60]}")
+
+            # ── Dismiss org picker if present ─────────────────────────────────
+            try:
+                _cont = page.locator('button:has-text("Continue")').first
+                if _cont.is_visible(timeout=4000):
+                    _cont.click()
+                    page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            # ── Helpers ───────────────────────────────────────────────────────
+            def _nav(label: str, timeout: int = 7000) -> bool:
+                for _s in [
+                    f'a:has-text("{label}")', f'button:has-text("{label}")',
+                    f'li:has-text("{label}") > a', f'li:has-text("{label}") > button',
+                    f'[role="menuitem"]:has-text("{label}")',
+                ]:
+                    try:
+                        el = page.locator(_s).first
+                        if el.is_visible(timeout=timeout):
+                            el.click(); page.wait_for_timeout(1200)
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _go(label_chain: list) -> bool:
+                """Navigate via a chain of sidebar labels; returns True if last click succeeded."""
+                page.goto(_base, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+                for _lbl in label_chain:
+                    _nav(_lbl)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2500)
+                return True
+
+            def _on_home() -> bool:
+                """True if we are still on the SCC platform-level page (not inside SA).
+                SA pages have /secure-access/ in the URL (legacy: /sase/).
+                Platform Management pages have /platform-management in the URL."""
+                _u = page.url.lower()
+                return ("/sase/" not in _u
+                        and "/secure-access/" not in _u
+                        and "/platform-management" not in _u)
+
+            def _sa_url(path: str) -> str:
+                """Build a full SA URL by extracting the org number from the current
+                page URL (e.g. /secure-access/org/8383340/...) and appending path."""
+                import re as _re
+                _m = _re.search(r'/secure-access/org/(\d+)', page.url)
+                if _m:
+                    return f"https://security.cisco.com/secure-access/org/{_m.group(1)}{path}"
+                return ""
+
+            def _enter_secure_access() -> bool:
+                """Click into Secure Access from the platform home."""
+                page.goto(_base, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+                # Dismiss any open overlay/panel (org switcher, flyout, etc.)
+                try:
+                    page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                # Also click the close button on any overlay
+                try:
+                    page.evaluate("""() => {
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        const b = btns.find(b => {
+                            const t = (b.textContent || '').trim();
+                            const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                            const rect = b.getBoundingClientRect();
+                            return (t === '\u00d7' || t === '\u2715' || a.includes('close'))
+                                   && rect.width > 0 && rect.height > 0;
+                        });
+                        if (b) b.click();
+                    }""")
+                    page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                page.wait_for_timeout(500)
+                for _sel in ['a:has-text("Secure Access")', 'button:has-text("Secure Access")',
+                             'li:has-text("Secure Access") > a', '[role="menuitem"]:has-text("Secure Access")']:
+                    try:
+                        el = page.locator(_sel).first
+                        if el.is_visible(timeout=3000):
+                            el.click()
+                            page.wait_for_timeout(3000)
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=8000)
+                            except Exception:
+                                pass
+                            page.wait_for_timeout(1500)
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _sase_nav(flyout_label: str, item_label: str, shot_prefix: str = "") -> bool:
+                """Within Secure Access: click the sidebar toggle button (which expands the
+                flyout panel), then click the sub-item link inside the panel.
+                SA sidebar expandable items are <button>, NOT <a> — so button:has-text
+                must come BEFORE a:has-text to avoid matching the breadcrumb link.
+
+                Two-click pattern: first click collapses whatever flyout is currently
+                open; second click opens the target flyout. A JS close is attempted first
+                to handle the sticky Resources panel whose × button has no standard
+                aria-label or PatternFly class."""
+                # Step 1: close any currently-open flyout panel
+                # JS approach: find any visible × / ✕ / Close button in the panel header
+                try:
+                    page.evaluate("""() => {
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        const b = btns.find(b => {
+                            const t = (b.textContent || '').trim();
+                            const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                            const rect = b.getBoundingClientRect();
+                            return (t === '\u00d7' || t === '\u2715' || t === '\u2716'
+                                    || t === 'Close' || a.includes('close'))
+                                   && rect.width > 0 && rect.height > 0;
+                        });
+                        if (b) b.click();
+                    }""")
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                # Selector-based fallback close
+                for _close_sel in [
+                    'button[aria-label*="close" i]',
+                    '[aria-label="Close"]',
+                    '[aria-label="Close panel"]',
+                    'button:has-text("×")',
+                    'button:has-text("✕")',
+                    'button[class*="close"]',
+                ]:
+                    try:
+                        cb = page.locator(_close_sel).first
+                        if cb.is_visible(timeout=600):
+                            cb.click(); page.wait_for_timeout(400); break
+                    except Exception:
+                        continue
+                # Escape as final close attempt
+                try:
+                    page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                except Exception:
+                    pass
+
+                # Debug: log all matching buttons to identify wrong match
+                try:
+                    _all_matches = page.locator(f'button:has-text("{flyout_label}")').all()
+                    _debug_texts = []
+                    for _mx in _all_matches[:8]:
+                        try:
+                            _t = _mx.inner_text()[:40].replace('\n', ' ')
+                            _bb = _mx.bounding_box()
+                            _pos = f"x={int(_bb['x'])},y={int(_bb['y'])}" if _bb else "?"
+                            _debug_texts.append(f"'{_t}'@{_pos}")
+                        except Exception:
+                            _debug_texts.append("?")
+                    log_fn(f"[scc-nav-debug] button:has-text('{flyout_label}') → {_debug_texts}")
+                except Exception as _de:
+                    log_fn(f"[scc-nav-debug] debug error: {_de}")
+
+                # Step 2: two-click pattern on sidebar toggle
+                # Click 1 — may close a currently-open flyout (side effect on some panels)
+                # Click 2 — reliably opens the target flyout
+                _fsel_list = [
+                    f'button:has-text("{flyout_label}")',        # SA sidebar toggle (button) ← first
+                    f'nav button:has-text("{flyout_label}")',    # scoped to nav
+                    f'li:has-text("{flyout_label}") > button',
+                    f'[role="button"]:has-text("{flyout_label}")',
+                    f'a:has-text("{flyout_label}")',             # fallback (avoid breadcrumb)
+                ]
+                for _attempt in range(2):
+                    for _fsel in _fsel_list:
+                        try:
+                            el = page.locator(_fsel).first
+                            if el.is_visible(timeout=2000):
+                                el.hover()
+                                page.wait_for_timeout(400)
+                                el.click()
+                                page.wait_for_timeout(1200 if _attempt == 0 else 1800)
+                                break
+                        except Exception:
+                            continue
+                    # After click 1: check if a flyout sub-item is already visible
+                    if _attempt == 0:
+                        try:
+                            if page.locator(f'a:has-text("{item_label}")').is_visible(timeout=800):
+                                break  # already open — skip click 2
+                        except Exception:
+                            pass
+
+                # Debug: log URL after clicks
+                try:
+                    log_fn(f"[scc-nav-debug] after clicks → url={page.url[:80]}")
+                except Exception:
+                    pass
+
+                # Screenshot of flyout state for diagnosis
+                if shot_prefix:
+                    try:
+                        page.screenshot(path=str(DATA_DIR / "data" / f"scc_flyout_{shot_prefix}_{pod_id}.png"))
+                    except Exception:
+                        pass
+
+                # Step 3: click the sub-item in the now-open flyout panel
+                for _sel in [
+                    f'a:has-text("{item_label}")',
+                    f'button:has-text("{item_label}")',
+                    f'[role="menuitem"]:has-text("{item_label}")',
+                    f'[role="option"]:has-text("{item_label}")',
+                    f'span:has-text("{item_label}")',
+                ]:
+                    try:
+                        el = page.locator(_sel).first
+                        if el.is_visible(timeout=2500):
+                            el.click()
+                            page.wait_for_timeout(2500)
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _sase_goto(nav_chains: list, content_checks: list = None,
+                           shot_prefix: str = "") -> bool:
+                """Enter Secure Access from platform Home, then try each (flyout, item) nav
+                chain until we land on a page with expected content (or just off-home).
+                nav_chains  = [(flyout_label, item_label), ...]
+                content_checks = list of lowercase strings; any must be in page body.
+                Returns True on success."""
+                for (_flyout, _item) in nav_chains:
+                    if not _enter_secure_access():
+                        return False
+                    page.wait_for_timeout(800)
+                    _sase_nav(_flyout, _item, shot_prefix=shot_prefix)
+                    page.wait_for_timeout(2000)
+                    if _on_home():
+                        continue  # nav didn't leave home — try next chain
+                    if content_checks:
+                        _b = page.inner_text("body").lower()
+                        if any(c.lower() in _b for c in content_checks):
+                            return True
+                        # Left home but content not found — try next chain
+                        continue
+                    return True  # off-home and no content check required
+                return False
+
+            def _goto_sase(path: str) -> bool:
+                """Navigate directly to a Secure Access sub-page by URL path.
+                Returns True only if we left the Home/Dashboard page."""
+                _eid_param = f"?enterpriseId={_eid}" if _eid else ""
+                _url = f"https://security.cisco.com{path}{_eid_param}"
+                page.goto(_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(1500)
+                return not _on_home()
+
+            def _shot(name: str):
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_reset_{name}_{pod_id}.png"))
+                except Exception:
+                    pass
+
+            def _sase_delete_row(nav_chains: list, row_hint: str, shot_name: str,
+                                 content_checks: list = None,
+                                 direct_url: str = "") -> str:
+                """Navigate to a Secure Access sub-page, find a row by hint,
+                click the three-dot popup menu, then click Delete.
+                direct_url: if provided, navigate there instead of using nav_chains.
+                nav_chains     = [(flyout_label, item_label), ...]
+                content_checks = strings that must appear in page body to confirm nav.
+                Returns 'deleted', 'not_found', or 'no_delete_option'."""
+                if direct_url:
+                    try:
+                        page.goto(direct_url, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(2500)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(1000)
+                        log_fn(f"[scc-reset] {shot_name}: navigated to {direct_url[:60]}")
+                    except Exception as _ne:
+                        log_fn(f"[scc-reset] {shot_name}: direct nav failed: {_ne}")
+                        return "not_found"
+                elif not _sase_goto(nav_chains, content_checks=content_checks,
+                                    shot_prefix=shot_name):
+                    log_fn(f"[scc-reset] {shot_name}: could not navigate to target page")
+                    return "not_found"
+                _shot(shot_name)
+                _body = page.inner_text("body")
+                if row_hint.lower() not in _body.lower():
+                    return "not_found"
+
+                # Find the row
+                _row = None
+                for _rs in [f'tr:has-text("{row_hint}")',
+                            f'[role="row"]:has-text("{row_hint}")',
+                            f'li:has-text("{row_hint}")',
+                            f'div[class*="row"]:has-text("{row_hint}")']:
+                    try:
+                        _r = page.locator(_rs).first
+                        if _r.is_visible(timeout=2000):
+                            _row = _r; break
+                    except Exception:
+                        continue
+                if not _row:
+                    return "not_found"
+
+                # Click the three-dot (⋮) button — opens popup menu
+                _opened = False
+                for _ks in [
+                    'button[aria-label*="action" i]', 'button[aria-label*="kebab" i]',
+                    'button[aria-label*="more" i]',   'button[aria-label*="option" i]',
+                    'button:has-text("⋮")',            'button:has-text("...")',
+                    'button:has-text("…")',
+                    '.pf-v5-c-menu-toggle',            'button.pf-v5-c-menu-toggle',
+                    'button.pf-c-dropdown__toggle',
+                ]:
+                    try:
+                        kb = _row.locator(_ks).first
+                        if kb.is_visible(timeout=800):
+                            kb.click(); page.wait_for_timeout(2000); _opened = True; break
+                    except Exception:
+                        continue
+                if not _opened:
+                    # Fallback: find the rightmost small (icon-sized) button in the row
+                    try:
+                        _btns = _row.locator('button').all()
+                        _best = None
+                        _best_x = -1
+                        for _b in _btns:
+                            try:
+                                _bb = _b.bounding_box()
+                                if (_bb and _bb['width'] < 60 and _bb['height'] < 60
+                                        and _b.is_visible(timeout=300)
+                                        and _bb['x'] > _best_x):
+                                    _best = _b; _best_x = _bb['x']
+                            except Exception:
+                                continue
+                        if _best:
+                            _best.click(force=True)
+                            page.wait_for_timeout(2000); _opened = True
+                    except Exception:
+                        pass
+                _shot(f"{shot_name}_menu")
+
+                # Click the delete menu item using JS dispatchEvent so React's
+                # synthetic event system actually fires.  Plain Playwright .click()
+                # on <li> items does NOT trigger React handlers — confirmed by repeated
+                # false-positive "deleted" reports while the rule stayed on the page.
+                _del_texts = ["Delete Rule", "Delete", "Remove"]
+                _del_clicked = False
+                # Primary: Playwright force-click — trusted event, pierces Shadow DOM.
+                # JS dispatchEvent creates isTrusted=false which React may reject.
+                for _dt in _del_texts:
+                    try:
+                        _dm = page.get_by_text(_dt, exact=True).first
+                        _dm.click(force=True)
+                        log_fn(f"[scc-reset] {shot_name}: PW-force-clicked '{_dt}'")
+                        _del_clicked = True
+                        page.wait_for_timeout(1500)
+                        break
+                    except Exception:
+                        pass
+                if not _del_clicked:
+                    # Fallback: JS dispatchEvent (may be blocked if component checks isTrusted)
+                    for _dt in _del_texts:
+                        _clicked = page.evaluate(f"""
+                            () => {{
+                                for (const el of document.querySelectorAll('*')) {{
+                                    if (el.children.length === 0
+                                            && el.textContent.trim() === '{_dt}') {{
+                                        const r = el.getBoundingClientRect();
+                                        if (r.width > 0 && r.height > 0) {{
+                                            el.dispatchEvent(new MouseEvent('click',
+                                                {{bubbles: true, cancelable: true}}));
+                                            return el.tagName + ':leaf';
+                                        }}
+                                    }}
+                                }}
+                                return false;
+                            }}
+                        """)
+                        if _clicked:
+                            log_fn(f"[scc-reset] {shot_name}: JS-clicked '{_dt}' on {_clicked}")
+                            _del_clicked = True
+                            page.wait_for_timeout(1500)
+                            break
+
+                if not _del_clicked:
+                    return "no_delete_option"
+
+                # ── Check mandatory checkbox in confirmation dialog ──
+                # Some dialogs require checking a checkbox BEFORE the Delete button is enabled
+                # (e.g. DLP "Delete rule 'AI Guardrails'." checkbox).  Try common dialog containers
+                # first, then fall back to any visible checkbox.
+                page.wait_for_timeout(600)
+                try:
+                    for _cb_sel in [
+                        'dialog input[type="checkbox"]',
+                        '[role="dialog"] input[type="checkbox"]',
+                        '[class*="modal"] input[type="checkbox"]',
+                        'input[type="checkbox"]',
+                    ]:
+                        _dlg_cb = page.locator(_cb_sel).first
+                        if _dlg_cb.count() > 0 and _dlg_cb.is_visible(timeout=1000):
+                            if not _dlg_cb.is_checked():
+                                _dlg_cb.click(force=True)
+                                page.wait_for_timeout(500)
+                                log_fn(f"[scc-reset] {shot_name}: checked mandatory"
+                                       f" confirm-dialog checkbox ({_cb_sel})")
+                            break
+                except Exception:
+                    pass
+
+                # Handle confirmation dialog — try all button types including Carbon cds-button
+                # (cds-button is a web component; button:has-text won't match it without explicit selector)
+                _conf_clicked = False
+                for _cs in [
+                    'cds-button:has-text("Delete")',    # Carbon web component
+                    '[label="Delete"]',                  # Carbon attribute
+                    'button:has-text("Delete")',
+                    'button:has-text("Yes")',
+                    'button:has-text("Confirm")',
+                    'button:has-text("OK")',
+                    'cds-button:has-text("Confirm")',
+                    '[label="Confirm"]',
+                ]:
+                    try:
+                        cb = page.locator(_cs).first
+                        if cb.count() > 0 and cb.is_visible(timeout=1500):
+                            cb.click(force=True); page.wait_for_timeout(2000)
+                            _conf_clicked = True; break
+                    except Exception:
+                        continue
+                if not _conf_clicked:
+                    # get_by_role pierces Shadow DOM — most reliable for cds-button
+                    for _name in ["Delete", "Confirm", "Yes"]:
+                        try:
+                            _rb = page.get_by_role("button", name=_name)
+                            if _rb.count() > 0:
+                                _rb.first.click(force=True)
+                                page.wait_for_timeout(2000); _conf_clicked = True; break
+                        except Exception:
+                            continue
+                if not _conf_clicked:
+                    # JS fallback: dispatchEvent on visible confirm button (bypasses Carbon overlay)
+                    _cf = page.evaluate("""
+                        () => {
+                            for (const btn of document.querySelectorAll('button')) {
+                                const t = btn.textContent.trim();
+                                if ((t === 'Delete' || t === 'Confirm' || t === 'Yes' || t === 'OK')
+                                        && btn.offsetParent !== null) {
+                                    btn.dispatchEvent(new MouseEvent('click',
+                                        {bubbles: true, cancelable: true}));
+                                    return t;
+                                }
+                            }
+                            return false;
+                        }
+                    """)
+                    if _cf:
+                        page.wait_for_timeout(2000)
+                        log_fn(f"[scc-reset] {shot_name}: JS-confirm clicked '{_cf}'")
+
+                # ── POST-DELETE VERIFICATION ────────────────────────────────
+                # Reload the page and confirm the row is actually gone.
+                # Never return "deleted" unless we can verify it.
+                page.wait_for_timeout(1500)
+                _shot(f"{shot_name}_after")
+                _body_after = page.inner_text("body").lower()
+                if row_hint.lower() in _body_after:
+                    log_fn(f"[scc-reset] {shot_name}: row still present after delete attempt")
+                    return "no_delete_option"
+                return "deleted"
+
+            def _delete_named_row(name_hint: str) -> str:
+                """Find a row containing name_hint and delete it via kebab menu.
+                Returns 'deleted', 'not_found', or 'no_delete_option'."""
+                _body = page.inner_text("body")
+                if name_hint.lower() not in _body.lower():
+                    return "not_found"
+                # Locate the row
+                for _rs in [
+                    f'tr:has-text("{name_hint}")',
+                    f'[role="row"]:has-text("{name_hint}")',
+                    f'li:has-text("{name_hint}")',
+                ]:
+                    try:
+                        row = page.locator(_rs).first
+                        if not row.is_visible(timeout=2000):
+                            continue
+                        # Open action menu — kebab or action button
+                        _opened = False
+                        for _ks in [
+                            'button[aria-label*="action" i]', 'button[aria-label*="more" i]',
+                            'button[aria-label*="option" i]', '.pf-v5-c-menu-toggle',
+                            'button.pf-v5-c-menu-toggle',
+                        ]:
+                            try:
+                                kb = row.locator(_ks).first
+                                if kb.is_visible(timeout=800):
+                                    kb.click(); page.wait_for_timeout(1500)
+                                    _opened = True; break
+                            except Exception:
+                                continue
+                        if not _opened:
+                            # Fallback: last button in row
+                            try:
+                                row.locator('button').last.click(force=True)
+                                page.wait_for_timeout(1500); _opened = True
+                            except Exception:
+                                pass
+                        # Pick Delete / Remove from dropdown or inline
+                        for _ds in [
+                            '[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")',
+                            'li:has-text("Delete") > a', 'a:has-text("Delete")',
+                            '[role="menuitem"]:has-text("Remove")', 'button:has-text("Remove")',
+                        ]:
+                            try:
+                                d = page.locator(_ds).first
+                                if d.is_visible(timeout=1500):
+                                    d.click(); page.wait_for_timeout(800)
+                                    # Confirm dialog
+                                    for _cs in [
+                                        'button:has-text("Delete")', 'button:has-text("Yes")',
+                                        'button:has-text("Confirm")', 'button:has-text("OK")',
+                                    ]:
+                                        try:
+                                            cb = page.locator(_cs).first
+                                            if cb.is_visible(timeout=2000):
+                                                cb.click(); page.wait_for_timeout(1500); break
+                                        except Exception:
+                                            continue
+                                    return "deleted"
+                            except Exception:
+                                continue
+                        return "no_delete_option"
+                    except Exception:
+                        continue
+                return "not_found"
+
+            # ── 0. zta_profiles (browser — Phase 1 API misses UI profiles) ──────
+            log_fn("[scc-reset] zta_profiles: browser-based check")
+            try:
+                _enter_secure_access()
+                _zta_url = _sa_url("/connect/user-connectivity/vpn")
+                if not _zta_url:
+                    _enter_secure_access()
+                    _zta_url = _sa_url("/connect/user-connectivity/vpn")
+                if not _zta_url:
+                    _persist("zta_profiles", "failed", "Could not resolve SA org URL")
+                    log_fn("[scc-reset] zta_profiles: could not resolve SA URL")
+                else:
+                    page.goto(_zta_url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(1000)
+                    try:
+                        page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                    except Exception:
+                        pass
+                    # Click "Zero Trust Access" tab
+                    _zta_tab = False
+                    for _ts in ['button:has-text("Zero Trust Access")',
+                                'a:has-text("Zero Trust Access")',
+                                '[role="tab"]:has-text("Zero Trust Access")']:
+                        try:
+                            _t = page.locator(_ts).first
+                            if _t.is_visible(timeout=2000):
+                                _t.click(); _zta_tab = True; break
+                        except Exception:
+                            continue
+                    if not _zta_tab:
+                        _zta_tab = page.evaluate("""
+                            () => {
+                                for (const el of document.querySelectorAll('*')) {
+                                    if (el.children.length === 0
+                                            && el.textContent.trim() === 'Zero Trust Access') {
+                                        const r = el.getBoundingClientRect();
+                                        if (r.width > 0 && r.height > 0) {
+                                            el.dispatchEvent(new MouseEvent('click',
+                                                {bubbles: true, cancelable: true}));
+                                            return true;
+                                        }
+                                    }
+                                }
+                                return false;
+                            }
+                        """)
+                    page.wait_for_timeout(2000)
+                    _shot("0_zta_tab")
+                    _zta_del = 0
+                    _zta_errs = []
+                    for _att in range(5):
+                        _body_zta = page.inner_text("body").lower()
+                        if "pseudoco" not in _body_zta:
+                            break
+                        _zta_row = None
+                        for _rs in ['tr:has-text("PseudoCo")',
+                                    '[role="row"]:has-text("PseudoCo")']:
+                            try:
+                                _r = page.locator(_rs).first
+                                if _r.is_visible(timeout=1500):
+                                    _zta_row = _r; break
+                            except Exception:
+                                continue
+                        if not _zta_row:
+                            break
+                        # Find delete icon in the row
+                        _del_btn = None
+                        for _ds in ['button[aria-label*="delete" i]',
+                                    'button[aria-label*="remove" i]',
+                                    '[title*="delete" i]',
+                                    'button[data-testid*="delete" i]']:
+                            try:
+                                _d = _zta_row.locator(_ds).first
+                                if _d.is_visible(timeout=500):
+                                    _del_btn = _d; break
+                            except Exception:
+                                continue
+                        if not _del_btn:
+                            # Fallback: rightmost small button in the row
+                            try:
+                                _btns = _zta_row.locator('button').all()
+                                _best = None; _best_x = -1
+                                for _b in _btns:
+                                    try:
+                                        _bb = _b.bounding_box()
+                                        if (_bb and _bb['width'] < 60
+                                                and _b.is_visible(timeout=300)
+                                                and _bb['x'] > _best_x):
+                                            _best = _b; _best_x = _bb['x']
+                                    except Exception:
+                                        continue
+                                if _best:
+                                    _del_btn = _best
+                            except Exception:
+                                pass
+                        if not _del_btn:
+                            _zta_errs.append("delete icon not found in ZTA row")
+                            break
+                        _del_btn.click(force=True)
+                        page.wait_for_timeout(1500)
+                        _shot("0_zta_confirm")
+                        # Dropdown is now open. Carbon cds-menu-item renders its label in
+                        # shadow DOM so JS leaf scan won't find it. Use Playwright force-click
+                        # which pierces Shadow DOM and creates a trusted event.
+                        _del_item = False
+                        try:
+                            page.get_by_text("Delete", exact=True).first.click(force=True)
+                            _del_item = "pw:force:Delete"
+                            page.wait_for_timeout(1000)
+                        except Exception:
+                            pass
+                        if not _del_item:
+                            # JS fallback — will work if label IS a leaf node
+                            _del_item = page.evaluate("""
+                                () => {
+                                    for (const el of document.querySelectorAll('*')) {
+                                        if (el.children.length === 0
+                                                && el.textContent.trim() === 'Delete') {
+                                            const r = el.getBoundingClientRect();
+                                            if (r.width > 0 && r.height > 0) {
+                                                el.dispatchEvent(new MouseEvent('click',
+                                                    {bubbles: true, cancelable: true}));
+                                                return el.tagName + ':leaf';
+                                            }
+                                        }
+                                    }
+                                    return false;
+                                }
+                            """)
+                        page.wait_for_timeout(1500)
+                        _conf = bool(_del_item)
+                        if _conf:
+                            # Handle any confirmation dialog (Playwright then JS)
+                            _conf2 = False
+                            for _cs in ['button:has-text("Delete")',
+                                        'button:has-text("Confirm")',
+                                        'button:has-text("Yes")']:
+                                try:
+                                    cb = page.locator(_cs).first
+                                    if cb.is_visible(timeout=2000):
+                                        cb.click(); page.wait_for_timeout(2000)
+                                        _conf2 = True; break
+                                except Exception:
+                                    continue
+                            if not _conf2:
+                                page.evaluate("""
+                                    () => {
+                                        for (const btn of document.querySelectorAll('button')) {
+                                            const t = btn.textContent.trim();
+                                            if ((t==='Delete'||t==='Confirm'||t==='Yes')
+                                                    && btn.offsetParent !== null) {
+                                                btn.dispatchEvent(new MouseEvent('click',
+                                                    {bubbles: true, cancelable: true}));
+                                                return true;
+                                            }
+                                        }
+                                        return false;
+                                    }
+                                """)
+                                page.wait_for_timeout(2000)
+                            _zta_del += 1
+                        else:
+                            _zta_errs.append("Delete menu item not found in dropdown")
+                            break
+                    if _zta_del:
+                        _persist("zta_profiles", "completed",
+                                 f"Deleted {_zta_del} ZTA profile(s) ✓")
+                        log_fn(f"[scc-reset] zta_profiles: deleted {_zta_del} ✓")
+                    elif _zta_errs:
+                        _persist("zta_profiles", "failed",
+                                 f"Browser: {'; '.join(_zta_errs)}")
+                        log_fn(f"[scc-reset] zta_profiles errors: {_zta_errs}")
+                    else:
+                        _persist("zta_profiles", "completed",
+                                 "No custom ZTA profiles found (browser confirmed clean)")
+                        log_fn("[scc-reset] zta_profiles: already clean (browser)")
+            except Exception as _e:
+                _persist("zta_profiles", "failed", f"Browser error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] zta_profiles browser error: {_e}")
+
+            # ── 1. logging_settings ───────────────────────────────────────────
+            log_fn("[scc-reset] 1/7 logging_settings")
+            try:
+                # Enter Secure Access then navigate Secure ▸ Access Policy
+                _landed = False
+                for _idx, (_flyout, _item) in enumerate([
+                    ("Secure", "Access Policy"),
+                    ("Secure", "Internet Access"),
+                    ("Secure", "Internet Policy"),
+                    ("Secure", "Web Policy"),
+                    ("Secure", "Web Security"),
+                ]):
+                    _enter_secure_access()
+                    page.wait_for_timeout(800)
+                    # Take flyout screenshot on first attempt to reveal actual sub-item labels
+                    _sase_nav(_flyout, _item, shot_prefix=f"secure_flyout" if _idx == 0 else "")
+                    page.wait_for_timeout(2000)
+                    if not _on_home():
+                        _b = page.inner_text("body").lower()
+                        if any(c in _b for c in ["access policy", "internet access",
+                                                  "internet policy", "web policy",
+                                                  "web security", "all traffic"]):
+                            _landed = True
+                            break
+                _shot("1_logging")
+                _body = page.inner_text("body").lower()
+                _detail = "Could not navigate to Access Policy page — check 1_logging screenshot"
+                if not _landed:
+                    _persist("logging_settings", "failed", _detail)
+                    log_fn(f"[scc-reset] logging_settings: {_detail}")
+                elif any(c in _body for c in ["access policy", "internet access",
+                                               "internet policy", "web policy",
+                                               "web security", "all traffic"]):
+                    _edit_found = False
+                    for _rs in [
+                        'tr:has-text("Internet")', 'tr:has-text("internet")',
+                        '[role="row"]:has-text("Internet")', 'tr:has-text("All")',
+                    ]:
+                        try:
+                            _row = page.locator(_rs).first
+                            for _es in [
+                                'button[aria-label*="edit" i]', 'button:has-text("Edit")',
+                                'a:has-text("Edit")', '[aria-label*="edit" i]',
+                            ]:
+                                try:
+                                    eb = _row.locator(_es).first
+                                    if eb.is_visible(timeout=800):
+                                        eb.click(); page.wait_for_timeout(2000)
+                                        _edit_found = True; break
+                                except Exception:
+                                    continue
+                            if _edit_found:
+                                break
+                        except Exception:
+                            continue
+                    if _edit_found:
+                        _shot("1_logging_edit")
+                        _toggled = False
+                        for _ts in [
+                            'input[aria-label*="log" i]', '[aria-label*="log" i][role="switch"]',
+                            'label:has-text("Log") input', 'label:has-text("Logging") input',
+                            'input[id*="log" i]',
+                        ]:
+                            try:
+                                tog = page.locator(_ts).first
+                                if tog.is_visible(timeout=1500):
+                                    if tog.is_checked():
+                                        tog.click(); page.wait_for_timeout(400)
+                                    _toggled = True; break
+                            except Exception:
+                                continue
+                        for _ss in ['button:has-text("Save")', 'button:has-text("Apply")', 'button[type="submit"]']:
+                            try:
+                                sb = page.locator(_ss).first
+                                if sb.is_visible(timeout=1500):
+                                    sb.click(); page.wait_for_timeout(1500); break
+                            except Exception:
+                                continue
+                        _detail = "Logging disabled ✓" if _toggled else "Edit opened — logging toggle not found (may already be off)"
+                    else:
+                        _detail = "Policy row found but no Edit button — logging may already be disabled"
+                else:
+                    _detail = "Landed on Access Policy page but content pattern not recognized"
+                if _landed:
+                    _persist("logging_settings", "completed", _detail)
+                    log_fn(f"[scc-reset] logging_settings: {_detail}")
+            except Exception as _e:
+                _persist("logging_settings", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] error: {_e}")
+
+            # ── 2. ravpn_profiles ─────────────────────────────────────────────
+            log_fn("[scc-reset] 2/7 ravpn_profiles")
+            try:
+                # Enter SA first so _sa_url() can extract the org number from the URL
+                _enter_secure_access()
+                _ravpn_direct = _sa_url("/connect/user-connectivity/vpn")
+                _res = _sase_delete_row(
+                    [("Connect", "Remote Access"),
+                     ("Connect", "Remote Access VPN"),
+                     ("Connect", "VPN"),
+                     ("Connect", "Network Access")],
+                    "PseudoCo_RA_VPN", "2_ravpn",
+                    content_checks=["remote access", "vpn profile", "vpn", "profile"],
+                    direct_url=_ravpn_direct,
+                )
+                _detail = {
+                    "deleted":          "Deleted PseudoCo_RA_VPN_Profile ✓",
+                    "not_found":        "No RAVPN profile found (already clean)",
+                    "no_delete_option": "No deletable RAVPN profile (already clean)",
+                }.get(_res, _res)
+                _persist("ravpn_profiles", "completed", _detail)
+                log_fn(f"[scc-reset] ravpn_profiles: {_detail}")
+            except Exception as _e:
+                _persist("ravpn_profiles", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] ravpn_profiles error: {_e}")
+
+            # ── 3. dlp_rules ──────────────────────────────────────────────────
+            log_fn("[scc-reset] 3/7 dlp_rules")
+            try:
+                # DLP page is at /secure/dlppolicy/ within Secure Access.
+                # Row is named "AI Guardrails". Three-dot menu → "Delete Rule".
+                _enter_secure_access()
+                _dlp_url = _sa_url("/secure/dlppolicy/")
+                _res = _sase_delete_row(
+                    [("Secure", "Data Loss Prevention Policy"),
+                     ("Secure", "Data Loss Prevention"),
+                     ("Secure", "DLP")],
+                    "AI Guardrails", "3_dlp",
+                    content_checks=["data loss", "dlp", "guardrail", "rule"],
+                    direct_url=_dlp_url,
+                )
+                _detail = {
+                    "deleted":          "Deleted DLP rule (AI Guardrails) ✓",
+                    "not_found":        "No DLP rule found (already clean)",
+                    "no_delete_option": "DLP rule found but no delete option in menu",
+                }.get(_res, _res)
+                _persist("dlp_rules",
+                         "failed" if _res == "no_delete_option" else "completed",
+                         _detail)
+                log_fn(f"[scc-reset] dlp_rules: {_detail}")
+            except Exception as _e:
+                _persist("dlp_rules", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] dlp_rules error: {_e}")
+
+            # ── 4. ravpn_ip_pool ──────────────────────────────────────────────
+            log_fn("[scc-reset] 4/7 ravpn_ip_pool")
+            try:
+                # URL: /connect/user-connectivity/vpn → shows "Regions and IP Pools" card
+                # with a "Manage" link.  The "Manage servers" button at top-right ALSO
+                # contains "Manage", so we must NOT use a selector — instead extract the
+                # href of the exact <a>Manage</a> link via JS and navigate directly.
+                _enter_secure_access()
+                _vpn_url = _sa_url("/connect/user-connectivity/vpn")
+                if not _vpn_url:
+                    _enter_secure_access()
+                    _vpn_url = _sa_url("/connect/user-connectivity/vpn")
+                if not _vpn_url:
+                    _persist("ravpn_ip_pool", "failed", "Could not resolve SA org URL")
+                    log_fn("[scc-reset] ravpn_ip_pool: could not resolve SA org URL")
+                else:
+                    page.goto(_vpn_url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(3000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(1000)
+                    # Close Resources flyout if it opened
+                    try:
+                        page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                    except Exception:
+                        pass
+                    _shot("4_ippool")
+                    # "Manage" is a React Router link — no href, needs dispatchEvent.
+                    # Try both exact "Manage" and any <a> containing "Manage" but not "servers".
+                    _manage_clicked = page.evaluate("""
+                        () => {
+                            // STRICT: exact 'Manage' text only — 'Platform Management' (19 chars)
+                            // would pass the old length<20 check and gets clicked first (sidebar).
+                            // Leaf-node scan first (children.length===0), then non-leaf a/button.
+                            for (const el of document.querySelectorAll('*')) {
+                                if (el.children.length === 0
+                                        && el.textContent.trim() === 'Manage') {
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width > 0 && r.height > 0) {
+                                        el.dispatchEvent(new MouseEvent('click',
+                                            {bubbles: true, cancelable: true}));
+                                        return el.tagName + ':leaf-manage';
+                                    }
+                                }
+                            }
+                            for (const el of document.querySelectorAll('a, button')) {
+                                if (el.textContent.trim() === 'Manage') {
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width > 0 && r.height > 0) {
+                                        el.dispatchEvent(new MouseEvent('click',
+                                            {bubbles: true, cancelable: true}));
+                                        return el.tagName + ':exact-manage';
+                                    }
+                                }
+                            }
+                            return false;
+                        }
+                    """)
+                    log_fn(f"[scc-reset] ravpn_ip_pool: Manage click={_manage_clicked}")
+                    if not _manage_clicked:
+                        # Can't reach the pools sub-page — log all <a> texts for debug
+                        _link_texts = page.evaluate("""
+                            () => [...document.querySelectorAll('a')]
+                                    .map(l => l.textContent.trim())
+                                    .filter(t => t.length > 0 && t.length < 40)
+                        """)
+                        log_fn(f"[scc-reset] ravpn_ip_pool: page links = {_link_texts[:15]}")
+                        # No "Manage" link = no custom IP pools configured — already clean.
+                        _persist("ravpn_ip_pool", "completed",
+                                 "No IP Pools page (Manage link absent) — already clean")
+                    else:
+                        page.wait_for_timeout(3000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=6000)
+                        except Exception:
+                            pass
+                        _shot("4_ippool_pools")
+                        _ip_deleted = 0
+                        for _attempt in range(5):
+                            _body = page.inner_text("body").lower()
+                            if "system pool" not in _body and "user pool" not in _body:
+                                break
+                            _pool_row = None
+                            for _rs in [
+                                'tr:has-text("System Pool")', '[role="row"]:has-text("System Pool")',
+                                'tr:has-text("User Pool")',   '[role="row"]:has-text("User Pool")',
+                                'tr:has-text("PseudoCo")',    '[role="row"]:has-text("PseudoCo")',
+                            ]:
+                                try:
+                                    _r = page.locator(_rs).first
+                                    if _r.is_visible(timeout=1500):
+                                        _pool_row = _r; break
+                                except Exception:
+                                    continue
+                            if not _pool_row:
+                                break
+                            _trash = None
+                            for _ts in [
+                                'button[aria-label*="delete" i]', 'button[aria-label*="remove" i]',
+                                '[title*="delete" i]', 'button[data-testid*="delete" i]',
+                            ]:
+                                try:
+                                    _t = _pool_row.locator(_ts).first
+                                    if _t.is_visible(timeout=500):
+                                        _trash = _t; break
+                                except Exception:
+                                    continue
+                            if not _trash:
+                                try:
+                                    _btns = _pool_row.locator('button').all()
+                                    _best = None; _best_x = -1
+                                    for _b in _btns:
+                                        try:
+                                            _bb = _b.bounding_box()
+                                            if (_bb and _bb['width'] < 60
+                                                    and _b.is_visible(timeout=300)
+                                                    and _bb['x'] > _best_x):
+                                                _best = _b; _best_x = _bb['x']
+                                        except Exception:
+                                            continue
+                                    if _best:
+                                        _trash = _best
+                                except Exception:
+                                    pass
+                            if not _trash:
+                                log_fn("[scc-reset] ravpn_ip_pool: trash can not found on row")
+                                break
+                            _trash.click()
+                            page.wait_for_timeout(1500)
+                            _shot("4_ippool_confirm")
+                            _confirmed = False
+                            for _cs in ['button:has-text("Delete")', 'button:has-text("Confirm")',
+                                        'button:has-text("Yes")']:
+                                try:
+                                    cb = page.locator(_cs).first
+                                    if cb.is_visible(timeout=3000):
+                                        cb.click(); page.wait_for_timeout(2500)
+                                        _ip_deleted += 1; _confirmed = True; break
+                                except Exception:
+                                    continue
+                            if not _confirmed:
+                                log_fn("[scc-reset] ravpn_ip_pool: confirm dialog not found")
+                                break
+                        if _ip_deleted:
+                            _persist("ravpn_ip_pool", "completed",
+                                     f"Deleted {_ip_deleted} IP pool(s) ✓")
+                        else:
+                            _body_final = page.inner_text("body").lower()
+                            if "system pool" in _body_final or "user pool" in _body_final:
+                                _persist("ravpn_ip_pool", "failed",
+                                         "IP pool rows found but could not delete — check screenshots")
+                            else:
+                                _persist("ravpn_ip_pool", "completed",
+                                         "No IP pool found (already clean)")
+                        log_fn(f"[scc-reset] ravpn_ip_pool: "
+                               + (f"Deleted {_ip_deleted} IP pool(s) ✓" if _ip_deleted
+                                  else "No IP pool found (already clean)"))
+            except Exception as _e:
+                _persist("ravpn_ip_pool", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] ravpn_ip_pool error: {_e}")
+
+            # ── 5. duo_saml ───────────────────────────────────────────────────
+            log_fn("[scc-reset] 5/7 duo_saml")
+            try:
+                # Page: Configuration Management → Directories section has "Duo [Duo]" accordion;
+                # SSO authentication section has "DuoSSO [SAML]" accordion.
+                # PROBLEM: Playwright .click() doesn't trigger React accordion — use JS evaluate.
+                # Flow per profile: JS-click accordion header → wait for expansion →
+                # JS-click "Edit" link → scroll bottom → click Delete button.
+                _enter_secure_access()
+                _saml_url = _sa_url("/connect/users-and-groups/samlmanagement")
+                if not _saml_url:
+                    _enter_secure_access()
+                    _saml_url = _sa_url("/connect/users-and-groups/samlmanagement")
+                if not _saml_url:
+                    _persist("duo_saml", "failed", "Could not resolve SA org URL")
+                    log_fn("[scc-reset] duo_saml: could not resolve SA org URL")
+                else:
+                    _deleted_saml = []
+                    _failed_saml  = []
+                    for _profile in ["Duo"]:   # DuoSSO cascades when Duo is deleted
+                        page.goto(_saml_url, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(3000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(1000)
+                        try:
+                            page.keyboard.press("Escape"); page.wait_for_timeout(400)
+                        except Exception:
+                            pass
+                        _shot(f"5_{_profile.lower()}_nav")
+                        # Wait for page to fully render accordion items
+                        try:
+                            page.wait_for_selector('text="Directories"', timeout=5000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(500)
+                        _body = page.inner_text("body")
+                        if _profile.lower() not in _body.lower():
+                            log_fn(f"[scc-reset] {_profile}: not on page — skipping")
+                            continue
+                        # Use JS to find the accordion toggle by its DIRECT text node.
+                        # React Router accordions don't respond to Playwright .click() —
+                        # use dispatchEvent(MouseEvent) which propagates through React's
+                        # synthetic event system properly.
+                        # Direct text node scan avoids matching nested child text.
+                        # ── Accordion toggle: try Playwright click first, JS row-walk fallback ──
+                        # Root cause of previous failures: single 'click' dispatchEvent on a
+                        # leaf text node doesn't expand the accordion.  Fix:
+                        # 1. Playwright .click() on aria-expanded/role="button" selectors (trusted event).
+                        # 2. JS fallback: walk UP from leaf node to the full-width row container
+                        #    (width>600, height 40-100px) and fire the complete event sequence
+                        #    pointerdown→mousedown→pointerup→mouseup→click so React sees a real interaction.
+                        _toggled = None
+                        # ── Accordion expand: click the chevron at the RIGHT of the row ──
+                        # The SAML page accordion toggle is a chevron at the FAR RIGHT of
+                        # the row — NOT the row center.  Strategy:
+                        #   1. Find Y coord of "Duo" text node
+                        #   2. Scan all interactive elements at that row Y (±40px)
+                        #   3. Take the rightmost one (chevron) → page.mouse.click() (trusted)
+                        #   4. Fallback: click right edge of the wide row div
+                        _excl_acc = "DuoSSO" if _profile == "Duo" else ""
+                        _excl_js  = (f"if (t.startsWith('{_excl_acc}')) continue;"
+                                     if _excl_acc else "")
+                        _btn_info = page.evaluate(f"""
+                            () => {{
+                                // Step 1: Y coord of the profile text node
+                                const walker = document.createTreeWalker(
+                                    document.body, NodeFilter.SHOW_TEXT);
+                                let profileY = null;
+                                while (walker.nextNode()) {{
+                                    const node = walker.currentNode;
+                                    const t = node.textContent.trim();
+                                    if (t !== '{_profile}' && !t.startsWith('{_profile} ')) continue;
+                                    {_excl_js}
+                                    const par = node.parentElement;
+                                    if (!par) continue;
+                                    const r = par.getBoundingClientRect();
+                                    if (r.width > 0 && r.height > 0) {{
+                                        profileY = r.top + r.height / 2; break;
+                                    }}
+                                }}
+                                if (profileY === null) return {{err: 'no-text-found'}};
+                                // Step 2: rightmost interactive element within ±40px of profileY
+                                let best = null, bestX = -1;
+                                const sels = 'button,[role="button"],a,'
+                                    + '[class*="chevron"],[class*="arrow"],'
+                                    + '[class*="toggle"],[class*="expand"]';
+                                for (const el of document.querySelectorAll(sels)) {{
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width <= 0 || r.height <= 0) continue;
+                                    if (Math.abs((r.top + r.height/2) - profileY) > 40) continue;
+                                    const cx = r.left + r.width/2;
+                                    if (cx > bestX) {{ best = r; bestX = cx; }}
+                                }}
+                                if (best) return {{x: best.left + best.width/2,
+                                                  y: best.top + best.height/2,
+                                                  src: 'rightmost-btn'}};
+                                // Step 3: fallback — right edge of the wide row div
+                                const walker2 = document.createTreeWalker(
+                                    document.body, NodeFilter.SHOW_TEXT);
+                                while (walker2.nextNode()) {{
+                                    const node = walker2.currentNode;
+                                    const t = node.textContent.trim();
+                                    if (t !== '{_profile}' && !t.startsWith('{_profile} ')) continue;
+                                    {_excl_js}
+                                    let el = node.parentElement;
+                                    while (el && el !== document.body) {{
+                                        const r = el.getBoundingClientRect();
+                                        if (r.width > 600 && r.height >= 30 && r.height < 110) {{
+                                            return {{x: r.right - 25, y: r.top + r.height/2,
+                                                     src: 'row-right-edge'}};
+                                        }}
+                                        el = el.parentElement;
+                                    }}
+                                }}
+                                return {{err: 'no-clickable-found'}};
+                            }}
+                        """)
+                        if _btn_info and _btn_info.get('x') and _btn_info.get('y'):
+                            page.mouse.click(_btn_info['x'], _btn_info['y'])
+                            _toggled = f"mouse:{_btn_info.get('src','?')}:{_profile}"
+                            log_fn(f"[scc-reset] {_profile}: mouse.click"
+                                   f" src={_btn_info.get('src','?')}"
+                                   f" x={_btn_info['x']:.0f} y={_btn_info['y']:.0f}")
+                        else:
+                            log_fn(f"[scc-reset] {_profile}: btn_info={_btn_info}")
+                        if not _toggled:
+                            # Fallback: Playwright locator for accordion-related buttons
+                            _excl_fa = "DuoSSO" if _profile == "Duo" else ""
+                            for _acc_sel in [
+                                f'button[class*="accordion"]:has-text("{_profile}")',
+                                f'[class*="accordion"] button',
+                                f'li:has-text("{_profile}") button',
+                            ]:
+                                try:
+                                    _cands = page.locator(_acc_sel).all()
+                                    for _cand in _cands:
+                                        _ctxt = (_cand.text_content() or "").strip()
+                                        if _excl_fa and _excl_fa in _ctxt:
+                                            continue
+                                        _bb = _cand.bounding_box()
+                                        if _bb and _bb['width'] > 0:
+                                            page.mouse.click(
+                                                _bb['x'] + _bb['width'] / 2,
+                                                _bb['y'] + _bb['height'] / 2)
+                                            _toggled = f"mouse:locator-bb:{_profile}"
+                                            log_fn(f"[scc-reset] {_profile}: mouse.click"
+                                                   f" locator-bb {_acc_sel[:30]}")
+                                            break
+                                    if _toggled:
+                                        break
+                                except Exception as _te:
+                                    log_fn(f"[scc-reset] {_profile}: locator-bb"
+                                           f" {_acc_sel[:30]}: {_te}")
+                                    continue
+                        page.wait_for_timeout(3000)
+                        _shot(f"5_{_profile.lower()}_expanded")
+                        # Gate on actual expansion — only proceed if Edit link is visible.
+                        # A set _toggled does NOT mean the accordion expanded; the edit link
+                        # appearing is the only reliable confirmation.
+                        _edit_visible = False
+                        try:
+                            _edit_visible = page.locator(
+                                'a:has-text("Edit"), button:has-text("Edit")'
+                            ).first.is_visible(timeout=2000)
+                        except Exception:
+                            pass
+                        log_fn(f"[scc-reset] {_profile}: toggled={_toggled!r}"
+                               f" edit_visible={_edit_visible}")
+                        if not _edit_visible:
+                            log_fn(f"[scc-reset] {_profile}: accordion did not expand — mark failed")
+                            _failed_saml.append(_profile)
+                            continue
+                        log_fn(f"[scc-reset] {_profile}: toggled={_toggled!r}"
+                               f" edit_visible={_edit_visible}")
+                        # ── Click "Edit" link (text may be "✎ Edit" — use has-text not exact) ──
+                        _edited = False
+                        try:
+                            for _edit_sel in [
+                                'a:has-text("Edit")',
+                                'button:has-text("Edit")',
+                                '[class*="edit"]:visible',
+                            ]:
+                                _el = page.locator(_edit_sel).first
+                                if _el.count() > 0 and _el.is_visible(timeout=1500):
+                                    _el.click(force=True); _edited = True; break
+                        except Exception:
+                            pass
+                        if not _edited:
+                            _edited = page.evaluate("""
+                                () => {
+                                    const els = [...document.querySelectorAll('a, button')];
+                                    const e = els.find(el =>
+                                        el.textContent.includes('Edit')
+                                        && el.offsetParent !== null);
+                                    if (e) {
+                                        e.dispatchEvent(new MouseEvent('click',
+                                            {bubbles: true, cancelable: true}));
+                                        return true;
+                                    }
+                                    return false;
+                                }
+                            """)
+                        page.wait_for_timeout(2500)
+                        _shot(f"5_{_profile.lower()}_edit")
+                        # Scroll to bottom to reveal Cancel / Delete / Save buttons
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(800)
+                        try:
+                            page.wait_for_selector(
+                                'button:has-text("Cancel"), button:has-text("Delete")',
+                                timeout=4000)
+                        except Exception:
+                            pass
+                        # Click Delete button
+                        _del_clicked = False
+                        for _ds in ['button:has-text("Delete")',
+                                    'button[class*="danger"]:has-text("Delete")']:
+                            try:
+                                _d = page.locator(_ds).first
+                                if _d.is_visible(timeout=2000):
+                                    _d.click(); page.wait_for_timeout(1500)
+                                    _del_clicked = True; break
+                            except Exception:
+                                continue
+                        if not _del_clicked:
+                            # JS fallback for Delete button
+                            _del_clicked = page.evaluate("""
+                                () => {
+                                    const btns = [...document.querySelectorAll('button')];
+                                    const b = btns.find(el => el.textContent.trim() === 'Delete'
+                                                              && el.offsetParent !== null);
+                                    if (b) { b.click(); return true; }
+                                    return false;
+                                }
+                            """)
+                            page.wait_for_timeout(1500)
+                        if not _del_clicked:
+                            log_fn(f"[scc-reset] {_profile}: Delete button not found — mark failed")
+                            _failed_saml.append(_profile)
+                            continue
+                        _shot(f"5_{_profile.lower()}_confirm")
+                        # ── Confirmation dialog: check mandatory checkbox, then click
+                        # the dialog's own Delete button (NOT the form's Delete button).
+                        # The form also has a Delete button behind the overlay — using
+                        # .first picks whichever appears first in DOM which may be wrong.
+                        # Fix: check checkbox → wait 1.5s for React to enable button →
+                        # find the TOPMOST visible Delete button by Y coord (dialog is
+                        # centered higher on page than the form's bottom button).
+                        try:
+                            for _cb_sel in [
+                                'dialog input[type="checkbox"]',
+                                '[role="dialog"] input[type="checkbox"]',
+                                'input[type="checkbox"]',
+                            ]:
+                                _dlg_cb = page.locator(_cb_sel).first
+                                if _dlg_cb.count() > 0 and _dlg_cb.is_visible(timeout=1500):
+                                    if not _dlg_cb.is_checked():
+                                        _dlg_cb.click(force=True)
+                                        page.wait_for_timeout(1500)  # wait for React to enable btn
+                                        log_fn(f"[scc-reset] {_profile}: checked 'I understand' checkbox")
+                                    break
+                        except Exception:
+                            pass
+                        # Click the dialog's Delete button — find it by lowest Y (topmost on page)
+                        _conf_clicked = False
+                        try:
+                            _all_del = page.locator('button:has-text("Delete")').all()
+                            _best_btn = None
+                            _best_y   = 99999
+                            for _db in _all_del:
+                                try:
+                                    _dbb = _db.bounding_box()
+                                    if _dbb and _dbb['y'] < _best_y and _dbb['width'] > 0:
+                                        _best_btn = _db
+                                        _best_y   = _dbb['y']
+                                except Exception:
+                                    pass
+                            if _best_btn:
+                                _bbx = _best_btn.bounding_box()
+                                page.mouse.click(
+                                    _bbx['x'] + _bbx['width'] / 2,
+                                    _bbx['y'] + _bbx['height'] / 2)
+                                _conf_clicked = True
+                                log_fn(f"[scc-reset] {_profile}: clicked dialog Delete"
+                                       f" at x={_bbx['x']:.0f} y={_best_y:.0f}")
+                        except Exception as _ce:
+                            log_fn(f"[scc-reset] {_profile}: dialog-delete error: {_ce}")
+                        if not _conf_clicked:
+                            for _cs in ['button:has-text("Delete")', 'button:has-text("Confirm")',
+                                        'button:has-text("Yes")']:
+                                try:
+                                    cb = page.locator(_cs).first
+                                    if cb.is_visible(timeout=1500):
+                                        cb.click(force=True); _conf_clicked = True; break
+                                except Exception:
+                                    continue
+                        page.wait_for_timeout(4000)
+                        # ── Post-delete verification: reload and confirm Duo row is gone ──
+                        page.goto(_saml_url, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(3000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=6000)
+                        except Exception:
+                            pass
+                        _verify_body = page.inner_text("body").lower()
+                        _profile_gone = _profile.lower() not in _verify_body or (
+                            "directories" in _verify_body
+                            and f'"{_profile.lower()}"' not in _verify_body
+                            and _profile.lower() + " duo" not in _verify_body)
+                        # Simpler: check accordion row is gone by looking for edit context
+                        # Reload and see if profile name still appears in Directories section
+                        _dirs_section = ""
+                        try:
+                            _dirs_el = page.locator('text="Directories"').first
+                            if _dirs_el.is_visible(timeout=2000):
+                                # Get text of a parent container of Directories heading
+                                _dirs_section = (_dirs_el.evaluate(
+                                    "el => { let p=el; for(let i=0;i<5;i++){p=p.parentElement;} return p.innerText||''; }"
+                                ) or "").lower()
+                        except Exception:
+                            pass
+                        _duo_gone_verified = (
+                            _profile.lower() not in _dirs_section
+                            if _dirs_section
+                            else "configurations" in _verify_body and _profile.lower() not in _verify_body
+                        )
+                        _shot(f"5_{_profile.lower()}_verify")
+                        log_fn(f"[scc-reset] {_profile}: post-delete verify gone={_duo_gone_verified}"
+                               f" conf_clicked={_conf_clicked}")
+                        if not _duo_gone_verified:
+                            log_fn(f"[scc-reset] {_profile}: still present after delete — mark failed")
+                            _failed_saml.append(_profile)
+                            continue
+                        _deleted_saml.append(_profile)
+                        log_fn(f"[scc-reset] {_profile}: deleted and verified ✓")
+                    # DuoSSO deletes itself automatically when Duo directory is removed —
+                    # no separate check needed.
+                    if _failed_saml:
+                        _persist("duo_saml", "failed",
+                                 f"Could not delete: {', '.join(_failed_saml)} — check screenshots")
+                    elif _deleted_saml:
+                        _persist("duo_saml", "completed",
+                                 f"Deleted Duo directory ✓ (DuoSSO removes itself automatically)")
+                    else:
+                        _persist("duo_saml", "completed",
+                                 "No Duo directory found (already clean)")
+                    log_fn(f"[scc-reset] duo_saml: deleted={_deleted_saml} failed={_failed_saml}")
+            except Exception as _e:
+                _persist("duo_saml", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] duo_saml error: {_e}")
+
+            # ── 6. ise_pxgrid ─────────────────────────────────────────────────
+            log_fn("[scc-reset] 6/7 ise_pxgrid")
+            try:
+                _go(["Platform Management", "Integrations"])
+                page.wait_for_timeout(1000)
+                for _tab in ['button:has-text("My Integrations")', 'a:has-text("My Integrations")', '[role="tab"]:has-text("My Integrations")']:
+                    try:
+                        t = page.locator(_tab).first
+                        if t.is_visible(timeout=3000):
+                            t.click(); page.wait_for_timeout(2000); break
+                    except Exception: continue
+                _shot("6_ise")
+                _body = page.inner_text("body").lower()
+                _deleted = False
+                if "ise" in _body:
+                    try:
+                        _row = page.locator('tr').filter(has_text="ISE").first
+                        _row.locator('button').last.click(force=True, timeout=4000)
+                        page.wait_for_timeout(600)
+                        for _ds in ['[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")',
+                                    '[role="menuitem"]:has-text("Remove")', 'a:has-text("Delete")']:
+                            try:
+                                d = page.locator(_ds).first
+                                if d.is_visible(timeout=1500):
+                                    d.click(); page.wait_for_timeout(800)
+                                    for _cs in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
+                                        try:
+                                            cb = page.locator(_cs).first
+                                            if cb.is_visible(timeout=2000):
+                                                cb.click(); page.wait_for_timeout(1500); break
+                                        except Exception: continue
+                                    _deleted = True; break
+                            except Exception: continue
+                    except Exception as _ie:
+                        log_fn(f"[scc-reset] ise row error: {_ie}")
+                _detail = "Deleted ISE/pxGrid integration ✓" if _deleted else "No ISE integration found (already clean)"
+                _persist("ise_pxgrid", "completed", _detail)
+                log_fn(f"[scc-reset] ise_pxgrid: {_detail}")
+            except Exception as _e:
+                _persist("ise_pxgrid", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] ise_pxgrid error: {_e}")
+
+            # ── 7. te_integration ─────────────────────────────────────────────
+            log_fn("[scc-reset] 7/7 te_integration")
+            try:
+                _go(["Experience and Insights", "Account Management"])
+                if "account management" not in page.inner_text("body").lower():
+                    _go(["Experience", "Account Management"])
+                _shot("7_te")
+                _body = page.inner_text("body").lower()
+                _deleted = False
+                if "thousandeyes" in _body or "thousand eyes" in _body:
+                    _r = _delete_named_row("ThousandEyes")
+                    if _r != "deleted":
+                        # ThousandEyes may use Disconnect/Unlink instead of Delete
+                        for _btn in ["Disconnect", "Unlink", "Remove"]:
+                            try:
+                                b = page.locator(f'button:has-text("{_btn}")').first
+                                if b.is_visible(timeout=1500):
+                                    b.click(); page.wait_for_timeout(1000)
+                                    for _cs in ['button:has-text("Confirm")', 'button:has-text("Yes")', 'button:has-text("Delete")']:
+                                        try:
+                                            cb = page.locator(_cs).first
+                                            if cb.is_visible(timeout=2000):
+                                                cb.click(); page.wait_for_timeout(1500); break
+                                        except Exception: continue
+                                    _deleted = True; break
+                            except Exception: continue
+                    else:
+                        _deleted = True
+                _detail = "Deleted ThousandEyes integration ✓" if _deleted else "No ThousandEyes integration found (already clean)"
+                _persist("te_integration", "completed", _detail)
+                log_fn(f"[scc-reset] te_integration: {_detail}")
+            except Exception as _e:
+                _persist("te_integration", "failed", f"Error: {str(_e)[:120]}")
+                log_fn(f"[scc-reset] te_integration error: {_e}")
+
+        finally:
+            browser.close()
+
+    return True, "SCC manual reset automation complete — all 7 items processed"
+
+
+@app.route("/api/ise/scc-complete", methods=["POST"])
+def api_ise_scc_complete():
+    """Called by the Docker ISE container after getting the OTP from ISE.
+    Runs SCC Platform Integrations Playwright navigation on the HOST (not Docker)
+    because Docker's VPN routing breaks Okta silent-renew in headless Chromium.
+    Returns {ok, message} — DB status is updated by the calling container.
+    """
+    data = request.get_json(silent=True) or {}
+    pod_id = data.get("pod_id", "")
+    otp_token = data.get("otp_token", "")
+    if not pod_id or not otp_token:
+        return jsonify({"ok": False, "message": "pod_id and otp_token required"}), 400
+
+    session_path = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
+    if not session_path.exists():
+        return jsonify({"ok": False, "message": f"No SCC session file for {pod_id}"}), 404
+
+    log(pod_id, f"[scc-nav] Host SCC nav starting for {pod_id} (OTP: {otp_token[:12]}...)")
+
+    def _lf(msg):
+        log(pod_id, msg)
+
+    ok, message = _host_scc_integrate(pod_id, otp_token, str(session_path), _lf)
+    log(pod_id, f"[scc-nav] {'OK' if ok else 'FAIL'}: {message}")
+    return jsonify({"ok": ok, "message": message})
+
+
+_scc_refresh_thread = [None]  # track running refresh thread
+
+
+def _scc_otp_watcher():
+    """Background thread: watch for ise_scc_otp_*.json files written by Docker container.
+    When found, run SCC Playwright nav on host (outside VPN), write result file.
+    Uses shared volume /pipeline/host-data/ = data/ on host.
+    """
+    import glob as _glob
+    while True:
+        try:
+            for _otp_file in _glob.glob(str(DATA_DIR / "data" / "ise_scc_otp_*.json")):
+                try:
+                    _data = json.loads(Path(_otp_file).read_text())
+                    _pod_id = _data.get("pod_id", "")
+                    _otp = _data.get("otp_token", "")
+                    _ts = _data.get("ts", 0)
+                    if not _pod_id or not _otp:
+                        continue
+                    # Ignore stale files older than 5 min
+                    if time.time() - _ts > 300:
+                        Path(_otp_file).unlink(missing_ok=True)
+                        continue
+                    # Remove signal file immediately so we don't process twice
+                    Path(_otp_file).unlink(missing_ok=True)
+                    log(_pod_id, f"[scc-nav] Watcher picked up OTP for {_pod_id} — running host SCC nav")
+                    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
+                    if not _session_path.exists():
+                        _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
+                    else:
+                        _ok, _msg = _host_scc_integrate(_pod_id, _otp, str(_session_path),
+                                                        lambda m: log(_pod_id, m))
+                        _res = {"ok": _ok, "message": _msg}
+                    log(_pod_id, f"[scc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+                    # Write result for container to pick up
+                    _result_path = DATA_DIR / "data" / f"ise_scc_result_{_pod_id}.json"
+                    _result_path.write_text(json.dumps(_res))
+                except Exception as _e:
+                    try:
+                        log("SCC_WATCHER", f"[scc-nav] watcher error processing {_otp_file}: {_e}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+threading.Thread(target=_scc_otp_watcher, daemon=True, name="scc-otp-watcher").start()
+
+
+# ── SCC Manual Reset Automation endpoint ──────────────────────────────────────
+
+@app.route("/api/scc/manual-reset/<pod_id>", methods=["POST"])
+def api_scc_manual_reset(pod_id):
+    """Run API-based SCC reset (6 items) then Playwright automation (7 items) in a background thread."""
+
+    def _run():
+        # ── Phase 1: API-based checks (access policy, NTGs, ZTA, private resources, DNS, EPP) ──
+        try:
+            import sys, os as _os, importlib
+            log(pod_id, "[scc-reset] Phase 1: running API-based checks (6 items)...")
+            sys.path.insert(0, str(Path(__file__).parent))
+            _os.environ["POD_ID"] = pod_id
+            _os.environ["DB_PATH"] = str(Path(__file__).parent / "data" / "pod_state.db")
+            _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
+            import onboard_router
+            importlib.reload(onboard_router)
+            ok, result = onboard_router.phase_scc_reset_check()
+            log(pod_id, f"[scc-reset] API checks done: {result}")
+        except Exception as _e:
+            log(pod_id, f"[scc-reset] API checks error: {_e}")
+
+        # ── Phase 2: Playwright automation (logging, RAVPN, DLP, IP pool, Duo, ISE, TE) ──
+        try:
+            ok, msg = _scc_auto_reset_manual(pod_id, lambda m: log(pod_id, m))
+            log(pod_id, f"[scc-reset] Done: {msg}")
+        except Exception as _e:
+            log(pod_id, f"[scc-reset] Uncaught error: {_e}")
+
+    threading.Thread(target=_run, daemon=True, name=f"scc-manual-reset-{pod_id}").start()
+    return jsonify({"status": "started", "pod_id": pod_id})
+
+
+# ── Host-side cdFMC pxGrid integration (step 4) ──────────────────────────────
+
+def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
+                          session_path: str, log_fn) -> tuple:
+    """Run cdFMC pxGrid integration on the HOST (not Docker).
+
+    Navigation path (confirmed by diag22-25):
+    1. SCC /firewalls/applications/FMC/?enterpriseId=... (15s wait for HBR-BUTTON drawer)
+    2. expect_popup() + JS shadow-DOM click on HBR-BUTTON 'Platform Settings'
+       → authenticated cdFMC tab at /ddd/#PFSettingsPolicyList
+    3. Navigate tab directly to /ui/identity-sources/pxgrid
+    4. Click 'Create pxGrid Application Instance'
+    5. Fill input[name='name'] and input[name='otp'], click Create → Save
+    """
+    from playwright.sync_api import sync_playwright
+
+    _JS_CLICK_HBR = """(label) => {
+        function deepQueryAll(root) {
+            const found = [];
+            const all = root.querySelectorAll('*');
+            for (const el of all) {
+                if ((el.textContent||'').trim() === label) found.push(el);
+                if (el.shadowRoot) found.push(...deepQueryAll(el.shadowRoot));
+            }
+            return found;
+        }
+        const hbr = deepQueryAll(document).filter(e => e.tagName === 'HBR-BUTTON');
+        if (hbr.length > 0) { hbr[0].click(); return 'HBR-BUTTON clicked'; }
+        const any = deepQueryAll(document);
+        if (any.length > 0) { any[0].click(); return any[0].tagName + ' clicked'; }
+        return 'NOT_FOUND';
+    }"""
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True,
+            args=["--disable-popup-blocking", "--no-sandbox", "--disable-dev-shm-usage"])
+        try:
+            _sd = json.loads(Path(session_path).read_text())
+            ctx = browser.new_context(
+                storage_state=_sd, viewport={"width": 1920, "height": 1080},
+                ignore_https_errors=True,
+            )
+            log_fn(f"[cdfmc-nav] storage_state: {len(_sd.get('cookies',[]))} cookies")
+
+            page = ctx.new_page()
+            page.set_default_timeout(30000)
+
+            # ── 1. Get EID from session localStorage ─────────────────────────
+            _eid = ""
+            for _o in (_sd.get("origins", []) if isinstance(_sd, dict) else []):
+                for _it in _o.get("localStorage", []):
+                    if _it.get("name") == "enterpriseId":
+                        _eid = _it["value"]
+                        break
+
+            # ── 2. Navigate to SCC FMC app page (draws HBR-BUTTON drawer) ────
+            _fmc_url = (f"https://security.cisco.com/firewalls/applications/FMC/?enterpriseId={_eid}"
+                        if _eid else "https://security.cisco.com/firewalls/applications/FMC/")
+            log_fn(f"[cdfmc-nav] Loading FMC app page (EID={_eid or 'none'}, 15s wait)...")
+            for _nav_try in range(3):
+                if _nav_try > 0:
+                    log_fn(f"[cdfmc-nav] chrome-error on attempt {_nav_try} — retrying in 8s...")
+                    page.wait_for_timeout(8000)
+                try:
+                    page.goto(_fmc_url, wait_until="domcontentloaded", timeout=60000)
+                except Exception as _ge:
+                    log_fn(f"[cdfmc-nav] goto exception (attempt {_nav_try}): {_ge}")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(15000)
+                if "chrome-error" not in page.url:
+                    break
+                page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_chrome_error_{pod_id}_t{_nav_try}.png"))
+                log_fn(f"[cdfmc-nav] Attempt {_nav_try}: URL={page.url[:60]}")
+
+            if "sign-on" in page.url.lower():
+                return False, "SCC session expired — re-run Refresh SCC Sessions"
+            log_fn(f"[cdfmc-nav] On SCC FMC app page: {page.url[:70]}")
+            page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_fmc_app_{pod_id}.png"))
+
+            # ── 3. Open authenticated cdFMC tab via Platform Settings HBR-BUTTON ──
+            log_fn("[cdfmc-nav] Opening cdFMC tab via Platform Settings (expect_popup)...")
+            try:
+                with page.expect_popup(timeout=40000) as _popup_info:
+                    _r = page.evaluate(_JS_CLICK_HBR, "Platform Settings")
+                    log_fn(f"[cdfmc-nav] JS shadow-DOM click: {_r}")
+                _fmc_tab = _popup_info.value
+                _cdfmc_host = _fmc_tab.url.split("/")[2]  # capture immediately — tab may redirect away after wait
+                log_fn(f"[cdfmc-nav] cdFMC tab opened: {_fmc_tab.url}")
+            except Exception as _e:
+                page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_no_popup_{pod_id}.png"))
+                return False, f"cdFMC tab did not open (Platform Settings click failed): {_e}"
+
+            try:
+                _fmc_tab.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            _fmc_tab.wait_for_timeout(5000)
+
+            # ── 4. Navigate directly to pxGrid Identity Sources ───────────────
+            # _cdfmc_host captured at popup-open time (before any post-open redirects)
+            _pxgrid_url = f"https://{_cdfmc_host}/ui/identity-sources/pxgrid"
+            log_fn(f"[cdfmc-nav] Navigating to {_pxgrid_url}...")
+            _fmc_tab.goto(_pxgrid_url, wait_until="domcontentloaded", timeout=30000)
+            _fmc_tab.wait_for_timeout(6000)
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_pxgrid_page_{pod_id}.png"))
+
+            _body = _fmc_tab.inner_text("body").lower()
+            if "create pxgrid application instance" not in _body:
+                log_fn(f"[cdfmc-nav] pxGrid page body: {_body[:300]!r}")
+                return False, f"cdFMC pxGrid page not found at {_fmc_tab.url}"
+            log_fn("[cdfmc-nav] pxGrid Identity Sources page loaded ✓")
+
+            # ── 5. Click Create pxGrid Application Instance ───────────────────
+            _fmc_tab.locator('button:has-text("Create pxGrid Application Instance")').first.click(timeout=10000)
+            _fmc_tab.wait_for_timeout(4000)
+            log_fn("[cdfmc-nav] Clicked Create pxGrid Application Instance")
+
+            # ── 6. Fill name and OTP ──────────────────────────────────────────
+            _name_input = _fmc_tab.locator('input[name="name"]').first
+            _name_input.click()
+            _name_input.press_sequentially(instance_name, delay=0)
+            log_fn(f"[cdfmc-nav] Typed name: {instance_name!r}")
+
+            _otp_input = _fmc_tab.locator('input[name="otp"]').first
+            _otp_input.click()
+            _otp_input.press_sequentially(otp_token, delay=0)
+            log_fn(f"[cdfmc-nav] Typed OTP ({len(otp_token)} chars via press_sequentially)")
+            _fmc_tab.wait_for_timeout(500)
+
+            # ── 7. Submit Create dialog ───────────────────────────────────────
+            def _dialog_closed():
+                return _fmc_tab.evaluate("""() => {
+                    const portal = document.querySelector('#backdraft-fragments');
+                    if (!portal) return true;
+                    const hasOtp = !!portal.querySelector('input[name="otp"]');
+                    const hasCreate = Array.from(portal.querySelectorAll('button'))
+                        .some(b => b.innerText.trim() === 'Create');
+                    return !hasOtp && !hasCreate;
+                }""")
+
+            def _log_dialog_state(label):
+                state = _fmc_tab.evaluate("""() => {
+                    const portal = document.querySelector('#backdraft-fragments');
+                    const portalText = portal ? portal.innerText.slice(0, 500) : 'no portal';
+                    const errors = Array.from(document.querySelectorAll(
+                        '[class*="error" i],[class*="invalid" i],[role="alert"],[class*="alert" i]'))
+                        .map(e => (e.innerText||'').trim().slice(0,100)).filter(t=>t);
+                    const portalErrors = portal ? Array.from(portal.querySelectorAll(
+                        '[class*="error" i],[class*="invalid" i],[role="alert"]'))
+                        .map(e => (e.innerText||'').trim().slice(0,100)).filter(t=>t) : [];
+                    return {portalText, errors, portalErrors};
+                }""")
+                log_fn(f"[cdfmc-nav] State after {label}: portal={state['portalText'][:200]!r} errors={state['errors']} portalErrors={state['portalErrors']}")
+
+            _submitted = False
+
+            # Method 0: regular Playwright click on portal's Create button
+            log_fn("[cdfmc-nav] Method 0: Playwright click on portal Create button...")
+            try:
+                _portal_create = _fmc_tab.locator('#backdraft-fragments button').filter(has_text="Create").first
+                _portal_create.click(timeout=5000)
+                log_fn("[cdfmc-nav] Portal Create click: dispatched")
+                _fmc_tab.wait_for_timeout(4000)
+                if _dialog_closed():
+                    log_fn("[cdfmc-nav] Dialog closed after portal click ✓")
+                    _submitted = True
+                else:
+                    _log_dialog_state("portal-click")
+            except Exception as _ce:
+                log_fn(f"[cdfmc-nav] Portal Create click FAILED: {str(_ce)[:200]}")
+
+            # Method A: force=True
+            if not _submitted:
+                try:
+                    _fmc_tab.locator('#backdraft-fragments button').filter(has_text="Create").first.click(timeout=8000, force=True)
+                    _fmc_tab.wait_for_timeout(4000)
+                    if _dialog_closed():
+                        log_fn("[cdfmc-nav] Dialog closed after force click ✓")
+                        _submitted = True
+                    else:
+                        _log_dialog_state("force-click")
+                except Exception as _fe:
+                    log_fn(f"[cdfmc-nav] force click exception: {str(_fe)[:150]}")
+
+            # Method B: JS click
+            if not _submitted:
+                _js_result = _fmc_tab.evaluate("""() => {
+                    const portal = document.querySelector('#backdraft-fragments');
+                    if (!portal) return 'no portal';
+                    const btn = Array.from(portal.querySelectorAll('button'))
+                        .find(b => b.innerText.trim() === 'Create' && !b.disabled);
+                    if (!btn) return 'no Create button in portal';
+                    btn.click();
+                    return 'clicked: ' + btn.innerText.trim();
+                }""")
+                log_fn(f"[cdfmc-nav] JS portal click result: {_js_result!r}")
+                _fmc_tab.wait_for_timeout(4000)
+                if _dialog_closed():
+                    log_fn("[cdfmc-nav] Dialog closed after JS click ✓")
+                    _submitted = True
+                else:
+                    _log_dialog_state("js-click")
+
+            # Method C: focus + Enter
+            if not _submitted:
+                _focus_result = _fmc_tab.evaluate("""() => {
+                    const portal = document.querySelector('#backdraft-fragments');
+                    if (!portal) return 'no portal';
+                    const btn = Array.from(portal.querySelectorAll('button'))
+                        .find(b => b.innerText.trim() === 'Create' && !b.disabled);
+                    if (!btn) return 'no Create button';
+                    btn.focus(); return 'focused';
+                }""")
+                if _focus_result == 'focused':
+                    _fmc_tab.keyboard.press("Enter")
+                    _fmc_tab.wait_for_timeout(4000)
+                    if _dialog_closed():
+                        log_fn("[cdfmc-nav] Dialog closed after Enter ✓")
+                        _submitted = True
+                    else:
+                        _log_dialog_state("Enter")
+
+            if not _submitted:
+                log_fn("[cdfmc-nav] Waiting extra 30s for server response...")
+                for _w in range(30):
+                    _fmc_tab.wait_for_timeout(1000)
+                    if _dialog_closed():
+                        log_fn(f"[cdfmc-nav] Dialog closed after extra {_w+1}s ✓")
+                        _submitted = True
+                        break
+                    if _w % 10 == 9:
+                        _log_dialog_state(f"wait-{_w+1}s")
+
+            if not _submitted:
+                _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_create_stuck_{pod_id}.png"))
+                return False, "cdFMC Create dialog did not close — check cdfmc_create_stuck screenshot"
+
+            _fmc_tab.wait_for_timeout(2000)
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_after_create_{pod_id}.png"))
+            log_fn("[cdfmc-nav] Instance created ✓")
+
+            # ── 8. Select the new instance (click "Selected" column button) ────
+            # The Application Instances table is ReactVirtualized — rows are
+            # DIV.ReactVirtualized__Table__row (NOT <tr>).
+            # First rowColumn child = "Selected" column — has 1 BUTTON, 0 radios.
+            # The 4 input[type="radio"] on this page are ALL Service Type radios
+            # (None / ISE / pxGrid Cloud / Passive) — never inside an instance row.
+            log_fn(f"[cdfmc-nav] Selecting instance {instance_name!r}...")
+            _fmc_tab.wait_for_timeout(3000)
+
+            _selected = False
+            for _sel_try in range(8):
+                _fmc_tab.wait_for_timeout(1000)
+                _sel_result = _fmc_tab.evaluate(f"""() => {{
+                    // ReactVirtualized rows — DIV not <tr>
+                    const rows = Array.from(document.querySelectorAll(
+                        'div.ReactVirtualized__Table__row'
+                    ));
+                    const targetRow = rows.find(r => (r.textContent||'').includes({instance_name!r}));
+                    if (!targetRow) return 'no-row:' + rows.length;
+                    // First rowColumn = "Selected" column; contains a button (NOT a radio)
+                    const firstCol = targetRow.querySelector('div.ReactVirtualized__Table__rowColumn');
+                    if (!firstCol) return 'no-col';
+                    const btn = firstCol.querySelector('button');
+                    if (!btn) return 'no-btn';
+                    btn.click();
+                    return 'clicked';
+                }}""")
+                if _sel_result == 'clicked':
+                    log_fn(f"[cdfmc-nav] Selected {instance_name!r} via ReactVirtualized row button ✓")
+                    _selected = True
+                    break
+                log_fn(f"[cdfmc-nav] Select try {_sel_try+1}: {_sel_result}")
+
+            if not _selected:
+                _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_select_failed_{pod_id}.png"))
+                return False, f"Could not find row button for {instance_name!r} — check cdfmc_select_failed screenshot"
+            # ── Handle "Make the pxGrid Cloud application instance active?" popup ──
+            # Clicking the radio immediately triggers this confirmation dialog.
+            log_fn("[cdfmc-nav] Waiting for 'Make active' confirmation popup...")
+            _make_active_clicked = False
+            for _ma_sel in [
+                'button:has-text("Make active")',
+                'button:has-text("Make Active")',
+            ]:
+                try:
+                    _ma_btn = _fmc_tab.locator(_ma_sel).first
+                    if _ma_btn.is_visible(timeout=6000):
+                        _ma_btn.click(timeout=6000)
+                        log_fn("[cdfmc-nav] Clicked 'Make active' in popup ✓")
+                        _make_active_clicked = True
+                        _fmc_tab.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    continue
+            if not _make_active_clicked:
+                log_fn("[cdfmc-nav] WARN: 'Make active' popup not seen — proceeding anyway")
+
+            _fmc_tab.wait_for_timeout(2000)
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_after_select_{pod_id}.png"))
+
+            # ── 9. Click Save ─────────────────────────────────────────────────
+            log_fn("[cdfmc-nav] Clicking Save...")
+            _fmc_tab.locator('button:has-text("Save")').first.click(timeout=10000, force=True)
+            _fmc_tab.wait_for_timeout(4000)
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_after_save_{pod_id}.png"))
+            log_fn("[cdfmc-nav] Save clicked ✓")
+
+            # ── 10. Delete old stale instances (any row NOT matching our name) ──
+            log_fn("[cdfmc-nav] Cleaning up old instances...")
+            _fmc_tab.wait_for_timeout(2000)
+            for _del_attempt in range(5):
+                _deleted_any = False
+                try:
+                    # ReactVirtualized table — rows are DIV not <tr>
+                    _all_rows = _fmc_tab.locator('div.ReactVirtualized__Table__row').all()
+                except Exception:
+                    _all_rows = []
+                for _row in _all_rows:
+                    try:
+                        _row_txt = _row.inner_text() or ""
+                        if instance_name in _row_txt:
+                            continue  # skip our new instance
+                        if not _row_txt.strip():
+                            continue  # skip empty rows
+                        # This is an old instance row — find its trash/delete button.
+                        # Try named selectors first, then fall back to the last button
+                        # in the row (Actions column: Test link + trash icon button).
+                        _del_btn = None
+                        for _ds in [
+                            'button[aria-label*="delete" i]',
+                            'button[title*="delete" i]',
+                            'button[data-testid*="delete" i]',
+                            'button[class*="delete" i]',
+                        ]:
+                            try:
+                                _b = _row.locator(_ds).first
+                                if _b.is_visible(timeout=800):
+                                    _del_btn = _b
+                                    break
+                            except Exception:
+                                continue
+                        if _del_btn is None:
+                            # Fallback: last button in the row is the trash icon
+                            _btns = _row.locator('button').all()
+                            if _btns:
+                                _del_btn = _btns[-1]
+                        if _del_btn:
+                            log_fn(f"[cdfmc-nav] Deleting old instance: {_row_txt.strip()[:80]!r}")
+                            _del_btn.click(force=True, timeout=5000)
+                            _fmc_tab.wait_for_timeout(2000)
+                            _deleted_any = True
+                            # Confirm delete modal if it appears
+                            for _conf in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
+                                try:
+                                    _cb = _fmc_tab.locator(_conf).first
+                                    if _cb.is_visible(timeout=3000):
+                                        _cb.click(force=True)
+                                        _fmc_tab.wait_for_timeout(2000)
+                                        log_fn("[cdfmc-nav] Delete confirmed ✓")
+                                        break
+                                except Exception:
+                                    pass
+                            break  # re-scan rows after each deletion
+                    except Exception:
+                        continue
+                if not _deleted_any:
+                    break  # no more old instances
+
+            _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_final_{pod_id}.png"))
+            log_fn("[cdfmc-nav] ✓ cdFMC pxGrid Application Instance created, selected, and saved")
+            return True, f"cdFMC pxGrid instance '{instance_name}' created and selected"
+
+        except Exception as _e:
+            log_fn(f"[cdfmc-nav] Exception: {_e}")
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_exception_{pod_id}.png"))
+            except Exception:
+                pass
+            return False, f"cdFMC nav exception: {_e}"
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+def _cdfmc_otp_watcher():
+    """Background thread: watch for ise_cdfmc_otp_*.json written by Docker step 4.
+    Runs _host_cdfmc_integrate on the host (outside Docker VPN) and writes result file.
+    """
+    import glob as _glob
+    while True:
+        try:
+            for _otp_file in _glob.glob(str(DATA_DIR / "data" / "ise_cdfmc_otp_*.json")):
+                try:
+                    _data = json.loads(Path(_otp_file).read_text())
+                    _pod_id      = _data.get("pod_id", "")
+                    _otp         = _data.get("otp_token", "")
+                    _iname       = _data.get("instance_name", f"ISE-FMC-POD-{_pod_id}")
+                    _ts          = _data.get("ts", 0)
+                    if not _pod_id or not _otp:
+                        continue
+                    if time.time() - _ts > 600:  # 10 min stale
+                        Path(_otp_file).unlink(missing_ok=True)
+                        continue
+                    Path(_otp_file).unlink(missing_ok=True)
+                    log(_pod_id, f"[cdfmc-nav] Watcher picked up OTP for {_pod_id}")
+                    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
+                    if not _session_path.exists():
+                        _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
+                    else:
+                        _ok, _msg = _host_cdfmc_integrate(
+                            _pod_id, _otp, _iname, str(_session_path),
+                            lambda m: log(_pod_id, m),
+                        )
+                        _res = {"ok": _ok, "message": _msg}
+                    log(_pod_id, f"[cdfmc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+                    _result_path = DATA_DIR / "data" / f"ise_cdfmc_result_{_pod_id}.json"
+                    _result_path.write_text(json.dumps(_res))
+                except Exception as _e:
+                    try:
+                        log("CDFMC_WATCHER", f"[cdfmc-nav] watcher error: {_e}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+threading.Thread(target=_cdfmc_otp_watcher, daemon=True, name="cdfmc-otp-watcher").start()
+
+
+# ── SGT Propagation Verify (step 5) — host-side Playwright ───────────────────
+
+def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
+                     skip_wait: bool = False) -> tuple:
+    """Verify Security Group Tags in Secure Access after ISE→SCC propagation.
+
+    Checks every 5 min up to 20 min total (4 checks). Logs elapsed time.
+    If skip_wait=True, checks immediately with no propagation wait (for recheck button).
+    """
+    import re as _re, time as _t
+    from playwright.sync_api import sync_playwright
+
+    MAX_WAIT    = 20 * 60   # 20 min total
+    INTERVAL    = 5  * 60   # check every 5 min
+
+    # Load session file — normalize to Playwright storage_state dict
+    try:
+        _sd = json.loads(Path(session_path).read_text())
+    except Exception as _se:
+        return False, f"Cannot read SCC session file: {_se}"
+    _storage = {"cookies": _sd, "origins": []} if isinstance(_sd, list) else _sd
+
+    # Extract enterpriseId from localStorage
+    _eid = ""
+    for _o in (_sd.get("origins", []) if isinstance(_sd, dict) else []):
+        for _it in _o.get("localStorage", []):
+            if _it.get("name") == "enterpriseId":
+                _eid = _it["value"]
+                break
+
+    sgt_url = (
+        f"https://security.cisco.com/secure-access/org/{sa_org_id}"
+        f"/resources/securitygrouptags"
+        + (f"?enterpriseId={_eid}" if _eid else "")
+    )
+    log_fn(f"[sgt-verify] SGT URL: {sgt_url}")
+
+    def _navigate_and_count(page) -> tuple:
+        """Go to SGT page, return (ok, count).  ok=None means session expired."""
+        page.goto(sgt_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)
+        if "sign-on" in page.url.lower():
+            return None, 0
+        body = page.inner_text("body")
+        m = _re.search(r'(\d+)\s+total', body, _re.IGNORECASE)
+        count = int(m.group(1)) if m else 0
+        if count == 0:
+            try:
+                count = page.locator("table tbody tr").count()
+            except Exception:
+                pass
+        return count > 0, count
+
+    browser = None
+    page    = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx  = browser.new_context(
+                storage_state=_storage, viewport={"width": 1920, "height": 1080}
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(30000)
+
+            if skip_wait:
+                # ── Immediate recheck — no propagation wait ───────────────────
+                log_fn("[sgt-verify] Immediate recheck — querying SGTs now...")
+                ok, count = _navigate_and_count(page)
+                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_recheck_{pod_id}.png"))
+                if ok is None:
+                    return False, "SCC session expired — click Refresh SCC Sessions"
+                if ok:
+                    log_fn(f"[sgt-verify] ✓ Found {count} SGTs")
+                    return True, f"SGT verify passed: {count} Security Group Tags found in Secure Access"
+                return True, f"WARN: No SGTs found — ISE→SCC integration may not be active yet"
+
+            # ── Check every 5 min up to 20 min ───────────────────────────────
+            log_fn(f"[sgt-verify] Checking every 5 min up to 20 min (4 checks)...")
+            start = _t.time()
+            for check_num in range(1, 5):   # checks at 5, 10, 15, 20 min
+                next_check_at = check_num * INTERVAL
+                # Wait with elapsed logging every 60s
+                while True:
+                    elapsed = _t.time() - start
+                    if elapsed >= next_check_at:
+                        break
+                    e_mins, e_secs = divmod(int(elapsed), 60)
+                    log_fn(f"[sgt-verify] Elapsed {e_mins:02d}:{e_secs:02d} — next check at {check_num*5} min...")
+                    wake = min(_t.time() + 60, start + next_check_at)
+                    while _t.time() < wake:
+                        _t.sleep(2)
+
+                elapsed = _t.time() - start
+                e_mins, e_secs = divmod(int(elapsed), 60)
+                log_fn(f"[sgt-verify] Check {check_num}/4 at {e_mins:02d}:{e_secs:02d} elapsed...")
+                ok, count = _navigate_and_count(page)
+                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_check{check_num}_{pod_id}.png"))
+
+                if ok is None:
+                    return False, "SCC session expired — click Refresh SCC Sessions"
+                if ok:
+                    log_fn(f"[sgt-verify] ✓ Found {count} SGTs at check {check_num} ({e_mins:02d}:{e_secs:02d} elapsed)")
+                    return True, f"SGT verify passed: {count} Security Group Tags found after {e_mins}m{e_secs:02d}s"
+
+                log_fn(f"[sgt-verify] No SGTs yet (count={count}) — next check in 5 min...")
+
+            log_fn(f"[sgt-verify] ⚠ WARN: No SGTs after 20 min — check ISE → cdFMC integration")
+            return True, (
+                f"WARN: No SGTs in Secure Access after 20 min — "
+                f"check ISE→cdFMC integration (screenshot: sgt_verify_check4_{pod_id}.png)"
+            )
+
+    except Exception as _e:
+        log_fn(f"[sgt-verify] Exception: {_e}")
+        if page:
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_error_{pod_id}.png"))
+            except Exception:
+                pass
+        return False, f"SGT verify exception: {_e}"
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+def _sgt_verify_watcher():
+    """Background thread: watch for ise_sgt_trigger_{pod_id}.json written by Docker step 5.
+    Calls _host_sgt_verify (with countdown + Playwright) and writes ise_sgt_result_{pod_id}.json.
+    """
+    import glob as _glob
+    while True:
+        try:
+            for _trig_file in _glob.glob(str(DATA_DIR / "data" / "ise_sgt_trigger_*.json")):
+                try:
+                    _data = json.loads(Path(_trig_file).read_text())
+                    _pod_id  = _data.get("pod_id", "")
+                    _sa_org  = _data.get("sa_org_id", "")
+                    _ts      = _data.get("ts", 0)
+                    if not _pod_id or not _sa_org:
+                        continue
+                    if time.time() - _ts > 2400:   # 40 min stale guard
+                        Path(_trig_file).unlink(missing_ok=True)
+                        continue
+                    Path(_trig_file).unlink(missing_ok=True)
+                    log(_pod_id, f"[sgt-verify] Watcher picked up SGT trigger for {_pod_id}")
+                    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
+                    if not _session_path.exists():
+                        _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
+                    else:
+                        _ok, _msg = _host_sgt_verify(
+                            _pod_id, _sa_org, str(_session_path),
+                            lambda m: log(_pod_id, m),
+                        )
+                        _res = {"ok": _ok, "message": _msg}
+                    log(_pod_id, f"[sgt-verify] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+                    _result_path = DATA_DIR / "data" / f"ise_sgt_result_{_pod_id}.json"
+                    Path(_result_path).write_text(json.dumps(_res))
+                except Exception as _e:
+                    try:
+                        log("SGT_WATCHER", f"[sgt-verify] watcher error: {_e}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+threading.Thread(target=_sgt_verify_watcher, daemon=True, name="sgt-verify-watcher").start()
+
+
+@app.route("/api/ise/sgt-recheck/<pod_id>", methods=["POST"])
+def api_ise_sgt_recheck(pod_id):
+    """Immediately recheck SGTs in Secure Access — no propagation wait."""
+    import threading as _th
+    _ensure_ise_table()
+    _session_path = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
+    if not _session_path.exists():
+        return jsonify({"status": "error", "message": "No SCC session file — Refresh SCC Sessions first"}), 400
+    _sa_org = None
+    try:
+        import re as _re
+        with sqlite3.connect(str(DATA_DIR / "data" / "pod_state.db")) as _c:
+            _row = _c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+            if _row and _row[0]:
+                _m = _re.search(r"pseudoco-(\d+)", _row[0])
+                if _m:
+                    _oc = _c.execute("SELECT sa_org_id FROM org_credentials WHERE org_number=?", (_m.group(1),)).fetchone()
+                    if _oc:
+                        _sa_org = _oc[0]
+    except Exception:
+        pass
+    if not _sa_org:
+        return jsonify({"status": "error", "message": "sa_org_id not set — check Org Credentials card"}), 400
+
+    def _run():
+        try:
+            log(pod_id, f"[sgt-recheck] Manual SGT recheck triggered for {pod_id}")
+            _ok, _msg = _host_sgt_verify(
+                pod_id, _sa_org, str(_session_path),
+                lambda m: log(pod_id, m),
+                skip_wait=True,
+            )
+            log(pod_id, f"[sgt-recheck] {'✓' if _ok else '✗'} {_msg}")
+            # Update step 5 result in DB
+            try:
+                with sqlite3.connect(str(DATA_DIR / "data" / "pod_state.db")) as _c:
+                    _status = "completed" if _ok else "failed"
+                    _c.execute(
+                        "UPDATE ise_steps SET status=?, result=?, completed_at=? WHERE pod_id=? AND step_name='ise_sgt_verify'",
+                        (_status, _msg, datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), pod_id)
+                    )
+            except Exception as _e:
+                log(pod_id, f"[sgt-recheck] DB update error: {_e}")
+        except Exception as _e:
+            log(pod_id, f"[sgt-recheck] Error: {_e}")
+
+    _th.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "pod_id": pod_id})
+
+@app.route("/api/scc/refresh-sessions", methods=["POST"])
+def api_scc_refresh_sessions():
+    """Launch refresh_scc_sessions.py locally (headed Chrome) to refresh per-POD SCC
+    session files for all active PODs.  Streams progress to pipeline_logs under
+    pod_id='SCC_REFRESH'.  Runs on the Mac — NOT in Docker."""
+    import threading, os
+
+    req_data = request.get_json(silent=True) or {}
+    trigger_pod = req_data.get("pod_id", "SCC_REFRESH")  # for log attribution
+
+    script = DATA_DIR / "refresh_scc_sessions.py"
+    if not script.exists():
+        return jsonify({"status": "error", "message": "refresh_scc_sessions.py not found"}), 404
+
+    def _run():
+        log(trigger_pod, "[scc-refresh] Starting SCC session refresh for all active PODs...")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", str(script), str(DB_PATH)],
+                cwd=str(DATA_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    log(trigger_pod, line if line.startswith("[scc-refresh]") else f"[scc-refresh] {line}")
+            proc.wait()
+            status = "completed" if proc.returncode == 0 else "failed"
+            log(trigger_pod, f"[scc-refresh] {status} (rc={proc.returncode})")
+        except Exception as e:
+            log(trigger_pod, f"[scc-refresh] ERROR: {e}")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    _scc_refresh_thread[0] = t
+    return jsonify({"status": "started", "pod_id": trigger_pod})
+
+
+@app.route("/api/scc/refresh-cancel", methods=["POST"])
+def api_scc_refresh_cancel():
+    """Kill the running refresh_scc_sessions.py process."""
+    import signal
+    killed = 0
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "refresh_scc_sessions.py"],
+            capture_output=True, text=True
+        )
+        for pid in result.stdout.strip().split():
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+                killed += 1
+            except Exception:
+                pass
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+    return jsonify({"status": "ok", "killed": killed})
+
+
+@app.route("/api/scc/session-status", methods=["GET"])
+def api_scc_session_status():
+    """Return freshness of per-POD SCC session files."""
+    import time as _time
+    pod_id = request.args.get("pod_id")
+    result = {}
+    # If specific pod_id, just check that one; otherwise check all
+    if pod_id:
+        f = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
+        if not f.exists():
+            # Fallback: legacy scc_session.json
+            f = DATA_DIR / "data" / "scc_session.json"
+        result[pod_id] = {
+            "exists": f.exists(),
+            "age_hours": round((_time.time() - f.stat().st_mtime) / 3600, 1) if f.exists() else None,
+            "file": f.name if f.exists() else None,
+        }
+    else:
+        # Only include real POD sessions (scc_session_POD-*.json) so stale
+        # orphan files (scc_session_fresh.json, scc_session.json, etc.) don't
+        # inflate `total` in the JS poller and prevent it from ever declaring done.
+        for f in (DATA_DIR / "data").glob("scc_session_POD-*.json"):
+            pid = f.stem.replace("scc_session_", "")
+            result[pid] = {
+                "exists": True,
+                "age_hours": round((_time.time() - f.stat().st_mtime) / 3600, 1),
+                "file": f.name,
+            }
+    return jsonify(result)
+
+
 @app.route("/api/catc/discover/<pod_id>", methods=["POST"])
 def api_catc_discover(pod_id):
     """Run Catalyst Center discovery for a POD's switches (manual trigger)."""
@@ -1770,6 +5180,65 @@ def api_baseconfig_reset(pod_id, switch_key):
         """Collapse multiline error strings to a single line for clean card display."""
         return " | ".join(line.strip() for line in str(s).splitlines() if line.strip())[:300]
     def _run():
+        # ── Step 1: ISE cleanup (before switch resets so NADs are gone before fabric tear-down) ──
+        if switch_key == "all":
+            import datetime as _dt
+            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            log(pod_id, f"[baseconfig/ise] RUNNING started_at={ts}: removing switch NADs from ISE...")
+            script = (
+                "import sys; sys.path.insert(0, '.'); import onboard_router; "
+                "ok, detail = onboard_router.phase_ise_cleanup(); "
+                "print(repr((ok, detail)))"
+            )
+            try:
+                result = subprocess.run([
+                    "docker", "run", "--rm",
+                    "--network", f"container:vpn-{pod_id}",
+                    "--entrypoint", "python3",
+                    "pod-automator:latest", "-c", script
+                ], capture_output=True, text=True, timeout=90)
+                stdout = result.stdout.strip()
+                last_line = stdout.splitlines()[-1] if stdout else ""
+                try:
+                    ok_val, detail_val = eval(last_line)
+                except Exception:
+                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
+            except subprocess.TimeoutExpired:
+                ok_val, detail_val = False, "timed out after 90s"
+            except Exception as e:
+                ok_val, detail_val = False, str(e)
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[baseconfig/ise] {status_str}: {_sanitize(detail_val)}")
+
+            # ── Step 2: CatC cleanup (before switch resets — retries internally on 'being provisioned') ──
+            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            log(pod_id, f"[baseconfig/catc] RUNNING started_at={ts}: removing switches from Catalyst Center...")
+            script = (
+                "import sys; sys.path.insert(0, '.'); import onboard_router; "
+                "ok, detail = onboard_router.phase_catc_cleanup(); "
+                "print(repr((ok, detail)))"
+            )
+            try:
+                result = subprocess.run([
+                    "docker", "run", "--rm",
+                    "--network", f"container:vpn-{pod_id}",
+                    "--entrypoint", "python3",
+                    "pod-automator:latest", "-c", script
+                ], capture_output=True, text=True, timeout=120)  # best-effort delete, ~30s task poll per device
+                stdout = result.stdout.strip()
+                last_line = stdout.splitlines()[-1] if stdout else ""
+                try:
+                    ok_val, detail_val = eval(last_line)
+                except Exception:
+                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
+            except subprocess.TimeoutExpired:
+                ok_val, detail_val = False, "timed out after 120s"
+            except Exception as e:
+                ok_val, detail_val = False, str(e)
+            status_str = "OK" if ok_val else "FAILED"
+            log(pod_id, f"[baseconfig/catc] {status_str}: {_sanitize(detail_val)}")
+
+        # ── Step 3: Switch resets (leaves first, then Border Spine) ──
         for key in keys:
             import datetime as _dt
             ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1819,75 +5288,19 @@ def api_baseconfig_reset(pod_id, switch_key):
                         "-e", "BASE_CONFIGS_DIR=/pipeline/base_configs",
                         "--entrypoint", "python3",
                         "pod-automator:latest", "-c", vscript
-                    ], capture_output=True, text=True, timeout=60)
+                    ], capture_output=True, text=True, timeout=150)
                     vout = vresult.stdout.strip()
                     vlast = vout.splitlines()[-1] if vout else ""
                     try:
                         vok, vdetail = eval(vlast)
                     except Exception:
-                        vok, vdetail = False, f"parse error: {vout[:200]}"
+                        vok, vdetail = False, f"parse error: {vout[:200]} stderr: {vresult.stderr[:100]}"
+                except subprocess.TimeoutExpired:
+                    vok, vdetail = False, "verify timed out after 150s"
                 except Exception as ve:
                     vok, vdetail = False, str(ve)
                 vstatus = "OK" if vok else "FAILED"
                 log(pod_id, f"[verify/{key}] {vstatus}: {_sanitize(vdetail)}")
-
-        # After all switches, clean up ISE NADs (only when resetting all)
-        if switch_key == "all":
-            import datetime as _dt
-            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            log(pod_id, f"[baseconfig/ise] RUNNING started_at={ts}: removing switch NADs from ISE...")
-            script = (
-                "import sys; sys.path.insert(0, '.'); import onboard_router; "
-                "ok, detail = onboard_router.phase_ise_cleanup(); "
-                "print(repr((ok, detail)))"
-            )
-            try:
-                result = subprocess.run([
-                    "docker", "run", "--rm",
-                    "--network", f"container:vpn-{pod_id}",
-                    "--entrypoint", "python3",
-                    "pod-automator:latest", "-c", script
-                ], capture_output=True, text=True, timeout=60)
-                stdout = result.stdout.strip()
-                last_line = stdout.splitlines()[-1] if stdout else ""
-                try:
-                    ok_val, detail_val = eval(last_line)
-                except Exception:
-                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
-            except subprocess.TimeoutExpired:
-                ok_val, detail_val = False, "timed out after 60s"
-            except Exception as e:
-                ok_val, detail_val = False, str(e)
-            status_str = "OK" if ok_val else "FAILED"
-            log(pod_id, f"[baseconfig/ise] {status_str}: {_sanitize(detail_val)}")
-
-            # Catalyst Center — delete the 3 switches from inventory
-            ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            log(pod_id, f"[baseconfig/catc] RUNNING started_at={ts}: removing switches from Catalyst Center...")
-            script = (
-                "import sys; sys.path.insert(0, '.'); import onboard_router; "
-                "ok, detail = onboard_router.phase_catc_cleanup(); "
-                "print(repr((ok, detail)))"
-            )
-            try:
-                result = subprocess.run([
-                    "docker", "run", "--rm",
-                    "--network", f"container:vpn-{pod_id}",
-                    "--entrypoint", "python3",
-                    "pod-automator:latest", "-c", script
-                ], capture_output=True, text=True, timeout=60)
-                stdout = result.stdout.strip()
-                last_line = stdout.splitlines()[-1] if stdout else ""
-                try:
-                    ok_val, detail_val = eval(last_line)
-                except Exception:
-                    ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
-            except subprocess.TimeoutExpired:
-                ok_val, detail_val = False, "timed out after 60s"
-            except Exception as e:
-                ok_val, detail_val = False, str(e)
-            status_str = "OK" if ok_val else "FAILED"
-            log(pod_id, f"[baseconfig/catc] {status_str}: {_sanitize(detail_val)}")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "message": f"Base config reset started for {switch_key} on {pod_id}"})
@@ -2390,15 +5803,30 @@ def pod_assigned(pod_id):
 
 @app.route("/api/pod-scc-keys/<pod_id>", methods=["GET"])
 def get_scc_keys(pod_id):
-    """Return SCC API key/secret for a POD (masked secret)."""
+    """Return SCC API key/secret for a POD.
+    Priority: pods table override → org_credentials fallback (same as _scc_load_keys)."""
+    import re as _re
     conn = _db()
     row = conn.execute(
-        "SELECT scc_api_key, scc_api_secret FROM pods WHERE pod_id=?", (pod_id,)
+        "SELECT scc_api_key, scc_api_secret, scc_org FROM pods WHERE pod_id=?", (pod_id,)
     ).fetchone()
     conn.close()
     if not row:
         return jsonify({"scc_api_key": "", "scc_api_secret": ""})
-    return jsonify({"scc_api_key": row["scc_api_key"] or "", "scc_api_secret": row["scc_api_secret"] or ""})
+    # 1. POD-level override
+    if row["scc_api_key"] and row["scc_api_secret"]:
+        return jsonify({"scc_api_key": row["scc_api_key"], "scc_api_secret": row["scc_api_secret"]})
+    # 2. Fallback: org_credentials table
+    m = _re.search(r"pseudoco-(\d+)", row["scc_org"] or "")
+    if m:
+        conn2 = _db()
+        oc = conn2.execute(
+            "SELECT scc_api_key, scc_api_secret FROM org_credentials WHERE org_number=?", (m.group(1),)
+        ).fetchone()
+        conn2.close()
+        if oc and oc["scc_api_key"] and oc["scc_api_secret"]:
+            return jsonify({"scc_api_key": oc["scc_api_key"], "scc_api_secret": oc["scc_api_secret"]})
+    return jsonify({"scc_api_key": "", "scc_api_secret": ""})
 
 
 @app.route("/api/pod-scc-keys/<pod_id>", methods=["POST"])
@@ -2512,7 +5940,10 @@ def get_org_credentials(org_number):
                         "scc_api_key": "", "scc_api_secret": "",
                         "sa_org_id": "", "sa_api_key": "", "sa_api_secret": "",
                         "scc_email": "", "scc_password": "", "authproxy_cfg": "",
-                        "sa_scim_token": ""})
+                        "sa_scim_token": "", "authproxy_enroll_blob": "",
+                        "authproxy_blob_saved_at": "",
+                        "pxgrid_cloud_email": "", "pxgrid_cloud_password": "",
+                        "pxgrid_cloud_account": ""})
     return jsonify(dict(row))
 
 
@@ -2542,8 +5973,12 @@ def save_org_credentials(org_number):
         "sa_api_secret":     data.get("sa_api_secret", "").strip(),
         "scc_email":         data.get("scc_email", "").strip(),
         "scc_password":      data.get("scc_password", "").strip(),
-        "authproxy_cfg":     data.get("authproxy_cfg", ""),  # preserve whitespace
-        "sa_scim_token":     data.get("sa_scim_token", "").strip(),
+        "authproxy_cfg":          data.get("authproxy_cfg", ""),  # preserve whitespace
+        "sa_scim_token":          data.get("sa_scim_token", "").strip(),
+        "authproxy_enroll_blob":  data.get("authproxy_enroll_blob", "").strip(),
+        "pxgrid_cloud_email":     data.get("pxgrid_cloud_email", "").strip(),
+        "pxgrid_cloud_password":  data.get("pxgrid_cloud_password", "").strip(),
+        "pxgrid_cloud_account":   data.get("pxgrid_cloud_account", "").strip(),
     }
     updates = {k: v for k, v in fields.items() if v != ""}
     if updates:
@@ -2551,6 +5986,12 @@ def save_org_credentials(org_number):
         conn.execute(
             f"UPDATE org_credentials SET {set_clause}, updated_at=datetime('now') WHERE org_number=?",
             list(updates.values()) + [org_number]
+        )
+    # If a new blob was submitted, stamp its individual save time so UI can warn when stale
+    if data.get("authproxy_enroll_blob", "").strip():
+        conn.execute(
+            "UPDATE org_credentials SET authproxy_blob_saved_at=datetime('now') WHERE org_number=?",
+            (org_number,)
         )
     conn.commit()
     conn.close()
@@ -2563,7 +6004,7 @@ ORG_CSV_COLS = [
     "scc_api_key", "scc_api_secret",
     "sa_org_id", "sa_api_key", "sa_api_secret",
     "scc_email", "scc_password", "authproxy_cfg",
-    "sa_scim_token",
+    "sa_scim_token", "authproxy_enroll_blob",
 ]
 
 
@@ -2912,6 +6353,7 @@ DASHBOARD_HTML = """
   .progress-label { font-size: 12px; color: #8899aa; margin-bottom: 6px; }
 
   .switch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+  .switch-card.cedge-full { grid-column: 1 / -1; }
   .switch-card { background: #0a1628; border-radius: 8px; padding: 12px; border: 1px solid #1a2d4a; display: flex; flex-direction: column; }
   .switch-card.fail { border-color: #3d0000; }
   .switch-card.pass { border-color: #003d2a; }
@@ -2922,6 +6364,7 @@ DASHBOARD_HTML = """
   .switch-card-title .role-tag.border { background: #1a0a3d; color: #a855f7; }
   .switch-card-title .role-tag.leaf { background: #0a2a1a; color: #22c55e; }
   .switch-card-title .role-tag.cc { background: #0a1a3d; color: #3b82f6; }
+  .switch-card-title .role-tag.cedge { background: #1a1a0a; color: #f59e0b; }
   .switch-card-title .device-name { color: #e0e6ed; font-size: 13px; font-weight: 600; cursor: pointer; }
   .switch-card-title .device-name:hover { color: #60a5fa; text-decoration: underline; }
   .toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #1a2332; color: #e0e6ed; padding: 10px 20px; border-radius: 8px; border: 1px solid #2a3a4a; font-size: 12px; z-index: 9999; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
@@ -3051,13 +6494,15 @@ DASHBOARD_HTML = """
 
    <div class="summary" id="summary"></div>
 
-  <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-    <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
-    <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
-    <button class="btn-start-all" id="btn-docker-down" onclick="dockerDown()" style="background:#ff4757;color:#fff;">&#9632; Teardown All</button>
-    <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
-    <span id="docker-status" style="font-size:12px;color:#667788;"></span>
-  </div>
+   <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+     <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
+     <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
+     <button class="btn-start-all" id="btn-docker-down" onclick="dockerDown()" style="background:#ff4757;color:#fff;">&#9632; Teardown All</button>
+     <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
+     <button class="btn-start-all" id="btn-scc-refresh-global" onclick="refreshSccSessionsGlobal()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#8635; Refresh SCC Sessions</button>
+     <span id="scc-refresh-global-status" style="font-size:12px;color:#667788;"></span>
+     <span id="docker-status" style="font-size:12px;color:#667788;"></span>
+   </div>
 
   <table>
     <thead>
@@ -3093,14 +6538,15 @@ DASHBOARD_HTML = """
      <div class="detail-tabs">
        <button class="tab-btn active" onclick="switchTab(this, 'steps')">Pipeline Steps</button>
        <button class="tab-btn" onclick="switchTab(this, 'logs')">Live Logs</button>
-       <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches</button>
+       <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches / Routes</button>
        <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
        <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
        <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
         <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
         <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
-        <button class="tab-btn" onclick="switchTab(this, 'duo')">&#x1F512; Duo</button>
-        <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
+         <button class="tab-btn" onclick="switchTab(this, 'duo')">&#x1F512; Duo</button>
+         <button class="tab-btn" onclick="switchTab(this, 'ise')">&#x1F4F6; ISE</button>
+         <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
        <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
        <button class="tab-btn" onclick="switchTab(this, 'kb')">&#128218; Knowledge Base</button>
      </div>
@@ -3147,11 +6593,17 @@ DASHBOARD_HTML = """
        </div>
      </div>
 
-      <div class="tab-content" id="tab-duo">
-        <div id="duo-grid" style="padding:16px;min-height:260px;">
-          <div style="color:#667788;font-size:13px;">Select a POD to manage Duo integration</div>
-        </div>
-      </div>
+       <div class="tab-content" id="tab-duo">
+         <div id="duo-grid" style="padding:16px;min-height:260px;">
+           <div style="color:#667788;font-size:13px;">Select a POD to manage Duo integration</div>
+         </div>
+       </div>
+
+       <div class="tab-content" id="tab-ise">
+         <div id="ise-grid" style="padding:16px;min-height:260px;">
+           <div style="color:#667788;font-size:13px;">Select a POD to manage ISE integrations</div>
+         </div>
+       </div>
 
       <div class="tab-content" id="tab-scc">
         <div id="scc-actions" style="display:none;margin-bottom:10px;">
@@ -3200,6 +6652,7 @@ const PIPELINE_ORDER = [
   "verify_leaf1",
   "verify_leaf2",
   "connectivity_test",
+  "route_verification",
   "cdfmc_check",
   "ad_verify",
   "scc_reset_check",
@@ -3252,6 +6705,7 @@ async function load() {
      else if (tabName === 'fabric')    loadFabricStatus(detailId);
      else if (tabName === 'sda')       loadSdaStatus(detailId);
      else if (tabName === 'duo')       loadDuoStatus(detailId);
+     else if (tabName === 'ise')       loadIseStatus(detailId);
      else if (tabName === 'scc')       loadSccChecklist(detailId);
      else if (tabName === 'baseconfig') loadBaseConfig(detailId);
     // logs tab has its own 2s poller; kb tab is static
@@ -3531,6 +6985,7 @@ async function showPipeline(podId) {
   if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
   if (window._duoPoller)    { clearInterval(window._duoPoller);    window._duoPoller    = null; }
   if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
+  if (window._switchRecheckPoller) { clearTimeout(window._switchRecheckPoller); window._switchRecheckPoller = null; }
   // Reset CatC tile so it re-initialises for the new POD
   const _ct = document.getElementById('catc-tile-container');
   if (_ct) { _ct._initialized = false; _ct._podId = null; }
@@ -3679,6 +7134,7 @@ function roleClass(name) {
   if (name.includes('Leaf')) return 'leaf';
   if (name.includes('Catalyst')) return 'cc';
   if (name === 'Switch Connectivity') return 'cc';
+  if (name.includes('CEDGE') || name.includes('Route')) return 'cedge';
   return '';
 }
 
@@ -3731,20 +7187,54 @@ async function loadSwitches(podId) {
       </div>`;
     }).join('');
 
-    const roleLabel = sw.name === 'Catalyst Center' ? 'CC' : sw.name === 'Switch Connectivity' ? 'TEST' : sw.name.includes('Border') ? 'Spine' : 'Leaf';
+    const roleLabel = sw.name === 'Catalyst Center' ? 'CC'
+      : sw.name === 'Switch Connectivity' ? 'TEST'
+      : (sw.name.includes('CEDGE') || sw.name.includes('Route')) ? 'CEDGE'
+      : sw.name.includes('Border') ? 'Spine' : 'Leaf';
 
+    const isRouteCard = sw.host === 'route_verification';
+    const warnBadge = sw.step_status === 'completed' && sw.failed === 0 && sw.reloaded === 'yes'
+      ? '<span class="badge warn" style="margin-left:8px">RELOADED</span>' : '';
+    const manualRebootBtn = isRouteCard
+      ? '<button class="btn-reconnect" id="route-test-btn-' + escHtml(podId) + '" '
+          + 'style="margin-left:auto;font-size:10px;padding:2px 8px;" '
+          + 'title="Reboot CEDGE and re-verify VRF 10 routes">Manual Reboot / Re-test</button>'
+      : '';
 
-    return '<div class="switch-card ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
+    // Raw route table block — only shown on the CEDGE card when output is available
+    let rawRoutesHtml = '';
+    if (isRouteCard) {
+      if (sw.raw_routes) {
+        rawRoutesHtml = '<div style="margin-top:10px;font-size:10px;color:#7899aa;font-family:monospace;margin-bottom:4px;">show ip route vrf 10</div>'
+          + '<pre style="margin:0;padding:10px;background:#0a1520;border:1px solid #1a2d4a;'
+          + 'border-radius:4px;font-size:10px;color:#c8d8e8;white-space:pre-wrap;word-break:break-all;'
+          + 'overflow-y:visible;">'
+          + escHtml(sw.raw_routes)
+          + '</pre>';
+      } else if (sw.step_status === 'completed' || sw.step_status === 'failed') {
+        // Route check ran but SSH to HQ CEDGE failed — show the raw result string as error
+        const errText = (sw.checks || []).map(c => c.result).find(r => r && r !== 'pending' && r !== 'checking...') || 'SSH to HQ CEDGE failed — no route table captured';
+        rawRoutesHtml = '<div style="margin-top:10px;padding:8px 10px;background:#1a0a0a;border:1px solid #3d0000;'
+          + 'border-radius:4px;font-size:10px;color:#ff6b6b;">'
+          + '⚠ show ip route vrf 10 unavailable — ' + escHtml(errText)
+          + '</div>';
+      }
+    }
+
+    const cardExtraClass = isRouteCard ? ' cedge-full' : '';
+    return '<div class="switch-card' + cardExtraClass + ' ' + (allDevicePass ? 'pass' : hasAnyFail ? 'fail' : sw.step_status === 'skipped' ? 'warn' : '') + '">' +
       '<div class="switch-card-title">' +
         '<span class="role-tag ' + roleClass(sw.name) + '">' + roleLabel + '</span>' +
         '<span class="device-name"' + (sw.ip ? ' data-pod-id="' + escHtml(podId) + '" data-ip="' + escHtml(sw.ip) + '"' : '') + ' title="' + (sw.ip ? 'Click to open SSH terminal' : '') + '">' + escHtml(sw.name) + '</span>' +
         '<span class="device-model">' + escHtml(sw.model || '') + '</span>' +
         (sw.step_status === 'running' ? '<span class="badge" style="margin-left:auto;background:#02c8ff22;color:#02c8ff;border:1px solid #02c8ff55;">⟳ checking</span>' : '') +
         (sw.step_status === 'skipped' ? '<span class="badge warn" style="margin-left:auto">WARN</span>' : '') +
+        warnBadge + manualRebootBtn +
       '</div>' +
       (sw.step_status === 'skipped' ? '<div style="font-size:11px;color:#ffa502;margin-bottom:6px;">⚠ Verification skipped — switch unreachable during pipeline. Click Re-check Switches to retry.</div>' : '') +
       '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + devicePct + '%;background:' + barColor + '"></div></div>' +
       checksHtml +
+      rawRoutesHtml +
       '</div>';
   }).join('');
 
@@ -3752,6 +7242,41 @@ async function loadSwitches(podId) {
   grid.querySelectorAll('.device-name[data-ip]').forEach(el => {
     el.addEventListener('click', () => openTerminal(el.dataset.podId, el.dataset.ip));
   });
+
+  // Wire Manual Reboot / Re-test button for route verification card
+  const testBtn = document.getElementById('route-test-btn-' + podId);
+  if (testBtn) {
+    testBtn.addEventListener('click', async () => {
+      testBtn.disabled = true;
+      testBtn.textContent = 'Rebooting...';
+      try {
+        const resp = await fetch('/api/routes/manual-retest/' + podId, { method: 'POST' });
+        const j = await resp.json();
+        if (j.status !== 'started') {
+          alert('Manual reboot error: ' + (j.message || JSON.stringify(j)));
+          testBtn.disabled = false; testBtn.textContent = 'Manual Reboot / Re-test'; return;
+        }
+      } catch(e) {
+        alert('Manual reboot request failed: ' + e);
+        testBtn.disabled = false; testBtn.textContent = 'Manual Reboot / Re-test'; return;
+      }
+      // Poll until route_verification is no longer running
+      let polls = 0;
+      async function pollRoute() {
+        polls++;
+        const r2 = await fetch('/api/pipeline/' + podId);
+        const steps = await r2.json();
+        const rv = steps.find(s => s.step_name === 'route_verification');
+        await loadSwitches(podId);
+        if (rv && rv.status === 'running' && polls < 120) {
+          setTimeout(pollRoute, 5000);
+        } else {
+          testBtn.disabled = false; testBtn.textContent = 'Manual Reboot / Re-test';
+        }
+      }
+      setTimeout(pollRoute, 3000);
+    });
+  }
 }
 
 async function openTerminal(podId, ip) {
@@ -3764,30 +7289,39 @@ async function openTerminal(podId, ip) {
 }
 
 async function recheckSwitches(podId) {
-  await fetch('/api/switches/recheck/' + podId, { method: 'POST' });
+  // Cancel any in-progress recheck poller (possibly for a different POD)
+  if (window._switchRecheckPoller) { clearTimeout(window._switchRecheckPoller); window._switchRecheckPoller = null; }
+
+  const resp = await fetch('/api/switches/recheck/' + podId, { method: 'POST' });
+  const respJson = await resp.json().catch(() => ({}));
+  if (!resp.ok || respJson.status === 'error') {
+    alert('Re-check error: ' + (respJson.message || 'Unknown error'));
+    return;
+  }
+
   let attempts = 0;
-  const maxAttempts = 40;
+  const maxAttempts = 50;  // 200s max
 
   async function doPoll() {
+    window._switchRecheckPoller = null;
     attempts++;
     try {
-      const switchNames = ['verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test'];
+      const switchNames = ['verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','route_verification'];
       const r2 = await fetch('/api/pipeline/' + podId);
       const steps = await r2.json();
       const switchSteps = steps.filter(s => switchNames.includes(s.step_name));
       const anyRunning = switchSteps.some(s => s.status === 'running');
-      // Always reload the cards so user sees live updates
       await loadSwitches(podId);
       loadSteps(podId);
       if (anyRunning && attempts < maxAttempts) {
-        setTimeout(doPoll, 4000);
+        window._switchRecheckPoller = setTimeout(doPoll, 4000);
       }
     } catch(e) {
       loadSwitches(podId);
     }
   }
 
-  setTimeout(doPoll, 2000);
+  window._switchRecheckPoller = setTimeout(doPoll, 2000);
 }
 
 async function loadCdfmc(podId) {
@@ -4147,6 +7681,30 @@ function escHtml(s) {
 }
 
 // ── Org Credentials Management ───────────────────────────────────────────────
+
+// Returns an inline warning banner if the enrollment blob is stale (>24h).
+// savedAt is a SQLite datetime string 'YYYY-MM-DD HH:MM:SS' (UTC) or empty.
+function closeOrgCredsForm() {
+  const formEl = document.getElementById('org-creds-form');
+  if (formEl) formEl.style.display = 'none';
+  document.querySelectorAll('.org-card').forEach(el => el.classList.remove('selected'));
+  window._currentEditOrg = null;
+}
+
+function blobAgeWarning(savedAt) {
+  if (!savedAt) return '<div style="font-size:11px;color:#f59e0b;background:#2a1a00;border:1px solid #f59e0b;border-radius:4px;padding:5px 9px;margin-bottom:5px;">&#9888; No save timestamp \u2014 paste a fresh blob from Duo Admin portal before running step 5.</div>';
+  const saved = new Date(savedAt.replace(' ', 'T') + 'Z');
+  if (isNaN(saved.getTime())) return '';
+  const ageH = (Date.now() - saved.getTime()) / 3600000;
+  if (ageH > 24) {
+    const d = Math.floor(ageH / 24), h = Math.round(ageH % 24);
+    return '<div style="font-size:11px;color:#f59e0b;background:#2a1a00;border:1px solid #f59e0b;border-radius:4px;padding:5px 9px;margin-bottom:5px;">'
+      + '&#9888; Blob is <b>' + d + 'd ' + h + 'h old</b> \u2014 one-time codes expire after first use. '
+      + 'Generate a new command: Duo Admin \u2192 SSO Settings \u2192 External Auth Sources \u2192 AD \u2192 Auth Proxy \u2192 Step 2 \u2192 Generate Command, paste here and Save before re-running step 5.'
+      + '</div>';
+  }
+  return '<div style="font-size:11px;color:#22c55e;margin-bottom:4px;">&#10003; Blob saved ' + Math.round(ageH) + 'h ago</div>';
+}
 async function initOrgCredsList() {
   const listEl   = document.getElementById('org-creds-list');
   const countEl  = document.getElementById('org-creds-count');
@@ -4214,6 +7772,16 @@ async function importOrgCsv(input) {
   setTimeout(() => { statusEl.textContent = ''; }, 6000);
 }
 
+function orgCredsNew() {
+  const row = document.getElementById('org-new-row');
+  if (!row) return;
+  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
+  if (row.style.display !== 'none') {
+    const inp = document.getElementById('org-num-input');
+    if (inp) { inp.value = ''; inp.focus(); }
+  }
+}
+
 async function loadOrgCreds(orgNum) {
   if (!orgNum) return;
   window._currentEditOrg = orgNum;  // store for saveOrgCreds onclick
@@ -4227,7 +7795,7 @@ async function loadOrgCreds(orgNum) {
   formEl.style.display = 'block';
   formEl.innerHTML = '<div style="color:#667788;font-size:12px;">Loading...</div>';
 
-  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', duo_saml_app_ikey:'', scc_api_key:'', scc_api_secret:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', scc_email:'', scc_password:'', authproxy_cfg:'', sa_scim_token:''};
+  let d = {org_number: orgNum, duo_ikey:'', duo_skey:'', duo_host:'', duo_saml_app_ikey:'', scc_api_key:'', scc_api_secret:'', sa_org_id:'', sa_api_key:'', sa_api_secret:'', scc_email:'', scc_password:'', authproxy_cfg:'', sa_scim_token:'', authproxy_enroll_blob:'', pxgrid_cloud_email:'', pxgrid_cloud_password:'', pxgrid_cloud_account:''};
   try {
     const r = await fetch('/api/org-credentials/' + encodeURIComponent(orgNum));
     d = await r.json();
@@ -4249,11 +7817,12 @@ async function loadOrgCreds(orgNum) {
     + col('Integration Key (ikey)', 'duo_ikey', d.duo_ikey, 'DIRIBLQ...', false)
     + col('Secret Key (skey)', 'duo_skey', d.duo_skey, 'Secret...', true)
     + col('API Hostname', 'duo_host', d.duo_host, 'api-xxxxx.duosecurity.com', false)
-    + '<div style="grid-column:1/-1;">'
-    + lbl('SAML App Integration Key (duo_saml_app_ikey)')
-    + inp('duo_saml_app_ikey', d.duo_saml_app_ikey || '', 'ikey of the Cisco Secure Access SAML app in Duo', false)
-    + '<div style="font-size:10px;color:#445566;margin-top:2px;">In Duo Admin portal: Applications \u2192 Protect an Application \u2192 Cisco Secure Access \u2192 copy the Integration Key. Required for step 4 (verify) and step 5 (enroll).</div>'
-    + '</div>'
+     + '<div style="grid-column:1/-1;">'
+     + lbl('SSO Enrollment Blob (authproxy_enroll_blob)')
+     + blobAgeWarning(d.authproxy_blob_saved_at)
+     + inp('authproxy_enroll_blob', d.authproxy_enroll_blob || '', 'base64 blob from Duo SSO Settings → External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command', false)
+     + '<div style="font-size:10px;color:#445566;margin-top:2px;">In Duo Admin portal: Applications \u2192 SSO Settings \u2192 External Authentication Sources \u2192 Active Directory \u2192 Auth Proxy \u2192 Step 2 \u2192 click \u201cGenerate Command\u201d. Copy the base64 argument (after the .exe path). <b>One-time code \u2014 must be regenerated for each new dCloud session.</b></div>'
+     + '</div>'
     + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">Secure Access (SA)</div>'
     + '<div style="grid-column:1/-1;">'
     + lbl('SA SCIM Provisioning Token')
@@ -4279,10 +7848,16 @@ async function loadOrgCreds(orgNum) {
     + lbl('SCC Admin Password')
     + inp('scc_password', d.scc_password || '', 'C1sco12345!!', true)
     + '</div>'
-    + '<div style="grid-column:1/-1;">'
-    + lbl('Auth Proxy Config (authproxy.cfg content)')
-    + '<textarea id="oc-authproxy_cfg" rows="10" placeholder="[cloud]&#10;ikey=...&#10;skey=...&#10;api_host=api-xxx.duosecurity.com&#10;&#10;[ad_client]&#10;host=198.18.5.102&#10;..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:4px 7px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical;"></textarea>'
-    + '<div style="font-size:10px;color:#445566;margin-top:2px;">Paste the complete authproxy.cfg downloaded from Duo Admin portal. Include [cloud], [ad_client], and [sso] sections. Stored per-org and pushed verbatim to AD1 at pipeline time.</div>'
+     + '<div style="grid-column:1/-1;">'
+     + lbl('Auth Proxy Config (authproxy.cfg content)')
+     + '<textarea id="oc-authproxy_cfg" rows="10" placeholder="[cloud]&#10;ikey=...&#10;skey=...&#10;api_host=api-xxx.duosecurity.com&#10;&#10;[ad_client]&#10;host=198.18.5.102&#10;..." style="width:100%;background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:4px 7px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical;"></textarea>'
+     + '<div style="font-size:10px;color:#445566;margin-top:2px;">Paste the complete authproxy.cfg downloaded from Duo Admin portal. Include [cloud], [ad_client], and [sso] sections. Stored per-org and pushed verbatim to AD1 at pipeline time.</div>'
+     + '</div>'
+     + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">pxGrid Cloud Portal (ISE Integration)</div>'
+     + '<div style="grid-column:1/-1;font-size:10px;color:#445566;margin-bottom:6px;">Credentials for the Catalyst Cloud Portal used during ISE pxGrid Cloud registration (Step 1 of ISE tab). The account name is in the format <code style="color:#02c8ff;">SEC-NET-CL25-02</code> — shown on the account selection screen after login.</div>'
+     + col('Catalyst Cloud Email', 'pxgrid_cloud_email', d.pxgrid_cloud_email, 'user@example.com', false)
+     + col('Catalyst Cloud Password', 'pxgrid_cloud_password', d.pxgrid_cloud_password, 'Password', true)
+     + col('Account Name', 'pxgrid_cloud_account', d.pxgrid_cloud_account, 'SEC-NET-CL25-02', false)
     + '</div>'
     + '</div>'
      + '<div id="oc-save-banner" style="display:none;margin-top:8px;padding:8px 14px;border-radius:6px;font-size:13px;font-weight:600;"></div>'
@@ -4298,19 +7873,23 @@ async function loadOrgCreds(orgNum) {
     // Browsers block HTML value= attribute on type="password" inputs (security feature).
     // Programmatically setting .value bypasses this — values are visible in the field.
     const _setVal = (id, val) => { const el = document.getElementById(id); if (el) el.value = val || ''; };
-    _setVal('oc-duo_ikey',          d.duo_ikey);
-    _setVal('oc-duo_skey',          d.duo_skey);
-    _setVal('oc-duo_host',          d.duo_host);
-    _setVal('oc-duo_saml_app_ikey', d.duo_saml_app_ikey);
-    _setVal('oc-sa_scim_token',     d.sa_scim_token);
-    _setVal('oc-scc_api_key',       d.scc_api_key);
-    _setVal('oc-scc_api_secret',    d.scc_api_secret);
-    _setVal('oc-sa_org_id',         d.sa_org_id);
-    _setVal('oc-sa_api_key',        d.sa_api_key);
-    _setVal('oc-sa_api_secret',     d.sa_api_secret);
-    _setVal('oc-scc_email',         d.scc_email);
-    _setVal('oc-scc_password',      d.scc_password);
-    _setVal('oc-authproxy_cfg',     d.authproxy_cfg);
+    _setVal('oc-duo_ikey',               d.duo_ikey);
+    _setVal('oc-duo_skey',               d.duo_skey);
+    _setVal('oc-duo_host',               d.duo_host);
+    _setVal('oc-duo_saml_app_ikey',      d.duo_saml_app_ikey);
+    _setVal('oc-sa_scim_token',          d.sa_scim_token);
+    _setVal('oc-authproxy_enroll_blob',  d.authproxy_enroll_blob);
+    _setVal('oc-scc_api_key',            d.scc_api_key);
+    _setVal('oc-scc_api_secret',         d.scc_api_secret);
+    _setVal('oc-sa_org_id',              d.sa_org_id);
+    _setVal('oc-sa_api_key',             d.sa_api_key);
+    _setVal('oc-sa_api_secret',          d.sa_api_secret);
+    _setVal('oc-scc_email',              d.scc_email);
+    _setVal('oc-scc_password',           d.scc_password);
+    _setVal('oc-authproxy_cfg',          d.authproxy_cfg);
+    _setVal('oc-pxgrid_cloud_email',     d.pxgrid_cloud_email);
+    _setVal('oc-pxgrid_cloud_password',  d.pxgrid_cloud_password);
+    _setVal('oc-pxgrid_cloud_account',   d.pxgrid_cloud_account);
   }, 0);
 }
 
@@ -4321,19 +7900,23 @@ async function saveOrgCreds(orgNum) {
   if (banner) banner.style.display = 'none';
   const _g = id => { const el = document.getElementById(id); return el ? el.value : ''; };
   const payload = {
-    duo_ikey:          _g('oc-duo_ikey').trim(),
-    duo_skey:          _g('oc-duo_skey').trim(),
-    duo_host:          _g('oc-duo_host').trim(),
-    duo_saml_app_ikey: _g('oc-duo_saml_app_ikey').trim(),
-    sa_scim_token:     _g('oc-sa_scim_token').trim(),
-    scc_api_key:       _g('oc-scc_api_key').trim(),
-    scc_api_secret:    _g('oc-scc_api_secret').trim(),
-    sa_org_id:         _g('oc-sa_org_id').trim(),
-    sa_api_key:        _g('oc-sa_api_key').trim(),
-    sa_api_secret:     _g('oc-sa_api_secret').trim(),
-    scc_email:         _g('oc-scc_email').trim(),
-    scc_password:      _g('oc-scc_password').trim(),
-    authproxy_cfg:     _g('oc-authproxy_cfg'),
+    duo_ikey:               _g('oc-duo_ikey').trim(),
+    duo_skey:               _g('oc-duo_skey').trim(),
+    duo_host:               _g('oc-duo_host').trim(),
+    duo_saml_app_ikey:      _g('oc-duo_saml_app_ikey').trim(),
+    sa_scim_token:          _g('oc-sa_scim_token').trim(),
+    authproxy_enroll_blob:  _g('oc-authproxy_enroll_blob').trim(),
+    scc_api_key:            _g('oc-scc_api_key').trim(),
+    scc_api_secret:         _g('oc-scc_api_secret').trim(),
+    sa_org_id:              _g('oc-sa_org_id').trim(),
+    sa_api_key:             _g('oc-sa_api_key').trim(),
+    sa_api_secret:          _g('oc-sa_api_secret').trim(),
+    scc_email:              _g('oc-scc_email').trim(),
+    scc_password:           _g('oc-scc_password').trim(),
+    authproxy_cfg:          _g('oc-authproxy_cfg'),
+    pxgrid_cloud_email:     _g('oc-pxgrid_cloud_email').trim(),
+    pxgrid_cloud_password:  _g('oc-pxgrid_cloud_password').trim(),
+    pxgrid_cloud_account:   _g('oc-pxgrid_cloud_account').trim(),
   };
   const _showBanner = (ok, msg) => {
     if (!banner) return;
@@ -4387,23 +7970,22 @@ const SCC_AUTO_ITEMS = [
     desc: 'Secure Access → Resources → DNS Servers. Delete PseudoCo DNS.' },
   { key: 'epp_posture_profiles', label: 'EPP Posture Profile deleted',
     desc: 'Secure Access → Secure → Endpoint Posture Profile. Delete PseudoCo Windows profile.' },
-];
-const SCC_MANUAL_ITEMS = [
-  { key: 'logging_settings',  label: 'Logging disabled',
+  { key: 'logging_settings',     label: 'Logging disabled',
     desc: 'Secure Access → Secure → Access Policy. Edit "For all Internet access" — disable Logging.' },
-  { key: 'ravpn_profiles',    label: 'RAVPN Profile deleted',
+  { key: 'ravpn_profiles',       label: 'RAVPN Profile deleted',
     desc: 'Secure Access → Connect → End User Connectivity → Virtual Private Network. Delete PseudoCo_RA_VPN_Profile.' },
-  { key: 'dlp_rules',     label: 'DLP Policy cleared',
+  { key: 'dlp_rules',            label: 'DLP Policy cleared',
     desc: 'Secure Access → Secure → Data Loss Prevention Policy. Delete configured policy.' },
-  { key: 'ravpn_ip_pool', label: 'RAVPN IP Pool deleted',
+  { key: 'ravpn_ip_pool',        label: 'RAVPN IP Pool deleted',
     desc: 'Secure Access → Connect → End User Connectivity → Virtual Private Network. Click Manage under Regions and IP Pools — delete the configured IP Pool.' },
-  { key: 'duo_saml',      label: 'Duo / DuoSSO SAML profiles removed',
+  { key: 'duo_saml',             label: 'Duo / DuoSSO SAML profiles removed',
     desc: 'Secure Access → Connect → Users, Groups, and Endpoint Devices → Configuration Management. Click Edit then Delete on both Duo and DuoSSO profiles (delete Duo first, DuoSSO should follow).' },
-  { key: 'ise_pxgrid',    label: 'ISE / pxGrid integration removed',
+  { key: 'ise_pxgrid',           label: 'ISE / pxGrid integration removed',
     desc: 'SCC Platform Management → Platform Integrations. Delete the ISE/pxGrid integration.' },
-  { key: 'te_integration',label: 'ThousandEyes integration removed',
+  { key: 'te_integration',       label: 'ThousandEyes integration removed',
     desc: 'Secure Access → Experience and Insights → Account Management. Delete ThousandEyes integration.' },
 ];
+const SCC_MANUAL_ITEMS = [];
 
 // ── Duo Setup Panel ──────────────────────────────────────────────────────────
 async function loadDuoPanel(podId) {
@@ -4689,20 +8271,27 @@ async function loadSccChecklist(podId) {
     + '<div style="font-size:11px;color:#667788;white-space:nowrap;">' + completedCount + '/' + allItems.length + '</div>'
     + '</div>'
     + (allDone ? '<div style="padding:8px 12px;background:#00e68a22;border:1px solid #00e68a;border-radius:6px;color:#00e68a;font-size:13px;margin-bottom:12px;">&#x2713; All 13 items confirmed — POD cleared</div>' : '')
-    // Auto card
-    + '<div class="switch-card' + (SCC_AUTO_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : SCC_AUTO_ITEMS.some(i => (map[i.key]||{}).status==='failed') ? ' fail' : '') + '" style="margin-bottom:10px;">'
-    + '<div class="switch-card-title"><span class="role-tag cc">AUTO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automated API Checks</span></div>'
+    // Unified auto card (all 13 items automated)
+    + '<div class="switch-card' + (SCC_AUTO_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : SCC_AUTO_ITEMS.some(i => (map[i.key]||{}).status==='failed') ? ' fail' : '') + '">'
+    + '<div class="switch-card-title" style="display:flex;align-items:center;justify-content:space-between;">'
+    + '<div><span class="role-tag cc">AUTO</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Automated Checks</span></div>'
+    + '<button id="scc-auto-reset-btn" class="btn-reconnect" style="font-size:11px;padding:4px 10px;">&#x25B6; Auto-Reset All</button>'
+    + '<button id="scc-clear-btn" class="btn-reconnect" style="font-size:11px;padding:4px 10px;background:#1a1a2e;border-color:#445566;color:#8899aa;">&#x2715; Clear Results</button>'
+    + '</div>'
+    + '<div id="scc-auto-reset-status" style="font-size:11px;color:#667788;min-height:14px;margin-bottom:4px;"></div>'
     + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_AUTO_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_AUTO_ITEMS.length*100) + '%;background:' + (SCC_AUTO_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : SCC_AUTO_ITEMS.some(i=>(map[i.key]||{}).status==='failed') ? '#ff4757' : '#445566') + '"></div></div>'
     + SCC_AUTO_ITEMS.map(i => sccCheck(i, false)).join('')
-    + '</div>'
-    // Manual card
-    + '<div class="switch-card' + (SCC_MANUAL_ITEMS.every(i => (map[i.key]||{}).status==='completed') ? ' pass' : '') + '">'
-    + '<div class="switch-card-title"><span class="role-tag border">MANUAL</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">Proctor Confirmation</span></div>'
-    + '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + Math.round(SCC_MANUAL_ITEMS.filter(i=>(map[i.key]||{}).status==='completed').length/SCC_MANUAL_ITEMS.length*100) + '%;background:' + (SCC_MANUAL_ITEMS.every(i=>(map[i.key]||{}).status==='completed') ? '#00e68a' : '#445566') + '"></div></div>'
-    + SCC_MANUAL_ITEMS.map(i => sccCheck(i, true)).join('')
     + '</div>';
 
   setTimeout(() => {
+    const autoResetBtn = document.getElementById('scc-auto-reset-btn');
+    if (autoResetBtn) autoResetBtn.onclick = () => sccAutoReset(podId);
+    const clearBtn = document.getElementById('scc-clear-btn');
+    if (clearBtn) clearBtn.onclick = async () => {
+      if (!confirm('Clear all SCC checklist results for ' + podId + '?')) return;
+      await fetch('/api/scc/clear/' + podId, { method: 'POST' });
+      loadSccChecklist(podId);
+    };
     const saveBtn = document.getElementById('scc-keys-save-btn');
     if (saveBtn) saveBtn.onclick = async () => {
       const key = document.getElementById('scc-key-input').value.trim();
@@ -4747,6 +8336,42 @@ async function loadSccChecklist(podId) {
 async function sccConfirm(podId, itemKey) {
   await fetch('/api/scc/confirm/' + podId + '/' + itemKey, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({confirmed_by: 'proctor'}) });
   loadSccChecklist(podId);
+}
+
+async function sccAutoReset(podId) {
+  const btn = document.getElementById('scc-auto-reset-btn');
+  const status = document.getElementById('scc-auto-reset-status');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Running...'; }
+  if (status) { status.style.color = '#ffa502'; status.textContent = 'Automation running — navigating SCC (may take 2-3 min)...'; }
+  try {
+    const res = await fetch('/api/scc/manual-reset/' + podId, { method: 'POST' });
+    const d = await res.json();
+    if (d.status === 'started') {
+      if (status) status.textContent = 'Started — items will update as each completes...';
+      // Poll checklist every 5s while automation is running
+      let polls = 0;
+      const poller = setInterval(async () => {
+        polls++;
+        await loadSccChecklist(podId);
+        const st = document.getElementById('scc-auto-reset-status');
+        if (st) st.textContent = 'Running... (' + (polls * 5) + 's elapsed)';
+        if (polls >= 42) { // 3.5 min max
+          clearInterval(poller);
+          const b = document.getElementById('scc-auto-reset-btn');
+          if (b) { b.disabled = false; b.textContent = '▶ Auto-Reset All'; }
+          await loadSccChecklist(podId);
+          const s = document.getElementById('scc-auto-reset-status');
+          if (s) { s.style.color = '#00e68a'; s.textContent = 'Automation complete — check results above'; }
+        }
+      }, 5000);
+    } else {
+      if (status) { status.style.color = '#ff4757'; status.textContent = 'Failed to start: ' + (d.message || JSON.stringify(d)); }
+      if (btn) { btn.disabled = false; btn.textContent = '▶ Auto-Reset All'; }
+    }
+  } catch(e) {
+    if (status) { status.style.color = '#ff4757'; status.textContent = 'Error: ' + e; }
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Auto-Reset All'; }
+  }
 }
 
 async function sccUnconfirm(podId, itemKey) {
@@ -4857,6 +8482,7 @@ function switchTab(btn, name) {
 
   const podId = document.getElementById('detail-pod-id').dataset.podId;
   if (name === 'duo')        { if (podId) loadDuoStatus(podId); }
+  if (name === 'ise')        { if (podId) loadIseStatus(podId); }
   if (name === 'scc')        { if (podId) loadSccChecklist(podId); }
   if (name === 'fabric')     { if (podId) loadFabricStatus(podId); }
   if (name === 'sda')        { if (podId) loadSdaStatus(podId); }
@@ -5499,7 +9125,7 @@ const DUO_CARD_LABELS = {
   ad_sync:          'AD Directory Sync',
   saml_scim_config: 'SA SAML + SCIM Config',
   authproxy_enroll: 'Auth Proxy Enroll',
-  scim_push:        'SA SCIM User Push',
+  scim_push:        'SA SCIM Verify Users',
   verify:           'Verify Auth Proxy',
 };
 const DUO_REFRESH_ONLY = new Set(['saml_scim_config']);  // skipped in refresh mode
@@ -5686,8 +9312,8 @@ function _bcStatusBadge(line) {
   }
   // Extract text after the closing bracket tag
   const afterTag = line.replace(/^\[.*?\]\s*/, '');
-  if (line.includes('FAILED')) return { color: '#e74c3c', text: '&#10007; FAILED', short: afterTag.replace(/^FAILED:\s*/i, '').substring(0, 120).trim(), running: false, startedAt: null };
-  return { color: '#00e68a', text: '&#10003; OK', short: afterTag.replace(/^OK:\s*/i, '').substring(0, 120).trim(), running: false, startedAt: null };
+  if (line.includes('FAILED')) return { color: '#e74c3c', text: '&#10007; FAILED', short: afterTag.replace(/^FAILED:\s*/i, '').substring(0, 500).trim(), running: false, startedAt: null };
+  return { color: '#00e68a', text: '&#10003; OK', short: afterTag.replace(/^OK:\s*/i, '').substring(0, 500).trim(), running: false, startedAt: null };
 }
 
 function renderBaseConfigGrid(podId, statusData) {
@@ -5731,18 +9357,26 @@ function renderBaseConfigGrid(podId, statusData) {
     h += '<span style="color:' + resetBadge.color + ';font-weight:600;">' + resetBadge.text + '</span>';
     h += '</div>';
     // Detail / progress under reset
+    const isSwitch = ['border_spine', 'leaf1', 'leaf2'].includes(key);
     if (resetBadge.running && resetBadge.startedAt) {
       const ts = new Date(resetBadge.startedAt).getTime();
       const elapsed = isNaN(ts) ? 0 : Math.floor((Date.now() - ts) / 1000);
       const elStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
-      const phase = elapsed < 20  ? '① Connecting via Telnet...'
-                  : elapsed < 50  ? '② Pushing config lines...'
-                  : elapsed < 70  ? '③ Saving + reloading...'
-                  : elapsed < 310 ? '④ Waiting for reboot... (' + Math.max(0, 310-elapsed) + 's left)'
-                  : elapsed < 370 ? '⑤ Reconnecting via SSH...'
-                  : '⑥ RSA keys + final save...';
-      h += '<div id="bc-timer-' + key + '" style="' + detailStyle + 'color:#f39c12;"></div>';
-      h += '<div class="switch-bar" style="margin-bottom:4px;"><div id="bc-bar-' + key + '" class="switch-bar-fill" style="width:0%;background:#f39c12;"></div></div>';
+      if (isSwitch) {
+        const phase = elapsed < 20  ? '① Connecting via Telnet...'
+                    : elapsed < 50  ? '② Pushing config lines...'
+                    : elapsed < 70  ? '③ Saving + reloading...'
+                    : elapsed < 310 ? '④ Waiting for reboot... (' + Math.max(0, 310-elapsed) + 's left)'
+                    : elapsed < 370 ? '⑤ Reconnecting via SSH...'
+                    : '⑥ RSA keys + final save...';
+        h += '<div id="bc-timer-' + key + '" style="' + detailStyle + 'color:#f39c12;"></div>';
+        h += '<div class="switch-bar" style="margin-bottom:4px;"><div id="bc-bar-' + key + '" class="switch-bar-fill" style="width:0%;background:#f39c12;"></div></div>';
+      } else {
+        // ISE / CatC: elapsed + short message only — no switch-specific phase labels
+        const shortMsg = (resetBadge.short || 'working...').substring(0, 80);
+        h += '<div style="' + detailStyle + 'color:#f39c12;white-space:normal;">' + elStr + ' — ' + shortMsg + '</div>';
+        h += '<div style="height:4px;margin-bottom:4px;"></div>';
+      }
     } else {
       const txt = (resetBadge.short || '').substring(0, 60);
       h += '<div style="' + detailStyle + '" title="' + (resetBadge.short||'').replace(/"/g,'&quot;') + '">' + (txt || '&nbsp;') + '</div>';
@@ -5750,12 +9384,38 @@ function renderBaseConfigGrid(podId, statusData) {
     }
     // Verify row — always rendered for uniform height
     if (verifyBadge !== null) {
-      h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:2px;">';
+      h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:4px;">';
       h += '<span style="color:#8899aa;">Verify</span>';
       h += '<span style="color:' + verifyBadge.color + ';font-weight:600;">' + verifyBadge.text + '</span>';
       h += '</div>';
-      const vtxt = (verifyBadge.short || '').substring(0, 60);
-      h += '<div style="' + detailStyle + '" title="' + (verifyBadge.short||'').replace(/"/g,'&quot;') + '">' + (vtxt || '&nbsp;') + '</div>';
+      // Parse semicolon-separated check items (format: key=OK or key=FAIL extra:... or key=STILL_PRESENT)
+      const vShort = verifyBadge.short || '';
+      if (vShort) {
+        const _esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        const parts = vShort.split(';').map(p => p.trim()).filter(p => p);
+        let vHtml = '<div style="font-size:10px;line-height:1.6;border-top:1px solid #1e2e3e;padding-top:4px;margin-top:2px;">';
+        for (const part of parts) {
+          const eqIdx = part.indexOf('=');
+          if (eqIdx === -1) {
+            vHtml += '<div style="color:#8899aa;">' + _esc(part) + '</div>';
+            continue;
+          }
+          const key = part.substring(0, eqIdx).trim();
+          const val = part.substring(eqIdx + 1).trim();
+          if (val === 'OK') {
+            vHtml += '<div style="color:#00e68a;">&#10003; ' + _esc(key) + '</div>';
+          } else if (val.startsWith('FAIL') || val === 'STILL_PRESENT' || val === 'MISSING') {
+            const detail = val.replace(/^FAIL extra:/i,'').replace(/^FAIL/i,'').trim();
+            vHtml += '<div style="color:#e74c3c;font-weight:600;">&#10007; ' + _esc(key) + (detail ? ': ' + _esc(detail) : '') + '</div>';
+          } else {
+            vHtml += '<div style="color:#8899aa;">' + _esc(part) + '</div>';
+          }
+        }
+        vHtml += '</div>';
+        h += vHtml;
+      } else {
+        h += '<div style="' + detailStyle + '">&nbsp;</div>';
+      }
     } else {
       h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:2px;">';
       h += '<span style="color:#8899aa;">Verify</span>';
@@ -6109,9 +9769,91 @@ async function dockerDown() {
   const data = await r.json();
   status.textContent = data.output.slice(0, 300);
   btn.disabled = false;
-  btn.textContent = '■ Teardown All';
+  btn.textContent = '\u25a0 Teardown All';
   setTimeout(() => status.textContent = '', 10000);
   load();
+}
+
+let _sccRefreshPoller = null;  // module-level so re-clicks cancel the old poller
+
+async function refreshSccSessionsGlobal() {
+  const btn    = document.getElementById('btn-scc-refresh-global');
+  const status = document.getElementById('scc-refresh-global-status');
+  btn.disabled = true;
+  btn.textContent = '\u23f3 Opening browser...';
+  status.style.color = '#02c8ff';
+  status.textContent = 'Log in to security.cisco.com and complete MFA in the browser window that just opened';
+
+  // Cancel button
+  let cancelBtn = document.getElementById('scc-refresh-cancel-btn');
+  if (!cancelBtn) {
+    cancelBtn = document.createElement('button');
+    cancelBtn.id = 'scc-refresh-cancel-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.cssText = 'margin-left:10px;background:#c0392b;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px;';
+    btn.parentNode.insertBefore(cancelBtn, btn.nextSibling);
+  }
+  cancelBtn.style.display = 'inline-block';
+
+  // Clear any previous poller before starting a new one
+  if (_sccRefreshPoller) { clearInterval(_sccRefreshPoller); _sccRefreshPoller = null; }
+
+  const _reset = () => {
+    if (_sccRefreshPoller) { clearInterval(_sccRefreshPoller); _sccRefreshPoller = null; }
+    cancelBtn.style.display = 'none';
+    btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions';
+  };
+  cancelBtn.onclick = async () => {
+    _reset();
+    status.style.color = '#667788'; status.textContent = '';
+    await fetch('/api/scc/refresh-cancel', {method:'POST'});
+  };
+
+  try {
+    const r = await fetch('/api/scc/refresh-sessions', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({pod_id: 'SCC_REFRESH'}),
+    });
+    const d = await r.json();
+    if (d.status !== 'started') {
+      _reset();
+      status.style.color = '#ff4757';
+      status.textContent = 'Error: ' + (d.message || 'unknown');
+      return;
+    }
+
+    // Poll — same logic as per-pod (age < 1h), show per-POD progress
+    let polls = 0;
+    _sccRefreshPoller = setInterval(async () => {
+      polls++;
+      try {
+        const sr = await fetch('/api/scc/session-status');
+        const sd = await sr.json();
+        const entries  = Object.entries(sd);
+        const fresh    = entries.filter(([,s]) => s.exists && (s.age_hours || 99) < 1);
+        const total    = entries.length;
+        if (fresh.length > 0 && fresh.length >= total) {
+          _reset();
+          status.style.color = '#00e68a';
+          status.textContent = '\u2713 Sessions refreshed for ' + fresh.length + ' org(s)';
+          setTimeout(() => { status.textContent = ''; status.style.color = '#667788'; }, 15000);
+        } else if (polls > 90) {
+          _reset();
+          status.style.color = '#f0a500';
+          status.textContent = 'Timeout — check Live Logs for [scc-refresh] output';
+        } else {
+          const doneList = fresh.map(([pid]) => pid).join(', ');
+          status.textContent = 'Running... (' + (polls * 5) + 's)'
+            + (doneList ? ' \u2713 ' + doneList : '') + ' — complete login in browser window';
+        }
+      } catch(e) {}
+    }, 5000);
+  } catch(e) {
+    _reset();
+    status.style.color = '#ff4757';
+    status.textContent = 'Request failed';
+  }
 }
 
 load();
@@ -6289,6 +10031,254 @@ async function kbDeleteArticle() {
 
 // Hook into switchTab to load KB when selected
 const _origSwitchTab = typeof switchTab === 'function' ? switchTab : null;
+
+// ── ISE Integration Card JS ────────────────────────────────────────────────
+
+const ISE_STEPS = ['ise_pxgrid_register', 'ise_scc_integrate', 'ise_scc_deactivate_reactivate', 'ise_cdfmc_integrate', 'ise_sgt_verify'];
+const ISE_STEP_LABELS = {
+  ise_pxgrid_register:            'pxGrid Cloud Register',
+  ise_scc_integrate:              'ISE \u2192 Secure Access (SGTs)',
+  ise_cdfmc_integrate:            'ISE \u2192 cdFMC (SGTs)',
+  ise_scc_deactivate_reactivate:  'ISE\u2192SCC Deactivate + Reactivate',
+  ise_sgt_verify:                 'Secure Access SGT Verify',
+};
+
+async function loadIseStatus(podId) {
+  if (window._isePoller) { clearInterval(window._isePoller); window._isePoller = null; }
+  const grid = document.getElementById('ise-grid');
+  if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+  if (!grid._lastHtml) grid.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
+  const [r, sr] = await Promise.all([
+    fetch('/api/ise/status/' + podId),
+    fetch('/api/scc/session-status?pod_id=' + podId),
+  ]);
+  const data = await r.json();
+  const sessMap = await sr.json();
+  data.session = sessMap[podId] || {};
+  renderIseGrid(podId, data);
+  const anyRunning = Object.values(data.steps || {}).some(s => (s||{}).status === 'running');
+  if (anyRunning) _iseStartPoller(podId);
+}
+
+function _iseStartPoller(podId) {
+  if (window._isePoller) clearInterval(window._isePoller);
+  let polls = 0;
+  window._isePoller = setInterval(async () => {
+    polls++;
+    const [r, sr] = await Promise.all([
+      fetch('/api/ise/status/' + podId),
+      fetch('/api/scc/session-status?pod_id=' + podId),
+    ]);
+    const data = await r.json();
+    const sessMap = await sr.json();
+    data.session = sessMap[podId] || {};
+    renderIseGrid(podId, data);
+    const anyRunning = Object.values(data.steps || {}).some(s => (s||{}).status === 'running');
+    if (!anyRunning || polls > 200) { clearInterval(window._isePoller); window._isePoller = null; }
+  }, 3000);
+}
+
+function renderIseGrid(podId, data) {
+  const grid = document.getElementById('ise-grid');
+  if (!grid) return;
+  const steps = data.steps || {};
+  const sess  = data.session || {};          // { exists, age_hours, file }
+  const total   = ISE_STEPS.length;
+  const done    = ISE_STEPS.filter(s => ['completed','skipped'].includes((steps[s]||{}).status)).length;
+  const failed  = ISE_STEPS.filter(s => (steps[s]||{}).status === 'failed').length;
+  const running = ISE_STEPS.some(s => (steps[s]||{}).status === 'running');
+  const pct     = Math.min(100, Math.round(done / total * 100));
+  const barColor = failed ? '#ff4757' : running ? '#02c8ff' : done === total ? '#00e68a' : '#667788';
+  const labelText = failed  ? 'Failed \u2014 ' + failed + ' step(s) failed'
+                  : running ? 'Running \u2014 ' + done + '/' + total
+                  : done === total ? 'Complete!'
+                  : done === 0    ? 'Not started'
+                  : 'Paused \u2014 ' + done + '/' + total;
+  const isRunning = running;
+
+  // ── Session freshness indicator ──────────────────────────────────────────
+  let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No SCC session \u2014 refresh required';
+  if (sess.exists) {
+    const h = sess.age_hours || 0;
+    if (h < 4)       { sessColor = '#00e68a'; sessIcon = '\u2713'; sessLabel = 'SCC session fresh (' + h.toFixed(1) + 'h ago)'; }
+    else if (h < 8)  { sessColor = '#f0a500'; sessIcon = '\u26a0'; sessLabel = 'SCC session ageing (' + h.toFixed(1) + 'h ago)'; }
+    else             { sessColor = '#ff4757'; sessIcon = '\u26a0'; sessLabel = 'SCC session stale (' + h.toFixed(1) + 'h) \u2014 refresh'; }
+  }
+
+  let html = '';
+
+  // ── Pre-flight: Refresh SCC Sessions ─────────────────────────────────────
+  html += '<div style="background:#0d1117;border:1px solid #1e2d3d;border-radius:6px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">';
+  html += '<div>';
+  html += '<span style="font-size:12px;font-weight:600;color:#8899aa;text-transform:uppercase;letter-spacing:.5px;">Pre-flight</span>&nbsp;';
+  html += '<span id="scc-sess-badge" style="font-size:12px;color:' + sessColor + ';">' + sessIcon + ' ' + sessLabel + '</span>';
+  html += '</div>';
+  html += '<button id="scc-refresh-btn" style="background:#445566;color:#cdd6e0;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u21bb Refresh SCC Sessions</button>';
+  html += '</div>';
+
+  // ── Header + Run / Reset buttons ─────────────────────────────────────────
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
+  html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">ISE Integrations</span>';
+  html += '<div style="display:flex;gap:8px;">';
+   html += '<button id="ise-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u25b6 Run</button>';
+   html += '<button id="ise-reactivate-btn" title="Re-run only the ISE\u2192SCC Deactivate+Reactivate step" style="background:#f0a500;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u21ba Reactivate SCC</button>';
+   html += '<button id="ise-sgt-recheck-btn" title="Immediately recheck SGTs in Secure Access" style="background:#00e68a;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">\U0001F50D Re-verify SGTs</button>';
+   html += '<button id="ise-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;"' + (isRunning ? ' disabled' : '') + '>\u21bb Reset</button>';
+  html += '</div></div>';
+  html += '<div style="margin-bottom:14px;">';
+  html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
+  html += '<span>' + labelText + '</span><span>' + pct + '% (' + done + '/' + total + ')</span></div>';
+  html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
+  html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
+  html += '</div></div>';
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;">';
+  ISE_STEPS.forEach((s, i) => {
+    const info   = steps[s] || {};
+    const st     = info.status || 'pending';
+    const result = (info.result || '').substring(0, 180);
+    const dur    = formatDur(info.started_at, info.completed_at);
+    const cardBorder = st === 'failed'    ? 'border-left:3px solid #ff4757;'
+                     : st === 'running'   ? 'border-left:3px solid #02c8ff;'
+                     : st === 'completed' ? 'border-left:3px solid #00e68a;'
+                     : st === 'skipped'   ? 'border-left:3px solid #445566;opacity:0.7;'
+                     : '';
+    html += '<div class="step-card" style="' + cardBorder + '">';
+    html += '<div class="step-num">Step ' + (i+1) + '/' + total + '</div>';
+    html += '<div class="step-name">' + (ISE_STEP_LABELS[s]||s) + '</div>';
+    html += pipelineBadge(st);
+    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (dur)    html += '<div class="step-dur">' + dur + '</div>';
+    html += '</div>';
+  });
+  html += '</div>';
+  html += '<div style="margin-top:12px;font-size:11px;color:#445566;">ISE: 198.18.5.101 &nbsp;|&nbsp; pxGrid Cloud credentials set in Org Credentials card below</div>';
+
+  grid.innerHTML = html;
+  grid._lastHtml = true;
+
+  setTimeout(() => {
+    const runBtn        = document.getElementById('ise-run-btn');
+    const reactivateBtn = document.getElementById('ise-reactivate-btn');
+    const sgtRecheckBtn = document.getElementById('ise-sgt-recheck-btn');
+    const resetBtn      = document.getElementById('ise-reset-btn');
+    const refreshBtn    = document.getElementById('scc-refresh-btn');
+    if (runBtn)         runBtn.onclick        = () => iseRun(podId);
+    if (reactivateBtn)  reactivateBtn.onclick = () => iseReactivate(podId);
+    if (sgtRecheckBtn)  sgtRecheckBtn.onclick = () => iseSgtRecheck(podId);
+    if (resetBtn)       resetBtn.onclick      = () => iseReset(podId);
+    if (refreshBtn)     refreshBtn.onclick    = () => iseRefreshSessions(podId);
+  }, 0);
+}
+
+async function iseRun(podId, fromStep) {
+  // Start the poller immediately — don't wait for the first status fetch.
+  // The Docker container takes a few seconds to update the DB to 'running',
+  // so checking status synchronously right after POST would still show the
+  // old state and the poller would never start.
+  _iseStartPoller(podId);
+  await fetch('/api/ise/run/' + podId, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({from_step: fromStep || 0}),
+  });
+}
+
+async function iseReset(podId) {
+  if (!confirm('Clear all ISE steps for ' + podId + '?')) return;
+  await fetch('/api/ise/reset/' + podId, { method: 'POST' });
+  loadIseStatus(podId);
+}
+
+async function iseReactivate(podId) {
+  // Resets step 4 to pending and re-runs only the ISE→SCC deactivate+reactivate step.
+  if (!confirm('Re-run ISE\u2192SCC Deactivate+Reactivate for ' + podId + '?\\n\\nThis resets and re-runs ONLY step 4.')) return;
+  _iseStartPoller(podId);
+  await fetch('/api/ise/reactivate/' + podId, { method: 'POST' });
+}
+
+async function iseSgtRecheck(podId) {
+  const btn = document.getElementById('ise-sgt-recheck-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '\u23f3 Checking...'; }
+  try {
+    const res = await fetch('/api/ise/sgt-recheck/' + podId, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'started') {
+      _iseStartPoller(podId);
+    } else {
+      alert('SGT recheck error: ' + (data.message || 'unknown'));
+    }
+  } finally {
+    setTimeout(() => {
+      if (btn) { btn.disabled = false; btn.textContent = '\U0001F50D Re-verify SGTs'; }
+    }, 3000);
+  }
+}
+
+async function iseRefreshSessions(podId) {
+  const btn   = document.getElementById('scc-refresh-btn');
+  const badge = document.getElementById('scc-sess-badge');
+  if (btn) { btn.disabled = true; btn.textContent = '\u23f3 Refreshing...'; }
+  if (badge) { badge.style.color = '#02c8ff'; badge.textContent = '\u23f3 Browser opening — log in and complete MFA...'; }
+
+  // Add cancel button next to refresh button
+  let cancelBtn = document.getElementById('scc-refresh-cancel-pod-btn');
+  if (!cancelBtn && btn) {
+    cancelBtn = document.createElement('button');
+    cancelBtn.id = 'scc-refresh-cancel-pod-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.cssText = 'margin-left:8px;background:#c0392b;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;';
+    btn.parentNode.insertBefore(cancelBtn, btn.nextSibling);
+  }
+  if (cancelBtn) cancelBtn.style.display = 'inline-block';
+
+  let poller = null;
+  if (cancelBtn) cancelBtn.onclick = async () => {
+    if (poller) clearInterval(poller);
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+    if (badge) { badge.style.color = '#667788'; badge.textContent = 'Cancelled'; }
+    await fetch('/api/scc/refresh-cancel', {method:'POST'});
+  };
+
+  try {
+    const r = await fetch('/api/scc/refresh-sessions', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({pod_id: podId}),
+    });
+    const d = await r.json();
+    if (d.status === 'started') {
+      if (badge) badge.textContent = '\u23f3 Running — complete login in the browser window';
+      let polls = 0;
+      poller = setInterval(async () => {
+        polls++;
+        const sr = await fetch('/api/scc/session-status?pod_id=' + podId);
+        const sd = await sr.json();
+        const s = sd[podId] || {};
+        if (s.exists && (s.age_hours || 99) < 1) {
+          clearInterval(poller);
+          if (cancelBtn) cancelBtn.style.display = 'none';
+          if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+          if (badge) { badge.style.color = '#00e68a'; badge.textContent = '\u2713 SCC session refreshed just now'; }
+          loadIseStatus(podId);
+        } else if (polls > 72) { // 6 min timeout
+          clearInterval(poller);
+          if (cancelBtn) cancelBtn.style.display = 'none';
+          if (btn) { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+          loadIseStatus(podId);
+        }
+      }, 5000);
+    } else {
+      if (cancelBtn) cancelBtn.style.display = 'none';
+      if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+      if (badge) { badge.style.color = '#ff4757'; badge.textContent = '\u26a0 Error: ' + (d.message || 'unknown'); }
+    }
+  } catch (e) {
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
+    if (badge) { badge.style.color = '#ff4757'; badge.textContent = '\u26a0 Request failed'; }
+  }
+}
 </script>
 </body>
 </html>

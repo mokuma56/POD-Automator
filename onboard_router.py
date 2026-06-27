@@ -1454,7 +1454,6 @@ def phase_baseconfig_verify(switch_key, log_fn=print):
 
         # No EVPN NVE interface (should be gone after reset)
         out = switch_cmd(shell, "show run | include ^interface nve", timeout=8)
-        # Check for the actual interface line — avoid false positives from banner/echo noise
         nve_present = any(
             line.strip().lower().startswith("interface nve")
             for line in out.splitlines()
@@ -1465,6 +1464,44 @@ def phase_baseconfig_verify(switch_key, log_fn=print):
         out = switch_cmd(shell, "show vrf", timeout=8)
         fabric_vrfs = [v for v in ["Main", "IOT", "PROD"] if v in out]
         checks["no_fabric_vrfs"] = f"STILL_PRESENT:{','.join(fabric_vrfs)}" if fabric_vrfs else "OK"
+
+        # VLAN check — only base VLANs expected after reset
+        out_vlan = switch_cmd(shell, "show vlan brief", timeout=10)
+        vlan_lines = [l for l in out_vlan.splitlines() if l.strip() and l[0].isdigit()]
+        allowed_vlans = {1, 5} if switch_key == "border_spine" else {1}
+        extra_vlans = []
+        for l in vlan_lines:
+            try:
+                vid = int(l.split()[0])
+            except ValueError:
+                continue
+            if vid not in allowed_vlans and not (1002 <= vid <= 1005):
+                extra_vlans.append(str(vid))
+        checks["vlans"] = f"FAIL extra:{','.join(extra_vlans[:8])}" if extra_vlans else "OK"
+
+        # AAA check — only base-config AAA lines allowed; any RADIUS/dot1x lines = CatC leftover
+        out_aaa = switch_cmd(shell, "show run | include ^aaa", timeout=10)
+        ALLOWED_AAA = {
+            "aaa new-model",
+            "aaa session-id common",
+            "aaa authentication login default local",
+            "aaa authorization exec default local",
+            "aaa authorization network default local",
+        }
+        aaa_lines = [l.strip() for l in out_aaa.splitlines() if l.strip().startswith("aaa")]
+        extra_aaa = [l for l in aaa_lines if l not in ALLOWED_AAA]
+        checks["aaa"] = f"FAIL extra:{'; '.join(extra_aaa[:3])}" if extra_aaa else "OK"
+
+        # dot1x check — dot1x system-auth-control should not be present.
+        # strip command echo and prompt lines before checking — the raw output includes
+        # the sent command itself which would cause a false-positive match.
+        out_dot1x = switch_cmd(shell, "show run | include dot1x system-auth-control", timeout=8)
+        clean_dot1x = "\n".join(
+            l for l in out_dot1x.splitlines()
+            if "show run" not in l and not l.strip().endswith("#")
+        )
+        dot1x_present = "dot1x system-auth-control" in clean_dot1x
+        checks["no_dot1x"] = "STILL_PRESENT" if dot1x_present else "OK"
 
         client.close()
     except Exception as e:
@@ -1521,7 +1558,8 @@ ISE_SWITCH_NAD_IPS = {"172.30.255.3", "172.30.255.1", "172.30.255.2"}
 def phase_ise_cleanup(log_fn=print):
     """
     Delete the 3 switch NADs from ISE that Catalyst Center adds during discovery.
-    Catalyst Center will re-add them on next discovery/provisioning run.
+    Matches by IP (loopback OR management) rather than name — name format varies
+    depending on which domain CatC uses when registering the NAD.
     Returns (ok, detail).
     """
     import ssl, urllib.request, urllib.error, base64, json
@@ -1547,48 +1585,54 @@ def phase_ise_cleanup(log_fn=print):
                 return None  # already gone
             raise
 
+    # All known switch IPs — both loopback and management
+    # CatC may register NADs with either IP depending on discovery settings
+    ALL_SWITCH_IPS = ISE_SWITCH_NAD_IPS | {info["mgmt"] for info in CATC_DISCOVERY_IPS.values()}
+
+    # Fetch all NADs with pagination
     log_fn("  Fetching ISE network device list...")
+    all_resources = []
     try:
-        data = _get("/ers/config/networkdevice?size=100")
+        page = 1
+        while True:
+            data = _get(f"/ers/config/networkdevice?size=100&page={page}")
+            resources = data.get("SearchResult", {}).get("resources", [])
+            all_resources.extend(resources)
+            total = int(data.get("SearchResult", {}).get("total", 0))
+            if len(all_resources) >= total or not resources:
+                break
+            page += 1
     except Exception as e:
         return False, f"ISE unreachable: {e}"
 
-    resources = data.get("SearchResult", {}).get("resources", [])
-    # Build name→id map
-    nad_map = {r["name"]: r["id"] for r in resources}
+    log_fn(f"  Found {len(all_resources)} total NADs in ISE")
 
+    # For each NAD, fetch detail and check if IP matches any switch IP
     deleted, skipped, errors = [], [], []
-    for name in ISE_SWITCH_NAD_NAMES:
-        if name not in nad_map:
-            log_fn(f"  {name}: not found (already removed)")
-            skipped.append(name)
-            continue
-        nad_id = nad_map[name]
-        # Safety check: verify the NAD's IP is one of the known switch IPs
-        # before deleting — prevents accidentally wiping the CC NAD or others
+    for r in all_resources:
+        nad_id   = r["id"]
+        nad_name = r.get("name", nad_id)
         try:
             nad_detail = _get(f"/ers/config/networkdevice/{nad_id}")
             nad_ip = nad_detail.get("NetworkDevice", {}).get("NetworkDeviceIPList", [{}])[0].get("ipaddress", "")
-            if nad_ip not in ISE_SWITCH_NAD_IPS:
-                log_fn(f"  {name}: SKIPPED — IP {nad_ip} not in switch IP list (safety check)")
-                skipped.append(name)
-                continue
         except Exception as e:
-            log_fn(f"  {name}: could not verify IP — {e}, skipping for safety")
-            skipped.append(name)
-            continue
-        log_fn(f"  Deleting {name} ({nad_id}, IP {nad_ip})...")
+            continue  # skip unreadable NADs quietly
+
+        if nad_ip not in ALL_SWITCH_IPS:
+            continue  # not one of our switches
+
+        log_fn(f"  Deleting NAD '{nad_name}' (IP {nad_ip}, id {nad_id})...")
         try:
             result = _delete(f"/ers/config/networkdevice/{nad_id}")
             if result is None:
-                log_fn(f"  {name}: already gone (404)")
-                skipped.append(name)
+                log_fn(f"  '{nad_name}': already gone (404)")
+                skipped.append(nad_name)
             else:
-                log_fn(f"  {name}: deleted")
-                deleted.append(name)
+                log_fn(f"  '{nad_name}': deleted")
+                deleted.append(nad_name)
         except Exception as e:
-            log_fn(f"  {name}: ERROR — {e}")
-            errors.append(f"{name}: {e}")
+            log_fn(f"  '{nad_name}': ERROR — {e}")
+            errors.append(f"{nad_name}: {e}")
 
     if errors:
         return False, f"Errors: {'; '.join(errors)}"
@@ -1598,16 +1642,18 @@ def phase_ise_cleanup(log_fn=print):
         parts.append(f"deleted {len(deleted)}: {', '.join(n.split('.')[0] for n in deleted)}")
     if skipped:
         parts.append(f"already gone: {len(skipped)}")
-    return True, "; ".join(parts) if parts else "nothing to do"
+    return True, "; ".join(parts) if parts else "nothing to do (no switch NADs found by IP)"
 
 
 def phase_catc_cleanup(log_fn=print):
     """
     Delete the 3 switches from Catalyst Center inventory.
-    Catalyst Center will re-discover and provision them on the next run.
+    Searches by both management IPs (198.18.128.x) AND loopback IPs (172.30.255.x)
+    because CatC may store either as the managementIpAddress depending on discovery.
+    Polls the deletion task to confirm actual removal.
     Returns (ok, detail).
     """
-    import requests, urllib3
+    import requests, urllib3, time
     urllib3.disable_warnings()
 
     log_fn("  Getting Catalyst Center auth token...")
@@ -1616,48 +1662,94 @@ def phase_catc_cleanup(log_fn=print):
     except Exception as e:
         return False, f"CC auth failed: {e}"
 
-    # Get all network devices and find the 3 switch IPs
-    switch_ips = {info["mgmt"] for info in CATC_DISCOVERY_IPS.values()}
+    # Search by both mgmt IPs and loopback IPs
+    all_switch_ips = (
+        {info["mgmt"]     for info in CATC_DISCOVERY_IPS.values()} |
+        {info["loopback"] for info in CATC_DISCOVERY_IPS.values()}
+    )
+
     log_fn("  Fetching device inventory from Catalyst Center...")
     try:
-        r = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
-                         headers=headers, verify=False, timeout=15)
+        r = requests.get(
+            f"{CATC_BASE}/dna/intent/api/v1/network-device?limit=500",
+            headers=headers, verify=False, timeout=15
+        )
         r.raise_for_status()
         devices = r.json().get("response", [])
     except Exception as e:
         return False, f"CC inventory fetch failed: {e}"
 
-    # Match by management IP
-    to_delete = [d for d in devices if d.get("managementIpAddress") in switch_ips]
+    to_delete = [d for d in devices if d.get("managementIpAddress") in all_switch_ips]
+    log_fn(f"  Found {len(to_delete)} switch(es) in CC inventory (searched {len(devices)} devices)")
+
     if not to_delete:
         log_fn("  No switch devices found in CC inventory (already removed)")
         return True, "nothing to do — devices not in inventory"
 
-    deleted, errors = [], []
+    deleted, skipped, errors = [], [], []
     for dev in to_delete:
-        dev_id = dev["id"]
-        name   = dev.get("hostname", dev.get("managementIpAddress", dev_id))
-        log_fn(f"  Deleting {name} ({dev.get('managementIpAddress')}) from CC...")
-        try:
-            r = requests.delete(
-                f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}",
-                headers=headers, verify=False, timeout=30
-            )
-            if r.status_code in (200, 202, 204):
-                log_fn(f"  {name}: deleted")
-                deleted.append(name)
-            else:
-                msg = f"{name}: unexpected status {r.status_code} — {r.text[:100]}"
-                log_fn(f"  {msg}")
-                errors.append(msg)
-        except Exception as e:
-            msg = f"{name}: {e}"
-            log_fn(f"  ERROR: {msg}")
-            errors.append(msg)
+            dev_id = dev["id"]
+            name   = dev.get("hostname", dev.get("managementIpAddress", dev_id))
+            mgmt   = dev.get("managementIpAddress", "?")
+            log_fn(f"  Deleting {name} ({mgmt}) from CC...")
 
-    if errors:
-        return False, f"Errors: {'; '.join(errors)}"
-    return True, f"deleted {len(deleted)}: {', '.join(deleted)}"
+            # Single best-effort DELETE — no retry.
+            # If CatC refuses because a provisioning task is in-flight, we log a warning
+            # and move on.  The post-reload SSH teardown (in reset_switches._post_reload)
+            # will clean up any config that CatC re-pushes via NETCONF after the switch
+            # comes back online, so blocking here adds no value.
+            try:
+                r = requests.delete(
+                    f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}",
+                    headers=headers, verify=False, timeout=30
+                )
+                if r.status_code not in (200, 202, 204):
+                    msg = f"{name}: unexpected status {r.status_code} — {r.text[:100]}"
+                    log_fn(f"  WARNING: {msg} (continuing anyway)")
+                    skipped.append(name)
+                else:
+                    # Poll task briefly (up to 30s) just to log the outcome — never block on it
+                    try:
+                        task_id = r.json().get("response", {}).get("taskId", "")
+                    except Exception:
+                        task_id = ""
+
+                    if task_id:
+                        outcome = "unknown"
+                        for _ in range(6):  # up to 30s
+                            time.sleep(5)
+                            tr = requests.get(
+                                f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
+                                headers=headers, verify=False, timeout=10
+                            )
+                            if tr.status_code == 200:
+                                tdata = tr.json().get("response", {})
+                                if tdata.get("isError"):
+                                    reason = tdata.get("failureReason", "unknown")
+                                    outcome = f"task failed: {reason[:80]}"
+                                    log_fn(f"  WARNING: {name}: {outcome} (continuing anyway)")
+                                    skipped.append(name)
+                                    break
+                                if tdata.get("endTime"):
+                                    outcome = "confirmed"
+                                    log_fn(f"  {name}: deletion confirmed")
+                                    deleted.append(name)
+                                    break
+                        else:
+                            log_fn(f"  {name}: task did not confirm in 30s — treating as OK")
+                            deleted.append(name)
+                    else:
+                        log_fn(f"  {name}: deleted (no task ID returned)")
+                        deleted.append(name)
+
+            except Exception as e:
+                log_fn(f"  WARNING: {name}: {e} (continuing anyway)")
+                skipped.append(name)
+
+    summary_parts = []
+    if deleted: summary_parts.append(f"deleted {len(deleted)}: {', '.join(deleted)}")
+    if skipped:  summary_parts.append(f"skipped {len(skipped)} (still provisioning — post-reload teardown will clean up): {', '.join(skipped)}")
+    return True, "; ".join(summary_parts) if summary_parts else "nothing done"
 
 
 CDFMC_AUTOMATION_HOST = "198.18.134.12"
@@ -3280,3 +3372,237 @@ conn.commit()"""], timeout=5)
     print(f"\n{'='*40}")
     print(f"Pipeline complete for {pod_id}")
     print("Router in SD-WAN mode, switches verified, connectivity tested.")
+
+
+# ---------------------------------------------------------------------------
+# Route Verification — HQ-Site10-CEDGE8Kv
+# ---------------------------------------------------------------------------
+
+HQ_CEDGE_IP   = "198.18.133.13"
+HQ_CEDGE_USER = "admin"
+HQ_CEDGE_PASS = "C1sco12345"
+
+# All prefixes expected in 'show ip route vrf 10' after a successful SITE_105 onboard.
+# Prefixes via 100.100.100.105 are POD-specific (Site_105 SDWAN routes).
+ROUTE_VRF10_EXPECTED = [
+    "0.0.0.0",          # default via Null0
+    "10.10.252.0",      # HQ SDWAN via 2.2.2.2
+    "100.100.10.10",    # Loopback10 — directly connected
+    "100.100.10.11",    # HQ SDWAN via 2.2.2.2
+    "100.100.10.105",   # SITE_105 system-ip via 100.100.100.105  ← POD-specific
+    "172.30.254.0",     # SITE_105 network via 100.100.100.105    ← POD-specific
+    "172.30.255.0",     # SITE_105 network via 100.100.100.105    ← POD-specific
+    "192.168.252.12",   # HQ SDWAN via 2.2.2.2
+    "192.168.255.0",    # SITE_105 network via 100.100.100.105    ← POD-specific
+    "192.168.255.6",    # SITE_105 network via 100.100.100.105    ← POD-specific
+    "198.18.5.0",       # static via 198.18.8.1
+    "198.18.8.0",       # directly connected GigabitEthernet4
+    "198.18.9.0",       # static via 198.18.8.1
+]
+
+# Human-readable check groups shown in the UI card (label, [prefixes in group])
+ROUTE_VRF10_CHECKS = [
+    ("Default route (0.0.0.0/0)",           ["0.0.0.0"]),
+    ("HQ SDWAN: 10.10.252.0",               ["10.10.252.0"]),
+    ("Loopback10 (100.100.10.10)",           ["100.100.10.10"]),
+    ("HQ SDWAN: 100.100.10.11",             ["100.100.10.11"]),
+    ("SITE_105: 100.100.10.105",            ["100.100.10.105"]),
+    ("SITE_105: 172.30.254.0",              ["172.30.254.0"]),
+    ("SITE_105: 172.30.255.0",              ["172.30.255.0"]),
+    ("HQ SDWAN: 192.168.252.12",            ["192.168.252.12"]),
+    ("SITE_105: 192.168.255.0",             ["192.168.255.0"]),
+    ("SITE_105: 192.168.255.6",             ["192.168.255.6"]),
+    ("Static: 198.18.5.0 + 198.18.9.0",    ["198.18.5.0", "198.18.9.0"]),
+    ("Direct: 198.18.8.0 (GigE4)",          ["198.18.8.0"]),
+]
+
+
+def cedge_shell():
+    """Open an interactive SSH shell to HQ-CEDGE, drain banner, disable paging."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(HQ_CEDGE_IP, username=HQ_CEDGE_USER, password=HQ_CEDGE_PASS,
+                   look_for_keys=False, allow_agent=False, timeout=15)
+    shell = client.invoke_shell(width=200, height=50)
+    time.sleep(2)
+    if shell.recv_ready():
+        shell.recv(65535)
+    shell.send("terminal length 0\n")
+    time.sleep(1)
+    if shell.recv_ready():
+        shell.recv(65535)
+    return client, shell
+
+
+def _get_vrf10_routes():
+    """Return raw output of 'show ip route vrf 10' from HQ-CEDGE."""
+    client, shell = cedge_shell()
+    try:
+        out = switch_cmd(shell, "show ip route vrf 10", timeout=20)
+    finally:
+        client.close()
+    return out
+
+
+def _reload_cedge():
+    """Send 'reload' to HQ-CEDGE and handle IOS XE save/confirm prompts."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(HQ_CEDGE_IP, username=HQ_CEDGE_USER, password=HQ_CEDGE_PASS,
+                       look_for_keys=False, allow_agent=False, timeout=15)
+        shell = client.invoke_shell(width=200, height=50)
+        time.sleep(2)
+        if shell.recv_ready():
+            shell.recv(65535)
+        shell.send("reload\n")
+        time.sleep(2)
+        accumulated = ""
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if shell.recv_ready():
+                chunk = shell.recv(4096).decode("utf-8", errors="replace")
+                accumulated += chunk
+                low = accumulated.lower()
+                if "yes/no" in low or "save?" in low:
+                    shell.send("no\n")
+                    time.sleep(1)
+                    accumulated = ""
+                elif "confirm" in low:
+                    shell.send("\n")
+                    time.sleep(2)
+                    break
+            else:
+                time.sleep(0.5)
+    except Exception:
+        pass  # connection drops when router actually reboots — that's expected
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _wait_cedge_offline(timeout=90):
+    """Poll until HQ-CEDGE stops accepting SSH. Returns True when offline."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            c = paramiko.SSHClient()
+            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c.connect(HQ_CEDGE_IP, username=HQ_CEDGE_USER, password=HQ_CEDGE_PASS,
+                      look_for_keys=False, allow_agent=False, timeout=5)
+            c.close()
+            time.sleep(5)  # still up — keep polling
+        except Exception:
+            return True  # SSH failed — router is offline
+    return False
+
+
+def _wait_cedge_online(timeout=300):
+    """Poll until HQ-CEDGE accepts SSH again. Returns True when online."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            c = paramiko.SSHClient()
+            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c.connect(HQ_CEDGE_IP, username=HQ_CEDGE_USER, password=HQ_CEDGE_PASS,
+                      look_for_keys=False, allow_agent=False, timeout=10)
+            c.close()
+            return True
+        except Exception:
+            time.sleep(10)
+    return False
+
+
+_ROUTE_SEP = "\n---ROUTES---\n"
+
+
+def _phase_route_verification_impl(expected_prefixes):
+    """
+    Core route-verification logic (shared by pipeline + test paths).
+    Checks expected_prefixes against 'show ip route vrf 10' on HQ-CEDGE.
+    If any are missing → reload router → wait for it to come back → re-check.
+    Always returns (True, result_str) — soft-fail only, never blocks pipeline.
+
+    result_str format:
+      PASS|found=N/T|reloaded=no\n---ROUTES---\n<raw route table>
+      WARN|found=N/T|missing=p1,p2|reloaded=yes\n---ROUTES---\n<raw route table>
+
+    The raw route table is the post-reload table when a reload occurred, otherwise
+    the initial table.  Error paths omit the separator (no table available).
+    """
+    total = len(expected_prefixes)
+    print(f"  [route_verification] SSH to {HQ_CEDGE_IP} — checking {total} prefixes in VRF 10...")
+    try:
+        output = _get_vrf10_routes()
+    except Exception as e:
+        msg = f"WARN|found=0/{total}|missing=ssh_error|reloaded=no|err={str(e)[:80]}"
+        print(f"  [route_verification] {msg}")
+        return True, msg
+
+    missing = [p for p in expected_prefixes if p not in output]
+    found   = total - len(missing)
+
+    if not missing:
+        msg = f"PASS|found={found}/{total}|reloaded=no{_ROUTE_SEP}{output}"
+        print(f"  [route_verification] PASS|found={found}/{total}|reloaded=no")
+        return True, msg
+
+    print(f"  [route_verification] {len(missing)} prefixes missing: {missing}")
+    print(f"  [route_verification] Reloading {HQ_CEDGE_IP}...")
+    _reload_cedge()
+
+    print(f"  [route_verification] Waiting for {HQ_CEDGE_IP} to go offline...")
+    went_down = _wait_cedge_offline(timeout=90)
+    if not went_down:
+        print(f"  [route_verification] Warning: router did not appear to go offline")
+
+    print(f"  [route_verification] Waiting for {HQ_CEDGE_IP} to come back online (up to 5 min)...")
+    came_up = _wait_cedge_online(timeout=300)
+    if not came_up:
+        msg = (f"WARN|found={found}/{total}|missing={','.join(missing)}"
+               f"|reloaded=yes|err=did_not_come_back_online")
+        print(f"  [route_verification] {msg}")
+        return True, msg
+
+    print(f"  [route_verification] {HQ_CEDGE_IP} online — waiting 30 s for routes to converge...")
+    time.sleep(30)
+
+    try:
+        output2 = _get_vrf10_routes()
+    except Exception as e:
+        msg = (f"WARN|found={found}/{total}|missing={','.join(missing)}"
+               f"|reloaded=yes|err=post_reload_ssh:{str(e)[:60]}")
+        print(f"  [route_verification] {msg}")
+        return True, msg
+
+    missing2 = [p for p in expected_prefixes if p not in output2]
+    found2   = total - len(missing2)
+
+    if not missing2:
+        msg = f"PASS|found={found2}/{total}|reloaded=yes{_ROUTE_SEP}{output2}"
+        print(f"  [route_verification] PASS|found={found2}/{total}|reloaded=yes")
+        return True, msg
+
+    msg = f"WARN|found={found2}/{total}|missing={','.join(missing2)}|reloaded=yes{_ROUTE_SEP}{output2}"
+    print(f"  [route_verification] WARN|found={found2}/{total}|missing={','.join(missing2)}|reloaded=yes")
+    return True, msg
+
+
+def phase_route_verification():
+    """
+    Pipeline step: verify VRF 10 routes on HQ-Site10-CEDGE8Kv (198.18.133.13).
+    Missing routes → reload router → re-verify.
+    Soft-fail (WARN) if still missing after reload — pipeline proceeds.
+    """
+    return _phase_route_verification_impl(ROUTE_VRF10_EXPECTED)
+
+
+def phase_route_verification_test():
+    """
+    Test variant: injects 192.0.2.254 (RFC 5737 — never a real route) to force
+    a guaranteed first-pass failure and exercise the full reload → re-verify flow.
+    """
+    test_prefixes = ROUTE_VRF10_EXPECTED + ["192.0.2.254"]
+    return _phase_route_verification_impl(test_prefixes)
