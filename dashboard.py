@@ -1182,19 +1182,36 @@ def api_scc_recheck_timeout(pod_id):
 @app.route("/api/scc/run-check-sync/<pod_id>", methods=["POST"])
 def api_scc_run_check_sync(pod_id):
     """Run phase_scc_reset_check directly on the host (public internet access for api.sse.cisco.com).
-    Called by the pipeline container via host.docker.internal when inside Docker."""
-    import sys, os as _os
+    Called by the pipeline container via host.docker.internal when inside Docker.
+    Also kicks off the 7 browser-based checklist items in a background thread so all
+    13 items are persisted to scc_checklist by the time the operator views the dashboard."""
+    import sys, os as _os, threading, importlib
     sys.path.insert(0, str(Path(__file__).parent))
     _os.environ["POD_ID"] = pod_id
     _os.environ["DB_PATH"] = str(Path(__file__).parent / "data" / "pod_state.db")
     _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
     try:
-        import importlib, onboard_router
+        import onboard_router
         importlib.reload(onboard_router)
         ok, result = onboard_router.phase_scc_reset_check()
-        return jsonify({"ok": ok, "result": result})
     except Exception as e:
         return jsonify({"ok": False, "result": str(e)}), 500
+
+    # Kick off the 7 browser-based checklist items in the background.
+    # The pipeline step doesn't wait for this — it will complete asynchronously
+    # and persist results to scc_checklist so they appear in the dashboard.
+    def _run_browser_reset():
+        try:
+            log(pod_id, "[scc-reset] Background browser reset starting (7 manual items)...")
+            _ok, _msg = _scc_auto_reset_manual(pod_id, lambda m: log(pod_id, m))
+            log(pod_id, f"[scc-reset] Background browser reset done: {_msg}")
+        except Exception as _e:
+            log(pod_id, f"[scc-reset] Background browser reset error: {_e}")
+
+    threading.Thread(target=_run_browser_reset, daemon=True,
+                     name=f"scc-browser-reset-{pod_id}").start()
+
+    return jsonify({"ok": ok, "result": result})
 
 
 @app.route("/api/duo-saml-setup/<pod_id>", methods=["POST"])
@@ -6750,8 +6767,21 @@ function badge(val, yesLabel) {
   return '<span class="badge pending">?</span>';
 }
 
-function pipelineBadge(val) {
-  if (val === 'completed') return '<span class="badge pass">Done</span>';
+// Mirrors Python's SOFT_FAIL_STEPS in onboard.py — kept in sync manually
+const SOFT_FAIL_STEPS = new Set([
+  'detect_pod_number','controller_mode_enable','verify_online','redeploy_config_group',
+  'verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test',
+  'route_verification','cdfmc_check','ad_verify','scc_reset_check',
+]);
+
+function pipelineBadge(val, result, name) {
+  if (val === 'completed') {
+    // Soft-fail step that completed but has FAIL in result → show as warning
+    if (SOFT_FAIL_STEPS.has(name) && result && result.includes('FAIL')) {
+      return '<span class="badge warn">Warn</span>';
+    }
+    return '<span class="badge pass">Done</span>';
+  }
   if (val === 'running')   return '<span class="badge running">Run</span>';
   if (val === 'failed')    return '<span class="badge fail">Fail</span>';
   if (val === 'skipped')   return '<span class="badge skipped">Skip</span>';
@@ -7025,7 +7055,7 @@ async function loadSteps(podId) {
   const done    = steps.filter(s => s.status === 'completed' || s.status === 'skipped').length;
   const skipped = steps.filter(s => s.status === 'skipped').length;
   const running = steps.some(s => s.status === 'running');
-  const SOFT_FAIL = new Set(['controller_mode_enable','verify_online','redeploy_config_group','verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test','cdfmc_check','ad_verify']);
+  const SOFT_FAIL = SOFT_FAIL_STEPS;
   const hardFailed = steps.some(s => s.status === 'failed' && !SOFT_FAIL.has(s.step_name));
   const softFailed = steps.some(s => s.status === 'failed' && SOFT_FAIL.has(s.step_name));
   const allAccountedFor = steps.length > 0 && steps.every(s => s.status === 'completed' || s.status === 'skipped' || s.status === 'failed');
@@ -7070,7 +7100,7 @@ async function loadSteps(podId) {
     const label = name.replace(/_/g, ' ');
     const duration = formatDur(step?.started_at, step?.completed_at);
     const durHtml = duration ? '<div class="step-dur">' + duration + '</div>' : '';
-    const cardBorder = st === 'skipped' ? 'border-left:3px solid #ffa502;' : st === 'failed' ? 'border-left:3px solid #ff4757;' : '';
+    const cardBorder = st === 'skipped' || (SOFT_FAIL_STEPS.has(name) && st === 'completed' && result && result.includes('FAIL')) ? 'border-left:3px solid #ffa502;' : st === 'failed' ? 'border-left:3px solid #ff4757;' : '';
 
     // Live elapsed + progress bar for controller_mode_enable while running
     let rebootHtml = '';
@@ -7091,7 +7121,7 @@ async function loadSteps(podId) {
     return '<div class="step-card" style="' + cardBorder + '">' +
       '<div class="step-num">Phase ' + idx + '/' + total + '</div>' +
       '<div class="step-name">' + label + '</div>' +
-      pipelineBadge(st) +
+      pipelineBadge(st, step?.result || '', name) +
       '<div class="step-result">' + result + '</div>' +
       durHtml +
       rebootHtml +
