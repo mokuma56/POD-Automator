@@ -2645,7 +2645,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
     # can build direct SA URLs and interact with the org-picker modal.
     _sa_org_id_db = ""
     _scc_org_name = ""   # e.g. "PseudoCo-535" — used to select org in the picker modal
-    _pod_eid       = ""  # enterprise UUID for POD org (discovered via org-picker)
+    _pod_eid       = _eid  # enterprise UUID for POD org — with a correctly refreshed
+                           # session _eid IS the POD org UUID; picker may update it
     try:
         import re as _re_org
         with _sq.connect(db_path) as _c_org:
@@ -3723,80 +3724,117 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                     page.wait_for_timeout(1000)
                     _shot("1_logging")
 
-                    # Find "For all Internet access" row and click its three-dot menu.
-                    # The row is in the Default rules section at the bottom of the page.
+                    # Wait for Default rules section to render, then scroll
+                    # "For all Internet access" into view before clicking.
+                    try:
+                        page.wait_for_selector('text="Default rules"', timeout=12000)
+                        page.wait_for_timeout(600)
+                    except Exception:
+                        pass
+                    try:
+                        page.get_by_text("For all Internet access").first\
+                            .scroll_into_view_if_needed(timeout=5000)
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+                    _shot("1_logging")
+
+                    # Click the "..." on the "For all Internet access" row.
+                    # Returns {x, y} of the element centre — we then use
+                    # page.mouse.click() so React synthetic events fire correctly.
                     _three_dot_clicked = False
-                    for _row_sel in [
-                        'tr:has-text("For all Internet access")',
-                        '[role="row"]:has-text("For all Internet access")',
-                        'tr:has-text("internet access")',
-                        '[role="row"]:has-text("internet access")',
-                    ]:
-                        try:
-                            _row = page.locator(_row_sel).first
-                            if not _row.is_visible(timeout=3000):
-                                continue
-                            # Try named selectors first
-                            for _dot_sel in [
-                                'button[aria-label*="more" i]',
-                                'button[aria-label*="action" i]',
-                                'button[aria-label*="option" i]',
-                                'button:has-text("...")',
-                            ]:
-                                try:
-                                    dot_btn = _row.locator(_dot_sel).first
-                                    if dot_btn.is_visible(timeout=800):
-                                        dot_btn.click()
-                                        page.wait_for_timeout(1000)
-                                        _three_dot_clicked = True
-                                        break
-                                except Exception:
-                                    continue
-                            if not _three_dot_clicked:
-                                # JS fallback: click the rightmost visible button in the row
-                                _three_dot_clicked = page.evaluate("""(sel) => {
-                                    const row = document.querySelector(sel);
-                                    if (!row) return false;
-                                    const btns = Array.from(row.querySelectorAll('button'));
-                                    const visible = btns.filter(b => {
-                                        const r = b.getBoundingClientRect();
-                                        return r.width > 0 && r.height > 0;
-                                    });
-                                    if (!visible.length) return false;
-                                    const btn = visible.reduce((a, b) =>
-                                        b.getBoundingClientRect().x > a.getBoundingClientRect().x ? b : a);
-                                    btn.click();
-                                    return true;
-                                }""", _row_sel)
-                                if _three_dot_clicked:
-                                    page.wait_for_timeout(1000)
-                            if _three_dot_clicked:
-                                break
-                        except Exception:
-                            continue
+                    _dot_coords = page.evaluate("""() => {
+                        const all = Array.from(document.querySelectorAll('*'));
+                        const textEl = all.find(el => {
+                            const kids = Array.from(el.childNodes)
+                                .filter(n => n.nodeType === 3 && n.textContent.trim());
+                            return kids.length > 0 &&
+                                   (el.textContent || '').trim() === 'For all Internet access' &&
+                                   el.getBoundingClientRect().width > 0;
+                        });
+                        if (!textEl) return null;
+
+                        // Walk up to row container
+                        let row = textEl.parentElement;
+                        for (let i = 0; i < 10; i++) {
+                            if (!row || row === document.body) break;
+                            if (row.getBoundingClientRect().width > 400) break;
+                            row = row.parentElement;
+                        }
+                        if (!row) return null;
+
+                        // Hover events to reveal hidden buttons
+                        row.dispatchEvent(new MouseEvent('mouseenter', {bubbles:true}));
+                        row.dispatchEvent(new MouseEvent('mouseover',  {bubbles:true}));
+
+                        // Find "..." — any element type
+                        const rowEls = Array.from(row.querySelectorAll('*'));
+                        const dotEl = rowEls.find(el => {
+                            const t = (el.textContent || '').trim();
+                            const r = el.getBoundingClientRect();
+                            return t === '...' && r.width > 0 && r.height > 0;
+                        }) || (() => {
+                            // Fallback: rightmost small element
+                            const small = rowEls.filter(el => {
+                                const r = el.getBoundingClientRect();
+                                return r.width > 0 && r.width < 60 && r.height > 0;
+                            });
+                            if (!small.length) return null;
+                            return small.reduce((a, b) =>
+                                b.getBoundingClientRect().right >
+                                a.getBoundingClientRect().right ? b : a);
+                        })();
+                        if (!dotEl) return null;
+                        const r = dotEl.getBoundingClientRect();
+                        return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+                    }""")
+                    if _dot_coords:
+                        page.mouse.click(_dot_coords["x"], _dot_coords["y"])
+                        page.wait_for_timeout(800)
+                        _three_dot_clicked = True
 
                     if not _three_dot_clicked:
                         _persist("logging_settings", "failed",
                                  "Could not find three-dot menu on 'For all Internet access' row")
                         log_fn("[scc-reset] logging_settings: three-dot menu not found")
                     else:
-                        # Click "Edit" from the dropdown
+                        _shot("1_logging_dotmenu")
+                        # Click "Edit" — try Playwright selectors then JS coordinate click
                         _edit_clicked = False
                         for _es in [
                             '[role="menuitem"]:has-text("Edit")',
+                            '[role="option"]:has-text("Edit")',
                             'button:has-text("Edit")',
                             'a:has-text("Edit")',
                             'li:has-text("Edit")',
+                            'div:has-text("Edit")',
                         ]:
                             try:
                                 eb = page.locator(_es).first
-                                if eb.is_visible(timeout=2000):
+                                if eb.is_visible(timeout=1500):
                                     eb.click()
                                     page.wait_for_timeout(2000)
                                     _edit_clicked = True
                                     break
                             except Exception:
                                 continue
+                        if not _edit_clicked:
+                            # JS coordinate fallback
+                            _edit_coords = page.evaluate("""() => {
+                                const all = Array.from(document.querySelectorAll('*'));
+                                const el = all.find(e => {
+                                    const t = (e.textContent || '').trim();
+                                    const r = e.getBoundingClientRect();
+                                    return t === 'Edit' && r.width > 0 && r.height > 0;
+                                });
+                                if (!el) return null;
+                                const r = el.getBoundingClientRect();
+                                return {x: r.left + r.width/2, y: r.top + r.height/2};
+                            }""")
+                            if _edit_coords:
+                                page.mouse.click(_edit_coords["x"], _edit_coords["y"])
+                                page.wait_for_timeout(2000)
+                                _edit_clicked = True
 
                         if not _edit_clicked:
                             _persist("logging_settings", "failed",
@@ -3804,7 +3842,7 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                             log_fn("[scc-reset] logging_settings: Edit not found in dropdown")
                         else:
                             _shot("1_logging_edit")
-                            # Check toggle state: text "Logging is disabled" means already off
+                            # Check toggle state: "logging is disabled" means already off
                             _body_text = page.inner_text("body").lower()
                             if "logging is disabled" in _body_text:
                                 # Already disabled — cancel out
@@ -3820,41 +3858,49 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                                          "Logging already disabled ✓")
                                 log_fn("[scc-reset] logging_settings: already disabled ✓")
                             else:
-                                # Logging is enabled — click the toggle to disable it.
-                                # Primary selector: [role="switch"] with aria-checked="true"
+                                # Logging is enabled — use mouse.click() on the toggle
+                                # so React synthetic events fire (JS .click() doesn't).
+                                # Do NOT re-click: one click = off, trust it, then Save.
                                 _toggled = False
-                                for _ts in [
-                                    '[role="switch"][aria-checked="true"]',
-                                    '[role="switch"]',
-                                    'input[type="checkbox"][aria-label*="log" i]',
-                                    'input[type="checkbox"]',
-                                    'label:has-text("Log") input',
-                                ]:
-                                    try:
-                                        tog = page.locator(_ts).first
-                                        if tog.is_visible(timeout=1500):
-                                            tog.click()
-                                            page.wait_for_timeout(800)
-                                            # Verify toggle is now off
-                                            _after = page.inner_text("body").lower()
-                                            if "logging is disabled" in _after:
-                                                _toggled = True
-                                            else:
-                                                # Click again if it went wrong direction
-                                                tog.click()
-                                                page.wait_for_timeout(600)
-                                            break
-                                    except Exception:
-                                        continue
-                                # Save
-                                for _ss in ['button:has-text("Save")',
-                                            'button[type="submit"]']:
-                                    try:
-                                        sb = page.locator(_ss).first
-                                        if sb.is_visible(timeout=1500):
-                                            sb.click(); page.wait_for_timeout(1500); break
-                                    except Exception:
-                                        continue
+                                _tog_coords = page.evaluate("""() => {
+                                    const sels = [
+                                        '[role="switch"]',
+                                        'input[type="checkbox"]',
+                                        'label:has-text("Log") input',
+                                    ];
+                                    for (const s of sels) {
+                                        const el = document.querySelector(s);
+                                        if (el) {
+                                            const r = el.getBoundingClientRect();
+                                            if (r.width > 0 && r.height > 0)
+                                                return {x: r.left + r.width/2,
+                                                        y: r.top + r.height/2};
+                                        }
+                                    }
+                                    return null;
+                                }""")
+                                if _tog_coords:
+                                    page.mouse.click(_tog_coords["x"], _tog_coords["y"])
+                                    page.wait_for_timeout(1000)
+                                    _after = page.inner_text("body").lower()
+                                    _toggled = "logging is disabled" in _after
+                                    log_fn(f"[scc-reset] logging_settings: toggle clicked, disabled={_toggled}")
+                                else:
+                                    log_fn("[scc-reset] logging_settings: toggle element not found")
+                                # Click Save regardless — even if verification uncertain
+                                _save_coords = page.evaluate("""() => {
+                                    const btns = Array.from(document.querySelectorAll('button'));
+                                    const save = btns.find(b =>
+                                        (b.textContent || '').trim() === 'Save' &&
+                                        b.getBoundingClientRect().width > 0);
+                                    if (!save) return null;
+                                    const r = save.getBoundingClientRect();
+                                    return {x: r.left + r.width/2, y: r.top + r.height/2};
+                                }""")
+                                if _save_coords:
+                                    page.mouse.click(_save_coords["x"], _save_coords["y"])
+                                    page.wait_for_timeout(1500)
+                                    log_fn("[scc-reset] logging_settings: Save clicked")
                                 _detail = ("Logging disabled ✓" if _toggled
                                            else "Save clicked — toggle state uncertain")
                                 _persist("logging_settings", "completed", _detail)
