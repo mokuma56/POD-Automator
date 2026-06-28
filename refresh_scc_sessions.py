@@ -181,32 +181,112 @@ def run(db_path: str, log=None):
             except Exception as _e:
                 _log(f"Early save failed for {pod_id}: {_e}")
 
-        # ── 5. Per-POD: select org via dropdown modal, save ──────────────────
-        # Navigate to root (NOT /dashboard?enterpriseId= — that triggers Okta
-        # re-auth in some browser contexts). Dismiss the org picker Continue
-        # button, then capture and overwrite with org-scoped storage_state.
+        # ── 5. Per-POD: select correct org, save org-scoped session ─────────
+        # For each POD: navigate to SCC root, select PseudoCo-{org_number}
+        # from the org picker, click Continue, then save the storage state.
+        # This ensures each session file has the correct enterpriseId for
+        # the POD org — not the manager org.
         for pod_id, org_number, scc_org in pod_orgs:
             _log(f"--- {pod_id} (org {org_number}) ---")
             session_path = DATA_DIR / f"scc_session_{pod_id}.json"
+            _try_labels = [
+                f"PseudoCo-{org_number}",   # "PseudoCo-535"
+                f"pseudoco-{org_number}",   # "pseudoco-535"
+                f"pseudoco{org_number}",    # "pseudoco535"
+            ]
 
             try:
                 pg = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-                _log(f"  Navigating to SCC root for org context...")
+                _log(f"  Navigating to SCC root...")
                 pg.goto("https://security.cisco.com", timeout=30_000,
                         wait_until="domcontentloaded")
-                pg.wait_for_timeout(2000)
+                pg.wait_for_timeout(2500)
 
-                # Dismiss org picker modal (pre-selected dropdown → just Continue)
+                # ── Select the correct POD org in the picker ──────────────────
+                _switched = False
+
+                # Option A: native <select>
+                for _lbl in _try_labels:
+                    try:
+                        pg.select_option("select", label=_lbl, timeout=1500)
+                        _switched = True
+                        _log(f"  org picker: <select> '{_lbl}'")
+                        break
+                    except Exception:
+                        pass
+
+                # Option B: React combobox / listbox
+                if not _switched:
+                    for _csel in ['[role="combobox"]', '[aria-haspopup="listbox"]']:
+                        try:
+                            cb = pg.locator(_csel).first
+                            if cb.is_visible(timeout=1500):
+                                cb.click()
+                                pg.wait_for_timeout(600)
+                                for _lbl in _try_labels:
+                                    for _osel in [
+                                        f'[role="option"]:has-text("{_lbl}")',
+                                        f'li[role="option"]:has-text("{_lbl}")',
+                                        f'li:has-text("{_lbl}")',
+                                    ]:
+                                        try:
+                                            oel = pg.locator(_osel).first
+                                            if oel.is_visible(timeout=800):
+                                                oel.click()
+                                                pg.wait_for_timeout(500)
+                                                _switched = True
+                                                _log(f"  org picker: combobox '{_lbl}'")
+                                                break
+                                        except Exception:
+                                            pass
+                                    if _switched:
+                                        break
+                                break
+                        except Exception:
+                            continue
+
+                # Option C: JS scan
+                if not _switched:
+                    for _lbl in [l.lower() for l in _try_labels]:
+                        try:
+                            _ok = pg.evaluate(f"""() => {{
+                                const els = Array.from(document.querySelectorAll(
+                                    '[role="option"], li, option'));
+                                const el = els.find(e =>
+                                    (e.textContent || '').toLowerCase().includes('{_lbl}'));
+                                if (el && el.getBoundingClientRect().width > 0) {{
+                                    el.click(); return true;
+                                }}
+                                return false;
+                            }}""")
+                            if _ok:
+                                pg.wait_for_timeout(500)
+                                _switched = True
+                                _log(f"  org picker: JS '{_lbl}'")
+                                break
+                        except Exception:
+                            pass
+
+                _log(f"  org picker: switched={_switched}, clicking Continue...")
+
+                # Click Continue
                 try:
                     cont = pg.locator('button:has-text("Continue")').first
                     cont.wait_for(state="visible", timeout=5000)
                     cont.click()
                     pg.wait_for_load_state("domcontentloaded", timeout=15000)
-                    pg.wait_for_timeout(1500)
+                    pg.wait_for_timeout(2000)
                     _log(f"  Dismissed org picker → {pg.url[:80]}")
                 except Exception:
-                    _log(f"  No org picker modal → {pg.url[:80]}")
+                    _log(f"  No Continue button found → {pg.url[:80]}")
+
+                # Log the enterpriseId that was set
+                try:
+                    _eid = pg.evaluate("() => localStorage.getItem('enterpriseId') || ''")
+                    _log(f"  enterpriseId: {_eid[:16]}..." if _eid else "  enterpriseId: (empty)")
+                except Exception:
+                    pass
 
                 pod_storage = _clean_storage(ctx.storage_state())
                 n_cookies = len(pod_storage.get("cookies", []))
