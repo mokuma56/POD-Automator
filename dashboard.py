@@ -2690,14 +2690,121 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             page.wait_for_timeout(2000)
             log_fn(f"[scc-reset] Session OK: {page.url[:60]}")
 
-            # ── Dismiss org picker if present ─────────────────────────────────
-            try:
-                _cont = page.locator('button:has-text("Continue")').first
-                if _cont.is_visible(timeout=4000):
-                    _cont.click()
-                    page.wait_for_timeout(2000)
-            except Exception:
-                pass
+            # ── Switch to POD org via root navigation + org-picker ────────────
+            # Navigate to https://security.cisco.com (no enterpriseId param) to
+            # trigger the org-picker modal, select the POD org, click Continue,
+            # and capture the POD org's enterpriseId from localStorage.
+            # This MUST happen before any SA navigation — otherwise the SPA
+            # silently sets SA-looking URLs but renders manager-org content.
+            if _scc_org_name:
+                import re as _re_init
+                _m_init = _re_init.search(r"(\d+)", _scc_org_name)
+                _org_num_init = _m_init.group(1) if _m_init else ""
+                _try_labels_init = [
+                    _scc_org_name,                          # "PseudoCo-535"
+                    f"pseudoco{_org_num_init}",             # "pseudoco535"
+                    f"pseudoco-{_org_num_init}",            # "pseudoco-535"
+                ]
+                try:
+                    page.goto("https://security.cisco.com",
+                              wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2500)
+
+                    _switched_init = False
+                    # Option A: native <select>
+                    for _lbl in _try_labels_init:
+                        try:
+                            page.select_option("select", label=_lbl, timeout=1500)
+                            _switched_init = True
+                            log_fn(f"[scc-reset] org-picker init: <select> '{_lbl}'")
+                            break
+                        except Exception:
+                            pass
+
+                    # Option B: React combobox
+                    if not _switched_init:
+                        for _csel in ['[role="combobox"]', '[aria-haspopup="listbox"]',
+                                      '[aria-haspopup="true"][aria-expanded]']:
+                            try:
+                                _cb = page.locator(_csel).first
+                                if _cb.is_visible(timeout=1500):
+                                    _cb.click(); page.wait_for_timeout(600)
+                                    for _lbl in _try_labels_init:
+                                        for _osel in [
+                                            f'[role="option"]:has-text("{_lbl}")',
+                                            f'li[role="option"]:has-text("{_lbl}")',
+                                            f'li:has-text("{_lbl}")',
+                                        ]:
+                                            try:
+                                                _oel = page.locator(_osel).first
+                                                if _oel.is_visible(timeout=800):
+                                                    _oel.click(); page.wait_for_timeout(500)
+                                                    _switched_init = True
+                                                    log_fn(f"[scc-reset] org-picker init: combobox '{_lbl}'")
+                                                    break
+                                            except Exception:
+                                                pass
+                                        if _switched_init:
+                                            break
+                                    break
+                            except Exception:
+                                continue
+
+                    # Option C: JS scan
+                    if not _switched_init and _org_num_init:
+                        for _lbl in [l.lower() for l in _try_labels_init]:
+                            try:
+                                _ok = page.evaluate(f"""() => {{
+                                    const els = Array.from(document.querySelectorAll(
+                                        '[role="option"], li, option'));
+                                    const el = els.find(e =>
+                                        (e.textContent || '').toLowerCase().includes('{_lbl}'));
+                                    if (el && el.getBoundingClientRect().width > 0) {{
+                                        el.click(); return true;
+                                    }}
+                                    return false;
+                                }}""")
+                                if _ok:
+                                    page.wait_for_timeout(500)
+                                    _switched_init = True
+                                    log_fn(f"[scc-reset] org-picker init: JS '{_lbl}'")
+                                    break
+                            except Exception:
+                                pass
+
+                    log_fn(f"[scc-reset] org-picker init: switched={_switched_init}, clicking Continue...")
+                    for _csel in ['button:has-text("Continue")',
+                                  'button[type="submit"]:has-text("Continue")']:
+                        try:
+                            _cont = page.locator(_csel).first
+                            if _cont.is_visible(timeout=5000):
+                                _cont.click(); page.wait_for_timeout(3000)
+                                log_fn(f"[scc-reset] org-picker init: dismissed → {page.url[:60]}")
+                                break
+                        except Exception:
+                            pass
+
+                    # Capture POD org enterprise UUID from localStorage
+                    try:
+                        _new_eid = page.evaluate(
+                            "() => localStorage.getItem('enterpriseId') || ''")
+                        if _new_eid and _new_eid != _eid:
+                            _pod_eid = _new_eid
+                            log_fn(f"[scc-reset] POD enterpriseId: {_pod_eid[:12]}...")
+                        else:
+                            log_fn(f"[scc-reset] org-picker init: enterpriseId unchanged ({_new_eid[:8] if _new_eid else 'empty'})")
+                    except Exception:
+                        pass
+                except Exception as _ep_init:
+                    log_fn(f"[scc-reset] org-picker init error: {_ep_init}")
+            else:
+                # No org name — just dismiss any picker that appears
+                try:
+                    _cont = page.locator('button:has-text("Continue")').first
+                    if _cont.is_visible(timeout=3000):
+                        _cont.click(); page.wait_for_timeout(1500)
+                except Exception:
+                    pass
 
             # ── Helpers ───────────────────────────────────────────────────────
             def _nav(label: str, timeout: int = 7000) -> bool:
@@ -2778,7 +2885,17 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                             page.wait_for_load_state("networkidle", timeout=8000)
                         except Exception:
                             pass
-                        return "/secure-access/org/" in page.url
+                        # Check URL AND content — the SCC SPA can set a SA-looking URL
+                        # while rendering manager-org home (session context mismatch).
+                        # Manager home is identified by "Managed Organizations" in the body.
+                        if "/secure-access/org/" in page.url:
+                            try:
+                                _b = page.inner_text("body").lower()
+                                if "managed organizations" not in _b:
+                                    return True
+                            except Exception:
+                                return True  # assume ok if body check fails
+                        return False
                     except Exception:
                         return False
 
