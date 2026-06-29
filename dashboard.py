@@ -8665,13 +8665,18 @@ async function loadSccChecklist(podId) {
   window._sccCurrentPodId = podId;
   const actionsDiv = document.getElementById('scc-actions');
   if (actionsDiv) actionsDiv.style.display = 'block';
-  const r = await fetch('/api/scc/status/' + podId);
+  const [r, ssR, keysR] = await Promise.all([
+    fetch('/api/scc/status/' + podId),
+    fetch('/api/scc/session-status?pod_id=' + podId),
+    fetch('/api/pod-scc-keys/' + podId),
+  ]);
   const items = await r.json();
   const map = {};
   items.forEach(i => { map[i.item_key] = i; });
+  const sessMap = await ssR.json();
+  const sess = sessMap[podId] || {};
 
   // Load existing SCC keys — but don't overwrite if user is actively typing
-  const keysR = await fetch('/api/pod-scc-keys/' + podId);
   const keysD = await keysR.json();
   if (window._sccKeysDirty) {
     // User is typing — preserve their input, just update key/secret from DOM
@@ -8726,7 +8731,25 @@ async function loadSccChecklist(podId) {
       + '</div>';
   }
 
-  grid.innerHTML =
+  // ── Session freshness indicator ──────────────────────────────────────────
+  let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No SCC session \u2014 refresh required';
+  if (sess.exists) {
+    const h = sess.age_hours || 0;
+    if (h < 4)       { sessColor = '#00e68a'; sessIcon = '\u2713'; sessLabel = 'SCC session fresh (' + h.toFixed(1) + 'h ago)'; }
+    else if (h < 8)  { sessColor = '#f0a500'; sessIcon = '\u26a0'; sessLabel = 'SCC session ageing (' + h.toFixed(1) + 'h ago)'; }
+    else             { sessColor = '#ff4757'; sessIcon = '\u26a0'; sessLabel = 'SCC session stale (' + h.toFixed(1) + 'h) \u2014 refresh'; }
+  }
+
+  // ── Pre-flight: Refresh SCC Sessions ─────────────────────────────────────
+  let preflight = '<div style="background:#0d1117;border:1px solid #1e2d3d;border-radius:6px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">';
+  preflight += '<div>';
+  preflight += '<span style="font-size:12px;font-weight:600;color:#8899aa;text-transform:uppercase;letter-spacing:.5px;">Pre-flight</span>&nbsp;';
+  preflight += '<span id="scc-sess-badge" style="font-size:12px;color:' + sessColor + ';">' + sessIcon + ' ' + sessLabel + '</span>';
+  preflight += '</div>';
+  preflight += '<button id="scc-refresh-btn" style="background:#445566;color:#cdd6e0;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">\u21bb Refresh SCC Sessions</button>';
+  preflight += '</div>';
+
+  grid.innerHTML = preflight +
     // SCC API Credentials card
     '<div class="switch-card" style="margin-bottom:12px;">'
     + '<div class="switch-card-title"><span class="role-tag cc">KEYS</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">SCC API Credentials</span></div>'
@@ -8805,6 +8828,10 @@ async function loadSccChecklist(podId) {
     const secretInput = document.getElementById('scc-secret-input');
     if (keyInput) keyInput.addEventListener('input', () => { window._sccKeysDirty = true; });
     if (secretInput) secretInput.addEventListener('input', () => { window._sccKeysDirty = true; });
+
+    // Wire Refresh SCC Sessions button
+    const sccRefreshBtn = document.getElementById('scc-refresh-btn');
+    if (sccRefreshBtn) sccRefreshBtn.onclick = () => iseRefreshSessions(podId);
   }, 0);
 }
 

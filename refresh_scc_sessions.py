@@ -69,18 +69,53 @@ def run(db_path: str, log=None):
     with sync_playwright() as p:
         # launch_persistent_context keeps cookies/localStorage across runs.
         # On first run: user logs in; on subsequent runs: already authenticated.
-        ctx = p.chromium.launch_persistent_context(
+        # Try Google Chrome first (best compatibility with existing profiles);
+        # fall back to Playwright's bundled Chromium so the script works on
+        # machines where Chrome is not installed.
+        _launch_kwargs = dict(
             user_data_dir=str(PROFILE_DIR),
-            channel="chrome",
             headless=False,
             no_viewport=True,
             args=["--start-maximized", "--no-first-run", "--no-default-browser-check"],
         )
+        ctx = None
+        for _channel in ("chrome", None):
+            try:
+                if _channel:
+                    ctx = p.chromium.launch_persistent_context(channel=_channel, **_launch_kwargs)
+                    _log(f"Browser: Google Chrome")
+                else:
+                    # Ensure bundled Chromium binaries are present
+                    try:
+                        import subprocess as _sp
+                        _sp.run(
+                            [sys.executable, "-m", "playwright", "install", "chromium"],
+                            capture_output=True, timeout=120,
+                        )
+                    except Exception:
+                        pass
+                    ctx = p.chromium.launch_persistent_context(**_launch_kwargs)
+                    _log(f"Browser: Playwright bundled Chromium (Chrome not found on this machine)")
+                break
+            except Exception as _e:
+                if _channel:
+                    _log(f"Chrome not available ({_e}) — trying bundled Chromium...")
+                else:
+                    _log(f"ERROR: Could not launch any browser: {_e}")
+                    return False, f"No browser available: {_e}"
+
+        if ctx is None:
+            return False, "Failed to launch browser (Chrome and bundled Chromium both unavailable)"
 
         # Bring the browser window to the front on macOS
         try:
             subprocess.run(["osascript", "-e",
                 'tell application "Google Chrome" to activate'], check=False)
+        except Exception:
+            pass
+        try:
+            subprocess.run(["osascript", "-e",
+                'tell application "Chromium" to activate'], check=False)
         except Exception:
             pass
 
