@@ -13,13 +13,16 @@ import threading
 import time
 import queue
 import json
-import sys, os
+import sys, os, subprocess
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 sys.path.insert(0, os.path.dirname(__file__))
 
 app = Flask(__name__)
+
+# ── Dashboard proxy URL (can be overridden via POST /api/prep/config) ─────────
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://localhost:5050")
 
 # ── Switch definitions ────────────────────────────────────────────────────────
 SWITCHES = {
@@ -168,41 +171,57 @@ vrf definition PROD
 MULTICAST_CFG = """\
 l2vpn evpn
  replication-type static
- router-id loopback 0"""
+ router-id loopback 0
+"""
 
 L2VNI_CFG = """\
 vlan 10
  name Main
+!
 vlan 101
  name PROD
+!
 vlan 102
  name IOT
+!
 l2vpn evpn instance 10 vlan-based
  encapsulation vxlan
+!
 l2vpn evpn instance 101 vlan-based
  encapsulation vxlan
+!
 l2vpn evpn instance 102 vlan-based
  encapsulation vxlan
+!
 vlan configuration 10
  member evpn-instance 10 vni 100010
+!
 vlan configuration 101
  member evpn-instance 101 vni 100101
+!
 vlan configuration 102
- member evpn-instance 102 vni 100102"""
+ member evpn-instance 102 vni 100102
+"""
 
 L3VNI_CFG = """\
 vlan 1010
  name L3-VRF-CORE-VLAN-10
+!
 vlan 1101
  name L3-VRF-CORE-VLAN-101
+!
 vlan 1102
  name L3-VRF-CORE-VLAN-102
+!
 vlan configuration 1010
  member vni 110010
+!
 vlan configuration 1101
  member vni 110101
+!
 vlan configuration 1102
- member vni 110102"""
+ member vni 110102
+"""
 
 DAG_SVIS_CFG = """\
 interface Vlan10
@@ -212,6 +231,7 @@ interface Vlan10
  ip address 10.10.255.1 255.255.255.0
  ip helper-address global 198.18.5.102
  no shutdown
+!
 interface Vlan101
  mac-address 0001.0001.0101
  vrf forwarding PROD
@@ -219,13 +239,15 @@ interface Vlan101
  ip address 10.101.255.1 255.255.255.0
  ip helper-address global 198.18.5.102
  no shutdown
+!
 interface Vlan102
  mac-address 0001.0001.0102
  vrf forwarding IOT
  ip dhcp relay source-interface Loopback0
  ip address 10.102.255.1 255.255.255.0
  ip helper-address global 198.18.5.102
- no shutdown"""
+ no shutdown
+"""
 
 L3VNI_SVIS_CFG = """\
 interface Vlan1010
@@ -233,16 +255,19 @@ interface Vlan1010
  ip unnumbered Loopback0
  no autostate
  no shutdown
+!
 interface Vlan1101
  vrf forwarding PROD
  ip unnumbered Loopback0
  no autostate
  no shutdown
+!
 interface Vlan1102
  vrf forwarding IOT
  ip unnumbered Loopback0
  no autostate
- no shutdown"""
+ no shutdown
+"""
 
 NVE_LEAF_CFG = """\
 interface nve1
@@ -255,7 +280,8 @@ interface nve1
  member vni 110102 vrf IOT
  member vni 100010 mcast-group 232.1.1.1
  member vni 100101 mcast-group 232.1.1.1
- member vni 100102 mcast-group 232.1.1.1"""
+ member vni 100102 mcast-group 232.1.1.1
+"""
 
 NVE_SPINE_CFG = """\
 interface nve1
@@ -264,7 +290,8 @@ interface nve1
  host-reachability protocol bgp
  member vni 110010 vrf Main
  member vni 110101 vrf PROD
- member vni 110102 vrf IOT"""
+ member vni 110102 vrf IOT
+"""
 
 BGP_LEAF1 = """\
 router bgp 65535
@@ -273,24 +300,30 @@ router bgp 65535
  no bgp default ipv4-unicast
  neighbor 172.30.255.3 remote-as 65535
  neighbor 172.30.255.3 update-source Loopback0
+ !
  address-family ipv4
  exit-address-family
+ !
  address-family l2vpn evpn
   neighbor 172.30.255.3 activate
   neighbor 172.30.255.3 send-community both
  exit-address-family
+ !
  address-family ipv4 vrf IOT
   advertise l2vpn evpn
   redistribute connected
  exit-address-family
+ !
  address-family ipv4 vrf Main
   advertise l2vpn evpn
   redistribute connected
  exit-address-family
+ !
  address-family ipv4 vrf PROD
   advertise l2vpn evpn
   redistribute connected
- exit-address-family"""
+ exit-address-family
+"""
 
 BGP_LEAF2 = BGP_LEAF1.replace("172.30.255.1", "172.30.255.2")
 
@@ -303,6 +336,7 @@ router bgp 65535
  neighbor 172.30.255.1 update-source Loopback0
  neighbor 172.30.255.2 remote-as 65535
  neighbor 172.30.255.2 update-source Loopback0
+ !
  address-family l2vpn evpn
   neighbor 172.30.255.1 activate
   neighbor 172.30.255.1 send-community both
@@ -310,7 +344,8 @@ router bgp 65535
   neighbor 172.30.255.2 activate
   neighbor 172.30.255.2 send-community both
   neighbor 172.30.255.2 route-reflector-client
- exit-address-family"""
+ exit-address-family
+"""
 
 # ── 802.1x / IBNS 2.0 / CTS security config (copied from evpn_fabric.py) ─────
 # Pushed to Leaf1 + Leaf2 only. Required for ransomware simulation SGT
@@ -339,34 +374,45 @@ dot1x system-auth-control
 class-map type control subscriber match-all AAA_SVR_DOWN_AUTHD_HOST
  match result-type aaa-timeout
  match authorization-status authorized
+!
 class-map type control subscriber match-all AAA_SVR_DOWN_UNAUTHD_HOST
  match result-type aaa-timeout
  match authorization-status unauthorized
+!
 class-map type control subscriber match-all AUTHC_SUCCESS_AUTHZ_FAIL
  match authorization-status unauthorized
  match result-type success
+!
 class-map type control subscriber match-all DOT1X
  match method dot1x
+!
 class-map type control subscriber match-all DOT1X_FAILED
  match method dot1x
  match result-type method dot1x authoritative
+!
 class-map type control subscriber match-all DOT1X_NO_RESP
  match method dot1x
  match result-type method dot1x agent-not-found
+!
 class-map type control subscriber match-all DOT1X_TIMEOUT
  match method dot1x
  match result-type method dot1x method-timeout
+!
 class-map type control subscriber match-any IN_CRITICAL_AUTH
  match activated-service-template CRITICAL_DATA_ACCESS
  match activated-service-template CRITICAL_VOICE_ACCESS
+!
 class-map type control subscriber match-all MAB
  match method mab
+!
 class-map type control subscriber match-all MAB_FAILED
  match method mab
  match result-type method mab authoritative
+!
 class-map type control subscriber match-none NOT_IN_CRITICAL_AUTH
  match activated-service-template CRITICAL_DATA_ACCESS
  match activated-service-template CRITICAL_VOICE_ACCESS
+!
 policy-map type control subscriber DOT1X_MAB_POLICY
  event session-started match-all
   10 class always do-until-failure
@@ -414,7 +460,8 @@ policy-map type control subscriber DOT1X_MAB_POLICY
    10 restrict
  event authorization-failure match-all
   10 class AUTHC_SUCCESS_AUTHZ_FAIL do-until-failure
-   10 authentication-restart 60
+    10 authentication-restart 60
+!
 policy-map type control subscriber MAB_DOT1X_POLICY
  event session-started match-all
   10 class always do-until-failure
@@ -462,7 +509,8 @@ policy-map type control subscriber MAB_DOT1X_POLICY
    10 restrict
  event authorization-failure match-all
   10 class AUTHC_SUCCESS_AUTHZ_FAIL do-until-failure
-   10 authentication-restart 60
+    10 authentication-restart 60
+!
 template WIRED_DOT1X_CLOSED
  dot1x pae authenticator
  dot1x timeout quiet-period 300
@@ -474,6 +522,7 @@ template WIRED_DOT1X_CLOSED
  authentication periodic
  authentication timer reauthenticate server
  service-policy type control subscriber DOT1X_MAB_POLICY
+!
 template WIRED_DOT1X_OPEN
  dot1x pae authenticator
  dot1x timeout quiet-period 300
@@ -484,6 +533,7 @@ template WIRED_DOT1X_OPEN
  authentication periodic
  authentication timer reauthenticate server
  service-policy type control subscriber DOT1X_MAB_POLICY
+!
 template WIRED_MAB_CLOSED
  dot1x pae authenticator
  dot1x timeout quiet-period 300
@@ -495,6 +545,7 @@ template WIRED_MAB_CLOSED
  authentication periodic
  authentication timer reauthenticate server
  service-policy type control subscriber MAB_DOT1X_POLICY
+!
 template WIRED_MAB_OPEN
  dot1x pae authenticator
  dot1x timeout quiet-period 300
@@ -778,26 +829,28 @@ def _run_sda_verify(sid):
 
 # ── SDA full deploy (CATC discover + sda_fabric run_deploy) ──────────────────
 def _run_sda_deploy(sid):
-    """Run CATC discovery then full SDA fabric deploy, streaming steps via SSE."""
-    # Step 1: CATC discovery via onboard_router.phase_catc_discover
-    _emit(sid, "step_start", {"name": "Catalyst Center Discovery"})
-    try:
-        import onboard_router
-        ok, msg = onboard_router.phase_catc_discover(log_fn=lambda m: None)
-        _emit(sid, "step_done", {"name": "Catalyst Center Discovery", "ok": ok, "detail": msg[:120] if msg else ""})
-        if not ok:
-            _emit(sid, "complete", {"path": "sda"})
-            return _done(sid)
-    except Exception as e:
-        _emit(sid, "step_done", {"name": "Catalyst Center Discovery", "ok": False, "detail": str(e)[:120]})
-        _emit(sid, "complete", {"path": "sda"})
-        return _done(sid)
+    """Run full SDA fabric deploy via sda_fabric.DEPLOY_STEPS, streaming steps via SSE."""
+    # Human-friendly labels keyed by sda_fabric.DEPLOY_STEPS step names
+    STEP_LABELS = {
+        "discovery":                   "Catalyst Center Discovery",
+        "provision":                   "Provision Switches",
+        "fabric_site":                 "Create Fabric Site",
+        "virtual_networks":            "Create Virtual Networks",
+        "anycast_gateways":            "Create Anycast Gateways",
+        "transit":                     "Create Transit",
+        "fabric_devices":              "Add Fabric Devices",
+        "ise_nads":                    "Configure ISE NADs",
+        "l3_handoff":                  "L3 Handoff",
+        "configure_handoff_interface": "Configure Handoff Interface",
+        "deploy_anycast_gateways":     "Deploy Anycast Gateways",
+        "port_assignments":            "Port Assignments",
+        "verify":                      "Verify Fabric",
+    }
 
-    # Step 2: SDA fabric deploy steps
     try:
         import sda_fabric
         for step_name, step_fn in sda_fabric.DEPLOY_STEPS:
-            label = step_name.replace("_", " ").title()
+            label = STEP_LABELS.get(step_name, step_name.replace("_", " ").title())
             _emit(sid, "step_start", {"name": label})
             try:
                 ok, msg = step_fn(log_fn=lambda m: None)
@@ -805,9 +858,12 @@ def _run_sda_deploy(sid):
                 ok, msg = False, str(e)
             _emit(sid, "step_done", {"name": label, "ok": ok, "detail": (msg or "")[:120]})
             if not ok:
-                break
+                _emit(sid, "complete", {"path": "sda"})
+                return _done(sid)
     except Exception as e:
         _emit(sid, "step_done", {"name": "SDA Deploy", "ok": False, "detail": str(e)[:120]})
+        _emit(sid, "complete", {"path": "sda"})
+        return _done(sid)
 
     # 802.1x / IBNS 2.0 / CTS — Leaf1 + Leaf2 (required for ransomware SGT enforcement)
     _emit(sid, "step_start", {"name": "Arming Identity & SGT Enforcement"})
@@ -1349,6 +1405,168 @@ def api_breach_reset():
     return jsonify({"status": "ok" if all_ok else "partial", "switches": results})
 
 
+# ── POD Prep — dashboard proxy helpers ───────────────────────────────────────
+def _dashboard_get(path):
+    """GET from dashboard; return (ok, parsed_json_or_text)."""
+    try:
+        r = requests.get(f"{DASHBOARD_URL}{path}", timeout=15)
+        ct = r.headers.get("content-type", "")
+        return True, r.json() if "application/json" in ct else r.text
+    except Exception as e:
+        return False, str(e)
+
+
+def _dashboard_post(path, body=None):
+    """POST to dashboard; return (ok, parsed_json_or_text)."""
+    try:
+        r = requests.post(f"{DASHBOARD_URL}{path}", json=body or {}, timeout=15)
+        ct = r.headers.get("content-type", "")
+        return True, r.json() if "application/json" in ct else r.text
+    except Exception as e:
+        return False, str(e)
+
+
+def _do_git_pull():
+    """Run git pull --ff-only in the pod_automator repo."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo, "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=30
+        )
+        ok = r.returncode == 0
+        return ok, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return False, str(e)
+
+
+# ── POD Prep — Flask routes ───────────────────────────────────────────────────
+@app.route("/prep")
+def page_prep():
+    return PREP_PAGE
+
+
+@app.route("/api/prep/info")
+def api_prep_info():
+    return jsonify({"dashboard_url": DASHBOARD_URL})
+
+
+@app.route("/api/prep/config", methods=["POST"])
+def api_prep_config():
+    global DASHBOARD_URL
+    data = request.get_json(silent=True) or {}
+    if "dashboard_url" in data:
+        DASHBOARD_URL = data["dashboard_url"].rstrip("/")
+    return jsonify({"dashboard_url": DASHBOARD_URL})
+
+
+@app.route("/api/prep/git-pull", methods=["POST"])
+def api_prep_git_pull():
+    ok, msg = _do_git_pull()
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/api/prep/pods")
+def api_prep_pods():
+    ok, data = _dashboard_get("/api/pods")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/pipeline/<pod_id>")
+def api_prep_pipeline(pod_id):
+    ok, data = _dashboard_get(f"/api/pipeline-steps/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    ok2, run_data = _dashboard_get(f"/api/pipeline-status/{pod_id}")
+    if ok2 and isinstance(run_data, dict):
+        running = run_data.get("running", False)
+        if isinstance(data, list):
+            return jsonify({"steps": data, "running": running})
+    return jsonify({"steps": data if isinstance(data, list) else [], "running": False})
+
+
+@app.route("/api/prep/logs/<pod_id>")
+def api_prep_logs(pod_id):
+    ok, data = _dashboard_get(f"/api/logs/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/run/<pod_id>", methods=["POST"])
+def api_prep_run(pod_id):
+    ok, data = _dashboard_post(f"/api/run-pod/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/reset/<pod_id>", methods=["POST"])
+def api_prep_reset(pod_id):
+    ok, data = _dashboard_post(f"/api/reset-pipeline/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/ise/<pod_id>")
+def api_prep_ise_status(pod_id):
+    ok, data = _dashboard_get(f"/api/ise/status/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/ise/run/<pod_id>", methods=["POST"])
+def api_prep_ise_run(pod_id):
+    ok, data = _dashboard_post(f"/api/ise/run/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/ise/reset/<pod_id>", methods=["POST"])
+def api_prep_ise_reset(pod_id):
+    ok, data = _dashboard_post(f"/api/ise/reset/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/switches/<pod_id>")
+def api_prep_switches(pod_id):
+    ok, data = _dashboard_get(f"/api/switches/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/switches/recheck/<pod_id>", methods=["POST"])
+def api_prep_switches_recheck(pod_id):
+    ok, data = _dashboard_post(f"/api/switches/recheck/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/baseconfig/<pod_id>")
+def api_prep_baseconfig_status(pod_id):
+    ok, data = _dashboard_get(f"/api/baseconfig/status/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/baseconfig/<pod_id>/<switch_key>", methods=["POST"])
+def api_prep_baseconfig_reset(pod_id, switch_key):
+    ok, data = _dashboard_post(f"/api/baseconfig/reset/{pod_id}/{switch_key}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
 # ── HTML / CSS / JS ───────────────────────────────────────────────────────────
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -1788,6 +2006,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border: 1px solid rgba(255,71,87,0.25);
   }
 
+  /* ── prep card ── */
+  .choice-card.prep::after {
+    background: radial-gradient(circle at 50% 0%, rgba(2,200,255,0.08) 0%, transparent 70%);
+  }
+  .choice-card.prep { border-color: rgba(2,200,255,0.18); }
+  .choice-card.prep:hover { border-color: var(--cyan); box-shadow: 0 8px 40px rgba(2,200,255,0.14); }
+  .choice-card.prep:hover::after { opacity: 1; }
+  .choice-card.prep .choice-top-bar { background: linear-gradient(90deg, #0050a0, var(--cyan)); }
+  .choice-card.prep .choice-label { color: var(--cyan); }
+  .choice-card.prep:hover .choice-arrow { color: var(--cyan); }
+  .prep-badge {
+    background: rgba(2,200,255,0.10);
+    color: var(--cyan);
+    border: 1px solid rgba(2,200,255,0.20);
+  }
+
   /* ── running screen ── */
   .run-header {
     padding: 32px 0 28px;
@@ -2217,6 +2451,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="or-divider">— or —</div>
       <p>a fabric optimized for <strong>open standards flexibility and deterministic control</strong>?</p>
       <p style="margin-top:16px; color: var(--text3); font-size:13px;">You are the architect. Step in, make your choice, and deploy.</p>
+    </div>
+
+    <!-- Prep card — instructor only, full width, above choice cards -->
+    <div class="choices" style="grid-template-columns:1fr; margin-bottom:0;">
+      <a class="choice-card prep" href="/prep" style="text-decoration:none;">
+        <div class="choice-top-bar"></div>
+        <div class="choice-label">Instructor Only &mdash; POD Management</div>
+        <div class="choice-title">POD Preparation</div>
+        <div class="choice-desc">Onboard the Secure Router to SD-WAN, verify switch base configs, run the ISE pxGrid &amp; SCC integration steps, and monitor pipeline progress — all from one place. Use before handing off the lab to students.</div>
+        <div class="choice-meta">
+          <span class="choice-badge prep-badge">Pipeline &bull; ISE &bull; Base Config</span>
+          <span class="choice-arrow">&#8594;</span>
+        </div>
+      </a>
     </div>
 
     <!-- Choice Cards -->
@@ -2854,9 +3102,19 @@ EVPN_STEP_LABELS = [
 
 SDA_STEP_LABELS = [
     "Catalyst Center Discovery",
-    "Discovery", "Provision", "Fabric Site", "Virtual Networks",
-    "Anycast Gateways", "Transit", "Fabric Devices",
-    "L3 Handoff", "Port Assignments", "Verify",
+    "Provision Switches",
+    "Create Fabric Site",
+    "Create Virtual Networks",
+    "Create Anycast Gateways",
+    "Create Transit",
+    "Add Fabric Devices",
+    "Configure ISE NADs",
+    "L3 Handoff",
+    "Configure Handoff Interface",
+    "Deploy Anycast Gateways",
+    "Port Assignments",
+    "Verify Fabric",
+    "Arming Identity & SGT Enforcement",
 ]
 
 # ── EVPN page ─────────────────────────────────────────────────────────────────
@@ -3726,6 +3984,558 @@ function resetBreachDemo() {{
       if (btn) {{ btn.disabled = false; btn.textContent = origText || 'Reset Demo'; }}
     }});
 }}
+</script>
+</body>
+</html>
+"""
+
+# ── POD Preparation page ──────────────────────────────────────────────────────
+PREP_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>POD Preparation — Cisco Lab</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:  #06111f;
+    --bg2: #0d1e30;
+    --bg3: #112240;
+    --border:  rgba(255,255,255,0.07);
+    --border2: rgba(255,255,255,0.15);
+    --cyan:    #02c8ff;
+    --green:   #00e68a;
+    --red:     #ff4757;
+    --orange:  #ffa502;
+    --text1:   #e8eef5;
+    --text2:   #8899aa;
+    --text3:   #445566;
+  }
+  body { background: var(--bg); color: var(--text1);
+         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         font-size: 14px; min-height: 100vh; }
+  #banner { padding: 7px 24px; font-size: 12px; font-weight: 600; display: none; }
+  #banner.ok  { background: rgba(0,230,138,0.10); color: var(--green);
+                border-bottom: 1px solid rgba(0,230,138,0.18); }
+  #banner.err { background: rgba(255,71,87,0.10);  color: var(--red);
+                border-bottom: 1px solid rgba(255,71,87,0.18); }
+  .topbar { background: var(--bg2); border-bottom: 1px solid var(--border);
+            padding: 0 24px; display: flex; align-items: center; gap: 18px; height: 54px; }
+  .back-link { color: var(--text2); text-decoration: none; font-size: 13px; }
+  .back-link:hover { color: var(--cyan); }
+  .topbar-title { font-size: 16px; font-weight: 700; color: var(--cyan); letter-spacing: .5px; }
+  .pod-selector { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .pod-selector label { color: var(--text2); font-size: 12px; }
+  select, button {
+    background: var(--bg3); color: var(--text1);
+    border: 1px solid var(--border2); border-radius: 4px;
+    padding: 5px 10px; font-size: 13px; cursor: pointer;
+    transition: border-color .2s, color .2s;
+  }
+  select:focus, button:focus { outline: none; border-color: var(--cyan); }
+  button:hover { border-color: var(--cyan); color: var(--cyan); }
+  button.primary { background: rgba(2,200,255,0.10); border-color: rgba(2,200,255,0.30); color: var(--cyan); }
+  button.primary:hover { background: rgba(2,200,255,0.18); }
+  button.danger  { background: rgba(255,71,87,0.08); border-color: rgba(255,71,87,0.25); color: var(--red); }
+  button.danger:hover { background: rgba(255,71,87,0.16); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .tabs { background: var(--bg2); border-bottom: 1px solid var(--border);
+          display: flex; padding: 0 24px; }
+  .tab-btn { background: none; border: none; border-bottom: 2px solid transparent;
+             border-radius: 0; color: var(--text2); padding: 12px 18px;
+             font-size: 13px; font-weight: 500; cursor: pointer;
+             transition: color .2s, border-color .2s; }
+  .tab-btn:hover { color: var(--text1); }
+  .tab-btn.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+  .content { padding: 20px 24px; }
+  .action-bar { display: flex; align-items: center; gap: 10px;
+                margin-bottom: 14px; flex-wrap: wrap; }
+  .status-msg { font-size: 12px; color: var(--text2); margin-left: auto; }
+  .section-label { font-size: 10px; font-weight: 700; letter-spacing: 1.5px;
+                   text-transform: uppercase; color: var(--text3); margin-bottom: 8px; }
+  /* step grid */
+  .step-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px,1fr));
+               gap: 7px; margin-bottom: 14px; }
+  .step-chip { background: var(--bg3); border: 1px solid var(--border); border-radius: 5px;
+               padding: 7px 9px; font-size: 11px; display: flex; flex-direction: column;
+               gap: 2px; min-height: 48px; }
+  .step-chip .sn { color: var(--text2); font-weight: 500; line-height: 1.2; }
+  .step-chip .ss { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text3); }
+  .step-chip .sr { font-size: 10px; color: var(--text3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .step-chip.pass    { border-color: rgba(0,230,138,.22); }
+  .step-chip.pass    .ss { color: var(--green); }
+  .step-chip.failed  { border-color: rgba(255,71,87,.22); }
+  .step-chip.failed  .ss { color: var(--red); }
+  .step-chip.running { border-color: rgba(255,165,2,.32); background: rgba(255,165,2,.05); }
+  .step-chip.running .ss { color: var(--orange); }
+  .step-chip.skipped .ss { color: var(--orange); }
+  /* log box */
+  .log-box { background: #030c15; border: 1px solid var(--border); border-radius: 5px;
+             padding: 10px 12px; font-family: 'Courier New', monospace; font-size: 11px;
+             line-height: 1.5; color: #6a8aaa; max-height: 200px; overflow-y: auto;
+             white-space: pre-wrap; word-break: break-all; }
+  .lk  { color: var(--green); }
+  .le  { color: var(--red); }
+  /* switch cards */
+  .sw-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px,1fr)); gap: 10px; }
+  .sw-card  { background: var(--bg3); border: 1px solid var(--border); border-radius: 7px; padding: 12px 14px; }
+  .sw-card h4 { color: var(--text1); font-size: 13px; margin-bottom: 7px; }
+  .sw-chk { font-size: 11px; color: var(--text2); padding: 2px 0;
+            display: flex; align-items: center; gap: 6px; }
+  .sw-chk.ok   { color: var(--green); }
+  .sw-chk.fail { color: var(--red); }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text3); flex-shrink: 0; }
+  .dot.ok   { background: var(--green); }
+  .dot.fail { background: var(--red); }
+  .dot.run  { background: var(--orange); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.4} }
+  /* base config cards */
+  .bc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px,1fr)); gap: 10px; margin-bottom: 12px; }
+  .bc-card { background: var(--bg3); border: 1px solid var(--border); border-radius: 5px; padding: 10px 12px; }
+  .bc-card h4 { color: var(--text2); font-size: 10px; text-transform: uppercase; letter-spacing: .8px; margin-bottom: 5px; }
+  .bc-line     { font-size: 11px; color: var(--text2); margin: 1px 0; }
+  .bc-line.ok  { color: var(--green); }
+  .bc-line.err { color: var(--red); }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  .no-pod { color: var(--text3); padding: 40px 0; text-align: center; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="banner"></div>
+<div class="topbar">
+  <a href="/" class="back-link">&#8592; Lab Home</a>
+  <div class="topbar-title">POD Preparation</div>
+  <div class="pod-selector">
+    <label>POD:</label>
+    <select id="pod-select" onchange="onPodChange()"><option value="">Loading…</option></select>
+    <button onclick="doRefresh()" title="Refresh">&#8635;</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab-btn active" data-tab="pipeline"   onclick="switchTab('pipeline')">Pipeline (21 steps)</button>
+  <button class="tab-btn"        data-tab="ise"        onclick="switchTab('ise')">ISE Prep</button>
+  <button class="tab-btn"        data-tab="baseconfig" onclick="switchTab('baseconfig')">Base Config</button>
+  <button class="tab-btn"        data-tab="switches"   onclick="switchTab('switches')">Switches</button>
+</div>
+
+<div class="content">
+
+  <!-- Pipeline tab -->
+  <div id="tab-pipeline" class="tab-pane active">
+    <div class="action-bar">
+      <button class="primary" id="btn-run"   onclick="runPipeline()">&#9654; Run Pipeline</button>
+      <button class="danger"  id="btn-reset" onclick="resetPipeline()">&#8635; Reset</button>
+      <span class="status-msg" id="pipeline-msg"></span>
+    </div>
+    <div class="section-label">21 Pipeline Steps</div>
+    <div class="step-grid" id="pipeline-grid"></div>
+    <div class="section-label" style="margin-top:12px;">Pipeline Logs (last 60 lines)</div>
+    <div class="log-box" id="pipeline-logs">No logs yet.</div>
+  </div>
+
+  <!-- ISE Prep tab -->
+  <div id="tab-ise" class="tab-pane">
+    <div class="action-bar">
+      <button class="primary" id="btn-ise-run"   onclick="runIse()">&#9654; Run ISE</button>
+      <button class="danger"  id="btn-ise-reset" onclick="resetIse()">&#8635; Reset</button>
+      <span class="status-msg" id="ise-msg"></span>
+    </div>
+    <div class="section-label">5 ISE Integration Steps</div>
+    <div class="step-grid" id="ise-grid"></div>
+  </div>
+
+  <!-- Base Config tab -->
+  <div id="tab-baseconfig" class="tab-pane">
+    <div class="action-bar">
+      <select id="switch-select">
+        <option value="all">All Switches</option>
+        <option value="border_spine">Border Spine</option>
+        <option value="leaf1">Leaf 1</option>
+        <option value="leaf2">Leaf 2</option>
+      </select>
+      <button class="danger" id="btn-bc" onclick="pushBaseConfig()">&#8635; Push Base Config</button>
+      <span class="status-msg" id="bc-msg"></span>
+    </div>
+    <div class="section-label">Last Reset / Verify Status</div>
+    <div class="bc-grid" id="bc-grid"></div>
+    <div class="section-label" style="margin-top:8px;">Base Config Logs</div>
+    <div class="log-box" id="bc-logs">No base config operations yet.</div>
+  </div>
+
+  <!-- Switches tab -->
+  <div id="tab-switches" class="tab-pane">
+    <div class="action-bar">
+      <button class="primary" id="btn-sw-recheck" onclick="recheckSwitches()">&#8635; Recheck Switches</button>
+      <span class="status-msg" id="sw-msg"></span>
+    </div>
+    <div class="section-label">Switch Verification</div>
+    <div class="sw-cards" id="sw-grid"></div>
+  </div>
+
+</div><!-- /content -->
+
+<script>
+const PIPELINE_STEPS = [
+  ['detect_pod_number',      'Detect POD'],
+  ['verify_router',          'Verify Router'],
+  ['reset_device',           'Reset Device'],
+  ['quick_connect',          'Quick Connect'],
+  ['config_group_associate', 'Assoc Config Grp'],
+  ['assign_license',         'Assign License'],
+  ['set_variables',          'Set Variables'],
+  ['deploy_config_group',    'Deploy Config Grp'],
+  ['generate_bootstrap',     'Gen Bootstrap'],
+  ['copy_bootstrap',         'Copy Bootstrap'],
+  ['controller_mode_enable', 'Controller Mode'],
+  ['verify_online',          'Verify Online'],
+  ['redeploy_config_group',  'Redeploy Config'],
+  ['verify_border_spine',    'Border Spine'],
+  ['verify_leaf1',           'Leaf 1'],
+  ['verify_leaf2',           'Leaf 2'],
+  ['connectivity_test',      'Connectivity'],
+  ['route_verification',     'Route Verify'],
+  ['cdfmc_check',            'cdFMC Check'],
+  ['ad_verify',              'AD Verify'],
+  ['scc_reset_check',        'SCC Reset'],
+];
+
+const ISE_STEPS = [
+  ['ise_pxgrid_register',           'pxGrid Register'],
+  ['ise_scc_integrate',             'SCC Integrate'],
+  ['ise_scc_deactivate_reactivate', 'SCC Deact/React'],
+  ['ise_cdfmc_integrate',           'cdFMC Integrate'],
+  ['ise_sgt_verify',                'SGT Verify'],
+];
+
+let currentPod = '';
+let pollTimer  = null;
+
+window.addEventListener('DOMContentLoaded', async () => {
+  await loadPods();
+  gitPull();
+  startPoll();
+});
+
+async function gitPull() {
+  try {
+    const r = await fetch('/api/prep/git-pull', {method:'POST'});
+    const d = await r.json();
+    const b = document.getElementById('banner');
+    b.className = d.ok ? 'ok' : 'err';
+    b.textContent = (d.ok ? '\u2713 git pull: ' : '\u26a0 git pull: ') + (d.message || '');
+    b.style.display = 'block';
+    setTimeout(() => { b.style.display = 'none'; }, 7000);
+  } catch(e) {}
+}
+
+async function loadPods() {
+  try {
+    const r = await fetch('/api/prep/pods');
+    const pods = await r.json();
+    const sel = document.getElementById('pod-select');
+    sel.innerHTML = '<option value="">— select POD —</option>';
+    (Array.isArray(pods) ? pods : []).forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.pod_id;
+      opt.textContent = p.pod_id + (p.status ? '  (' + p.status + ')' : '');
+      sel.appendChild(opt);
+    });
+    if (!currentPod && Array.isArray(pods) && pods.length > 0) {
+      currentPod = pods[0].pod_id;
+      sel.value = currentPod;
+      doRefresh();
+    }
+  } catch(e) {
+    document.getElementById('pod-select').innerHTML = '<option value="">Error loading pods</option>';
+  }
+}
+
+function onPodChange() {
+  currentPod = document.getElementById('pod-select').value;
+  doRefresh();
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + tab).classList.add('active');
+  document.querySelector('.tab-btn[data-tab="' + tab + '"]').classList.add('active');
+  doRefresh();
+}
+
+function startPoll() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(doRefresh, 5000);
+}
+
+function doRefresh() {
+  if (!currentPod) return;
+  const active = document.querySelector('.tab-pane.active');
+  if (!active) return;
+  const tab = active.id.replace('tab-', '');
+  if (tab === 'pipeline')   { refreshPipeline(); refreshLogs(); }
+  if (tab === 'ise')        refreshIse();
+  if (tab === 'baseconfig') { refreshBaseconfig(); refreshBcLogs(); }
+  if (tab === 'switches')   refreshSwitches();
+}
+
+// helpers
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function sCls(s) {
+  if (!s) return '';
+  s = s.toLowerCase();
+  if (s === 'pass' || s === 'completed') return 'pass';
+  if (s === 'failed' || s === 'fail')    return 'failed';
+  if (s === 'running' || s === 'in_progress') return 'running';
+  if (s === 'skipped') return 'skipped';
+  return '';
+}
+function chip(label, status, result) {
+  const c = sCls(status);
+  return '<div class="step-chip ' + c + '">'
+    + '<span class="sn">' + esc(label) + '</span>'
+    + '<span class="ss">' + esc(status || 'pending') + '</span>'
+    + (result ? '<span class="sr" title="' + esc(result) + '">' + esc(result.substring(0,38)) + '</span>' : '')
+    + '</div>';
+}
+
+// ── Pipeline tab ──────────────────────────────────────────────────────────────
+async function refreshPipeline() {
+  if (!currentPod) return;
+  try {
+    const r = await fetch('/api/prep/pipeline/' + currentPod);
+    const d = await r.json();
+    const steps = d.steps || [];
+    const m = {};
+    steps.forEach(s => { m[s.step_name] = s; });
+    document.getElementById('pipeline-grid').innerHTML =
+      PIPELINE_STEPS.map(([n, lbl]) => {
+        const s = m[n] || {};
+        return chip(lbl, s.status, s.result);
+      }).join('');
+    const msg  = document.getElementById('pipeline-msg');
+    const done = steps.filter(s => s.status === 'pass' || s.status === 'completed').length;
+    const fail = steps.filter(s => s.status === 'failed').length;
+    if (d.running) {
+      msg.textContent = '\u27f3 Pipeline running\u2026';
+      msg.style.color = 'var(--orange)';
+    } else {
+      msg.textContent = done + '/' + PIPELINE_STEPS.length + ' passed'
+                        + (fail ? '   ' + fail + ' failed' : '');
+      msg.style.color = fail ? 'var(--red)' : done === PIPELINE_STEPS.length ? 'var(--green)' : 'var(--text2)';
+    }
+  } catch(e) {}
+}
+
+async function refreshLogs() {
+  if (!currentPod) return;
+  try {
+    const r = await fetch('/api/prep/logs/' + currentPod);
+    const logs = await r.json();
+    const box = document.getElementById('pipeline-logs');
+    if (!Array.isArray(logs) || logs.length === 0) { box.textContent = 'No logs yet.'; return; }
+    box.innerHTML = logs.slice(-60).map(l => {
+      const line = esc(l.log_line || '');
+      const cls  = /error|fail|ERROR|FAIL/.test(line) ? 'le'
+                 : /ok|pass|success|\u2713/.test(line) ? 'lk' : '';
+      return '<span' + (cls ? ' class="' + cls + '"' : '') + '>' + line + '</span>';
+    }).join('\n');
+    box.scrollTop = box.scrollHeight;
+  } catch(e) {}
+}
+
+async function runPipeline() {
+  if (!currentPod) { alert('Select a POD first'); return; }
+  const btn = document.getElementById('btn-run');
+  btn.disabled = true;
+  document.getElementById('pipeline-msg').textContent = 'Starting\u2026';
+  try {
+    const r = await fetch('/api/prep/run/' + currentPod, {method:'POST'});
+    const d = await r.json();
+    document.getElementById('pipeline-msg').textContent = d.message || d.status || '';
+  } catch(e) {
+    document.getElementById('pipeline-msg').textContent = 'Error: ' + e;
+  } finally { setTimeout(() => { btn.disabled = false; }, 2000); }
+}
+
+async function resetPipeline() {
+  if (!currentPod) { alert('Select a POD first'); return; }
+  if (!confirm('Reset all pipeline steps for ' + currentPod + '?')) return;
+  const btn = document.getElementById('btn-reset');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/prep/reset/' + currentPod, {method:'POST'});
+    const d = await r.json();
+    document.getElementById('pipeline-msg').textContent = d.message || d.status || 'Reset done';
+  } catch(e) {
+    document.getElementById('pipeline-msg').textContent = 'Error: ' + e;
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 1500);
+    refreshPipeline();
+  }
+}
+
+// ── ISE Prep tab ──────────────────────────────────────────────────────────────
+async function refreshIse() {
+  if (!currentPod) return;
+  try {
+    const r = await fetch('/api/prep/ise/' + currentPod);
+    const d = await r.json();
+    const steps = d.steps || {};
+    document.getElementById('ise-grid').innerHTML =
+      ISE_STEPS.map(([n, lbl]) => {
+        const s = steps[n] || {};
+        return chip(lbl, s.status, s.result);
+      }).join('');
+    const msg  = document.getElementById('ise-msg');
+    const done = ISE_STEPS.filter(([n]) => { const s = (steps[n]||{}).status||''; return s==='pass'||s==='completed'; }).length;
+    const fail = ISE_STEPS.filter(([n]) => (steps[n]||{}).status === 'failed').length;
+    msg.textContent = done + '/' + ISE_STEPS.length + ' done' + (fail ? '   ' + fail + ' failed' : '');
+    msg.style.color = fail ? 'var(--red)' : done === ISE_STEPS.length ? 'var(--green)' : 'var(--text2)';
+  } catch(e) {}
+}
+
+async function runIse() {
+  if (!currentPod) { alert('Select a POD first'); return; }
+  const btn = document.getElementById('btn-ise-run');
+  btn.disabled = true;
+  document.getElementById('ise-msg').textContent = 'Starting ISE\u2026';
+  try {
+    const r = await fetch('/api/prep/ise/run/' + currentPod, {method:'POST'});
+    const d = await r.json();
+    document.getElementById('ise-msg').textContent = d.message || d.status || 'Started';
+  } catch(e) {
+    document.getElementById('ise-msg').textContent = 'Error: ' + e;
+  } finally { setTimeout(() => { btn.disabled = false; }, 2000); }
+}
+
+async function resetIse() {
+  if (!currentPod) { alert('Select a POD first'); return; }
+  if (!confirm('Reset ISE steps for ' + currentPod + '?')) return;
+  const btn = document.getElementById('btn-ise-reset');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/prep/ise/reset/' + currentPod, {method:'POST'});
+    const d = await r.json();
+    document.getElementById('ise-msg').textContent = d.message || d.status || 'Reset done';
+  } catch(e) {
+    document.getElementById('ise-msg').textContent = 'Error: ' + e;
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 1500);
+    refreshIse();
+  }
+}
+
+// ── Base Config tab ───────────────────────────────────────────────────────────
+async function refreshBaseconfig() {
+  if (!currentPod) return;
+  try {
+    const r = await fetch('/api/prep/baseconfig/' + currentPod);
+    const d = await r.json();
+    const keys  = ['border_spine', 'leaf1', 'leaf2'];
+    const names = {border_spine:'Border Spine', leaf1:'Leaf 1', leaf2:'Leaf 2'};
+    document.getElementById('bc-grid').innerHTML = keys.map(k => {
+      const info = d[k] || {};
+      const rl = info.reset  || '\u2014';
+      const vl = info.verify || '\u2014';
+      const rOk = /ok|success|\u2713/i.test(rl);
+      const vOk = /ok|success|\u2713/i.test(vl);
+      return '<div class="bc-card">'
+        + '<h4>' + names[k] + '</h4>'
+        + '<div class="bc-line ' + (rOk ? 'ok' : rl==='\u2014' ? '' : 'err') + '">Reset: ' + esc(rl.substring(0,55)) + '</div>'
+        + '<div class="bc-line ' + (vOk ? 'ok' : vl==='\u2014' ? '' : 'err') + '">Verify: ' + esc(vl.substring(0,55)) + '</div>'
+        + '</div>';
+    }).join('');
+  } catch(e) {}
+}
+
+async function refreshBcLogs() {
+  if (!currentPod) return;
+  try {
+    const r = await fetch('/api/prep/logs/' + currentPod);
+    const logs = await r.json();
+    if (!Array.isArray(logs)) return;
+    const bcLogs = logs.filter(l => /\[baseconfig|verify\//.test(l.log_line || ''));
+    const box = document.getElementById('bc-logs');
+    if (bcLogs.length === 0) { box.textContent = 'No base config operations yet.'; return; }
+    box.innerHTML = bcLogs.slice(-40).map(l => esc(l.log_line||'')).join('\n');
+    box.scrollTop = box.scrollHeight;
+  } catch(e) {}
+}
+
+async function pushBaseConfig() {
+  if (!currentPod) { alert('Select a POD first'); return; }
+  const switchKey = document.getElementById('switch-select').value;
+  const btn = document.getElementById('btn-bc');
+  btn.disabled = true;
+  document.getElementById('bc-msg').textContent = 'Pushing to ' + switchKey + '\u2026';
+  try {
+    const r = await fetch('/api/prep/baseconfig/' + currentPod + '/' + switchKey, {method:'POST'});
+    const d = await r.json();
+    document.getElementById('bc-msg').textContent = d.message || d.status || 'Done';
+  } catch(e) {
+    document.getElementById('bc-msg').textContent = 'Error: ' + e;
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 3000);
+    setTimeout(refreshBaseconfig, 2000);
+  }
+}
+
+// ── Switches tab ──────────────────────────────────────────────────────────────
+async function refreshSwitches() {
+  if (!currentPod) return;
+  try {
+    const r = await fetch('/api/prep/switches/' + currentPod);
+    const d = await r.json();
+    const grid = document.getElementById('sw-grid');
+    const sws  = d.switches || [];
+    if (sws.length === 0) {
+      grid.innerHTML = '<div class="no-pod">No switch data yet. Run the pipeline first.</div>';
+      return;
+    }
+    grid.innerHTML = sws.map(sw => {
+      const parts = sw.checks || [];
+      return '<div class="sw-card">'
+        + '<h4>' + esc(sw.name || sw.key || '') + '</h4>'
+        + parts.map(p => {
+            const ok   = /pass|ok|\u2713/i.test(p);
+            const fail = /fail|error|\u2717/i.test(p);
+            return '<div class="sw-chk ' + (ok ? 'ok' : fail ? 'fail' : '') + '">'
+              + '<span class="dot ' + (ok ? 'ok' : fail ? 'fail' : '') + '"></span>'
+              + esc(p.substring(0, 60))
+              + '</div>';
+          }).join('')
+        + '</div>';
+    }).join('');
+    const msg    = document.getElementById('sw-msg');
+    const allOk  = sws.every(sw => sw.status === 'pass' || sw.status === 'completed');
+    const anyFail= sws.some(sw => sw.status === 'failed');
+    msg.textContent = allOk ? 'All switches verified' : anyFail ? 'One or more switches failed' : '';
+    msg.style.color = allOk ? 'var(--green)' : anyFail ? 'var(--red)' : 'var(--text2)';
+  } catch(e) {}
+}
+
+async function recheckSwitches() {
+  if (!currentPod) { alert('Select a POD first'); return; }
+  const btn = document.getElementById('btn-sw-recheck');
+  btn.disabled = true;
+  document.getElementById('sw-msg').textContent = 'Rechecking\u2026';
+  try {
+    const r = await fetch('/api/prep/switches/recheck/' + currentPod, {method:'POST'});
+    const d = await r.json();
+    document.getElementById('sw-msg').textContent = d.message || 'Done';
+  } catch(e) {
+    document.getElementById('sw-msg').textContent = 'Error: ' + e;
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 2000);
+    setTimeout(refreshSwitches, 1500);
+  }
+}
 </script>
 </body>
 </html>
