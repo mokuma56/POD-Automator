@@ -29,6 +29,16 @@ DEFAULT_DB  = DATA_DIR / "pod_state.db"
 def run(db_path: str, log=None):
     _log = log or (lambda s: print(f"[scc-refresh] {s}", flush=True))
 
+    # ── 0. Upfront diagnostics ────────────────────────────────────────────────
+    import sys as _sys
+    _log(f"Python: {_sys.executable}")
+    try:
+        import playwright as _pw
+        _log(f"Playwright: installed ({_pw.__file__})")
+    except ImportError:
+        _log("ERROR: Playwright not installed in this Python env — run: uv run playwright install chromium")
+        return False, "Playwright not installed — run dashboard with 'uv run python3 dashboard.py'"
+
     # ── 1. Load all PODs with scc_org configured ─────────────────────────────
     try:
         db = sqlite3.connect(db_path)
@@ -36,14 +46,19 @@ def run(db_path: str, log=None):
         pods = db.execute(
             "SELECT pod_id, scc_org FROM pods WHERE scc_org IS NOT NULL AND scc_org != '';"
         ).fetchall()
+        all_pods = db.execute("SELECT pod_id FROM pods;").fetchall()
         db.close()
     except Exception as e:
         _log(f"DB error: {e}")
         return False, f"DB error: {e}"
 
+    _log(f"Total PODs in DB: {len(all_pods)} — PODs with scc_org set: {len(pods)}")
+
     if not pods:
-        _log("No PODs with scc_org configured — nothing to refresh")
-        return True, "No PODs to refresh"
+        _log("No PODs with scc_org configured — Chrome will not launch.")
+        _log("scc_org is set automatically when the pipeline runs 'detect_pod_number'.")
+        _log("Ensure the pipeline has run at least through step 1 for your PODs.")
+        return True, "No PODs to refresh — scc_org not set (run pipeline detect_pod_number first)"
 
     pod_orgs = []
     for pod in pods:
