@@ -1567,6 +1567,32 @@ def api_prep_baseconfig_reset(pod_id, switch_key):
     return jsonify(data)
 
 
+@app.route("/api/prep/scc/<pod_id>")
+def api_prep_scc_status(pod_id):
+    ok, data = _dashboard_get(f"/api/scc/status/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/scc/reset/<pod_id>", methods=["POST"])
+def api_prep_scc_reset(pod_id):
+    """Proxy to full 13-item SCC reset (synchronous, long-running)."""
+    ok, data = _dashboard_post(f"/api/scc/run-check-sync/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
+@app.route("/api/prep/scc/recheck/<pod_id>", methods=["POST"])
+def api_prep_scc_recheck(pod_id):
+    """Proxy to 6-item API-only SCC recheck (faster)."""
+    ok, data = _dashboard_post(f"/api/scc/recheck/{pod_id}")
+    if not ok:
+        return jsonify({"error": data}), 502
+    return jsonify(data)
+
+
 # ── HTML / CSS / JS ───────────────────────────────────────────────────────────
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -1653,7 +1679,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--text3);
     letter-spacing: 2px;
     text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 14px;
   }
+  .prep-btn {
+    display: inline-block;
+    padding: 3px 10px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--cyan);
+    border: 1px solid rgba(2,200,255,0.28);
+    border-radius: 3px;
+    text-decoration: none;
+    opacity: 0.65;
+    transition: opacity 0.2s, border-color 0.2s;
+  }
+  .prep-btn:hover { opacity: 1; border-color: var(--cyan); }
 
   /* ── hero ── */
   .hero {
@@ -2344,7 +2388,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <text x="14" y="66" font-family="Arial" font-weight="700" font-size="32" fill="#FFFFFF" letter-spacing="2">CISCO</text>
       </svg>
     </div>
-    <div class="topbar-right">Integrated Security Architecture &nbsp;|&nbsp; Hands-On Lab</div>
+    <div class="topbar-right">Integrated Security Architecture &nbsp;|&nbsp; Hands-On Lab<a href="/prep" class="prep-btn">&#9881; Prep</a></div>
   </div>
 
   <!-- ════════════════════════════════════════
@@ -2451,20 +2495,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="or-divider">— or —</div>
       <p>a fabric optimized for <strong>open standards flexibility and deterministic control</strong>?</p>
       <p style="margin-top:16px; color: var(--text3); font-size:13px;">You are the architect. Step in, make your choice, and deploy.</p>
-    </div>
-
-    <!-- Prep card — instructor only, full width, above choice cards -->
-    <div class="choices" style="grid-template-columns:1fr; margin-bottom:0;">
-      <a class="choice-card prep" href="/prep" style="text-decoration:none;">
-        <div class="choice-top-bar"></div>
-        <div class="choice-label">Instructor Only &mdash; POD Management</div>
-        <div class="choice-title">POD Preparation</div>
-        <div class="choice-desc">Onboard the Secure Router to SD-WAN, verify switch base configs, run the ISE pxGrid &amp; SCC integration steps, and monitor pipeline progress — all from one place. Use before handing off the lab to students.</div>
-        <div class="choice-meta">
-          <span class="choice-badge prep-badge">Pipeline &bull; ISE &bull; Base Config</span>
-          <span class="choice-arrow">&#8594;</span>
-        </div>
-      </a>
     </div>
 
     <!-- Choice Cards -->
@@ -4025,8 +4055,18 @@ PREP_PAGE = r"""<!DOCTYPE html>
   .back-link { color: var(--text2); text-decoration: none; font-size: 13px; }
   .back-link:hover { color: var(--cyan); }
   .topbar-title { font-size: 16px; font-weight: 700; color: var(--cyan); letter-spacing: .5px; }
-  .pod-selector { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-  .pod-selector label { color: var(--text2); font-size: 12px; }
+  .pod-badge { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+  .pod-label { color: var(--text3); font-size: 10px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; }
+  .pod-id-val { color: var(--cyan); font-size: 13px; font-weight: 700; }
+  .scc-org-bar { display: flex; align-items: center; justify-content: space-between;
+                 background: var(--bg3); border: 1px solid var(--border);
+                 border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; }
+  .scc-org-val { color: var(--cyan); font-size: 14px; font-weight: 700; margin-left: 10px; }
+  .scc-open-btn { color: var(--cyan); font-size: 12px; font-weight: 600;
+                  text-decoration: none; border: 1px solid rgba(2,200,255,0.30);
+                  border-radius: 4px; padding: 4px 11px;
+                  transition: background 0.2s; }
+  .scc-open-btn:hover { background: rgba(2,200,255,0.10); }
   select, button {
     background: var(--bg3); color: var(--text1);
     border: 1px solid var(--border2); border-radius: 4px;
@@ -4107,9 +4147,9 @@ PREP_PAGE = r"""<!DOCTYPE html>
 <div class="topbar">
   <a href="/" class="back-link">&#8592; Lab Home</a>
   <div class="topbar-title">POD Preparation</div>
-  <div class="pod-selector">
-    <label>POD:</label>
-    <select id="pod-select" onchange="onPodChange()"><option value="">Loading…</option></select>
+  <div class="pod-badge">
+    <span class="pod-label">POD</span>
+    <span id="pod-id-display" class="pod-id-val">—</span>
     <button onclick="doRefresh()" title="Refresh">&#8635;</button>
   </div>
 </div>
@@ -4119,6 +4159,7 @@ PREP_PAGE = r"""<!DOCTYPE html>
   <button class="tab-btn"        data-tab="ise"        onclick="switchTab('ise')">ISE Prep</button>
   <button class="tab-btn"        data-tab="baseconfig" onclick="switchTab('baseconfig')">Base Config</button>
   <button class="tab-btn"        data-tab="switches"   onclick="switchTab('switches')">Switches</button>
+  <button class="tab-btn"        data-tab="scc"        onclick="switchTab('scc')">SCC</button>
 </div>
 
 <div class="content">
@@ -4175,6 +4216,24 @@ PREP_PAGE = r"""<!DOCTYPE html>
     <div class="sw-cards" id="sw-grid"></div>
   </div>
 
+  <!-- SCC tab -->
+  <div id="tab-scc" class="tab-pane">
+    <div class="scc-org-bar">
+      <div>
+        <span class="pod-label">SCC Org</span>
+        <span id="scc-org-name" class="scc-org-val">—</span>
+      </div>
+      <a id="scc-open-link" class="scc-open-btn" href="https://admin.sse.cisco.com" target="_blank">Open SCC Console &#8599;</a>
+    </div>
+    <div class="action-bar">
+      <button class="danger"  id="btn-scc-reset"   onclick="runSccReset()">&#8635; Full SCC Reset (13 items)</button>
+      <button class="primary" id="btn-scc-recheck" onclick="recheckScc()">&#8635; Recheck API Items</button>
+      <span class="status-msg" id="scc-msg"></span>
+    </div>
+    <div class="section-label">13 SCC Checklist Items</div>
+    <div class="step-grid" id="scc-grid"></div>
+  </div>
+
 </div><!-- /content -->
 
 <script>
@@ -4210,11 +4269,28 @@ const ISE_STEPS = [
   ['ise_sgt_verify',                'SGT Verify'],
 ];
 
+const SCC_ITEMS = [
+  ['access_policy_rules',   'Access Policy Rules'],
+  ['network_tunnel_groups', 'Network Tunnel Groups'],
+  ['zta_profiles',          'ZTA Profiles'],
+  ['private_resources',     'Private Resources'],
+  ['dns_servers',           'DNS Servers'],
+  ['epp_posture_profiles',  'EPP Posture Profiles'],
+  ['logging_settings',      'Logging Settings'],
+  ['ravpn_profiles',        'RA VPN Profiles'],
+  ['dlp_rules',             'DLP Rules'],
+  ['ravpn_ip_pool',         'RA VPN IP Pool'],
+  ['duo_saml',              'Duo SAML'],
+  ['ise_pxgrid',            'ISE pxGrid'],
+  ['te_integration',        'ThousandEyes'],
+];
+
 let currentPod = '';
+let sccOrg     = '';
 let pollTimer  = null;
 
 window.addEventListener('DOMContentLoaded', async () => {
-  await loadPods();
+  await detectPod();
   gitPull();
   startPoll();
 });
@@ -4231,31 +4307,23 @@ async function gitPull() {
   } catch(e) {}
 }
 
-async function loadPods() {
+async function detectPod() {
   try {
     const r = await fetch('/api/prep/pods');
     const pods = await r.json();
-    const sel = document.getElementById('pod-select');
-    sel.innerHTML = '<option value="">— select POD —</option>';
-    (Array.isArray(pods) ? pods : []).forEach(p => {
-      const opt = document.createElement('option');
-      opt.value = p.pod_id;
-      opt.textContent = p.pod_id + (p.status ? '  (' + p.status + ')' : '');
-      sel.appendChild(opt);
-    });
-    if (!currentPod && Array.isArray(pods) && pods.length > 0) {
-      currentPod = pods[0].pod_id;
-      sel.value = currentPod;
+    if (Array.isArray(pods) && pods.length > 0) {
+      const p = pods[0];
+      currentPod = p.pod_id;
+      sccOrg     = p.scc_org || '';
+      document.getElementById('pod-id-display').textContent = currentPod;
+      document.getElementById('scc-org-name').textContent   = sccOrg || '—';
       doRefresh();
+    } else {
+      document.getElementById('pod-id-display').textContent = 'No POD found';
     }
   } catch(e) {
-    document.getElementById('pod-select').innerHTML = '<option value="">Error loading pods</option>';
+    document.getElementById('pod-id-display').textContent = 'Error';
   }
-}
-
-function onPodChange() {
-  currentPod = document.getElementById('pod-select').value;
-  doRefresh();
 }
 
 function switchTab(tab) {
@@ -4280,6 +4348,7 @@ function doRefresh() {
   if (tab === 'ise')        refreshIse();
   if (tab === 'baseconfig') { refreshBaseconfig(); refreshBcLogs(); }
   if (tab === 'switches')   refreshSwitches();
+  if (tab === 'scc')        refreshScc();
 }
 
 // helpers
@@ -4350,7 +4419,6 @@ async function refreshLogs() {
 }
 
 async function runPipeline() {
-  if (!currentPod) { alert('Select a POD first'); return; }
   const btn = document.getElementById('btn-run');
   btn.disabled = true;
   document.getElementById('pipeline-msg').textContent = 'Starting\u2026';
@@ -4364,7 +4432,6 @@ async function runPipeline() {
 }
 
 async function resetPipeline() {
-  if (!currentPod) { alert('Select a POD first'); return; }
   if (!confirm('Reset all pipeline steps for ' + currentPod + '?')) return;
   const btn = document.getElementById('btn-reset');
   btn.disabled = true;
@@ -4401,7 +4468,6 @@ async function refreshIse() {
 }
 
 async function runIse() {
-  if (!currentPod) { alert('Select a POD first'); return; }
   const btn = document.getElementById('btn-ise-run');
   btn.disabled = true;
   document.getElementById('ise-msg').textContent = 'Starting ISE\u2026';
@@ -4415,7 +4481,6 @@ async function runIse() {
 }
 
 async function resetIse() {
-  if (!currentPod) { alert('Select a POD first'); return; }
   if (!confirm('Reset ISE steps for ' + currentPod + '?')) return;
   const btn = document.getElementById('btn-ise-reset');
   btn.disabled = true;
@@ -4469,7 +4534,6 @@ async function refreshBcLogs() {
 }
 
 async function pushBaseConfig() {
-  if (!currentPod) { alert('Select a POD first'); return; }
   const switchKey = document.getElementById('switch-select').value;
   const btn = document.getElementById('btn-bc');
   btn.disabled = true;
@@ -4521,7 +4585,6 @@ async function refreshSwitches() {
 }
 
 async function recheckSwitches() {
-  if (!currentPod) { alert('Select a POD first'); return; }
   const btn = document.getElementById('btn-sw-recheck');
   btn.disabled = true;
   document.getElementById('sw-msg').textContent = 'Rechecking\u2026';
@@ -4534,6 +4597,66 @@ async function recheckSwitches() {
   } finally {
     setTimeout(() => { btn.disabled = false; }, 2000);
     setTimeout(refreshSwitches, 1500);
+  }
+}
+
+// ── SCC tab ───────────────────────────────────────────────────────────────────
+async function refreshScc() {
+  if (!currentPod) return;
+  try {
+    const r = await fetch('/api/prep/scc/' + currentPod);
+    const items = await r.json();
+    const m = {};
+    (Array.isArray(items) ? items : []).forEach(i => { m[i.item_key] = i; });
+    document.getElementById('scc-grid').innerHTML =
+      SCC_ITEMS.map(([key, lbl]) => {
+        const it = m[key] || {};
+        return chip(lbl, it.status, it.detail);
+      }).join('');
+    const msg  = document.getElementById('scc-msg');
+    const done = SCC_ITEMS.filter(([k]) => (m[k]||{}).status === 'completed').length;
+    const fail = SCC_ITEMS.filter(([k]) => (m[k]||{}).status === 'failed').length;
+    msg.textContent = done + '/' + SCC_ITEMS.length + ' completed' + (fail ? '   ' + fail + ' failed' : '');
+    msg.style.color = fail ? 'var(--red)' : done === SCC_ITEMS.length ? 'var(--green)' : 'var(--text2)';
+  } catch(e) {}
+}
+
+async function runSccReset() {
+  if (!confirm('Run full SCC reset (all 13 items) for ' + currentPod + '?\nThis will take several minutes.')) return;
+  const btn = document.getElementById('btn-scc-reset');
+  btn.disabled = true;
+  document.getElementById('scc-msg').textContent = 'Running full SCC reset\u2026 (may take 5\u201310 min)';
+  document.getElementById('scc-msg').style.color = 'var(--orange)';
+  try {
+    const r = await fetch('/api/prep/scc/reset/' + currentPod, {method:'POST'});
+    const d = await r.json();
+    document.getElementById('scc-msg').textContent = d.message || d.status || 'Done';
+    document.getElementById('scc-msg').style.color = (d.ok === false || d.status === 'error') ? 'var(--red)' : 'var(--green)';
+  } catch(e) {
+    document.getElementById('scc-msg').textContent = 'Error: ' + e;
+    document.getElementById('scc-msg').style.color = 'var(--red)';
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 5000);
+    refreshScc();
+  }
+}
+
+async function recheckScc() {
+  const btn = document.getElementById('btn-scc-recheck');
+  btn.disabled = true;
+  document.getElementById('scc-msg').textContent = 'Rechecking API items\u2026';
+  document.getElementById('scc-msg').style.color = 'var(--orange)';
+  try {
+    const r = await fetch('/api/prep/scc/recheck/' + currentPod, {method:'POST'});
+    const d = await r.json();
+    document.getElementById('scc-msg').textContent = d.message || d.status || 'Recheck triggered';
+    document.getElementById('scc-msg').style.color = 'var(--text2)';
+  } catch(e) {
+    document.getElementById('scc-msg').textContent = 'Error: ' + e;
+    document.getElementById('scc-msg').style.color = 'var(--red)';
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 3000);
+    setTimeout(refreshScc, 2000);
   }
 }
 </script>
