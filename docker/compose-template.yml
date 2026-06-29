@@ -5,8 +5,8 @@ services:
     cap_add: [NET_ADMIN, SYS_ADMIN]
     devices: [/dev/net/tun]
     dns:
-      - 64.102.6.247
-      - 173.37.137.85
+      - 1.1.1.1
+      - 8.8.8.8
     entrypoint: ["/bin/sh", "/vpn-entrypoint.sh"]
     command: ["{{vpn_host}}", "{{vpn_user}}", "{{vpn_pass}}"]
     restart: unless-stopped
