@@ -7190,7 +7190,7 @@ async function loadSccGlobalStatus() {
       return;
     }
     const SESSION_TTL_H = 12;
-    const maxAge = Math.max(...entries.map(([,s]) => s.age_hours || 99));
+    const maxAge = Math.max(...entries.map(([,s]) => s.age_hours ?? 99));
     const hoursLeft = Math.max(0, SESSION_TTL_H - maxAge);
     if (maxAge < 4) {
       statusEl.style.color = '#00e68a';
@@ -8766,7 +8766,7 @@ async function loadSccChecklist(podId) {
   // ── Session freshness indicator ──────────────────────────────────────────
   let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No SCC session \u2014 refresh required';
   if (sess.exists) {
-    const h = sess.age_hours || 0;
+    const h = sess.age_hours ?? 0;
     if (h < 4)       { sessColor = '#00e68a'; sessIcon = '\u2713'; sessLabel = 'SCC session fresh (' + h.toFixed(1) + 'h ago)'; }
     else if (h < 8)  { sessColor = '#f0a500'; sessIcon = '\u26a0'; sessLabel = 'SCC session ageing (' + h.toFixed(1) + 'h ago)'; }
     else             { sessColor = '#ff4757'; sessIcon = '\u26a0'; sessLabel = 'SCC session stale (' + h.toFixed(1) + 'h) \u2014 refresh'; }
@@ -10369,11 +10369,11 @@ async function refreshSccSessionsGlobal() {
         const sd = await sr.json();
         const entries = Object.entries(sd);
         const elapsedH = (Date.now() - startMs + 120000) / 3600000; // elapsed + 2min buffer
-        const newlySaved = entries.filter(([,s]) => s.exists && (s.age_hours || 99) < elapsedH);
+        const newlySaved = entries.filter(([,s]) => s.exists && (s.age_hours ?? 99) < elapsedH);
         if (newlySaved.length > 0) {
           _reset();
           const SESSION_TTL_H = 12;
-          const maxAge = Math.max(...newlySaved.map(([,s]) => s.age_hours || 0));
+          const maxAge = Math.max(...newlySaved.map(([,s]) => s.age_hours ?? 0));
           const hoursLeft = Math.max(0, SESSION_TTL_H - maxAge).toFixed(0);
           status.style.color = '#00e68a';
           status.textContent = '\u2713 ' + newlySaved.length + ' session(s) refreshed \u2014 valid ~' + hoursLeft + 'h';
@@ -10636,7 +10636,7 @@ function renderIseGrid(podId, data) {
   // ── Session freshness indicator ──────────────────────────────────────────
   let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No SCC session \u2014 refresh required';
   if (sess.exists) {
-    const h = sess.age_hours || 0;
+    const h = sess.age_hours ?? 0;
     if (h < 4)       { sessColor = '#00e68a'; sessIcon = '\u2713'; sessLabel = 'SCC session fresh (' + h.toFixed(1) + 'h ago)'; }
     else if (h < 8)  { sessColor = '#f0a500'; sessIcon = '\u26a0'; sessLabel = 'SCC session ageing (' + h.toFixed(1) + 'h ago)'; }
     else             { sessColor = '#ff4757'; sessIcon = '\u26a0'; sessLabel = 'SCC session stale (' + h.toFixed(1) + 'h) \u2014 refresh'; }
@@ -10792,7 +10792,7 @@ async function iseRefreshSessions(podId) {
         const sr = await fetch('/api/scc/session-status?pod_id=' + podId);
         const sd = await sr.json();
         const s = sd[podId] || {};
-        if (s.exists && (s.age_hours || 99) < 1) {
+        if (s.exists && (s.age_hours ?? 99) < 1) {
           clearInterval(poller);
           if (cancelBtn) cancelBtn.style.display = 'none';
           if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
