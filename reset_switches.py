@@ -4,15 +4,14 @@ reset_switches.py — Reset a switch to base config via raw Telnet config push.
 Workflow:
   1. Raw Telnet connect (telnetlib) — works on blank and configured switches
   2. Authenticate if needed, get to enable prompt
-  3. Enter 'conf t', push base config lines, exit config mode
-  4. write memory — saves base config to NVRAM (also regenerates nvram_config on flash)
-  5. Delete flash files that would re-apply lab config on reload:
-     - nvram_config / nvram_config_bkup (C9300 restores from these if present,
-       overriding NVRAM — must be deleted AFTER write memory so they don't
-       get deleted then regenerated with the old lab config)
-     - .dbpersist, .prst_sync, vlan.dat, dc_profile_dir (CC/DNAC provisioning)
-  6. reload — switch boots from NVRAM (base config) since flash backups are gone
-  7. Wait 300s, reconnect SSH, generate RSA keys, final write memory
+  3. write erase — wipe NVRAM completely (unknown prior state is irrelevant)
+  4. Enter 'conf t', push base config lines ONLY, exit config mode
+  5. write memory — saves base config to NVRAM
+  6. Delete flash files that may restore old config on reload:
+     - nvram_config / nvram_config_bkup, vlan.dat, .dbpersist, .prst_sync,
+       dc_profile_dir, pnp-info, evpn/LISP artifacts
+  7. reload — switch boots from NVRAM (base config)
+  8. Wait 300s, reconnect SSH, generate RSA keys, final write memory
 """
 
 import time
@@ -50,80 +49,6 @@ FLASH_CLEANUP = [
     "flash:evpn_cfg.json",
     "flash:.evpn",
     "flash:dnac_evpn.cfg",
-]
-
-# Teardown block injected at the START of every conf t push (before base config lines).
-# All commands are idempotent — safe on clean switches (IOS-XE silently ignores
-# 'no X' when X does not exist).
-#
-# Order is critical:
-#   1. Per-interface template/IPDT refs FIRST — IOS-XE refuses to delete a global
-#      template that is still referenced via 'source template' on any interface.
-#   2. SVIs before VRFs/VLANs they belong to.
-#   3. AAA group references before removing the group itself.
-#   4. Global objects (LISP, CTS, templates, IPDT, RADIUS server) after per-iface cleanup.
-CATC_TEARDOWN_LINES = [
-    # ── 1. Per-interface dot1x / IPDT / template refs (all 48 switch ports) ──
-    # Enter interface range, strip all CatC-pushed per-port config, then exit.
-    "interface range GigabitEthernet1/0/1 - 48",
-    "no source template DefaultWiredDot1xClosedAuth",
-    "no source template DefaultWiredDot1xOpenAuth",
-    "no source template DefaultWiredDot1xFlexAuth",
-    "no device-tracking attach-policy IPDT_POLICY",
-    "no device-tracking attach-policy IPDT_EXTENDED_POLICY",
-    "no service-policy type control subscriber PMAP_DefaultWiredDot1xClosedAuth_1x_Open",
-    "no service-policy type control subscriber PMAP_DefaultWiredDot1xClosedAuth_MAB_Closed",
-    "no service-policy type control subscriber PMAP_DefaultWiredDot1xClosedAuth_MAB_Open",
-    "no service-policy type control subscriber PMAP_DefaultWiredDot1xClosedAuth_Closed",
-    "exit",
-    # ── 2. Remove CatC-pushed SVI interfaces (before VRFs/VLANs they use) ────
-    "no interface Vlan10",
-    "no interface Vlan101",
-    "no interface Vlan102",
-    "no interface Vlan1010",
-    "no interface Vlan1101",
-    "no interface Vlan1102",
-    # ── 3. Disable dot1x globally ─────────────────────────────────────────────
-    "no dot1x system-auth-control",
-    # ── 4. Remove AAA list references before removing the RADIUS group ────────
-    "no aaa authentication login dnac-cts-list group dnac-client-radius-group local",
-    "no aaa authentication dot1x default group dnac-client-radius-group",
-    "no aaa authorization network default group dnac-client-radius-group local",
-    "no aaa authorization network dnac-cts-list group dnac-client-radius-group local",
-    "no aaa group server radius dnac-client-radius-group",
-    # ── 5. Remove CatC RADIUS server entry ───────────────────────────────────
-    "no radius server dnac-radius_198.18.5.101",
-    # ── 6. Remove dot1x templates (per-interface refs cleared above) ──────────
-    "no template DefaultWiredDot1xClosedAuth",
-    "no template DefaultWiredDot1xOpenAuth",
-    "no template DefaultWiredDot1xFlexAuth",
-    # ── 7. Remove IPDT device-tracking policies ───────────────────────────────
-    "no device-tracking policy IPDT_POLICY",
-    "no device-tracking policy IPDT_EXTENDED_POLICY",
-    "no device-tracking tracking auto-source",
-    # ── 8. Remove CTS role-based enforcement (affects traffic forwarding) ─────
-    "no cts role-based enforcement",
-    # ── 9. Remove LISP (active LISP affects routing — critical to remove) ─────
-    "no router lisp",
-    # ── 10. Remove CatC VRF definitions (SVIs removed above) ──────────────────
-    "no vrf definition Main",
-    "no vrf definition IOT",
-    "no vrf definition PROD",
-    # ── 11. Remove CatC VLANs ─────────────────────────────────────────────────
-    "no vlan 10,101,102,1010,1101,1102",
-    # ── 12. Remove webauth redirect ACL ──────────────────────────────────────
-    "no ip access-list extended ACL_WEBAUTH_REDIRECT",
-    # ── 13. Remove CatC ISE control-plane policy-maps ─────────────────────────
-    "no policy-map PMAP_DefaultWiredDot1xClosedAuth_1x_Open",
-    "no policy-map PMAP_DefaultWiredDot1xClosedAuth_MAB_Closed",
-    "no policy-map PMAP_DefaultWiredDot1xClosedAuth_MAB_Open",
-    "no policy-map PMAP_DefaultWiredDot1xClosedAuth_Closed",
-    # ── 14. Remove CatC NETCONF-pushed accounting/radius commands ─────────────
-    # These arrive via NETCONF during reload — also re-run in _post_reload()
-    # for belt-and-suspenders coverage.
-    "no aaa accounting update newinfo",
-    "no aaa accounting identity default start-stop group dnac-client-radius-group",
-    "no aaa server radius dynamic-author",
 ]
 
 
@@ -219,10 +144,10 @@ def _telnet_reset(host, local_config_path, log_fn):
     with open(local_config_path) as f:
         base_lines = [l.rstrip() for l in f if l.strip() and not l.strip().startswith("!")]
 
-    # Build final config_lines: teardown first, then base config
-    # Teardown removes CatC SVIs/AAA/VRFs/VLANs from running-config so write memory
-    # saves a clean state — without this, conf t merges and CatC remnants survive.
-    config_lines = list(CATC_TEARDOWN_LINES) + base_lines
+    # Build final config_lines: base config only.
+    # write erase above already wiped NVRAM — no teardown needed; we don't need
+    # to know or guess what was previously on the switch.
+    config_lines = list(base_lines)
 
     if "no ip domain lookup" not in config_lines:
         config_lines.insert(0, "no ip domain lookup")
@@ -230,7 +155,7 @@ def _telnet_reset(host, local_config_path, log_fn):
         config_lines.append("config-register 0x2102")
     config_lines.append("end")
 
-    log_fn(f"  Entering config mode, pushing {len(config_lines)} lines (incl. {len(CATC_TEARDOWN_LINES)}-line CatC teardown)...")
+    log_fn(f"  Entering config mode, pushing {len(config_lines)} lines (base config only)...")
     tn.write(b"conf t\n")
     tn.read_until(b"(config)#", timeout=10)
 
@@ -345,17 +270,6 @@ def _post_reload(host, log_fn):
         read_timeout=60,
     )
     log_fn(f"  RSA: {out[:80].strip()}")
-
-    # Remove any CatC NETCONF-pushed config that arrived during the 300s reload window.
-    # CatC reconnects via NETCONF after reload and re-pushes AAA/accounting/dot1x even
-    # when the device was deleted from inventory.  Run the full teardown set again here
-    # (all commands are idempotent — harmless on a clean switch).
-    log_fn(f"  Post-reload CatC teardown (removes NETCONF-pushed AAA/dot1x)...")
-    try:
-        conn.send_config_set(CATC_TEARDOWN_LINES)
-        log_fn(f"  Post-reload teardown complete")
-    except Exception as e:
-        log_fn(f"  Warning: post-reload teardown error (non-fatal): {e}")
 
     log_fn(f"  Final write memory...")
     out = conn.send_command("write memory", expect_string=r"\[OK\]|#", read_timeout=20)
