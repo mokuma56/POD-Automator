@@ -7170,9 +7170,41 @@ async function load() {
      else if (tabName === 'ise')       loadIseStatus(detailId);
      else if (tabName === 'scc')       loadSccChecklist(detailId);
      else if (tabName === 'baseconfig') loadBaseConfig(detailId);
-    // logs tab has its own 2s poller; kb tab is static
+     // logs tab has its own 2s poller; kb tab is static
   }
+  loadSccGlobalStatus();
 }
+
+async function loadSccGlobalStatus() {
+  // Don't overwrite the status span while a refresh is actively running
+  if (_sccRefreshPoller) return;
+  const statusEl = document.getElementById('scc-refresh-global-status');
+  if (!statusEl) return;
+  try {
+    const sr = await fetch('/api/scc/session-status');
+    const sd = await sr.json();
+    const entries = Object.entries(sd);
+    if (entries.length === 0) {
+      statusEl.style.color = '#667788';
+      statusEl.textContent = 'No sessions — refresh required';
+      return;
+    }
+    const SESSION_TTL_H = 12;
+    const maxAge = Math.max(...entries.map(([,s]) => s.age_hours || 99));
+    const hoursLeft = Math.max(0, SESSION_TTL_H - maxAge);
+    if (maxAge < 4) {
+      statusEl.style.color = '#00e68a';
+      statusEl.textContent = '\u2713 Sessions fresh (oldest ' + maxAge.toFixed(1) + 'h ago) \u2014 ' + hoursLeft.toFixed(0) + 'h remaining';
+    } else if (maxAge < SESSION_TTL_H) {
+      statusEl.style.color = '#f0a500';
+      statusEl.textContent = '\u26a0 Sessions aging (oldest ' + maxAge.toFixed(1) + 'h) \u2014 refresh soon';
+    } else {
+      statusEl.style.color = '#ff4757';
+      statusEl.textContent = '\u26a0 Sessions expired \u2014 refresh now';
+    }
+  } catch(e) {}
+}
+
 
 function isFullyReady(p) {
   // All pipeline steps completed (not skipped) + sdwan online
@@ -10312,6 +10344,7 @@ async function refreshSccSessionsGlobal() {
   };
 
   try {
+    const startMs = Date.now();
     const r = await fetch('/api/scc/refresh-sessions', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
@@ -10325,29 +10358,31 @@ async function refreshSccSessionsGlobal() {
       return;
     }
 
-    // Poll — same logic as per-pod (age < 1h), show per-POD progress
+    // Poll every 5s — detect sessions saved AFTER the refresh started.
+    // age_hours < elapsed_since_start + 2min buffer means the file was written
+    // after we began (avoids false positives from pre-existing fresh sessions).
     let polls = 0;
     _sccRefreshPoller = setInterval(async () => {
       polls++;
       try {
         const sr = await fetch('/api/scc/session-status');
         const sd = await sr.json();
-        const entries  = Object.entries(sd);
-        const fresh    = entries.filter(([,s]) => s.exists && (s.age_hours || 99) < 1);
-        const total    = entries.length;
-        if (fresh.length > 0 && fresh.length >= total) {
+        const entries = Object.entries(sd);
+        const elapsedH = (Date.now() - startMs + 120000) / 3600000; // elapsed + 2min buffer
+        const newlySaved = entries.filter(([,s]) => s.exists && (s.age_hours || 99) < elapsedH);
+        if (newlySaved.length > 0) {
           _reset();
+          const SESSION_TTL_H = 12;
+          const maxAge = Math.max(...newlySaved.map(([,s]) => s.age_hours || 0));
+          const hoursLeft = Math.max(0, SESSION_TTL_H - maxAge).toFixed(0);
           status.style.color = '#00e68a';
-          status.textContent = '\u2713 Sessions refreshed for ' + fresh.length + ' org(s)';
-          setTimeout(() => { status.textContent = ''; status.style.color = '#667788'; }, 15000);
+          status.textContent = '\u2713 ' + newlySaved.length + ' session(s) refreshed \u2014 valid ~' + hoursLeft + 'h';
         } else if (polls > 90) {
           _reset();
           status.style.color = '#f0a500';
-          status.textContent = 'Timeout — check Live Logs for [scc-refresh] output';
+          status.textContent = 'Timeout \u2014 check Live Logs for [scc-refresh] output';
         } else {
-          const doneList = fresh.map(([pid]) => pid).join(', ');
-          status.textContent = 'Running... (' + (polls * 5) + 's)'
-            + (doneList ? ' \u2713 ' + doneList : '') + ' — complete login in browser window';
+          status.textContent = 'Running\u2026 (' + (polls * 5) + 's) \u2014 complete login in browser window';
         }
       } catch(e) {}
     }, 5000);
