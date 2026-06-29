@@ -53,34 +53,74 @@ FLASH_CLEANUP = [
 ]
 
 # Teardown block injected at the START of every conf t push (before base config lines).
-# Order matters: SVIs first (so VRFs/VLANs can be deleted), then AAA refs, then group,
-# then VRF definitions, then VLANs.  All commands are idempotent — safe on clean switches.
+# All commands are idempotent — safe on clean switches (IOS-XE silently ignores
+# 'no X' when X does not exist).
+#
+# Order is critical:
+#   1. Per-interface template/IPDT refs FIRST — IOS-XE refuses to delete a global
+#      template that is still referenced via 'source template' on any interface.
+#   2. SVIs before VRFs/VLANs they belong to.
+#   3. AAA group references before removing the group itself.
+#   4. Global objects (LISP, CTS, templates, IPDT, RADIUS server) after per-iface cleanup.
 CATC_TEARDOWN_LINES = [
-    # Remove CatC-pushed SVI interfaces so VRFs and VLANs can be deleted
+    # ── 1. Per-interface dot1x / IPDT / template refs (all 48 switch ports) ──
+    # Enter interface range, strip all CatC-pushed per-port config, then exit.
+    "interface range GigabitEthernet1/0/1 - 48",
+    "no source template DefaultWiredDot1xClosedAuth",
+    "no source template DefaultWiredDot1xOpenAuth",
+    "no source template DefaultWiredDot1xFlexAuth",
+    "no device-tracking attach-policy IPDT_POLICY",
+    "no device-tracking attach-policy IPDT_EXTENDED_POLICY",
+    "no service-policy type control subscriber PMAP_DefaultWiredDot1xClosedAuth_1x_Open",
+    "no service-policy type control subscriber PMAP_DefaultWiredDot1xClosedAuth_MAB_Closed",
+    "no service-policy type control subscriber PMAP_DefaultWiredDot1xClosedAuth_MAB_Open",
+    "no service-policy type control subscriber PMAP_DefaultWiredDot1xClosedAuth_Closed",
+    "exit",
+    # ── 2. Remove CatC-pushed SVI interfaces (before VRFs/VLANs they use) ────
     "no interface Vlan10",
     "no interface Vlan101",
     "no interface Vlan102",
     "no interface Vlan1010",
     "no interface Vlan1101",
     "no interface Vlan1102",
-    # Remove dot1x
+    # ── 3. Disable dot1x globally ─────────────────────────────────────────────
     "no dot1x system-auth-control",
-    # Remove AAA list references to dnac group before removing the group itself
+    # ── 4. Remove AAA list references before removing the RADIUS group ────────
     "no aaa authentication login dnac-cts-list group dnac-client-radius-group local",
     "no aaa authentication dot1x default group dnac-client-radius-group",
     "no aaa authorization network default group dnac-client-radius-group local",
     "no aaa authorization network dnac-cts-list group dnac-client-radius-group local",
-    # Remove the CatC RADIUS server group (safe now that all AAA refs are gone)
     "no aaa group server radius dnac-client-radius-group",
-    # Remove CatC VRF definitions (SVIs removed above)
+    # ── 5. Remove CatC RADIUS server entry ───────────────────────────────────
+    "no radius server dnac-radius_198.18.5.101",
+    # ── 6. Remove dot1x templates (per-interface refs cleared above) ──────────
+    "no template DefaultWiredDot1xClosedAuth",
+    "no template DefaultWiredDot1xOpenAuth",
+    "no template DefaultWiredDot1xFlexAuth",
+    # ── 7. Remove IPDT device-tracking policies ───────────────────────────────
+    "no device-tracking policy IPDT_POLICY",
+    "no device-tracking policy IPDT_EXTENDED_POLICY",
+    "no device-tracking tracking auto-source",
+    # ── 8. Remove CTS role-based enforcement (affects traffic forwarding) ─────
+    "no cts role-based enforcement",
+    # ── 9. Remove LISP (active LISP affects routing — critical to remove) ─────
+    "no router lisp",
+    # ── 10. Remove CatC VRF definitions (SVIs removed above) ──────────────────
     "no vrf definition Main",
     "no vrf definition IOT",
     "no vrf definition PROD",
-    # Remove CatC VLANs (SVIs removed above so VLAN DB entries can be purged)
+    # ── 11. Remove CatC VLANs ─────────────────────────────────────────────────
     "no vlan 10,101,102,1010,1101,1102",
-    # Remove CatC NETCONF-pushed accounting/radius commands.
-    # These are pushed *after* reload via NETCONF so they are NOT caught by the pre-reload
-    # conf t teardown above.  They are idempotent — safe to run on clean switches.
+    # ── 12. Remove webauth redirect ACL ──────────────────────────────────────
+    "no ip access-list extended ACL_WEBAUTH_REDIRECT",
+    # ── 13. Remove CatC ISE control-plane policy-maps ─────────────────────────
+    "no policy-map PMAP_DefaultWiredDot1xClosedAuth_1x_Open",
+    "no policy-map PMAP_DefaultWiredDot1xClosedAuth_MAB_Closed",
+    "no policy-map PMAP_DefaultWiredDot1xClosedAuth_MAB_Open",
+    "no policy-map PMAP_DefaultWiredDot1xClosedAuth_Closed",
+    # ── 14. Remove CatC NETCONF-pushed accounting/radius commands ─────────────
+    # These arrive via NETCONF during reload — also re-run in _post_reload()
+    # for belt-and-suspenders coverage.
     "no aaa accounting update newinfo",
     "no aaa accounting identity default start-stop group dnac-client-radius-group",
     "no aaa server radius dynamic-author",
