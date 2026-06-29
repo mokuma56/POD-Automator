@@ -4,14 +4,17 @@ reset_switches.py — Reset a switch to base config via raw Telnet config push.
 Workflow:
   1. Raw Telnet connect (telnetlib) — works on blank and configured switches
   2. Authenticate if needed, get to enable prompt
-  3. write erase — wipe NVRAM completely (unknown prior state is irrelevant)
+  3. write erase — wipe NVRAM startup-config (unknown prior state is irrelevant)
   4. Enter 'conf t', push base config lines ONLY, exit config mode
-  5. write memory — saves base config to NVRAM
+  5. write memory — saves base config to NVRAM (startup-config)
   6. Delete flash files that may restore old config on reload:
      - nvram_config / nvram_config_bkup, vlan.dat, .dbpersist, .prst_sync,
        dc_profile_dir, pnp-info, evpn/LISP artifacts
-  7. reload — switch boots from NVRAM (base config)
-  8. Wait 300s, reconnect SSH, generate RSA keys, final write memory
+  7. crypto key generate rsa modulus 2048 — done HERE in the telnet session
+     (hostname + ip domain are now in running-config; keys go to NVRAM
+     private-config which survives reload; SSH daemon starts on boot)
+  8. reload — switch boots with base config + RSA keys already in NVRAM
+  9. Wait 300s, reconnect SSH (works because keys exist), final write memory
 """
 
 import time
@@ -215,6 +218,31 @@ def _telnet_reset(host, local_config_path, log_fn):
         tn.read_very_eager()
     log_fn(f"  Flash cleanup done")
 
+    # ── Step 3.5: Generate RSA keys NOW (before reload) ──────────────────────
+    # Hostname and ip domain name are already in running-config from the base
+    # config push above — both are required for key naming.
+    # IOS-XE stores RSA keys in NVRAM private-config, which is SEPARATE from
+    # startup-config and survives reload.  Generating here means SSH daemon
+    # starts immediately after reload — without this, SSH is unavailable
+    # post-reload (no daemon = can't SSH in to generate keys = chicken-and-egg).
+    log_fn(f"  Generating RSA 2048 keys (before reload so SSH works after)...")
+    tn.write(b"crypto key generate rsa modulus 2048\n")
+    rsa_buf = ""
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        chunk = tn.read_very_eager().decode("utf-8", errors="replace")
+        rsa_buf += chunk
+        if "[yes/no]" in rsa_buf:
+            # Keys already exist — answer "yes" to replace them
+            tn.write(b"yes\n")
+            rsa_buf = ""
+        # Done when we're back at the enable prompt
+        lines = [l.strip() for l in rsa_buf.splitlines() if l.strip()]
+        if lines and lines[-1].endswith("#") and "(config" not in lines[-1]:
+            break
+        time.sleep(0.5)
+    log_fn(f"  RSA keys ready")
+
     # ── Step 4: reload ───────────────────────────────────────────────────────
     log_fn(f"  Reloading switch...")
     tn.write(b"reload\n")
@@ -232,7 +260,10 @@ def _telnet_reset(host, local_config_path, log_fn):
 
 
 def _post_reload(host, log_fn):
-    """Reconnect via SSH after reload, generate RSA keys, write memory."""
+    """Reconnect via SSH after reload and do a final write memory.
+    RSA keys were generated before the reload in the telnet session so
+    SSH daemon is already running when the switch comes back up.
+    """
     from netmiko import ConnectHandler
 
     log_fn(f"  Reconnecting via SSH to {host}...")
@@ -262,14 +293,6 @@ def _post_reload(host, log_fn):
 
     if ">" in conn.find_prompt():
         conn.enable()
-
-    log_fn(f"  Generating RSA keys...")
-    out = conn.send_command(
-        "crypto key generate rsa modulus 2048",
-        expect_string=r"#|already exist",
-        read_timeout=60,
-    )
-    log_fn(f"  RSA: {out[:80].strip()}")
 
     log_fn(f"  Final write memory...")
     out = conn.send_command("write memory", expect_string=r"\[OK\]|#", read_timeout=20)
