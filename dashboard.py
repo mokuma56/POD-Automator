@@ -1434,6 +1434,12 @@ def api_fabric_run(pod_id):
     data = request.get_json(silent=True) or {}
     from_step = int(data.get("from_step", 1))
 
+    # Full re-run from step 1 — clear stale CatC discovery data so the tile starts fresh
+    if from_step == 1:
+        c = _db()
+        c.execute("DELETE FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[catc:step]%'", (pod_id,))
+        c.commit(); c.close()
+
     def _run():
         result = subprocess.run([
             "docker", "run", "--rm",
@@ -1605,6 +1611,12 @@ def api_sda_deploy(pod_id):
     )
     if r.returncode != 0 or r.stdout.strip() != "running":
         return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    # Full run from beginning — clear stale CatC discovery data so the tile starts fresh
+    if not from_step:
+        c = _db()
+        c.execute("DELETE FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[catc:step]%'", (pod_id,))
+        c.commit(); c.close()
 
     from_arg = f"from_step='{from_step}'" if from_step else "from_step=None"
     script = (
