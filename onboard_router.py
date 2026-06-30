@@ -1129,10 +1129,17 @@ def phase_catc_discover(log_fn=print):
                      "deviceManagementIpAddress": dip}]
         eid = None
 
-        r_post = requests.post(
-            f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
-            headers=headers, json=dpayload, verify=False, timeout=120,
-        )
+        try:
+            r_post = requests.post(
+                f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
+                headers=headers, json=dpayload, verify=False, timeout=120,
+            )
+        except requests.exceptions.Timeout:
+            log_fn(f"[catc:step] provision | running | {dname}: POST timed out after 120s — CatC may still be processing; will retry")
+            return False
+        except requests.exceptions.ConnectionError as _ce:
+            log_fn(f"[catc:step] provision | running | {dname}: POST connection error — {str(_ce)[:120]}")
+            return False
         pbody = {}
         try: pbody = r_post.json()
         except Exception: pass
@@ -1150,10 +1157,17 @@ def phase_catc_discover(log_fn=print):
                 log_fn(f"[catc:step] provision | running | {dname}: already provisioned — PUT to re-deploy [attempt {attempt}]")
             else:
                 log_fn(f"[catc:step] provision | running | {dname}: POST {r_post.status_code} ({pbody.get('description','')[:80]}) — trying PUT [attempt {attempt}]")
-            r_put = requests.put(
-                f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
-                headers=headers, json=dpayload, verify=False, timeout=60,
-            )
+            try:
+                r_put = requests.put(
+                    f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
+                    headers=headers, json=dpayload, verify=False, timeout=60,
+                )
+            except requests.exceptions.Timeout:
+                log_fn(f"[catc:step] provision | running | {dname}: PUT timed out after 60s")
+                return False
+            except requests.exceptions.ConnectionError as _ce:
+                log_fn(f"[catc:step] provision | running | {dname}: PUT connection error — {str(_ce)[:120]}")
+                return False
             putbody = {}
             try: putbody = r_put.json()
             except Exception: pass
