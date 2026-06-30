@@ -7186,21 +7186,28 @@ async function loadSccGlobalStatus() {
     const entries = Object.entries(sd);
     if (entries.length === 0) {
       statusEl.style.color = '#667788';
-      statusEl.textContent = 'No sessions — refresh required';
+      statusEl.textContent = 'No sessions \u2014 refresh required';
       return;
     }
     const SESSION_TTL_H = 12;
-    const maxAge = Math.max(...entries.map(([,s]) => s.age_hours ?? 99));
-    const hoursLeft = Math.max(0, SESSION_TTL_H - maxAge);
-    if (maxAge < 4) {
+    // Evaluate each session individually — one stale orphan shouldn't poison fresh ones
+    const fresh   = entries.filter(([,s]) => (s.age_hours ?? 99) < 4);
+    const valid   = entries.filter(([,s]) => (s.age_hours ?? 99) < SESSION_TTL_H);
+    const total   = entries.length;
+    // Use the FRESHEST session age for the "how long ago" display
+    const minAge  = Math.min(...entries.map(([,s]) => s.age_hours ?? 99));
+    const hoursLeft = Math.max(0, SESSION_TTL_H - minAge).toFixed(0);
+    if (fresh.length > 0) {
       statusEl.style.color = '#00e68a';
-      statusEl.textContent = '\u2713 Sessions fresh (oldest ' + maxAge.toFixed(1) + 'h ago) \u2014 ' + hoursLeft.toFixed(0) + 'h remaining';
-    } else if (maxAge < SESSION_TTL_H) {
+      statusEl.textContent = '\u2713 ' + fresh.length + '/' + total + ' session(s) fresh'
+        + ' (' + minAge.toFixed(1) + 'h ago) \u2014 ' + hoursLeft + 'h remaining';
+    } else if (valid.length > 0) {
+      const oldestValid = Math.max(...valid.map(([,s]) => s.age_hours ?? 99));
       statusEl.style.color = '#f0a500';
-      statusEl.textContent = '\u26a0 Sessions aging (oldest ' + maxAge.toFixed(1) + 'h) \u2014 refresh soon';
+      statusEl.textContent = '\u26a0 ' + valid.length + '/' + total + ' session(s) valid but aging \u2014 refresh soon';
     } else {
       statusEl.style.color = '#ff4757';
-      statusEl.textContent = '\u26a0 Sessions expired \u2014 refresh now';
+      statusEl.textContent = '\u26a0 All sessions expired \u2014 refresh now';
     }
   } catch(e) {}
 }
