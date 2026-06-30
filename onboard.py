@@ -32,12 +32,29 @@ onboard_router.ROUTER_IP = os.getenv("ROUTER_IP", "198.18.133.25")
 onboard_router.VMANAGE = f"https://{os.getenv('VMANAGE', '198.18.133.10')}"
 onboard_router.CG_ID = os.getenv("CG_ID", "ae290e0f-7bc4-40f7-9bfa-23b1e7b2a71a")
 
+# ── Early live-log writer (available before SERIAL/pod_id are known) ─────────
+# live_log() is defined later and depends on SERIAL. This writer uses POD_ID
+# from the container environment directly so connectivity errors appear in the
+# dashboard Live Logs panel, not just in 'docker logs'.
+def _pre_log(msg):
+    try:
+        import sqlite3 as _sq3
+        _pid = os.environ.get("POD_ID", "UNKNOWN")
+        _db  = "/pipeline/host-data/pod_state.db"
+        _c   = _sq3.connect(_db, timeout=5)
+        _c.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (_pid, msg))
+        _c.commit(); _c.close()
+    except Exception:
+        pass
+    print(msg)   # keep stdout copy for 'docker logs'
+
 # Auto-detect serial from router if not provided
 SERIAL = os.getenv("SERIAL", "")
 if not SERIAL and len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
     SERIAL = sys.argv[1]
 if not SERIAL:
-    print("  No SERIAL provided — detecting from router...")
+    _router_ip = onboard_router.ROUTER_IP
+    _pre_log(f"[preflight] No SERIAL provided — detecting from router at {_router_ip} ...")
     last_err = None
     for attempt in range(3):
         try:
@@ -61,13 +78,20 @@ if not SERIAL:
                 break
         except Exception as e:
             last_err = e
-            print(f"  Attempt {attempt+1}: {e}")
+            _pre_log(f"[preflight] Attempt {attempt+1}/3 — SSH to {_router_ip} failed: {e}")
             time.sleep(5)
     if not SERIAL:
-        print(f"  Failed: could not detect serial — {last_err}")
+        _pre_log(
+            f"[preflight] ERROR: Could not reach router at {_router_ip} after 3 attempts "
+            f"({last_err}). "
+            f"Pipeline cannot start. "
+            f"Check that all dCloud lab devices are ACTIVE — the router, jump host, and "
+            f"switches must be fully booted before automation can run. "
+            f"Re-run from the dashboard once the router is responding on SSH."
+        )
         sys.exit(1)
 if not SERIAL:
-    print("  Failed: could not detect serial from router")
+    _pre_log(f"[preflight] ERROR: SERIAL is empty after detection — cannot start pipeline.")
     sys.exit(1)
 
 print(f"  Using serial: {SERIAL}")
