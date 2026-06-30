@@ -85,6 +85,8 @@ EVPN_NO_COMMANDS = [
     "no aaa authentication login dnac-cts-list",
     "no aaa authentication dot1x default",
     "no aaa authorization network dnac-network-list",
+    "no aaa authorization network dnac-cts-list group dnac-client-radius-group",
+    "no aaa server radius dynamic-author",
     "no aaa accounting identity default",
     "no aaa accounting update newinfo periodic 2880",
     "no dot1x system-auth-control",
