@@ -1586,7 +1586,12 @@ def api_sda_status(pod_id):
         overall = "completed"
     else:
         overall = "pending"
-    return jsonify({"pod_id": pod_id, "overall": overall, "deploy": steps["deploy"], "rollback": steps["rollback"]})
+    # Include latest completed_at so JS can show "Last run: <date>"
+    last_run = None
+    all_ts = [v["completed_at"] for v in steps["deploy"].values() if v.get("completed_at")]
+    if all_ts:
+        last_run = sorted(all_ts)[-1]
+    return jsonify({"pod_id": pod_id, "overall": overall, "deploy": steps["deploy"], "rollback": steps["rollback"], "last_run": last_run})
 
 
 @app.route("/api/sda/deploy/<pod_id>", methods=["POST"])
@@ -9340,9 +9345,23 @@ function renderSdaGrid(podId, data) {
   const barColor = dFailed  ? '#ff4757'
                  : dRunning ? '#02c8ff'
                  : dDone === dTotal && dDone > 0 ? '#00e68a' : '#445566';
+
+  // Last run date label — shown when complete so stale data is obvious
+  let lastRunSuffix = '';
+  if (data.last_run && dDone === dTotal && dDone > 0 && !dRunning) {
+    try {
+      const d = new Date(data.last_run);
+      const today = new Date();
+      const isToday = d.toDateString() === today.toDateString();
+      if (!isToday) {
+        lastRunSuffix = ' \u00b7 last run: ' + d.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'});
+      }
+    } catch(e) {}
+  }
+
   const labelText = dFailed  ? 'Failed at step ' + (dDone + 1) + '/' + dTotal
                   : dRunning ? 'Running \u2014 ' + dDone + '/' + dTotal
-                  : dDone === dTotal && dDone > 0 ? 'Complete! All ' + dTotal + ' steps done'
+                  : dDone === dTotal && dDone > 0 ? 'Complete! All ' + dTotal + ' steps done' + lastRunSuffix
                   : dDone === 0 ? 'Not started'
                   : 'Paused \u2014 ' + dDone + '/' + dTotal;
 
