@@ -84,6 +84,10 @@ def _make_stub_lines(switch_key):
 
     Contains NOTHING from the lab — no EVPN, no CatC, no RADIUS, no AAA beyond
     local auth.  Just enough to telnet in for Pass 2 after the clean boot.
+
+    Each sub-config block ends with an explicit 'exit' so subsequent global
+    commands land in (config)# context.  The final 'end' exits conf t entirely
+    so _wait_for_enable sees the enable prompt.
     """
     hostname = SWITCH_HOSTNAMES[switch_key]
     ip       = SWITCH_IPS[switch_key]
@@ -93,18 +97,21 @@ def _make_stub_lines(switch_key):
         "vrf definition Mgmt-vrf",
         " address-family ipv4",
         " exit-address-family",
+        "exit",                                          # (config-vrf)# → (config)#
         f"enable password {SWITCH_SECRET}",
         f"username {SWITCH_USER} privilege 15 password {SWITCH_PASS}",
         "interface GigabitEthernet0/0",
-        f" vrf forwarding Mgmt-vrf",
+        " vrf forwarding Mgmt-vrf",
         f" ip address {ip} {MGMT_MASK}",
         " no shutdown",
+        "exit",                                          # (config-if)# → (config)#
         f"ip route vrf Mgmt-vrf 0.0.0.0 0.0.0.0 {MGMT_GATEWAY}",
         "line vty 0 4",
         " login local",
         " transport input telnet",
         "line vty 5 31",
         " transport input telnet",
+        "end",                                           # exit conf t → enable mode
     ]
 
 

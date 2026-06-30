@@ -5749,7 +5749,7 @@ def api_baseconfig_reset(pod_id, switch_key):
                     "-e", "BASE_CONFIGS_DIR=/pipeline/base_configs",
                     "--entrypoint", "python3",
                     "pod-automator:latest", "-c", script
-                ], capture_output=True, text=True, timeout=420)
+                ], capture_output=True, text=True, timeout=900)  # two-pass reset: 2×300s waits + overhead ≈ 750s; 900s gives headroom
                 stdout = result.stdout.strip()
                 last_line = stdout.splitlines()[-1] if stdout else ""
                 try:
@@ -5757,7 +5757,7 @@ def api_baseconfig_reset(pod_id, switch_key):
                 except Exception:
                     ok_val, detail_val = False, f"parse error: {stdout[:200]} stderr: {result.stderr[:100]}"
             except subprocess.TimeoutExpired:
-                ok_val, detail_val = False, "timed out after 300s"
+                ok_val, detail_val = False, "timed out after 900s"
             except Exception as e:
                 ok_val, detail_val = False, str(e)
             status_str = "OK" if ok_val else "FAILED"
