@@ -57,10 +57,47 @@ MGMT_GATEWAY   = "198.18.128.1"
 MGMT_MASK      = "255.255.192.0"
 TELNET_TIMEOUT = 30
 
-# Flash files deleted AFTER write memory in Pass 2.
+# EVPN config lines to explicitly remove from running config in Pass 1.
+# write erase clears NVRAM but NOT the running config.  If we push the stub
+# and immediately write memory, the EVPN VRFs/NVE/VLANs/AAA that were already
+# in running memory get merged with the stub and saved to NVRAM — then they
+# survive every subsequent reload.  Sending these `no` commands first ensures
+# write memory only captures the clean stub config.
+# Any command that fails (object not present) is silently ignored by IOS XE
+# (error message printed, switch stays in conf t mode) — safe to run always.
+EVPN_NO_COMMANDS = [
+    # Fabric overlay
+    "no interface nve1",
+    # Fabric VRFs (removes RD/RT/address-family config with them)
+    "no vrf definition Main",
+    "no vrf definition PROD",
+    "no vrf definition IOT",
+    "no vrf definition INFRA_VN",
+    # L3-VNI VLAN config and VLAN entries
+    "no vlan configuration 1010",
+    "no vlan configuration 1101",
+    "no vlan configuration 1102",
+    "no vlan 1010",
+    "no vlan 1101",
+    "no vlan 1102",
+    # CatC AAA/RADIUS
+    "no aaa group server radius dnac-client-radius-group",
+    "no aaa authentication login dnac-cts-list",
+    "no aaa authentication dot1x default",
+    "no aaa authorization network dnac-network-list",
+    "no aaa accounting identity default",
+    "no aaa accounting update newinfo periodic 2880",
+    "no dot1x system-auth-control",
+    "no radius server dnac-network-list",
+    # SGT / CTS
+    "no cts role-based enforcement",
+    "no cts role-based enforcement vlan-list all",
+]
+
+# Flash files deleted in Pass 1 (before stub reload) AND in Pass 2 (belt-and-suspenders).
 # nvram_config / nvram_config_bkup are the critical ones — C9300 loads these
 # in preference to NVRAM if they exist.  Delete them so reload uses NVRAM
-# (which has the base config).
+# (which has the clean stub/base config).
 FLASH_CLEANUP = [
     "flash:nvram_config",
     "flash:nvram_config_bkup",
@@ -78,7 +115,29 @@ FLASH_CLEANUP = [
 ]
 
 
-def _make_stub_lines(switch_key):
+def _remove_evpn_running_config(tn, log_fn):
+    """
+    Strip EVPN / CatC config from running memory before write memory.
+
+    write erase clears NVRAM but the running config is unchanged.  Unless we
+    explicitly remove the EVPN objects here, write memory will re-save them to
+    NVRAM and they survive every reload.  Commands that fail (object not present)
+    print an IOS error and stay in conf-t — harmless.
+    """
+    log_fn("  [Pass 1] Stripping EVPN config from running memory...")
+    tn.write(b"conf t\n")
+    tn.read_until(b"(config)#", timeout=10)
+    for cmd in EVPN_NO_COMMANDS:
+        tn.write(cmd.encode("utf-8") + b"\n")
+        time.sleep(2)       # heavy ops (no vrf definition) need settling time
+        tn.read_very_eager()
+    tn.write(b"end\n")
+    time.sleep(1)
+    tn.read_very_eager()
+    log_fn("  [Pass 1] EVPN running config stripped")
+
+
+
     """
     Minimal config pushed to NVRAM before Pass 1 reload.
 
@@ -263,6 +322,11 @@ def _telnet_wipe_to_stub(host, switch_key, log_fn):
             break
         time.sleep(0.5)
     log_fn(f"  NVRAM erased")
+
+    # Explicitly remove EVPN/CatC config from running memory.
+    # write erase clears NVRAM but running config is unchanged — without this
+    # step, write memory (below) would snapshot the EVPN config back into NVRAM.
+    _remove_evpn_running_config(tn, log_fn)
 
     # Push stub config into running config, then save to NVRAM
     stub_lines = _make_stub_lines(switch_key)
