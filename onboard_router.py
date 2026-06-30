@@ -1111,81 +1111,114 @@ def phase_catc_discover(log_fn=print):
         log_fn(f"[catc:step] assign_wlc_site | failed | {wlc_name} not in inventory — skipping site assignment")
 
     # ── Step 7: Provision switches ────────────────────────────────────────────
-    # GUI equivalent: select each device → Actions → Provision.
-    # Per-device: POST first (creates record + pushes config for new devices).
-    # If POST returns "already provisioned" → PUT (re-deploys to existing record).
-    # PUT on a device with no provision record returns HTTP 400 — must POST first.
-    log_fn(f"[catc:step] provision | running | Provisioning switches via CatC (POST per device)")
+    # Provision one device at a time with a 30s settle gap between devices.
+    # CatC's fabric engine returns exec SUCCESS before NETCONF/config push is
+    # fully committed — submitting the next device immediately hits a locked
+    # engine and the exec FAILS.  Manual GUI provisioning works because humans
+    # naturally wait between clicks; this replicates that behaviour.
+    # If a device fails on the first pass, a second retry pass runs after all
+    # other devices have settled.
+    log_fn(f"[catc:step] provision | running | Provisioning switches (one at a time, 30s settle between devices)")
 
-    for dev_key, dev_info in CATC_DISCOVERY_IPS.items():
-        dev_ip   = dev_info["loopback"]
-        dev_name = dev_info["name"]
-        dev_payload = [{"siteNameHierarchy": CATC_MAIN_SITE_HIERARCHY,
-                        "deviceManagementIpAddress": dev_ip}]
-        exec_id = None
+    def _do_provision(dev_info, attempt=1):
+        """POST (or PUT if already provisioned) one device, poll exec to completion.
+        Returns True on SUCCESS, False on FAILURE/skip/timeout."""
+        dip   = dev_info["loopback"]
+        dname = dev_info["name"]
+        dpayload = [{"siteNameHierarchy": CATC_MAIN_SITE_HIERARCHY,
+                     "deviceManagementIpAddress": dip}]
+        eid = None
 
-        # Try POST first — creates provision record and pushes config
         r_post = requests.post(
             f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
-            headers=headers, json=dev_payload, verify=False, timeout=30,
+            headers=headers, json=dpayload, verify=False, timeout=30,
         )
-        post_body = {}
-        try:
-            post_body = r_post.json()
-        except Exception:
-            pass
+        pbody = {}
+        try: pbody = r_post.json()
+        except Exception: pass
 
-        already_provisioned = "already provisioned" in post_body.get("description", "").lower()
+        already_prov = "already provisioned" in pbody.get("description", "").lower()
 
-        if r_post.status_code in (200, 202) and not already_provisioned:
-            exec_id = post_body.get("executionId") or post_body.get("taskId")
-            log_fn(f"[catc:step] provision | running | {dev_name}: POST accepted (exec {exec_id})")
+        if r_post.status_code in (200, 202) and not already_prov:
+            eid = pbody.get("executionId") or pbody.get("taskId")
+            if not eid:
+                log_fn(f"[catc:step] provision | running | {dname}: POST ok but no exec_id — body: {str(pbody)[:150]}")
+                return False
+            log_fn(f"[catc:step] provision | running | {dname}: POST accepted (exec {eid}) [attempt {attempt}]")
         else:
-            # Device already has a provision record → PUT re-deploys full config
-            if already_provisioned:
-                log_fn(f"[catc:step] provision | running | {dev_name}: already provisioned — PUT to re-deploy")
+            if already_prov:
+                log_fn(f"[catc:step] provision | running | {dname}: already provisioned — PUT to re-deploy [attempt {attempt}]")
             else:
-                log_fn(f"[catc:step] provision | running | {dev_name}: POST {r_post.status_code} — trying PUT")
-
+                log_fn(f"[catc:step] provision | running | {dname}: POST {r_post.status_code} ({pbody.get('description','')[:80]}) — trying PUT [attempt {attempt}]")
             r_put = requests.put(
                 f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
-                headers=headers, json=dev_payload, verify=False, timeout=60,
+                headers=headers, json=dpayload, verify=False, timeout=60,
             )
-            put_body = {}
-            try:
-                put_body = r_put.json()
-            except Exception:
-                pass
+            putbody = {}
+            try: putbody = r_put.json()
+            except Exception: pass
 
             if r_put.status_code not in (200, 202):
-                log_fn(f"[catc:step] provision | running | {dev_name}: PUT {r_put.status_code} — {put_body.get('description','')[:120]} — skipping")
-                continue
+                log_fn(f"[catc:step] provision | running | {dname}: PUT {r_put.status_code} — {putbody.get('description','')[:120]}")
+                return False
+            eid = putbody.get("executionId") or putbody.get("taskId")
+            if not eid:
+                log_fn(f"[catc:step] provision | running | {dname}: PUT ok but no exec_id — body: {str(putbody)[:150]}")
+                return False
+            log_fn(f"[catc:step] provision | running | {dname}: PUT accepted (exec {eid}) [attempt {attempt}]")
 
-            exec_id = put_body.get("executionId") or put_body.get("taskId")
-            log_fn(f"[catc:step] provision | running | {dev_name}: PUT accepted (exec {exec_id})")
+        # Poll exec until SUCCESS / FAILURE / timeout (5 min)
+        deadline_prov = _time.time() + 300
+        while _time.time() < deadline_prov:
+            r_exec = requests.get(
+                f"{CATC_BASE}/dna/intent/api/v1/dnacaap/management/execution-status/{eid}",
+                headers=headers, verify=False, timeout=15,
+            )
+            es     = r_exec.json() if r_exec.ok else {}
+            status = es.get("status", "")
+            log_fn(f"[catc:step] provision | running | {dname}: exec {str(eid)[:8]}… status={status}")
+            if status.upper() == "SUCCESS":
+                log_fn(f"[catc:step] provision | running | {dname}: provision SUCCESS")
+                return True
+            if status.upper() == "FAILURE":
+                reason = es.get("bapiError") or es.get("description") or str(es)[:150]
+                log_fn(f"[catc:step] provision | running | {dname}: provision FAILURE — {reason[:150]}")
+                return False
+            _time.sleep(10)
 
-        # Poll execution-status for this device (up to 5 min)
-        if exec_id:
-            deadline_prov = _time.time() + 300
-            while _time.time() < deadline_prov:
-                r_exec = requests.get(
-                    f"{CATC_BASE}/dna/intent/api/v1/dnacaap/management/execution-status/{exec_id}",
-                    headers=headers, verify=False, timeout=15,
-                )
-                es = r_exec.json() if r_exec.ok else {}
-                status = es.get("status", "")
-                log_fn(f"[catc:step] provision | running | {dev_name}: exec {str(exec_id)[:8]}… status={status}")
-                if status.upper() == "SUCCESS":
-                    log_fn(f"[catc:step] provision | running | {dev_name}: provision SUCCESS")
-                    break
-                if status.upper() == "FAILURE":
-                    reason = es.get("bapiError") or es.get("description") or ""
-                    log_fn(f"[catc:step] provision | running | {dev_name}: provision FAILURE: {reason[:120]}")
-                    break
-                _time.sleep(10)
+        log_fn(f"[catc:step] provision | running | {dname}: exec timed out after 5 min")
+        return False
 
+    # ── First pass ────────────────────────────────────────────────────────────
+    failed_devices = []
+    dev_items = list(CATC_DISCOVERY_IPS.items())
+    for idx, (dev_key, dev_info) in enumerate(dev_items):
+        ok = _do_provision(dev_info, attempt=1)
+        if not ok:
+            failed_devices.append((dev_key, dev_info))
+        # 30s settle between devices — CatC exec SUCCESS ≠ NETCONF push complete.
+        # Skip settle after the very last device (no next device to protect).
+        if idx < len(dev_items) - 1:
+            log_fn(f"[catc:step] provision | running | Settling 30s before next device...")
+            _time.sleep(30)
 
-    deadline = _time.time() + 120
+    # ── Second pass: retry failures ───────────────────────────────────────────
+    if failed_devices:
+        log_fn(f"[catc:step] provision | running | {len(failed_devices)} device(s) failed — retrying after 60s settle...")
+        _time.sleep(60)
+        still_failed = []
+        for dev_key, dev_info in failed_devices:
+            ok = _do_provision(dev_info, attempt=2)
+            if not ok:
+                still_failed.append(dev_info["name"])
+            _time.sleep(30)
+        if still_failed:
+            log_fn(f"[catc:step] provision | running | WARNING: still failed after retry: {', '.join(still_failed)}")
+        else:
+            log_fn(f"[catc:step] provision | running | All retried devices succeeded on second pass")
+
+    # ── Final: wait for all devices to reach Managed state ───────────────────
+    deadline = _time.time() + 180
     all_managed = False
     while _time.time() < deadline:
         r_check = requests.get(f"{CATC_BASE}/dna/intent/api/v1/network-device",
