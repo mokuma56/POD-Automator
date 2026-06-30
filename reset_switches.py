@@ -4,17 +4,21 @@ reset_switches.py — Reset a switch to base config via raw Telnet config push.
 Workflow:
   1. Raw Telnet connect (telnetlib) — works on blank and configured switches
   2. Authenticate if needed, get to enable prompt
-  3. write erase — wipe NVRAM startup-config (unknown prior state is irrelevant)
-  4. Enter 'conf t', push base config lines ONLY, exit config mode
-  5. write memory — saves base config to NVRAM (startup-config)
-  6. Delete flash files that may restore old config on reload:
+  3. Tear down EVPN running config (no interface nve1, no vlan 1010/1101/1102,
+     no vrf definition Main/PROD/IOT) — write erase only clears NVRAM; running
+     config retains all EVPN state, which merges into base config on write memory
+     and persists after reload if not explicitly removed first.
+  4. write erase — wipe NVRAM startup-config
+  5. Enter 'conf t', push base config lines ONLY, exit config mode
+  6. write memory — saves ONLY base config to NVRAM (running config is now clean)
+  7. Delete flash files that may restore old config on reload:
      - nvram_config / nvram_config_bkup, vlan.dat, .dbpersist, .prst_sync,
        dc_profile_dir, pnp-info, evpn/LISP artifacts
-  7. crypto key generate rsa modulus 2048 — done HERE in the telnet session
+  8. crypto key generate rsa modulus 2048 — done HERE in the telnet session
      (hostname + ip domain are now in running-config; keys go to NVRAM
      private-config which survives reload; SSH daemon starts on boot)
-  8. reload — switch boots with base config + RSA keys already in NVRAM
-  9. Wait 300s, reconnect SSH (works because keys exist), final write memory
+  9. reload — switch boots with base config + RSA keys already in NVRAM
+  10. Wait 300s, reconnect SSH (works because keys exist), final write memory
 """
 
 import time
@@ -52,6 +56,21 @@ FLASH_CLEANUP = [
     "flash:evpn_cfg.json",
     "flash:.evpn",
     "flash:dnac_evpn.cfg",
+]
+
+# EVPN config that must be removed from running config BEFORE write erase.
+# write erase only clears NVRAM — it does not touch the running config.
+# If these are still present when base config is pushed (conf t) and then
+# write memory is run, the merged (EVPN + base) config goes into NVRAM and
+# the switch reloads with EVPN config still present.
+# Order matters: remove NVE1 first (uses VNIs), then L3VNI VLANs (SVIs that
+# are vrf-forwarding bound), then the VRFs themselves.
+EVPN_TEARDOWN_CMDS = [
+    "no interface nve1",
+    "no vlan 1010,1101,1102",
+    "no vrf definition Main",
+    "no vrf definition PROD",
+    "no vrf definition IOT",
 ]
 
 
@@ -125,9 +144,31 @@ def _telnet_reset(host, local_config_path, log_fn):
     _send_cmd(tn, "terminal length 0", wait=0.5)
     _send_cmd(tn, "no ip domain lookup", wait=0.5)
 
-    # ── Step 0: Erase NVRAM so conf t push is the ONLY config on reload ───────
-    # Without this, conf t MERGES with existing config — CatC AAA/dot1x/RADIUS
-    # commands survive because they are never explicitly removed.
+    # ── Step 0a: Tear down EVPN from running config ──────────────────────────
+    # write erase (below) only wipes NVRAM — the running config is unchanged.
+    # EVPN leaves: interface nve1, vlan 1010/1101/1102 (L3VNI), and VRFs
+    # Main/PROD/IOT in the running config.  If we then push base config via
+    # conf t and run write memory, the NVRAM ends up with a merged
+    # (EVPN + base) config and the switch reloads with EVPN still present.
+    # Remove EVPN explicitly now so that write memory saves only base config.
+    # These commands are safe to run on a switch that never had EVPN — IOS
+    # will simply report the interface/vlan/vrf does not exist and continue.
+    log_fn(f"  Tearing down EVPN running config (nve1, L3VNI VLANs, VRFs)...")
+    tn.write(b"conf t\n")
+    tn.read_until(b"(config)#", timeout=10)
+    for cmd in EVPN_TEARDOWN_CMDS:
+        out = _send_cmd(tn, cmd, wait=2.0)
+        log_fn(f"    {cmd} → {out.strip()[-80:].strip()!r}")
+    tn.write(b"end\n")
+    time.sleep(1)
+    tn.read_very_eager()
+    _wait_for_enable(tn, log_fn, timeout=10)
+    log_fn(f"  EVPN teardown done")
+
+    # ── Step 0b: Erase NVRAM so conf t push is the ONLY config on reload ──────
+    # EVPN config has been removed from running config above — write erase now
+    # clears whatever was in NVRAM. Base config push below goes into a clean
+    # running config, and write memory saves only the base config.
     log_fn(f"  Erasing NVRAM (write erase)...")
     tn.write(b"write erase\n")
     out = tn.read_until(b"?", timeout=10).decode("utf-8", errors="replace")
@@ -147,9 +188,8 @@ def _telnet_reset(host, local_config_path, log_fn):
     with open(local_config_path) as f:
         base_lines = [l.rstrip() for l in f if l.strip() and not l.strip().startswith("!")]
 
-    # Build final config_lines: base config only.
-    # write erase above already wiped NVRAM — no teardown needed; we don't need
-    # to know or guess what was previously on the switch.
+    # Running config is clean (EVPN torn down above, NVRAM erased).
+    # Push base config lines directly — no teardown needed here.
     config_lines = list(base_lines)
 
     if "no ip domain lookup" not in config_lines:
