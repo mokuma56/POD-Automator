@@ -3725,7 +3725,11 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                     _shot("1_logging")
 
                     # Wait for Default rules section to render, then scroll
-                    # "For all Internet access" into view before clicking.
+                    # "For all Internet access" into VIEW CENTER before clicking.
+                    # scroll_into_view_if_needed only scrolls to the edge — the row
+                    # can end up just off-screen. JS scrollIntoView({block:'center'})
+                    # guarantees the row is centred in the viewport before we grab
+                    # coordinates and mouse.click().
                     try:
                         page.wait_for_selector('text="Default rules"', timeout=12000)
                         page.wait_for_timeout(600)
@@ -3734,9 +3738,19 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                     try:
                         page.get_by_text("For all Internet access").first\
                             .scroll_into_view_if_needed(timeout=5000)
-                        page.wait_for_timeout(500)
+                        page.wait_for_timeout(300)
                     except Exception:
                         pass
+                    # JS center-scroll — ensures row is fully in viewport
+                    page.evaluate("""() => {
+                        const all = Array.from(document.querySelectorAll('*'));
+                        const el = all.find(e =>
+                            (e.textContent || '').trim() === 'For all Internet access' &&
+                            e.getBoundingClientRect().width > 0
+                        );
+                        if (el) el.scrollIntoView({block: 'center', behavior: 'instant'});
+                    }""")
+                    page.wait_for_timeout(600)
                     _shot("1_logging")
 
                     # Click the "..." on the "For all Internet access" row.
