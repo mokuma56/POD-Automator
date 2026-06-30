@@ -19,4 +19,5 @@ dependencies = [
     "ldap3>=2.9",
     "netmiko>=4.3",
     "playwright>=1.40",
+    "fastmcp>=2.0",
 ]
