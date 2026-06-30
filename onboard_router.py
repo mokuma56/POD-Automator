@@ -3393,13 +3393,13 @@ conn.commit()"""], timeout=5)
                 ok, result = ret, ""
             if not ok:
                 print(f"FAILED at {step_name}")
-                report_step(step_name, "failed", str(result)[:200])
+                report_step(step_name, "failed", str(result))
                 sys.exit(1)
-            report_step(step_name, "completed", str(result)[:200] or "OK")
+            report_step(step_name, "completed", str(result) or "OK")
             print(f"  OK")
         except Exception as e:
             print(f"FAILED at {step_name}: {e}")
-            report_step(step_name, "failed", str(e)[:200])
+            report_step(step_name, "failed", str(e))
             sys.exit(1)
 
     print(f"\n{'='*40}")

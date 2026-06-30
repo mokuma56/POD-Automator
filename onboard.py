@@ -247,18 +247,18 @@ for step_name, func in steps:
             print(log_line)
             live_log(log_line)
             if step_name in SOFT_FAIL_STEPS:
-                report_step(step_name, "skipped", f"WARN: {str(result)[:200]}")
+                report_step(step_name, "skipped", f"WARN: {str(result)}")
                 log_line = f"⚠ {step_name} skipped (soft-fail) — pipeline continuing"
                 print(log_line)
                 live_log(log_line)
                 continue
-            report_step(step_name, "failed", str(result)[:200])
+            report_step(step_name, "failed", str(result))
             _kb_auto_draft(step_name, str(result), pod_id)
             sys.exit(1)
         log_line = f"✓ {step_name} OK"
         print(f"  {log_line}")
         live_log(log_line)
-        report_step(step_name, "completed", str(result)[:200] or "OK")
+        report_step(step_name, "completed", str(result) or "OK")
         # As soon as controller_mode_enable succeeds, mark SD-WAN online immediately.
         # This ensures the green dot is set even if a later soft-fail step causes
         # an early exit before the final status=ready write at the bottom.
@@ -295,12 +295,12 @@ conn.close()
         print(log_line)
         live_log(log_line)
         if step_name in SOFT_FAIL_STEPS:
-            report_step(step_name, "skipped", f"WARN: {str(e)[:200]}")
+            report_step(step_name, "skipped", f"WARN: {str(e)}")
             log_line = f"⚠ {step_name} skipped (soft-fail) — pipeline continuing"
             print(log_line)
             live_log(log_line)
             continue
-        report_step(step_name, "failed", str(e)[:200])
+        report_step(step_name, "failed", str(e))
         _kb_auto_draft(step_name, str(e), pod_id)
         sys.exit(1)
 
