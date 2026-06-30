@@ -198,7 +198,9 @@ def _reset_to_base(host, local_config_path, log_fn):
     # ── Step 5: Reload ────────────────────────────────────────────────────
     log_fn(f"  Reloading switch...")
     conn.send_command("reload", expect_string=r"confirm|Confirm|#", read_timeout=15)
-    conn.send_command("\n")
+    # Use write_channel for the confirmation — send_command would time out
+    # waiting for a prompt that never arrives (switch starts rebooting).
+    conn.write_channel("\n")
     time.sleep(2)
     try:
         conn.disconnect()
