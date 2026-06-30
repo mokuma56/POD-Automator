@@ -1,24 +1,32 @@
 """
-reset_switches.py — Reset a switch to base config via raw Telnet config push.
+reset_switches.py — Two-pass wipe and restore for C9300 switches.
 
-Workflow:
-  1. Raw Telnet connect (telnetlib) — works on blank and configured switches
-  2. Authenticate if needed, get to enable prompt
-  3. Tear down EVPN running config (no interface nve1, no vlan 1010/1101/1102,
-     no vrf definition Main/PROD/IOT) — write erase only clears NVRAM; running
-     config retains all EVPN state, which merges into base config on write memory
-     and persists after reload if not explicitly removed first.
-  4. write erase — wipe NVRAM startup-config
-  5. Enter 'conf t', push base config lines ONLY, exit config mode
-  6. write memory — saves ONLY base config to NVRAM (running config is now clean)
-  7. Delete flash files that may restore old config on reload:
-     - nvram_config / nvram_config_bkup, vlan.dat, .dbpersist, .prst_sync,
-       dc_profile_dir, pnp-info, evpn/LISP artifacts
-  8. crypto key generate rsa modulus 2048 — done HERE in the telnet session
-     (hostname + ip domain are now in running-config; keys go to NVRAM
-     private-config which survives reload; SSH daemon starts on boot)
-  9. reload — switch boots with base config + RSA keys already in NVRAM
-  10. Wait 300s, reconnect SSH (works because keys exist), final write memory
+Pass 1 — Wipe to stub:
+  1. Raw Telnet connect (works on any switch state)
+  2. Authenticate + enable
+  3. write erase  (clears NVRAM — removes every saved config)
+  4. Push minimal stub config via conf t:
+       hostname, Mgmt-vrf, Gi0/0 IP, default route, enable password,
+       username, VTY transport telnet  (nothing from the lab)
+  5. write memory  (saves STUB ONLY to NVRAM)
+  6. reload        (switch boots from stub — clean slate, no EVPN, no CatC,
+                    no RADIUS, no dot1x, no dirty config of any kind)
+
+Wait 300 s for switch to come back.
+
+Pass 2 — Push base config:
+  7. Telnet connect (stub has management IP + VTY — always reachable)
+  8. Authenticate + enable
+  9. Push full base config via conf t  (running config is stub-only — no merge)
+  10. write memory  (saves base config to NVRAM)
+  11. Delete flash files (nvram_config, vlan.dat, EVPN/LISP artifacts)
+  12. crypto key generate rsa modulus 2048  (SSH works after reload)
+  13. reload        (switch boots cleanly from base config in NVRAM)
+
+Wait 300 s for switch to come back.
+
+Pass 3 — SSH verify:
+  14. SSH connect + write memory  (confirms SSH works, final save)
 """
 
 import time
@@ -37,11 +45,22 @@ SWITCH_IPS = {
     "leaf2":        "198.18.128.23",
 }
 
+# Must match the base config hostnames — used in the stub so RSA key naming
+# is consistent between the stub boot and the final base config boot.
+SWITCH_HOSTNAMES = {
+    "border_spine": "Site_105-Border-Spine",
+    "leaf1":        "Site_105-Leaf1",
+    "leaf2":        "Site_105-Leaf2",
+}
+
+MGMT_GATEWAY   = "198.18.128.1"
+MGMT_MASK      = "255.255.192.0"
 TELNET_TIMEOUT = 30
 
-# Flash files deleted AFTER write memory to prevent lab config being restored on reload.
-# nvram_config / nvram_config_bkup are the key ones — C9300 loads these in preference
-# to NVRAM if they exist. Delete them after saving base config so reload uses NVRAM.
+# Flash files deleted AFTER write memory in Pass 2.
+# nvram_config / nvram_config_bkup are the critical ones — C9300 loads these
+# in preference to NVRAM if they exist.  Delete them so reload uses NVRAM
+# (which has the base config).
 FLASH_CLEANUP = [
     "flash:nvram_config",
     "flash:nvram_config_bkup",
@@ -58,27 +77,41 @@ FLASH_CLEANUP = [
     "flash:dnac_evpn.cfg",
 ]
 
-# EVPN config that must be removed from running config BEFORE write erase.
-# write erase only clears NVRAM — it does not touch the running config.
-# If these are still present when base config is pushed (conf t) and then
-# write memory is run, the merged (EVPN + base) config goes into NVRAM and
-# the switch reloads with EVPN config still present.
-# Order matters: remove NVE1 first (uses VNIs), then L3VNI VLANs (SVIs that
-# are vrf-forwarding bound), then the VRFs themselves.
-EVPN_TEARDOWN_CMDS = [
-    "no interface nve1",
-    "no vlan 1010,1101,1102",
-    "no vrf definition Main",
-    "no vrf definition PROD",
-    "no vrf definition IOT",
-]
 
+def _make_stub_lines(switch_key):
+    """
+    Minimal config pushed to NVRAM before Pass 1 reload.
+
+    Contains NOTHING from the lab — no EVPN, no CatC, no RADIUS, no AAA beyond
+    local auth.  Just enough to telnet in for Pass 2 after the clean boot.
+    """
+    hostname = SWITCH_HOSTNAMES[switch_key]
+    ip       = SWITCH_IPS[switch_key]
+    return [
+        "no ip domain lookup",
+        f"hostname {hostname}",
+        "vrf definition Mgmt-vrf",
+        " address-family ipv4",
+        " exit-address-family",
+        f"enable password {SWITCH_SECRET}",
+        f"username {SWITCH_USER} privilege 15 password {SWITCH_PASS}",
+        "interface GigabitEthernet0/0",
+        f" vrf forwarding Mgmt-vrf",
+        f" ip address {ip} {MGMT_MASK}",
+        " no shutdown",
+        f"ip route vrf Mgmt-vrf 0.0.0.0 0.0.0.0 {MGMT_GATEWAY}",
+        "line vty 0 4",
+        " login local",
+        " transport input telnet",
+        "line vty 5 31",
+        " transport input telnet",
+    ]
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
 
 def _wait_for_enable(tn, log_fn, timeout=15):
-    """
-    Read until we see an enable prompt: ends with '#' but NOT '(config'.
-    Sends blank lines periodically to get a fresh prompt.
-    """
+    """Read until we see an enable prompt (ends with '#', not in config mode)."""
     deadline = time.time() + timeout
     buf = ""
     while time.time() < deadline:
@@ -104,19 +137,8 @@ def _send_cmd(tn, cmd, wait=1.5):
     return tn.read_very_eager().decode("utf-8", errors="replace")
 
 
-def _telnet_reset(host, local_config_path, log_fn):
-    """
-    Raw Telnet to switch:
-      1. Authenticate + enable
-      2. Push base config via conf t
-      3. write memory  (base config now in NVRAM AND flash:nvram_config)
-      4. Delete flash files that would override NVRAM on reload
-      5. reload
-    """
-    log_fn(f"  Raw Telnet connecting to {host}:23...")
-    tn = telnetlib.Telnet(host, 23, timeout=TELNET_TIMEOUT)
-
-    # Wait for initial prompt
+def _telnet_auth(tn, log_fn):
+    """Authenticate and reach the enable prompt."""
     banner = tn.read_until(b">", timeout=20).decode("utf-8", errors="replace")
     log_fn(f"  Initial prompt: {banner[-50:].strip()!r}")
 
@@ -127,7 +149,6 @@ def _telnet_reset(host, local_config_path, log_fn):
         tn.write(SWITCH_PASS.encode() + b"\n")
         tn.read_until(b">", timeout=15)
 
-    # Enable
     log_fn(f"  Entering enable mode...")
     tn.write(b"enable\n")
     out = tn.read_until(b"#", timeout=10).decode("utf-8", errors="replace")
@@ -138,37 +159,90 @@ def _telnet_reset(host, local_config_path, log_fn):
     tn.write(b"\n")
     time.sleep(0.5)
     tn.read_very_eager()
-    log_fn(f"  At enable prompt")
-
-    # Suppress DNS lookups immediately
     _send_cmd(tn, "terminal length 0", wait=0.5)
     _send_cmd(tn, "no ip domain lookup", wait=0.5)
+    log_fn(f"  At enable prompt")
 
-    # ── Step 0a: Tear down EVPN from running config ──────────────────────────
-    # write erase (below) only wipes NVRAM — the running config is unchanged.
-    # EVPN leaves: interface nve1, vlan 1010/1101/1102 (L3VNI), and VRFs
-    # Main/PROD/IOT in the running config.  If we then push base config via
-    # conf t and run write memory, the NVRAM ends up with a merged
-    # (EVPN + base) config and the switch reloads with EVPN still present.
-    # Remove EVPN explicitly now so that write memory saves only base config.
-    # These commands are safe to run on a switch that never had EVPN — IOS
-    # will simply report the interface/vlan/vrf does not exist and continue.
-    log_fn(f"  Tearing down EVPN running config (nve1, L3VNI VLANs, VRFs)...")
+
+def _push_config_lines(tn, config_lines, log_fn, host):
+    """Enter conf t, push config_lines in batches, verify return to enable."""
     tn.write(b"conf t\n")
     tn.read_until(b"(config)#", timeout=10)
-    for cmd in EVPN_TEARDOWN_CMDS:
-        out = _send_cmd(tn, cmd, wait=2.0)
-        log_fn(f"    {cmd} → {out.strip()[-80:].strip()!r}")
+
+    BATCH = 10
+    for i in range(0, len(config_lines), BATCH):
+        for line in config_lines[i:i + BATCH]:
+            tn.write(line.encode("utf-8") + b"\r\n")
+            time.sleep(0.08)
+        time.sleep(0.5)
+        log_fn(f"  Pushed lines {i+1}–{min(i+BATCH, len(config_lines))}/{len(config_lines)}")
+
+    time.sleep(2)
+    ok = _wait_for_enable(tn, log_fn, timeout=20)
+    if not ok:
+        raise RuntimeError(f"Did not return to enable prompt after config push on {host}")
+
+    # Double-end safety — ensures we are not still inside config mode
     tn.write(b"end\n")
     time.sleep(1)
     tn.read_very_eager()
-    _wait_for_enable(tn, log_fn, timeout=10)
-    log_fn(f"  EVPN teardown done")
+    ok = _wait_for_enable(tn, log_fn, timeout=10)
+    if not ok:
+        raise RuntimeError(f"Still in config mode before write memory on {host}")
 
-    # ── Step 0b: Erase NVRAM so conf t push is the ONLY config on reload ──────
-    # EVPN config has been removed from running config above — write erase now
-    # clears whatever was in NVRAM. Base config push below goes into a clean
-    # running config, and write memory saves only the base config.
+
+def _write_memory(tn, host, log_fn):
+    """Run write memory and wait for [OK]."""
+    log_fn(f"  Saving config (write memory)...")
+    tn.write(b"write memory\n")
+    deadline = time.time() + 30
+    wm_buf = ""
+    while time.time() < deadline:
+        chunk = tn.read_very_eager().decode("utf-8", errors="replace")
+        wm_buf += chunk
+        if "[OK]" in wm_buf:
+            log_fn(f"  write memory OK")
+            return
+        if "(config" in wm_buf:
+            raise RuntimeError(f"write memory ran inside config mode on {host}")
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"write memory did not confirm [OK] on {host}: {wm_buf.strip()[-120:]!r}"
+    )
+
+
+def _do_reload(tn, log_fn):
+    """Issue reload (answer 'no' to save prompt) and close the telnet session."""
+    log_fn(f"  Reloading switch...")
+    tn.write(b"reload\n")
+    out = tn.read_until(b"?", timeout=15).decode("utf-8", errors="replace")
+    if "Save?" in out or "save" in out.lower():
+        tn.write(b"no\n")
+        tn.read_until(b"?", timeout=10)
+    tn.write(b"\n")
+    time.sleep(2)
+    try:
+        tn.close()
+    except Exception:
+        pass
+    log_fn(f"  Reload initiated")
+
+
+# ── Pass 1 ───────────────────────────────────────────────────────────────────
+
+def _telnet_wipe_to_stub(host, switch_key, log_fn):
+    """
+    Pass 1 — complete wipe.
+
+    Erases NVRAM, pushes a minimal stub config (management IP + VTY only),
+    saves to NVRAM, then reloads.  After this reload the switch has ZERO lab
+    config — no EVPN, no CatC AAA/RADIUS/dot1x, nothing.  Only the stub.
+    """
+    log_fn(f"  [Pass 1] Connecting to {host}:23 (wipe to stub)...")
+    tn = telnetlib.Telnet(host, 23, timeout=TELNET_TIMEOUT)
+    _telnet_auth(tn, log_fn)
+
+    # Erase NVRAM — every saved config is gone
     log_fn(f"  Erasing NVRAM (write erase)...")
     tn.write(b"write erase\n")
     out = tn.read_until(b"?", timeout=10).decode("utf-8", errors="replace")
@@ -183,74 +257,48 @@ def _telnet_reset(host, local_config_path, log_fn):
         time.sleep(0.5)
     log_fn(f"  NVRAM erased")
 
-    # ── Step 1: Push base config ──────────────────────────────────────────────
+    # Push stub config into running config, then save to NVRAM
+    stub_lines = _make_stub_lines(switch_key)
+    log_fn(f"  Pushing stub config ({len(stub_lines)} lines — connectivity only)...")
+    _push_config_lines(tn, stub_lines, log_fn, host)
+    _write_memory(tn, host, log_fn)
+
+    # Reload — switch boots from NVRAM = stub only
+    _do_reload(tn, log_fn)
+    log_fn(f"  [Pass 1] Complete — waiting 300s for stub boot...")
+
+
+# ── Pass 2 ───────────────────────────────────────────────────────────────────
+
+def _telnet_push_base(host, local_config_path, log_fn):
+    """
+    Pass 2 — push base config onto the clean stub-booted switch.
+
+    The running config at this point has ONLY the stub — no dirty config of any
+    kind.  Push the full base config, write memory, clean flash, generate RSA
+    keys, then reload into the final clean base config.
+    """
+    log_fn(f"  [Pass 2] Connecting to {host}:23 (push base config)...")
+    tn = telnetlib.Telnet(host, 23, timeout=TELNET_TIMEOUT)
+    _telnet_auth(tn, log_fn)
+
     log_fn(f"  Reading base config from {local_config_path}...")
     with open(local_config_path) as f:
         base_lines = [l.rstrip() for l in f if l.strip() and not l.strip().startswith("!")]
 
-    # Running config is clean (EVPN torn down above, NVRAM erased).
-    # Push base config lines directly — no teardown needed here.
     config_lines = list(base_lines)
-
     if "no ip domain lookup" not in config_lines:
         config_lines.insert(0, "no ip domain lookup")
     if "config-register 0x2102" not in config_lines:
         config_lines.append("config-register 0x2102")
     config_lines.append("end")
 
-    log_fn(f"  Entering config mode, pushing {len(config_lines)} lines (base config only)...")
-    tn.write(b"conf t\n")
-    tn.read_until(b"(config)#", timeout=10)
+    log_fn(f"  Pushing base config ({len(config_lines)} lines)...")
+    _push_config_lines(tn, config_lines, log_fn, host)
+    _write_memory(tn, host, log_fn)
 
-    BATCH = 10
-    for i in range(0, len(config_lines), BATCH):
-        batch = config_lines[i:i + BATCH]
-        for line in batch:
-            tn.write(line.encode("utf-8") + b"\r\n")
-            time.sleep(0.08)
-        time.sleep(0.5)
-        log_fn(f"  Pushed lines {i+1}–{min(i+BATCH, len(config_lines))}/{len(config_lines)}")
-
-    log_fn(f"  Waiting for enable prompt after config push...")
-    time.sleep(2)
-    ok = _wait_for_enable(tn, log_fn, timeout=20)
-    if not ok:
-        raise RuntimeError(f"Did not return to enable prompt after config push on {host}")
-
-    # Double-end safety
-    tn.write(b"end\n")
-    time.sleep(1)
-    tn.read_very_eager()
-    ok = _wait_for_enable(tn, log_fn, timeout=10)
-    if not ok:
-        raise RuntimeError(f"Still in config mode before write memory on {host}")
-
-    # ── Step 2: write memory FIRST ───────────────────────────────────────────
-    # This saves base config to NVRAM. It also regenerates flash:nvram_config
-    # and flash:nvram_config_bkup — but with the BASE config, not the lab config.
-    # We delete those files next so reload falls back to NVRAM (base config).
-    log_fn(f"  Saving base config to NVRAM (write memory)...")
-    tn.write(b"write memory\n")
-    deadline = time.time() + 30
-    wm_buf = ""
-    while time.time() < deadline:
-        chunk = tn.read_very_eager().decode("utf-8", errors="replace")
-        wm_buf += chunk
-        if "[OK]" in wm_buf:
-            log_fn(f"  write memory OK")
-            break
-        if "(config" in wm_buf:
-            raise RuntimeError(f"write memory ran inside config mode on {host}")
-        time.sleep(0.5)
-    else:
-        raise RuntimeError(f"write memory did not confirm [OK] on {host} — output: {wm_buf.strip()[-120:]!r}")
-
-    # ── Step 3: Delete flash files AFTER write memory ────────────────────────
-    # nvram_config / nvram_config_bkup now have base config — delete them so
-    # the C9300 cannot restore the old lab config. Also wipe NVRAM now that
-    # the flash backups are gone (so there is NO config backup path left except
-    # NVRAM which has the base config).
-    log_fn(f"  Deleting flash config backup files (post write memory)...")
+    # Delete flash files that could override NVRAM on reload
+    log_fn(f"  Deleting flash config backup files...")
     for fname in FLASH_CLEANUP:
         log_fn(f"    Deleting {fname}...")
         tn.write(f"delete /force /recursive {fname}\n".encode())
@@ -258,14 +306,9 @@ def _telnet_reset(host, local_config_path, log_fn):
         tn.read_very_eager()
     log_fn(f"  Flash cleanup done")
 
-    # ── Step 3.5: Generate RSA keys NOW (before reload) ──────────────────────
-    # Hostname and ip domain name are already in running-config from the base
-    # config push above — both are required for key naming.
-    # IOS-XE stores RSA keys in NVRAM private-config, which is SEPARATE from
-    # startup-config and survives reload.  Generating here means SSH daemon
-    # starts immediately after reload — without this, SSH is unavailable
-    # post-reload (no daemon = can't SSH in to generate keys = chicken-and-egg).
-    log_fn(f"  Generating RSA 2048 keys (before reload so SSH works after)...")
+    # Generate RSA keys before reload so SSH daemon starts immediately on boot.
+    # IOS-XE stores RSA keys in NVRAM private-config (separate from startup-config).
+    log_fn(f"  Generating RSA 2048 keys...")
     tn.write(b"crypto key generate rsa modulus 2048\n")
     rsa_buf = ""
     deadline = time.time() + 60
@@ -273,47 +316,33 @@ def _telnet_reset(host, local_config_path, log_fn):
         chunk = tn.read_very_eager().decode("utf-8", errors="replace")
         rsa_buf += chunk
         if "[yes/no]" in rsa_buf:
-            # Keys already exist — answer "yes" to replace them
             tn.write(b"yes\n")
             rsa_buf = ""
-        # Done when we're back at the enable prompt
         lines = [l.strip() for l in rsa_buf.splitlines() if l.strip()]
         if lines and lines[-1].endswith("#") and "(config" not in lines[-1]:
             break
         time.sleep(0.5)
     log_fn(f"  RSA keys ready")
 
-    # ── Step 4: reload ───────────────────────────────────────────────────────
-    log_fn(f"  Reloading switch...")
-    tn.write(b"reload\n")
-    out = tn.read_until(b"?", timeout=15).decode("utf-8", errors="replace")
-    if "Save?" in out or "save" in out.lower():
-        tn.write(b"no\n")
-        tn.read_until(b"?", timeout=10)
-    tn.write(b"\n")
-    time.sleep(2)
-    try:
-        tn.close()
-    except Exception:
-        pass
-    log_fn(f"  Reload initiated — waiting 300s for reboot...")
+    # Reload — boots cleanly from base config in NVRAM
+    _do_reload(tn, log_fn)
+    log_fn(f"  [Pass 2] Complete — waiting 300s for base config boot...")
 
+
+# ── Pass 3 ───────────────────────────────────────────────────────────────────
 
 def _post_reload(host, log_fn):
-    """Reconnect via SSH after reload and do a final write memory.
-    RSA keys were generated before the reload in the telnet session so
-    SSH daemon is already running when the switch comes back up.
-    """
+    """Pass 3 — SSH verify + final write memory."""
     from netmiko import ConnectHandler
 
-    log_fn(f"  Reconnecting via SSH to {host}...")
+    log_fn(f"  [Pass 3] Reconnecting via SSH to {host}...")
     params_ssh = {
         "device_type": "cisco_ios",
-        "host": host,
-        "username": SWITCH_USER,
-        "password": SWITCH_PASS,
-        "secret": SWITCH_SECRET,
-        "port": 22,
+        "host":         host,
+        "username":     SWITCH_USER,
+        "password":     SWITCH_PASS,
+        "secret":       SWITCH_SECRET,
+        "port":         22,
         "conn_timeout": 20,
         "banner_timeout": 30,
         "auth_timeout": 30,
@@ -339,20 +368,34 @@ def _post_reload(host, log_fn):
     if "[OK]" not in out:
         log_fn(f"  Warning: write memory output: {out[:80]}")
     conn.disconnect()
-    log_fn(f"  Done — SSH verified OK on {host}")
+    log_fn(f"  [Pass 3] Done — SSH verified OK on {host}")
     return True
 
 
+# ── Public entry point ────────────────────────────────────────────────────────
+
 def reset_switch(switch_key, local_config_path, log_fn=print):
-    """Full reset cycle. Returns (ok, detail)."""
+    """
+    Full two-pass reset. Returns (ok, detail).
+
+    Total time: ~10 min (two 300 s reload waits).
+
+    Pass 1: write erase → stub → reload     (guaranteed clean slate)
+    Pass 2: push base config → reload       (base config only in NVRAM)
+    Pass 3: SSH verify
+    """
     host = SWITCH_IPS.get(switch_key)
     if not host:
         return False, f"Unknown switch key: {switch_key}"
 
     try:
-        _telnet_reset(host, local_config_path, log_fn)
+        _telnet_wipe_to_stub(host, switch_key, log_fn)
         time.sleep(300)
+
+        _telnet_push_base(host, local_config_path, log_fn)
+        time.sleep(300)
+
         _post_reload(host, log_fn)
-        return True, f"OK: {switch_key} ({host}) reset to base config"
+        return True, f"OK: {switch_key} ({host}) wiped and restored to base config"
     except Exception as e:
         return False, f"FAILED: {switch_key} ({host}): {e}"
