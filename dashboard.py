@@ -6245,12 +6245,18 @@ def api_vpn_connect(pod_id):
     except Exception as e:
         return jsonify({"status": "error", "output": str(e)[:500]})
 
+def _delete_all_pod_data(conn, pod_id):
+    """Delete all session data for a POD across every pod_id-keyed table."""
+    for tbl in ("pipeline_steps", "pipeline_logs", "scc_checklist",
+                "fabric_steps", "sda_steps", "duo_steps", "ise_steps"):
+        conn.execute(f"DELETE FROM {tbl} WHERE pod_id=?", (pod_id,))
+
+
 @app.route("/api/delete-pod/<pod_id>", methods=["POST"])
 def delete_pod(pod_id):
     """Delete a POD and all its data from the DB."""
     conn = _db()
-    conn.execute("DELETE FROM pipeline_steps WHERE pod_id=?", (pod_id,))
-    conn.execute("DELETE FROM pipeline_logs WHERE pod_id=?", (pod_id,))
+    _delete_all_pod_data(conn, pod_id)
     conn.execute("DELETE FROM pods WHERE pod_id=?", (pod_id,))
     conn.commit()
     conn.close()
@@ -6259,10 +6265,9 @@ def delete_pod(pod_id):
 
 @app.route("/api/reset-pipeline/<pod_id>", methods=["POST"])
 def reset_pipeline(pod_id):
-    """Reset all pipeline steps to pending so the pipeline can be re-run."""
+    """Reset all pipeline steps and session data so the pipeline can be re-run fresh."""
     conn = _db()
-    conn.execute("DELETE FROM pipeline_steps WHERE pod_id=?", (pod_id,))
-    conn.execute("DELETE FROM pipeline_logs WHERE pod_id=?", (pod_id,))
+    _delete_all_pod_data(conn, pod_id)
     conn.execute("""UPDATE pods SET status='pending', sdwan_online='', notes='',
                     updated_at=datetime('now') WHERE pod_id=?""", (pod_id,))
     conn.commit()
