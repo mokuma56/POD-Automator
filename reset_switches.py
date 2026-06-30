@@ -137,8 +137,9 @@ def _remove_evpn_running_config(tn, log_fn):
     log_fn("  [Pass 1] EVPN running config stripped")
 
 
-
+def _make_stub_lines(switch_key):
     """
+
     Minimal config pushed to NVRAM before Pass 1 reload.
 
     Contains NOTHING from the lab — no EVPN, no CatC, no RADIUS, no AAA beyond
