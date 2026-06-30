@@ -270,7 +270,23 @@ def _telnet_wipe_to_stub(host, switch_key, log_fn):
     _push_config_lines(tn, stub_lines, log_fn, host)
     _write_memory(tn, host, log_fn)
 
-    # Reload — switch boots from NVRAM = stub only
+    # Delete flash files NOW (before stub reload) so they cannot override NVRAM
+    # during the stub boot.  flash:nvram_config / nvram_config_bkup take priority
+    # over NVRAM if they exist — if still present they would load the full EVPN
+    # config at stub-boot time, causing Pass 2 to push base config on top of it.
+    # vlan.dat and dnac_evpn.cfg cause VLANs/VRFs/NVE to reload from flash.
+    # Deleting here guarantees a truly clean stub boot.  Pass 2 flash cleanup
+    # is kept as a belt-and-suspenders measure for any files written by CatC
+    # during the stub-boot window.
+    log_fn(f"  [Pass 1] Deleting flash EVPN/config-backup files before reload...")
+    for fname in FLASH_CLEANUP:
+        log_fn(f"    Deleting {fname}...")
+        tn.write(f"delete /force /recursive {fname}\n".encode())
+        time.sleep(2)
+        tn.read_very_eager()
+    log_fn(f"  Flash cleanup done")
+
+    # Reload — switch boots from NVRAM = stub only, with no flash overrides
     _do_reload(tn, log_fn)
     log_fn(f"  [Pass 1] Complete — waiting 300s for stub boot...")
 
