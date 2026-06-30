@@ -1131,7 +1131,7 @@ def phase_catc_discover(log_fn=print):
 
         r_post = requests.post(
             f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device",
-            headers=headers, json=dpayload, verify=False, timeout=30,
+            headers=headers, json=dpayload, verify=False, timeout=120,
         )
         pbody = {}
         try: pbody = r_post.json()
