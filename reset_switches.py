@@ -381,7 +381,7 @@ def _post_reload(host, log_fn):
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def reset_switch(switch_key, local_config_path, log_fn=print):
+def reset_switch(switch_key, local_config_path, log_fn=print, on_pass1_wait=None):
     """
     Full two-pass reset. Returns (ok, detail).
 
@@ -390,6 +390,11 @@ def reset_switch(switch_key, local_config_path, log_fn=print):
     Pass 1: write erase → stub → reload     (guaranteed clean slate)
     Pass 2: push base config → reload       (base config only in NVRAM)
     Pass 3: SSH verify
+
+    on_pass1_wait: optional callable(log_fn) invoked ~60s into the Pass 1 wait
+                   (when the switch is in stub mode and CatC has marked it
+                   unreachable).  Used to delete the switch from CatC while it
+                   has no loopback IP, so CatC cannot re-provision after reload.
     """
     host = SWITCH_IPS.get(switch_key)
     if not host:
@@ -397,7 +402,17 @@ def reset_switch(switch_key, local_config_path, log_fn=print):
 
     try:
         _telnet_wipe_to_stub(host, switch_key, log_fn)
-        time.sleep(300)
+
+        # Give switch ~60s to fully go offline and CatC ~60s to mark it
+        # unreachable (no active provisioning task).  Then run on_pass1_wait
+        # (CatC delete) while the window is clean.
+        time.sleep(60)
+        if on_pass1_wait:
+            try:
+                on_pass1_wait(log_fn)
+            except Exception as cb_e:
+                log_fn(f"  on_pass1_wait callback error (continuing): {cb_e}")
+        time.sleep(240)  # remaining 240s of the 300s total Pass 1 boot wait
 
         _telnet_push_base(host, local_config_path, log_fn)
         time.sleep(300)

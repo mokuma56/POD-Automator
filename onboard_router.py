@@ -1561,10 +1561,156 @@ def phase_baseconfig_verify(switch_key, log_fn=print):
     return ok, summary
 
 
+def _catc_remove_device(dev_id, name, loopback_ip, headers, log_fn, requests, time):
+    """
+    Remove one device from CatC: SDA deprovision first, then inventory delete.
+
+    SDA deprovision (DELETE /business/sda/provision-device) removes the device
+    from the fabric provisioning state — required before the inventory DELETE
+    will succeed when the device has ever been provisioned.
+
+    The inventory DELETE uses cleanConfig=false so CatC does not try to push
+    'no' commands to the device (which would fail if it is offline/unreachable).
+
+    Returns (ok, detail).
+    """
+    # ── Step A: SDA deprovision ────────────────────────────────────────────
+    log_fn(f"  [CatC] {name}: SDA deprovision...")
+    try:
+        r = requests.delete(
+            f"{CATC_BASE}/dna/intent/api/v1/business/sda/provision-device"
+            f"?deviceManagementIpAddress={loopback_ip}",
+            headers=headers, verify=False, timeout=120
+        )
+        if r.status_code in (200, 202):
+            eid = r.json().get("executionId", "")
+            tid = r.json().get("taskId", "") or r.json().get("response", {}).get("taskId", "")
+            poll_id = eid or tid
+            if poll_id:
+                for _ in range(24):  # 2 min max
+                    time.sleep(5)
+                    for url in [
+                        f"{CATC_BASE}/dna/intent/api/v1/dnacaap/management/execution-status/{poll_id}",
+                        f"{CATC_BASE}/dna/intent/api/v1/task/{poll_id}",
+                    ]:
+                        tr = requests.get(url, headers=headers, verify=False, timeout=10)
+                        if tr.status_code == 200:
+                            tdata = tr.json().get("response", tr.json())
+                            status = tdata.get("status", "") or tdata.get("bapiStatus", "")
+                            done = (tdata.get("endTime") or tdata.get("isError")
+                                    or status in ("SUCCESS", "FAILURE"))
+                            if done:
+                                log_fn(f"  [CatC] {name}: SDA deprovision {status or 'done'}")
+                                break
+                    else:
+                        continue
+                    break
+        elif r.status_code == 400:
+            log_fn(f"  [CatC] {name}: SDA deprovision 400 (not in fabric or unreachable) — continuing to inventory delete")
+        else:
+            log_fn(f"  [CatC] {name}: SDA deprovision HTTP {r.status_code} — continuing")
+    except Exception as e:
+        log_fn(f"  [CatC] {name}: SDA deprovision exception ({e}) — continuing")
+
+    # ── Step B: Inventory delete ───────────────────────────────────────────
+    log_fn(f"  [CatC] {name}: inventory delete (cleanConfig=false)...")
+    try:
+        r2 = requests.delete(
+            f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}?cleanConfig=false",
+            headers=headers, verify=False, timeout=60
+        )
+        if r2.status_code not in (200, 202, 204):
+            return False, f"inventory DELETE HTTP {r2.status_code}: {r2.text[:100]}"
+
+        task_id = ""
+        try:
+            task_id = r2.json().get("response", {}).get("taskId", "")
+        except Exception:
+            pass
+
+        if not task_id:
+            log_fn(f"  [CatC] {name}: deleted (no task ID)")
+            return True, f"{name}: deleted"
+
+        for _ in range(12):  # 60s
+            time.sleep(5)
+            tr = requests.get(
+                f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
+                headers=headers, verify=False, timeout=10
+            )
+            if tr.status_code == 200:
+                tdata = tr.json().get("response", {})
+                if tdata.get("isError"):
+                    reason = tdata.get("failureReason", "unknown")
+                    # "Resource does not exist" means SDA deprovision already removed it
+                    if "does not exist" in reason.lower() or "not found" in reason.lower():
+                        log_fn(f"  [CatC] {name}: already removed by SDA deprovision")
+                        return True, f"{name}: removed"
+                    return False, f"inventory delete task failed: {reason[:120]}"
+                if tdata.get("endTime"):
+                    log_fn(f"  [CatC] {name}: deleted from inventory")
+                    return True, f"{name}: deleted"
+        log_fn(f"  [CatC] {name}: inventory delete task did not confirm — treating as OK")
+        return True, f"{name}: deleted (unconfirmed)"
+
+    except Exception as e:
+        return False, f"inventory delete exception: {e}"
+
+
+def _catc_delete_single(switch_key, log_fn=print):
+    """
+    Delete a single switch from CatC: SDA deprovision → inventory delete.
+    Returns (ok, detail).
+    """
+    import requests as _requests, urllib3, time as _time
+    urllib3.disable_warnings()
+
+    info = CATC_DISCOVERY_IPS.get(switch_key)
+    if not info:
+        return False, f"Unknown switch key: {switch_key}"
+
+    loopback_ip = info["loopback"]
+    mgmt_ip     = info["mgmt"]
+    log_fn(f"  [CatC] Removing {switch_key} ({loopback_ip}) from Catalyst Center...")
+
+    try:
+        headers = _catc_headers()
+    except Exception as e:
+        return False, f"CatC auth failed: {e}"
+
+    try:
+        r = _requests.get(
+            f"{CATC_BASE}/dna/intent/api/v1/network-device?limit=500",
+            headers=headers, verify=False, timeout=30
+        )
+        devices = r.json().get("response", [])
+    except Exception as e:
+        return False, f"CatC inventory fetch failed: {e}"
+
+    dev = next(
+        (d for d in devices if d.get("managementIpAddress") in (loopback_ip, mgmt_ip)),
+        None
+    )
+    if not dev:
+        log_fn(f"  [CatC] {switch_key}: not in inventory (already removed)")
+        return True, f"{switch_key}: not in inventory"
+
+    return _catc_remove_device(
+        dev["id"], dev.get("hostname", loopback_ip),
+        loopback_ip, headers, log_fn, _requests, _time
+    )
+
+
 def phase_baseconfig_reset(switch_key, log_fn=print):
     """
     Reset a switch to its known-good base config using Telnet + TFTP + reload.
     Delegates to reset_switches.reset_switch() which mirrors the proven manual script.
+
+    Deletes the switch from Catalyst Center DURING the Pass 1 boot wait, while
+    the switch is in stub mode (no loopback IP → CatC marks it unreachable →
+    no active provisioning task → DELETE succeeds).  This prevents CatC from
+    re-pushing EVPN config after the final reload.
+
     Returns (ok, detail).
     """
     import reset_switches
@@ -1578,8 +1724,13 @@ def phase_baseconfig_reset(switch_key, log_fn=print):
     if not os.path.exists(cfg_path):
         return False, f"Base config not found: {cfg_path}"
 
-    log_fn(f"  Starting TFTP-based reset for {info['name']} ({info['ip']})...")
-    return reset_switches.reset_switch(switch_key, cfg_path, log_fn=log_fn)
+    def _on_pass1_wait(lf):
+        ok, detail = _catc_delete_single(switch_key, log_fn=lf)
+        lf(f"  [CatC] {'OK' if ok else 'FAILED'}: {detail}")
+
+    log_fn(f"  Starting reset for {info['name']} ({info['ip']})...")
+    return reset_switches.reset_switch(switch_key, cfg_path, log_fn=log_fn,
+                                       on_pass1_wait=_on_pass1_wait)
 
 
 # ---------------------------------------------------------------------------
@@ -1694,10 +1845,9 @@ def phase_ise_cleanup(log_fn=print):
 
 def phase_catc_cleanup(log_fn=print):
     """
-    Delete the 3 switches from Catalyst Center inventory.
-    Searches by both management IPs (198.18.128.x) AND loopback IPs (172.30.255.x)
-    because CatC may store either as the managementIpAddress depending on discovery.
-    Polls the deletion task to confirm actual removal.
+    Remove all 3 switches from Catalyst Center: SDA deprovision → inventory delete.
+    Searches by both management IPs (198.18.128.x) AND loopback IPs (172.30.255.x).
+    Uses _catc_remove_device() for each switch — same logic as _catc_delete_single().
     Returns (ok, detail).
     """
     import requests, urllib3, time
@@ -1735,70 +1885,30 @@ def phase_catc_cleanup(log_fn=print):
         log_fn("  No switch devices found in CC inventory (already removed)")
         return True, "nothing to do — devices not in inventory"
 
-    deleted, skipped, errors = [], [], []
+    deleted, errors = [], []
     for dev in to_delete:
-            dev_id = dev["id"]
-            name   = dev.get("hostname", dev.get("managementIpAddress", dev_id))
-            mgmt   = dev.get("managementIpAddress", "?")
-            log_fn(f"  Deleting {name} ({mgmt}) from CC...")
+        dev_id = dev["id"]
+        name   = dev.get("hostname", dev.get("managementIpAddress", dev_id))
+        mgmt   = dev.get("managementIpAddress", "?")
+        # Resolve loopback IP for SDA deprovision (prefer loopback over mgmt)
+        loopback_ip = next(
+            (info["loopback"] for info in CATC_DISCOVERY_IPS.values()
+             if mgmt in (info["mgmt"], info["loopback"])),
+            mgmt
+        )
+        log_fn(f"  Removing {name} ({mgmt}) from CatC...")
+        ok, detail = _catc_remove_device(dev_id, name, loopback_ip, headers, log_fn, requests, time)
+        if ok:
+            deleted.append(name)
+        else:
+            log_fn(f"  ERROR: {detail}")
+            errors.append(name)
 
-            # Single best-effort DELETE — no retry.
-            # If CatC refuses because a provisioning task is in-flight, we log a warning
-            # and move on.  The post-reload SSH teardown (in reset_switches._post_reload)
-            # will clean up any config that CatC re-pushes via NETCONF after the switch
-            # comes back online, so blocking here adds no value.
-            try:
-                r = requests.delete(
-                    f"{CATC_BASE}/dna/intent/api/v1/network-device/{dev_id}",
-                    headers=headers, verify=False, timeout=30
-                )
-                if r.status_code not in (200, 202, 204):
-                    msg = f"{name}: unexpected status {r.status_code} — {r.text[:100]}"
-                    log_fn(f"  WARNING: {msg} (continuing anyway)")
-                    skipped.append(name)
-                else:
-                    # Poll task briefly (up to 30s) just to log the outcome — never block on it
-                    try:
-                        task_id = r.json().get("response", {}).get("taskId", "")
-                    except Exception:
-                        task_id = ""
-
-                    if task_id:
-                        outcome = "unknown"
-                        for _ in range(6):  # up to 30s
-                            time.sleep(5)
-                            tr = requests.get(
-                                f"{CATC_BASE}/dna/intent/api/v1/task/{task_id}",
-                                headers=headers, verify=False, timeout=10
-                            )
-                            if tr.status_code == 200:
-                                tdata = tr.json().get("response", {})
-                                if tdata.get("isError"):
-                                    reason = tdata.get("failureReason", "unknown")
-                                    outcome = f"task failed: {reason[:80]}"
-                                    log_fn(f"  WARNING: {name}: {outcome} (continuing anyway)")
-                                    skipped.append(name)
-                                    break
-                                if tdata.get("endTime"):
-                                    outcome = "confirmed"
-                                    log_fn(f"  {name}: deletion confirmed")
-                                    deleted.append(name)
-                                    break
-                        else:
-                            log_fn(f"  {name}: task did not confirm in 30s — treating as OK")
-                            deleted.append(name)
-                    else:
-                        log_fn(f"  {name}: deleted (no task ID returned)")
-                        deleted.append(name)
-
-            except Exception as e:
-                log_fn(f"  WARNING: {name}: {e} (continuing anyway)")
-                skipped.append(name)
-
+    ok = len(errors) == 0
     summary_parts = []
     if deleted: summary_parts.append(f"deleted {len(deleted)}: {', '.join(deleted)}")
-    if skipped:  summary_parts.append(f"skipped {len(skipped)} (still provisioning — post-reload teardown will clean up): {', '.join(skipped)}")
-    return True, "; ".join(summary_parts) if summary_parts else "nothing done"
+    if errors:  summary_parts.append(f"COULD NOT DELETE {len(errors)}: {', '.join(errors)}")
+    return ok, "; ".join(summary_parts) if summary_parts else "nothing done"
 
 
 CDFMC_AUTOMATION_HOST = "198.18.134.12"
