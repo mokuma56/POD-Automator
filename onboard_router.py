@@ -786,7 +786,7 @@ def _catc_token():
     import requests, urllib3
     urllib3.disable_warnings()
     r = requests.post(f"{CATC_BASE}/dna/system/api/v1/auth/token",
-                      auth=(CATC_USER, CATC_PASS), verify=False, timeout=15)
+                      auth=(CATC_USER, CATC_PASS), verify=False, timeout=60)
     r.raise_for_status()
     return r.json()["Token"]
 
@@ -1706,6 +1706,8 @@ def phase_catc_cleanup(log_fn=print):
     log_fn("  Getting Catalyst Center auth token...")
     try:
         headers = _catc_headers()
+    except requests.exceptions.Timeout:
+        return False, f"CC auth timed out connecting to {CATC_HOST} — CatC may be slow/busy, retry in a moment"
     except Exception as e:
         return False, f"CC auth failed: {e}"
 
@@ -1719,7 +1721,7 @@ def phase_catc_cleanup(log_fn=print):
     try:
         r = requests.get(
             f"{CATC_BASE}/dna/intent/api/v1/network-device?limit=500",
-            headers=headers, verify=False, timeout=15
+            headers=headers, verify=False, timeout=60
         )
         r.raise_for_status()
         devices = r.json().get("response", [])
