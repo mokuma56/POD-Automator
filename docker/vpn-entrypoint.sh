@@ -7,8 +7,9 @@ VPN_USER="$2"
 VPN_PASS="$3"
 
 # Ensure DNS works before openconnect tries to resolve the VPN host.
-# Use public DNS first — works from any network, resolves VPN hostname.
-printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+# Cisco internal DNS first (works on corporate network + via dCloud VPN tunnel),
+# public DNS as fallback for home/hotel networks where corporate DNS is unreachable.
+printf 'nameserver 64.102.6.247\nnameserver 173.37.137.85\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 
 echo "Connecting to $VPN_HOST as $VPN_USER..."
 echo "$VPN_PASS" | openconnect --interface tun0 --user "$VPN_USER" --passwd-on-stdin "$VPN_HOST" &
