@@ -546,3 +546,10 @@ uv run python3 kb.py reembed
 - Firmware images stored in `data/images/` — excluded from git
 - Bootstrap configs contain device secrets — excluded from git
 - Default lab passwords (`C1sco12345`) are dCloud session credentials
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch workflow, commit
+conventions, locked files, and high-collision file coordination.
