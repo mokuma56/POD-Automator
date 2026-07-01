@@ -10520,7 +10520,7 @@ let _sccResetAllPoller = null;
 async function resetAllSccOrgs() {
   const btn    = document.getElementById('btn-scc-reset-all');
   const status = document.getElementById('scc-reset-all-status');
-  if (!confirm('Run full SCC reset (Phase 1 API + Phase 2 browser) for ALL managed PODs?\n\nThis runs sequentially — allow ~3 min per POD.')) return;
+  if (!confirm('Run full SCC reset (Phase 1 API + Phase 2 browser) for ALL managed PODs?\\n\\nThis runs sequentially — allow ~3 min per POD.')) return;
 
   btn.disabled = true;
   btn.textContent = '\u23f3 Running...';
