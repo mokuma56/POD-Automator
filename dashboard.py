@@ -3774,55 +3774,71 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                     # Returns {x, y} of the element centre — we then use
                     # page.mouse.click() so React synthetic events fire correctly.
                     _three_dot_clicked = False
-                    _dot_coords = page.evaluate("""() => {
-                        const all = Array.from(document.querySelectorAll('*'));
-                        const textEl = all.find(el => {
-                            const kids = Array.from(el.childNodes)
-                                .filter(n => n.nodeType === 3 && n.textContent.trim());
-                            return kids.length > 0 &&
-                                   (el.textContent || '').trim() === 'For all Internet access' &&
-                                   el.getBoundingClientRect().width > 0;
-                        });
-                        if (!textEl) return null;
-
-                        // Walk up to row container
-                        let row = textEl.parentElement;
-                        for (let i = 0; i < 10; i++) {
-                            if (!row || row === document.body) break;
-                            if (row.getBoundingClientRect().width > 400) break;
-                            row = row.parentElement;
-                        }
-                        if (!row) return null;
-
-                        // Hover events to reveal hidden buttons
-                        row.dispatchEvent(new MouseEvent('mouseenter', {bubbles:true}));
-                        row.dispatchEvent(new MouseEvent('mouseover',  {bubbles:true}));
-
-                        // Find "..." — any element type
-                        const rowEls = Array.from(row.querySelectorAll('*'));
-                        const dotEl = rowEls.find(el => {
-                            const t = (el.textContent || '').trim();
-                            const r = el.getBoundingClientRect();
-                            return t === '...' && r.width > 0 && r.height > 0;
-                        }) || (() => {
-                            // Fallback: rightmost small element
-                            const small = rowEls.filter(el => {
+                    # Use Playwright bounding_box() — avoids brittle JS row-walk and
+                    # correctly reflects any remaining scroll offset.
+                    # React hover-reveal requires a real page.mouse.move(); dispatchEvent
+                    # and JS .click() are ignored by React's synthetic event system.
+                    _text_bb = None
+                    try:
+                        _text_el = page.get_by_text("For all Internet access").first
+                        _text_bb = _text_el.bounding_box()
+                    except Exception as _tbe:
+                        log_fn(f"[scc-reset] logging_settings: text element lookup: {_tbe}")
+                    if _text_bb:
+                        _cx = _text_bb["x"] + _text_bb["width"] / 2
+                        _cy = _text_bb["y"] + _text_bb["height"] / 2
+                        page.mouse.move(_cx, _cy)
+                        page.wait_for_timeout(700)
+                        log_fn(f"[scc-reset] logging_settings: hovered at ({_cx:.0f},{_cy:.0f})")
+                    else:
+                        log_fn("[scc-reset] logging_settings: 'For all Internet access' not found")
+                    _shot("1_logging_hover")
+                    _dot_coords = None
+                    # Strategy 1: find rightmost button/role=button near the row's Y.
+                    # Tolerance is tight (±20px) so we don't accidentally hit the row
+                    # above ("For all private access") which is only ~32px away and
+                    # has no "Edit" option — just "View".
+                    if _text_bb:
+                        _row_y = _text_bb["y"] + _text_bb["height"] / 2
+                        log_fn(f"[scc-reset] logging_settings: scanning for dot near y={_row_y:.0f}")
+                        _dot_coords = page.evaluate("""(rowY) => {
+                            const cands = Array.from(document.querySelectorAll(
+                                'button, [role="button"]'
+                            )).filter(el => {
                                 const r = el.getBoundingClientRect();
-                                return r.width > 0 && r.width < 60 && r.height > 0;
+                                return r.width > 0 && r.height > 0
+                                    && r.left > window.innerWidth * 0.45
+                                    && Math.abs((r.top + r.height / 2) - rowY) < 20;
                             });
-                            if (!small.length) return null;
-                            return small.reduce((a, b) =>
+                            if (!cands.length) return null;
+                            const best = cands.reduce((a, b) =>
                                 b.getBoundingClientRect().right >
                                 a.getBoundingClientRect().right ? b : a);
-                        })();
-                        if (!dotEl) return null;
-                        const r = dotEl.getBoundingClientRect();
-                        return {x: r.left + r.width / 2, y: r.top + r.height / 2};
-                    }""")
+                            const r = best.getBoundingClientRect();
+                            return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+                        }""", _row_y)
+                        if _dot_coords:
+                            log_fn(f"[scc-reset] logging_settings: dot via row-Y scan at y={_dot_coords['y']:.0f}")
+                    # Strategy 2: '...' text content (fallback for text-based menus)
+                    if not _dot_coords:
+                        _dot_coords = page.evaluate("""() => {
+                            const el = Array.from(document.querySelectorAll('*')).find(e => {
+                                const t = (e.textContent || '').trim();
+                                const r = e.getBoundingClientRect();
+                                return t === '...' && r.width > 0 && r.height > 0;
+                            });
+                            if (!el) return null;
+                            const r = el.getBoundingClientRect();
+                            return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+                        }""")
+                        if _dot_coords:
+                            log_fn("[scc-reset] logging_settings: dot via '...' text scan")
                     if _dot_coords:
                         page.mouse.click(_dot_coords["x"], _dot_coords["y"])
                         page.wait_for_timeout(800)
                         _three_dot_clicked = True
+                    else:
+                        log_fn("[scc-reset] logging_settings: three-dot not found after hover")
 
                     if not _three_dot_clicked:
                         _persist("logging_settings", "failed",
@@ -3850,13 +3866,16 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                             except Exception:
                                 continue
                         if not _edit_clicked:
-                            # JS coordinate fallback
+                            # JS coordinate fallback — use includes() not === so
+                            # whitespace-padded or compound labels (e.g. " Edit ") still match.
                             _edit_coords = page.evaluate("""() => {
                                 const all = Array.from(document.querySelectorAll('*'));
                                 const el = all.find(e => {
                                     const t = (e.textContent || '').trim();
                                     const r = e.getBoundingClientRect();
-                                    return t === 'Edit' && r.width > 0 && r.height > 0;
+                                    return t.includes('Edit') && !t.includes('Edit rule')
+                                        && r.width > 0 && r.height > 0
+                                        && r.width < 200;
                                 });
                                 if (!el) return null;
                                 const r = el.getBoundingClientRect();
@@ -4773,6 +4792,15 @@ def api_scc_reset_all():
         )
         sys.path.insert(0, str(Path(__file__).parent))
         _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
+
+        # Clear scc_checklist to pending for every POD about to be reset so the
+        # dashboard shows live progress instead of stale results from a prior run.
+        try:
+            with _sq2.connect(db_path) as _c_clear:
+                for _pid in pod_ids:
+                    _c_clear.execute("DELETE FROM scc_checklist WHERE pod_id=?", (_pid,))
+        except Exception as _ce:
+            pass  # non-fatal — worst case we show stale rows until new ones land
 
         for pod_id in pod_ids:
             _scc_reset_all_state["current"] = pod_id
