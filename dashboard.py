@@ -4622,6 +4622,9 @@ def api_ise_scc_complete():
 
 
 _scc_refresh_thread = [None]  # track running refresh thread
+_scc_reset_all_state = {        # track global SCC reset-all progress
+    "running": False, "current": "", "done": 0, "total": 0, "errors": []
+}
 
 
 def _scc_otp_watcher():
@@ -4700,8 +4703,152 @@ def api_scc_manual_reset(pod_id):
         except Exception as _e:
             log(pod_id, f"[scc-reset] Uncaught error: {_e}")
 
+        # ── Sync pipeline_steps so the main pipeline badge goes green ─────────
+        # api_scc_manual_reset runs outside the Docker pipeline container so
+        # report_step() in onboard.py is never called.  After both phases finish,
+        # check scc_checklist: if no failed items, mark the pipeline step completed.
+        try:
+            import sqlite3 as _sq_ps
+            _db_path = str(Path(__file__).parent / "data" / "pod_state.db")
+            with _sq_ps.connect(_db_path) as _c_ps:
+                _failed = _c_ps.execute(
+                    "SELECT COUNT(*) FROM scc_checklist WHERE pod_id=? AND status='failed'",
+                    (pod_id,)
+                ).fetchone()[0]
+                _step_status = "completed" if _failed == 0 else "skipped"
+                _step_result = ("all 13 items OK" if _failed == 0
+                                else f"WARN: {_failed} item(s) failed")
+                _c_ps.execute(
+                    "INSERT OR REPLACE INTO pipeline_steps "
+                    "(pod_id, step_name, status, started_at, completed_at, result) "
+                    "VALUES (?, 'scc_reset_check', ?, "
+                    "COALESCE((SELECT started_at FROM pipeline_steps WHERE pod_id=? AND step_name='scc_reset_check'), datetime('now')), "
+                    "datetime('now'), ?)",
+                    (pod_id, _step_status, pod_id, _step_result)
+                )
+                _c_ps.execute(
+                    "UPDATE pods SET updated_at=datetime('now') WHERE pod_id=?", (pod_id,)
+                )
+            log(pod_id, f"[scc-reset] pipeline_steps.scc_reset_check → {_step_status} ({_step_result})")
+        except Exception as _e:
+            log(pod_id, f"[scc-reset] pipeline_steps update error: {_e}")
+
     threading.Thread(target=_run, daemon=True, name=f"scc-manual-reset-{pod_id}").start()
     return jsonify({"status": "started", "pod_id": pod_id})
+
+
+@app.route("/api/scc/reset-all", methods=["POST"])
+def api_scc_reset_all():
+    """Run the full SCC reset (Phase 1 API + Phase 2 browser) for every active POD
+    that has scc_org configured.  Runs sequentially in a background thread so the
+    browser is never used by two PODs at once.  Progress tracked in _scc_reset_all_state."""
+    global _scc_reset_all_state
+
+    if _scc_reset_all_state["running"]:
+        return jsonify({"status": "already_running",
+                        "message": "Reset-all already in progress — check Live Logs"}), 409
+
+    db_path = str(Path(__file__).parent / "data" / "pod_state.db")
+    try:
+        import sqlite3 as _sq_ra
+        with _sq_ra.connect(db_path) as _c_ra:
+            _c_ra.row_factory = _sq_ra.Row
+            pod_rows = _c_ra.execute(
+                "SELECT pod_id FROM pods WHERE scc_org IS NOT NULL AND scc_org != '' "
+                "ORDER BY pod_id"
+            ).fetchall()
+        pod_ids = [r["pod_id"] for r in pod_rows]
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"DB error: {e}"}), 500
+
+    if not pod_ids:
+        return jsonify({"status": "error",
+                        "message": "No PODs with scc_org configured — run pipeline first"}), 400
+
+    def _run_all():
+        global _scc_reset_all_state
+        import sys, os as _os, importlib, sqlite3 as _sq2
+        _scc_reset_all_state.update(
+            running=True, done=0, total=len(pod_ids), errors=[], current=""
+        )
+        sys.path.insert(0, str(Path(__file__).parent))
+        _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
+
+        for pod_id in pod_ids:
+            _scc_reset_all_state["current"] = pod_id
+            log(pod_id, f"[scc-reset-all] Starting SCC reset for {pod_id} "
+                        f"({_scc_reset_all_state['done'] + 1}/{len(pod_ids)})...")
+
+            # ── Phase 1: API items ────────────────────────────────────────────
+            try:
+                _os.environ["POD_ID"] = pod_id
+                _os.environ["DB_PATH"] = db_path
+                import onboard_router
+                importlib.reload(onboard_router)
+                ok1, res1 = onboard_router.phase_scc_reset_check()
+                log(pod_id, f"[scc-reset-all] {pod_id} Phase 1: {res1}")
+            except Exception as _e1:
+                log(pod_id, f"[scc-reset-all] {pod_id} Phase 1 error: {_e1}")
+
+            # ── Phase 2: browser items ────────────────────────────────────────
+            try:
+                ok2, res2 = _scc_auto_reset_manual(pod_id, lambda m: log(pod_id, m))
+                log(pod_id, f"[scc-reset-all] {pod_id} Phase 2: {res2}")
+            except Exception as _e2:
+                log(pod_id, f"[scc-reset-all] {pod_id} Phase 2 error: {_e2}")
+
+            # ── Sync pipeline_steps ───────────────────────────────────────────
+            try:
+                with _sq2.connect(db_path) as _c2:
+                    _failed = _c2.execute(
+                        "SELECT COUNT(*) FROM scc_checklist WHERE pod_id=? AND status='failed'",
+                        (pod_id,)
+                    ).fetchone()[0]
+                    _step_status = "completed" if _failed == 0 else "skipped"
+                    _step_result = ("all 13 items OK" if _failed == 0
+                                    else f"WARN: {_failed} item(s) failed")
+                    _c2.execute(
+                        "INSERT OR REPLACE INTO pipeline_steps "
+                        "(pod_id, step_name, status, started_at, completed_at, result) "
+                        "VALUES (?, 'scc_reset_check', ?, "
+                        "COALESCE((SELECT started_at FROM pipeline_steps "
+                        "          WHERE pod_id=? AND step_name='scc_reset_check'), datetime('now')), "
+                        "datetime('now'), ?)",
+                        (pod_id, _step_status, pod_id, _step_result)
+                    )
+                    _c2.execute(
+                        "UPDATE pods SET updated_at=datetime('now') WHERE pod_id=?", (pod_id,)
+                    )
+                log(pod_id, f"[scc-reset-all] {pod_id} pipeline_steps → {_step_status}")
+                if _failed > 0:
+                    _scc_reset_all_state["errors"].append(pod_id)
+            except Exception as _e3:
+                log(pod_id, f"[scc-reset-all] {pod_id} pipeline_steps update error: {_e3}")
+                _scc_reset_all_state["errors"].append(pod_id)
+
+            _scc_reset_all_state["done"] += 1
+
+        errs = _scc_reset_all_state["errors"]
+        summary = (f"Reset-all complete: {len(pod_ids)} POD(s) processed"
+                   + (f", {len(errs)} with warnings: {errs}" if errs else " — all clean"))
+        log(pod_ids[0] if pod_ids else "SCC_RESET", f"[scc-reset-all] {summary}")
+        _scc_reset_all_state.update(running=False, current="", done=len(pod_ids))
+
+    threading.Thread(target=_run_all, daemon=True, name="scc-reset-all").start()
+    return jsonify({"status": "started", "total": len(pod_ids), "pod_ids": pod_ids})
+
+
+@app.route("/api/scc/reset-all-status", methods=["GET"])
+def api_scc_reset_all_status():
+    """Return current progress of the reset-all background thread."""
+    return jsonify({
+        "running": _scc_reset_all_state["running"],
+        "current": _scc_reset_all_state["current"],
+        "done":    _scc_reset_all_state["done"],
+        "total":   _scc_reset_all_state["total"],
+        "errors":  _scc_reset_all_state["errors"],
+    })
+
 
 
 # ── Host-side cdFMC pxGrid integration (step 4) ──────────────────────────────
@@ -6997,8 +7144,10 @@ DASHBOARD_HTML = """
      <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
      <button class="btn-start-all" id="btn-docker-down" onclick="dockerDown()" style="background:#ff4757;color:#fff;">&#9632; Teardown All</button>
      <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
-     <button class="btn-start-all" id="btn-scc-refresh-global" onclick="refreshSccSessionsGlobal()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#8635; Refresh SCC Sessions</button>
-     <span id="scc-refresh-global-status" style="font-size:12px;color:#667788;"></span>
+      <button class="btn-start-all" id="btn-scc-refresh-global" onclick="refreshSccSessionsGlobal()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#8635; Refresh SCC Sessions</button>
+      <button class="btn-start-all" id="btn-scc-reset-all" onclick="resetAllSccOrgs()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#9881; Reset All SCC Orgs</button>
+      <span id="scc-reset-all-status" style="font-size:12px;color:#667788;"></span>
+      <span id="scc-refresh-global-status" style="font-size:12px;color:#667788;"></span>
      <span id="docker-status" style="font-size:12px;color:#667788;"></span>
    </div>
 
@@ -10366,6 +10515,73 @@ async function dockerDown() {
 }
 
 let _sccRefreshPoller = null;  // module-level so re-clicks cancel the old poller
+let _sccResetAllPoller = null;
+
+async function resetAllSccOrgs() {
+  const btn    = document.getElementById('btn-scc-reset-all');
+  const status = document.getElementById('scc-reset-all-status');
+  if (!confirm('Run full SCC reset (Phase 1 API + Phase 2 browser) for ALL managed PODs?\n\nThis runs sequentially — allow ~3 min per POD.')) return;
+
+  btn.disabled = true;
+  btn.textContent = '\u23f3 Running...';
+  status.style.color = '#02c8ff';
+  status.textContent = 'Starting...';
+
+  if (_sccResetAllPoller) { clearInterval(_sccResetAllPoller); _sccResetAllPoller = null; }
+
+  const _reset = () => {
+    if (_sccResetAllPoller) { clearInterval(_sccResetAllPoller); _sccResetAllPoller = null; }
+    btn.disabled = false;
+    btn.textContent = '\u2699 Reset All SCC Orgs';
+  };
+
+  try {
+    const r = await fetch('/api/scc/reset-all', { method: 'POST', headers: {'Content-Type':'application/json'} });
+    const d = await r.json();
+    if (d.status === 'already_running') {
+      _reset();
+      status.style.color = '#f0a500';
+      status.textContent = 'Already running — check Live Logs';
+      return;
+    }
+    if (d.status !== 'started') {
+      _reset();
+      status.style.color = '#ff4757';
+      status.textContent = 'Error: ' + (d.message || JSON.stringify(d));
+      return;
+    }
+    const total = d.total || '?';
+    status.textContent = 'Running — 0/' + total + ' PODs done';
+
+    _sccResetAllPoller = setInterval(async () => {
+      try {
+        const sr = await fetch('/api/scc/reset-all-status');
+        const sd = await sr.json();
+        if (!sd.running && sd.done > 0) {
+          clearInterval(_sccResetAllPoller); _sccResetAllPoller = null;
+          _reset();
+          const errs = sd.errors || [];
+          if (errs.length === 0) {
+            status.style.color = '#00e68a';
+            status.textContent = '\u2713 All ' + sd.done + ' POD(s) reset successfully';
+          } else {
+            status.style.color = '#f0a500';
+            status.textContent = '\u26a0 ' + sd.done + ' done, ' + errs.length + ' with warnings: ' + errs.join(', ');
+          }
+        } else if (sd.running) {
+          status.style.color = '#02c8ff';
+          status.textContent = 'Running — ' + sd.done + '/' + sd.total + ' done'
+            + (sd.current ? ' (current: ' + sd.current + ')' : '');
+        }
+      } catch(e) {}
+    }, 4000);
+
+  } catch(e) {
+    _reset();
+    status.style.color = '#ff4757';
+    status.textContent = 'Request failed: ' + e;
+  }
+}
 
 async function refreshSccSessionsGlobal() {
   const btn    = document.getElementById('btn-scc-refresh-global');

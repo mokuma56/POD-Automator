@@ -186,6 +186,102 @@ rebuild needed.
 
 ---
 
+## SCC Reset Architecture — What Was Fixed and Why
+
+### Background: How the SCC Reset Fits Into the Pipeline
+
+The last step of every POD pipeline (`scc_reset_check`, step 21) resets
+the Secure Cloud Control (SCC) tenant back to a clean lab state. It runs
+in two phases:
+
+| Phase | Items | Auth |
+|-------|-------|------|
+| Phase 1 — API | 6 items: access policy rules, network tunnel groups, ZTA profiles, private resources, DNS servers, EPP posture profiles | SA API key + secret (stored in Org Credentials) |
+| Phase 2 — Browser | 7 items: logging settings, RAVPN profiles, DLP rules, RAVPN IP pool, Duo SAML directory, ISE pxGrid, ThousandEyes integration | SCC browser session (`scc_session_POD-N.json`) |
+
+The **Phase 1 API items** work without a browser session — they only need the
+SA API key and secret pre-populated in the Org Credentials tab.
+
+The **Phase 2 browser items** require a live SCC browser session. That session
+is created by running **Refresh SCC Sessions** (`refresh_scc_sessions.py`),
+which opens a Chrome window, logs in to `security.cisco.com`, selects each
+POD's org, and saves a `scc_session_POD-N.json` cookie file per POD.
+
+---
+
+### The Architectural Flaw (and why "refresh before starting" does not work)
+
+`refresh_scc_sessions.py` queries:
+```sql
+SELECT pod_id, scc_org FROM pods WHERE scc_org IS NOT NULL AND scc_org != ''
+```
+
+`scc_org` is only written to the database when `cdfmc_check` (step 19)
+runs and reads it from `terraform.tfvars` on the Ubuntu automation PC.
+
+**Consequence:** if you refresh SCC sessions before the pipeline runs,
+`scc_org` is empty for every new POD → the script finds zero rows → no
+browser window opens → no session files are saved → Phase 2 fails.
+
+**The correct workflow for a fresh POD:**
+
+1. Run the full pipeline. It completes steps 1–20 successfully.
+2. `scc_reset_check` (step 21) runs:
+   - Phase 1 (API): succeeds if Org Credentials are populated.
+   - Phase 2 (browser): fails — no session file yet. The step is marked
+     **Warn** (soft-fail) and the pipeline finishes.
+3. Run **Refresh SCC Sessions** — `scc_org` is now in the DB so the
+   script can select the right org for each POD and save the session files.
+4. Click **↺ Auto-Reset All** (on the SCC card inside the POD detail
+   panel) **or** click **⚙ Reset All SCC Orgs** (global toolbar button)
+   to run the reset again with a valid session.
+5. All 13 items go green. The pipeline step badge turns green automatically.
+
+---
+
+### Bug Fixed: Pipeline Badge Did Not Go Green on Re-run
+
+**Root cause:** The "Auto-Reset All" button (`/api/scc/manual-reset`) ran
+Phase 1 + Phase 2 and updated the `scc_checklist` table — but it never
+updated the `pipeline_steps` table. Only `onboard.py` inside the Docker
+pipeline container updates `pipeline_steps` (via `report_step()`).
+
+**Fix (dashboard.py — `api_scc_manual_reset`):** After both phases finish,
+the endpoint now reads `scc_checklist` for the POD. If zero items have
+`status='failed'`, it writes `pipeline_steps.scc_reset_check = completed`.
+If any items failed, it writes `skipped` (the same orange Warn state as
+before), so the badge accurately reflects the result.
+
+The same logic applies to the new **Reset All SCC Orgs** button.
+
+---
+
+### New Feature: Reset All SCC Orgs Button
+
+**Where:** Global toolbar on the main dashboard, next to **Refresh SCC Sessions**.
+
+**What it does:**
+- Finds every POD in the database that has `scc_org` configured.
+- Runs Phase 1 (API reset) + Phase 2 (browser reset) for each POD,
+  **sequentially** — the browser can only handle one POD at a time.
+- After each POD completes, updates `pipeline_steps.scc_reset_check` so
+  the pipeline badge reflects the result without needing to re-run the
+  full Docker pipeline.
+- Shows live progress in the toolbar: `Running — 2/5 done (current: POD-17)`.
+- On completion: green tick if all clean, amber warning if any POD had failures.
+
+**When to use it:**
+- After running **Refresh SCC Sessions** at the start of a new lab day,
+  use this button to reset all active PODs in one click rather than
+  opening each POD card and clicking Auto-Reset All individually.
+
+**Relevant endpoints:**
+- `POST /api/scc/reset-all` — starts the background job, returns `409` if
+  already running.
+- `GET /api/scc/reset-all-status` — returns `{running, current, done, total, errors}`.
+
+---
+
 ## Pushing to Both Remotes (if applicable)
 
 The repo has two GitHub remotes. Push to both after merging to main:
