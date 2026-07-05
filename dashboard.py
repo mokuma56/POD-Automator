@@ -6441,7 +6441,21 @@ def _delete_all_pod_data(conn, pod_id):
 
 @app.route("/api/delete-pod/<pod_id>", methods=["POST"])
 def delete_pod(pod_id):
-    """Delete a POD and all its data from the DB."""
+    """Delete a POD and all its data from the DB, stopping its Docker containers first."""
+    import subprocess as _sp
+    # Stop containers — best-effort, don't fail if docker not running
+    _proj = pod_id.lower()
+    try:
+        _sp.run(["docker", "compose", "-p", _proj, "down", "-v", "--remove-orphans"],
+                capture_output=True, text=True, timeout=60)
+    except Exception:
+        pass
+    # Force-remove by name in case compose project tracking is stale
+    for _cn in [f"vpn-{pod_id}", f"pipeline-{pod_id}"]:
+        try:
+            _sp.run(["docker", "rm", "-f", _cn], capture_output=True, timeout=10)
+        except Exception:
+            pass
     conn = _db()
     _delete_all_pod_data(conn, pod_id)
     conn.execute("DELETE FROM pods WHERE pod_id=?", (pod_id,))
@@ -6877,21 +6891,73 @@ def vpn_connect_all():
     except Exception as e:
         return jsonify({"status": "error", "output": str(e)[:500]})
 
-@app.route("/api/docker-down", methods=["POST"])
-def docker_down():
-    import subprocess
+@app.route("/api/full-reset", methods=["POST"])
+def full_reset():
+    """Full reset: stop ALL POD containers (including orphans), wipe all session
+    data from the DB, and delete SCC session files.  Leaves a clean slate for
+    the next lab session.  Keeps org_credentials, global_config, knowledge_base,
+    and upgrade_config (persistent config, not session data)."""
+    import subprocess as _sp
+    _steps = []
+
+    # ── 1. Stop containers for every known POD via generate.py --db --down ──────
     try:
-        r = subprocess.run(
+        _r = _sp.run(
             [sys.executable, "docker/generate.py", "--db", "--down"],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=180,
             cwd=os.path.dirname(os.path.abspath(__file__))
         )
-        return jsonify({
-            "status": "ok" if r.returncode == 0 else "error",
-            "output": (r.stdout + r.stderr)[:2000]
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "output": str(e)[:500]})
+        _steps.append(f"compose-down: {'ok' if _r.returncode == 0 else 'err'} "
+                      f"{(_r.stdout + _r.stderr)[:300]}")
+    except Exception as _e:
+        _steps.append(f"compose-down error: {_e}")
+
+    # ── 2. Orphan cleanup: force-remove containers from PODs already deleted ─────
+    for _pat in ["vpn-POD-", "pipeline-POD-"]:
+        try:
+            _ps = _sp.run(
+                ["docker", "ps", "-a", "--format", "{{.Names}}",
+                 f"--filter=name={_pat}"],
+                capture_output=True, text=True, timeout=10
+            )
+            for _cn in [c.strip() for c in _ps.stdout.splitlines() if c.strip()]:
+                _sp.run(["docker", "rm", "-f", _cn], capture_output=True, timeout=10)
+                _steps.append(f"orphan removed: {_cn}")
+        except Exception as _e:
+            _steps.append(f"orphan scan error ({_pat}): {_e}")
+
+    # ── 3. Wipe all session tables (keep org_credentials / global_config /
+    #       knowledge_base / upgrade_config — persistent config) ──────────────────
+    _session_tables = (
+        "pods", "pipeline_steps", "pipeline_logs",
+        "scc_checklist", "fabric_steps", "sda_steps",
+        "duo_steps", "ise_steps",
+    )
+    try:
+        _conn = _db()
+        for _tbl in _session_tables:
+            _conn.execute(f"DELETE FROM {_tbl}")
+        _conn.commit()
+        _conn.close()
+        _steps.append(f"db wiped: {', '.join(_session_tables)}")
+    except Exception as _e:
+        _steps.append(f"db wipe error: {_e}")
+
+    # ── 4. Delete SCC session files ──────────────────────────────────────────────
+    _data_dir = Path(__file__).parent / "data"
+    _removed = []
+    for _sf in _data_dir.glob("scc_session_POD-*.json"):
+        try:
+            _sf.unlink()
+            _removed.append(_sf.name)
+        except Exception:
+            pass
+    if _removed:
+        _steps.append(f"session files deleted: {', '.join(_removed)}")
+
+    return jsonify({"status": "ok",
+                    "message": "Full reset complete — clean slate for next session",
+                    "steps": _steps})
 
 @app.route("/api/docker-status")
 def docker_status():
@@ -7170,7 +7236,7 @@ DASHBOARD_HTML = """
    <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
      <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
      <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
-     <button class="btn-start-all" id="btn-docker-down" onclick="dockerDown()" style="background:#ff4757;color:#fff;">&#9632; Teardown All</button>
+      <button class="btn-start-all" id="btn-full-reset" onclick="fullReset()" style="background:#7f1d1d;border-color:#ef4444;color:#fca5a5;">&#9888; Full Reset</button>
      <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
       <button class="btn-start-all" id="btn-scc-refresh-global" onclick="refreshSccSessionsGlobal()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#8635; Refresh SCC Sessions</button>
       <button class="btn-start-all" id="btn-scc-reset-all" onclick="resetAllSccOrgs()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#9881; Reset All SCC Orgs</button>
@@ -7600,12 +7666,17 @@ async function runPod(podId) {
 }
 
 async function deletePod(podId) {
-  if (!confirm('Delete ' + podId + ' from the dashboard? This cannot be undone.')) return;
+  if (!confirm('Delete ' + podId + '?\\n\\nThis will stop its containers and remove it from the dashboard.')) return;
+  const status = document.getElementById('docker-status');
+  status.textContent = 'Stopping containers for ' + podId + '...';
   const r = await fetch('/api/delete-pod/' + podId, { method: 'POST' });
   const data = await r.json();
   if (data.status === 'ok') {
+    status.textContent = podId + ' deleted';
+    setTimeout(() => status.textContent = '', 4000);
     load();
   } else {
+    status.textContent = '';
     alert('Error: ' + (data.message || 'Unknown error'));
   }
 }
@@ -10526,18 +10597,22 @@ async function connectAllVpn() {
   load();
 }
 
-async function dockerDown() {
-  const btn = document.getElementById('btn-docker-down');
+async function fullReset() {
+  if (!confirm('Full Reset will:\\n\\n  \u2022 Stop ALL containers for every POD\\n  \u2022 Delete ALL PODs from the dashboard\\n  \u2022 Wipe all pipeline, SCC, Duo, ISE, and fabric data\\n  \u2022 Delete all SCC session files\\n\\nThis cannot be undone. Continue?')) return;
+  const confirm2 = prompt('Type RESET to confirm:');
+  if (confirm2 !== 'RESET') { alert('Full reset cancelled.'); return; }
+
+  const btn = document.getElementById('btn-full-reset');
   const status = document.getElementById('docker-status');
   btn.disabled = true;
-  btn.textContent = 'Tearing down...';
-  status.textContent = 'Tearing down Docker stacks...';
+  btn.textContent = 'Resetting...';
+  status.textContent = 'Full reset running — stopping containers and wiping data...';
 
-  const r = await fetch('/api/docker-down', { method: 'POST' });
+  const r = await fetch('/api/full-reset', { method: 'POST' });
   const data = await r.json();
-  status.textContent = data.output.slice(0, 300);
+  status.textContent = data.message || 'Done';
   btn.disabled = false;
-  btn.textContent = '\u25a0 Teardown All';
+  btn.textContent = '\u26A0 Full Reset';
   setTimeout(() => status.textContent = '', 10000);
   load();
 }
