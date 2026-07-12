@@ -305,9 +305,9 @@ def api_pods():
             "access_policy_rules", "network_tunnel_groups",
             "zta_profiles", "private_resources", "dns_servers",
             "epp_posture_profiles",
-            # 7 manual
-            "logging_settings", "ravpn_profiles",
-            "dlp_rules", "ravpn_ip_pool", "duo_saml", "ise_pxgrid", "te_integration",
+             # 6 manual
+             "ravpn_profiles",
+             "dlp_rules", "ravpn_ip_pool", "duo_saml", "ise_pxgrid", "te_integration",
         ]
         try:
             scc_rows = conn.execute(
@@ -1354,7 +1354,7 @@ def api_scc_confirm(pod_id, item_key):
     ALL_ITEMS = {
         "access_policy_rules", "network_tunnel_groups", "zta_profiles",
         "private_resources", "dns_servers", "epp_posture_profiles",
-        "logging_settings", "ravpn_profiles", "dlp_rules",
+        "ravpn_profiles", "dlp_rules",
         "ravpn_ip_pool", "ise_pxgrid", "duo_saml", "te_integration",
     }
     if item_key not in ALL_ITEMS:
@@ -1805,6 +1805,34 @@ def api_ise_run(pod_id):
     if r.returncode != 0 or r.stdout.strip() != "running":
         return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
 
+    # Immediately mark the first step as running so the dashboard reflects the
+    # true state before the container starts (~3-5s lag).
+    # IMPORTANT: only touch rows that are NOT already completed/skipped — never
+    # reset a completed step, as that allows a duplicate run to re-enter it.
+    try:
+        from ise_integrations import ISE_STEPS
+        _c = _db()
+        _now = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        _start_idx = max(0, from_step - 1)  # from_step is 1-indexed; 0 means start from index 0
+        for _i, _s in enumerate(ISE_STEPS):
+            if _i < _start_idx:
+                continue
+            _status = "running" if _i == _start_idx else "pending"
+            # Only INSERT new rows or update rows that are pending/failed/running.
+            # Never overwrite completed or skipped rows.
+            _c.execute("""
+                INSERT INTO ise_steps (pod_id, step_name, status, result, started_at, completed_at)
+                VALUES (?,?,?,?,?,NULL)
+                ON CONFLICT(pod_id, step_name) DO UPDATE SET
+                    status=excluded.status,
+                    started_at=CASE WHEN excluded.status='running' THEN excluded.started_at ELSE started_at END,
+                    completed_at=NULL
+                WHERE ise_steps.status NOT IN ('completed', 'skipped')
+            """, (pod_id, _s, _status, "", _now if _status == "running" else ""))
+        _c.commit(); _c.close()
+    except Exception as _pre_err:
+        log(pod_id, f"[ise] pre-run step init warning: {_pre_err}")
+
     def _run():
         proc = subprocess.Popen([
             "docker", "run", "--rm",
@@ -2249,14 +2277,21 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                     log_fn("[scc-nav] No form inputs yet — on ISE detail page, clicking Connect")
                     for _conn_sel in [
                         'button:has-text("Connect")',
+                        'button:has-text("Integrate")',
                         'a:has-text("Connect")',
+                        'a:has-text("Integrate")',
                     ]:
                         try:
                             btn = page.locator(_conn_sel).first
                             if btn.is_visible(timeout=5000):
                                 btn.click()
+                                page.wait_for_load_state("domcontentloaded", timeout=10000)
                                 page.wait_for_timeout(3000)
                                 log_fn(f"[scc-nav] Clicked Connect on detail page via {_conn_sel!r}")
+                                try:
+                                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_integrate_{pod_id}.png"))
+                                except Exception:
+                                    pass
                                 # Check if integration connected immediately (no form needed)
                                 _post_conn_text = page.inner_text("body").lower()
                                 if "connected" in _post_conn_text:
@@ -3285,7 +3320,9 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                     log_fn(f"[scc-reset] {shot_name}: could not navigate to target page")
                     return "not_found"
                 _shot(shot_name)
-                _body = page.inner_text("body")
+                # Use textContent (not inner_text) — captures collapsed/hidden rows
+                # that inner_text skips due to display:none on accordion items.
+                _body = page.evaluate("() => document.body.textContent") or ""
                 if row_hint.lower() not in _body.lower():
                     return "not_found"
 
@@ -3404,7 +3441,7 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                         if _dlg_cb.count() > 0 and _dlg_cb.is_visible(timeout=1000):
                             if not _dlg_cb.is_checked():
                                 _dlg_cb.click(force=True)
-                                page.wait_for_timeout(500)
+                                page.wait_for_timeout(1500)  # wait for React to enable confirm btn
                                 log_fn(f"[scc-reset] {shot_name}: checked mandatory"
                                        f" confirm-dialog checkbox ({_cb_sel})")
                             break
@@ -3466,7 +3503,13 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 # Never return "deleted" unless we can verify it.
                 page.wait_for_timeout(1500)
                 _shot(f"{shot_name}_after")
-                _body_after = page.inner_text("body").lower()
+                # Reload to get fresh DOM state, then use textContent for hidden rows
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=15000)
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+                _body_after = (page.evaluate("() => document.body.textContent") or "").lower()
                 if row_hint.lower() in _body_after:
                     log_fn(f"[scc-reset] {shot_name}: row still present after delete attempt")
                     return "no_delete_option"
@@ -3723,244 +3766,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("zta_profiles", "failed", f"Browser error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] zta_profiles browser error: {_e}")
 
-            # ── 1. logging_settings ───────────────────────────────────────────
-            log_fn("[scc-reset] 1/7 logging_settings")
-            try:
-                # Navigate directly to Access Policy page
-                _policy_url = _sa_url("/secure/policy/")
-                if not _policy_url:
-                    _persist("logging_settings", "failed", "Could not resolve SA policy URL")
-                    log_fn("[scc-reset] logging_settings: no SA URL")
-                else:
-                    page.goto(_policy_url, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(2000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=8000)
-                    except Exception:
-                        pass
-                    page.wait_for_timeout(1000)
-                    _shot("1_logging")
-
-                    # Wait for Default rules section to render, then scroll
-                    # "For all Internet access" into VIEW CENTER before clicking.
-                    # scroll_into_view_if_needed only scrolls to the edge — the row
-                    # can end up just off-screen. JS scrollIntoView({block:'center'})
-                    # guarantees the row is centred in the viewport before we grab
-                    # coordinates and mouse.click().
-                    try:
-                        page.wait_for_selector('text="Default rules"', timeout=12000)
-                        page.wait_for_timeout(600)
-                    except Exception:
-                        pass
-                    try:
-                        page.get_by_text("For all Internet access").first\
-                            .scroll_into_view_if_needed(timeout=5000)
-                        page.wait_for_timeout(300)
-                    except Exception:
-                        pass
-                    # JS center-scroll — ensures row is fully in viewport
-                    page.evaluate("""() => {
-                        const all = Array.from(document.querySelectorAll('*'));
-                        const el = all.find(e =>
-                            (e.textContent || '').trim() === 'For all Internet access' &&
-                            e.getBoundingClientRect().width > 0
-                        );
-                        if (el) el.scrollIntoView({block: 'center', behavior: 'instant'});
-                    }""")
-                    page.wait_for_timeout(600)
-                    _shot("1_logging")
-
-                    # Click the "..." on the "For all Internet access" row.
-                    # Returns {x, y} of the element centre — we then use
-                    # page.mouse.click() so React synthetic events fire correctly.
-                    _three_dot_clicked = False
-                    # Use Playwright bounding_box() — avoids brittle JS row-walk and
-                    # correctly reflects any remaining scroll offset.
-                    # React hover-reveal requires a real page.mouse.move(); dispatchEvent
-                    # and JS .click() are ignored by React's synthetic event system.
-                    _text_bb = None
-                    try:
-                        _text_el = page.get_by_text("For all Internet access").first
-                        _text_bb = _text_el.bounding_box()
-                    except Exception as _tbe:
-                        log_fn(f"[scc-reset] logging_settings: text element lookup: {_tbe}")
-                    if _text_bb:
-                        _cx = _text_bb["x"] + _text_bb["width"] / 2
-                        _cy = _text_bb["y"] + _text_bb["height"] / 2
-                        page.mouse.move(_cx, _cy)
-                        page.wait_for_timeout(700)
-                        log_fn(f"[scc-reset] logging_settings: hovered at ({_cx:.0f},{_cy:.0f})")
-                    else:
-                        log_fn("[scc-reset] logging_settings: 'For all Internet access' not found")
-                    _shot("1_logging_hover")
-                    _dot_coords = None
-                    # Strategy 1: find rightmost button/role=button near the row's Y.
-                    # Tolerance is tight (±20px) so we don't accidentally hit the row
-                    # above ("For all private access") which is only ~32px away and
-                    # has no "Edit" option — just "View".
-                    if _text_bb:
-                        _row_y = _text_bb["y"] + _text_bb["height"] / 2
-                        log_fn(f"[scc-reset] logging_settings: scanning for dot near y={_row_y:.0f}")
-                        _dot_coords = page.evaluate("""(rowY) => {
-                            const cands = Array.from(document.querySelectorAll(
-                                'button, [role="button"]'
-                            )).filter(el => {
-                                const r = el.getBoundingClientRect();
-                                return r.width > 0 && r.height > 0
-                                    && r.left > window.innerWidth * 0.45
-                                    && Math.abs((r.top + r.height / 2) - rowY) < 20;
-                            });
-                            if (!cands.length) return null;
-                            const best = cands.reduce((a, b) =>
-                                b.getBoundingClientRect().right >
-                                a.getBoundingClientRect().right ? b : a);
-                            const r = best.getBoundingClientRect();
-                            return {x: r.left + r.width / 2, y: r.top + r.height / 2};
-                        }""", _row_y)
-                        if _dot_coords:
-                            log_fn(f"[scc-reset] logging_settings: dot via row-Y scan at y={_dot_coords['y']:.0f}")
-                    # Strategy 2: '...' text content (fallback for text-based menus)
-                    if not _dot_coords:
-                        _dot_coords = page.evaluate("""() => {
-                            const el = Array.from(document.querySelectorAll('*')).find(e => {
-                                const t = (e.textContent || '').trim();
-                                const r = e.getBoundingClientRect();
-                                return t === '...' && r.width > 0 && r.height > 0;
-                            });
-                            if (!el) return null;
-                            const r = el.getBoundingClientRect();
-                            return {x: r.left + r.width / 2, y: r.top + r.height / 2};
-                        }""")
-                        if _dot_coords:
-                            log_fn("[scc-reset] logging_settings: dot via '...' text scan")
-                    if _dot_coords:
-                        page.mouse.click(_dot_coords["x"], _dot_coords["y"])
-                        page.wait_for_timeout(800)
-                        _three_dot_clicked = True
-                    else:
-                        log_fn("[scc-reset] logging_settings: three-dot not found after hover")
-
-                    if not _three_dot_clicked:
-                        _persist("logging_settings", "failed",
-                                 "Could not find three-dot menu on 'For all Internet access' row")
-                        log_fn("[scc-reset] logging_settings: three-dot menu not found")
-                    else:
-                        _shot("1_logging_dotmenu")
-                        # Click "Edit" — try Playwright selectors then JS coordinate click
-                        _edit_clicked = False
-                        for _es in [
-                            '[role="menuitem"]:has-text("Edit")',
-                            '[role="option"]:has-text("Edit")',
-                            'button:has-text("Edit")',
-                            'a:has-text("Edit")',
-                            'li:has-text("Edit")',
-                            'div:has-text("Edit")',
-                        ]:
-                            try:
-                                eb = page.locator(_es).first
-                                if eb.is_visible(timeout=1500):
-                                    eb.click()
-                                    page.wait_for_timeout(2000)
-                                    _edit_clicked = True
-                                    break
-                            except Exception:
-                                continue
-                        if not _edit_clicked:
-                            # JS coordinate fallback — use includes() not === so
-                            # whitespace-padded or compound labels (e.g. " Edit ") still match.
-                            _edit_coords = page.evaluate("""() => {
-                                const all = Array.from(document.querySelectorAll('*'));
-                                const el = all.find(e => {
-                                    const t = (e.textContent || '').trim();
-                                    const r = e.getBoundingClientRect();
-                                    return t.includes('Edit') && !t.includes('Edit rule')
-                                        && r.width > 0 && r.height > 0
-                                        && r.width < 200;
-                                });
-                                if (!el) return null;
-                                const r = el.getBoundingClientRect();
-                                return {x: r.left + r.width/2, y: r.top + r.height/2};
-                            }""")
-                            if _edit_coords:
-                                page.mouse.click(_edit_coords["x"], _edit_coords["y"])
-                                page.wait_for_timeout(2000)
-                                _edit_clicked = True
-
-                        if not _edit_clicked:
-                            _persist("logging_settings", "failed",
-                                     "Edit option not found in three-dot dropdown")
-                            log_fn("[scc-reset] logging_settings: Edit not found in dropdown")
-                        else:
-                            _shot("1_logging_edit")
-                            # Check toggle state: "logging is disabled" means already off
-                            _body_text = page.inner_text("body").lower()
-                            if "logging is disabled" in _body_text:
-                                # Already disabled — cancel out
-                                for _cs in ['button:has-text("Cancel")',
-                                            'button[aria-label*="cancel" i]']:
-                                    try:
-                                        cb = page.locator(_cs).first
-                                        if cb.is_visible(timeout=1500):
-                                            cb.click(); page.wait_for_timeout(500); break
-                                    except Exception:
-                                        continue
-                                _persist("logging_settings", "completed",
-                                         "Logging already disabled ✓")
-                                log_fn("[scc-reset] logging_settings: already disabled ✓")
-                            else:
-                                # Logging is enabled — use mouse.click() on the toggle
-                                # so React synthetic events fire (JS .click() doesn't).
-                                # Do NOT re-click: one click = off, trust it, then Save.
-                                _toggled = False
-                                _tog_coords = page.evaluate("""() => {
-                                    const sels = [
-                                        '[role="switch"]',
-                                        'input[type="checkbox"]',
-                                        'label:has-text("Log") input',
-                                    ];
-                                    for (const s of sels) {
-                                        const el = document.querySelector(s);
-                                        if (el) {
-                                            const r = el.getBoundingClientRect();
-                                            if (r.width > 0 && r.height > 0)
-                                                return {x: r.left + r.width/2,
-                                                        y: r.top + r.height/2};
-                                        }
-                                    }
-                                    return null;
-                                }""")
-                                if _tog_coords:
-                                    page.mouse.click(_tog_coords["x"], _tog_coords["y"])
-                                    page.wait_for_timeout(1000)
-                                    _after = page.inner_text("body").lower()
-                                    _toggled = "logging is disabled" in _after
-                                    log_fn(f"[scc-reset] logging_settings: toggle clicked, disabled={_toggled}")
-                                else:
-                                    log_fn("[scc-reset] logging_settings: toggle element not found")
-                                # Click Save regardless — even if verification uncertain
-                                _save_coords = page.evaluate("""() => {
-                                    const btns = Array.from(document.querySelectorAll('button'));
-                                    const save = btns.find(b =>
-                                        (b.textContent || '').trim() === 'Save' &&
-                                        b.getBoundingClientRect().width > 0);
-                                    if (!save) return null;
-                                    const r = save.getBoundingClientRect();
-                                    return {x: r.left + r.width/2, y: r.top + r.height/2};
-                                }""")
-                                if _save_coords:
-                                    page.mouse.click(_save_coords["x"], _save_coords["y"])
-                                    page.wait_for_timeout(1500)
-                                    log_fn("[scc-reset] logging_settings: Save clicked")
-                                _detail = ("Logging disabled ✓" if _toggled
-                                           else "Save clicked — toggle state uncertain")
-                                _persist("logging_settings", "completed", _detail)
-                                log_fn(f"[scc-reset] logging_settings: {_detail}")
-            except Exception as _e:
-                _persist("logging_settings", "failed", f"Error: {str(_e)[:120]}")
-                log_fn(f"[scc-reset] logging_settings error: {_e}")
-
-            # ── 2. ravpn_profiles ─────────────────────────────────────────────
-            log_fn("[scc-reset] 2/7 ravpn_profiles")
+            # ── 1. ravpn_profiles ─────────────────────────────────────────────
+            log_fn("[scc-reset] 1/6 ravpn_profiles")
             try:
                 # Enter SA first so _sa_url() can extract the org number from the URL
                 _enter_secure_access()
@@ -3985,8 +3792,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("ravpn_profiles", "failed", f"Error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] ravpn_profiles error: {_e}")
 
-            # ── 3. dlp_rules ──────────────────────────────────────────────────
-            log_fn("[scc-reset] 3/7 dlp_rules")
+            # ── 2. dlp_rules ──────────────────────────────────────────────────
+            log_fn("[scc-reset] 2/6 dlp_rules")
             try:
                 # DLP page is at /secure/dlppolicy/ within Secure Access.
                 # Row is named "AI Guardrails". Three-dot menu → "Delete Rule".
@@ -4013,8 +3820,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("dlp_rules", "failed", f"Error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] dlp_rules error: {_e}")
 
-            # ── 4. ravpn_ip_pool ──────────────────────────────────────────────
-            log_fn("[scc-reset] 4/7 ravpn_ip_pool")
+            # ── 3. ravpn_ip_pool ──────────────────────────────────────────────
+            log_fn("[scc-reset] 3/6 ravpn_ip_pool")
             try:
                 # URL: /connect/user-connectivity/vpn → shows "Regions and IP Pools" card
                 # with a "Manage" link.  The "Manage servers" button at top-right ALSO
@@ -4176,8 +3983,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("ravpn_ip_pool", "failed", f"Error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] ravpn_ip_pool error: {_e}")
 
-            # ── 5. duo_saml ───────────────────────────────────────────────────
-            log_fn("[scc-reset] 5/7 duo_saml")
+            # ── 4. duo_saml ───────────────────────────────────────────────────
+            log_fn("[scc-reset] 4/6 duo_saml")
             try:
                 # Page: Configuration Management → Directories section has "Duo [Duo]" accordion;
                 # SSO authentication section has "DuoSSO [SAML]" accordion.
@@ -4208,16 +4015,30 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                         except Exception:
                             pass
                         _shot(f"5_{_profile.lower()}_nav")
-                        # Wait for page to fully render accordion items
-                        try:
-                            page.wait_for_selector('text="Directories"', timeout=5000)
-                        except Exception:
-                            pass
-                        page.wait_for_timeout(500)
-                        _body = page.inner_text("body")
+                        # Poll up to ~15s for React content to render the Directories section.
+                        # domcontentloaded fires early; the accordion items load via API calls
+                        # and may take several seconds to appear in the DOM.
+                        _body = ""
+                        for _pi in range(5):  # 5 × 3s = 15s max
+                            _body = page.evaluate("() => document.body.textContent") or ""
+                            if _profile.lower() in _body.lower():
+                                break
+                            if _pi < 4:
+                                log_fn(f"[scc-reset] {_profile}: waiting for content"
+                                       f" (attempt {_pi+1}/5, {len(_body)} chars so far)...")
+                                page.wait_for_timeout(3000)
                         if _profile.lower() not in _body.lower():
-                            log_fn(f"[scc-reset] {_profile}: not on page — skipping")
-                            continue
+                            # Not found after 15s — distinguish truly-clean vs page-not-rendered
+                            _page_loaded = len(_body) > 500
+                            if _page_loaded:
+                                log_fn(f"[scc-reset] {_profile}: not found after 15s"
+                                       f" ({len(_body)} chars) — already clean")
+                                continue  # truly not there
+                            else:
+                                log_fn(f"[scc-reset] {_profile}: page did not render"
+                                       f" (only {len(_body)} chars) — marking failed")
+                                _failed_saml.append(_profile)
+                                continue
                         # Use JS to find the accordion toggle by its DIRECT text node.
                         # React Router accordions don't respond to Playwright .click() —
                         # use dispatchEvent(MouseEvent) which propagates through React's
@@ -4239,8 +4060,15 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                         #   3. Take the rightmost one (chevron) → page.mouse.click() (trusted)
                         #   4. Fallback: click right edge of the wide row div
                         _excl_acc = "DuoSSO" if _profile == "Duo" else ""
-                        _excl_js  = (f"if (t.startsWith('{_excl_acc}')) continue;"
-                                     if _excl_acc else "")
+                        # Exclude nav sidebar entries: "Duo Security" appears as a nav link
+                        # and matches t.startsWith('Duo '), causing the Y-coord lookup to land
+                        # on the left nav (~x=140) instead of the Directories accordion row.
+                        _excl_js  = (
+                            f"if (t.startsWith('{_excl_acc}') || t === 'Duo Security'"
+                            f" || t.startsWith('Duo Security ')) continue;"
+                            if _excl_acc else
+                            "if (t === 'Duo Security' || t.startsWith('Duo Security ')) continue;"
+                        )
                         _btn_info = page.evaluate(f"""
                             () => {{
                                 // Step 1: Y coord of the profile text node
@@ -4483,27 +4311,22 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                             page.wait_for_load_state("networkidle", timeout=6000)
                         except Exception:
                             pass
-                        _verify_body = page.inner_text("body").lower()
-                        _profile_gone = _profile.lower() not in _verify_body or (
-                            "directories" in _verify_body
-                            and f'"{_profile.lower()}"' not in _verify_body
-                            and _profile.lower() + " duo" not in _verify_body)
-                        # Simpler: check accordion row is gone by looking for edit context
-                        # Reload and see if profile name still appears in Directories section
+                        _verify_body = (page.evaluate("() => document.body.textContent") or "").lower()
+                        _profile_gone = _profile.lower() not in _verify_body
+                        # Refined: check just the Directories section text via parent-walk
                         _dirs_section = ""
                         try:
                             _dirs_el = page.locator('text="Directories"').first
                             if _dirs_el.is_visible(timeout=2000):
-                                # Get text of a parent container of Directories heading
                                 _dirs_section = (_dirs_el.evaluate(
-                                    "el => { let p=el; for(let i=0;i<5;i++){p=p.parentElement;} return p.innerText||''; }"
+                                    "el => { let p=el; for(let i=0;i<5;i++){p=p.parentElement;} return p.textContent||''; }"
                                 ) or "").lower()
                         except Exception:
                             pass
                         _duo_gone_verified = (
                             _profile.lower() not in _dirs_section
                             if _dirs_section
-                            else "configurations" in _verify_body and _profile.lower() not in _verify_body
+                            else _profile_gone
                         )
                         _shot(f"5_{_profile.lower()}_verify")
                         log_fn(f"[scc-reset] {_profile}: post-delete verify gone={_duo_gone_verified}"
@@ -4530,8 +4353,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("duo_saml", "failed", f"Error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] duo_saml error: {_e}")
 
-            # ── 6. ise_pxgrid ─────────────────────────────────────────────────
-            log_fn("[scc-reset] 6/7 ise_pxgrid")
+            # ── 5. ise_pxgrid ─────────────────────────────────────────────────
+            log_fn("[scc-reset] 5/6 ise_pxgrid")
             try:
                 _go(["Platform Management", "Integrations"])
                 page.wait_for_timeout(1000)
@@ -4572,8 +4395,8 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 _persist("ise_pxgrid", "failed", f"Error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] ise_pxgrid error: {_e}")
 
-            # ── 7. te_integration ─────────────────────────────────────────────
-            log_fn("[scc-reset] 7/7 te_integration")
+            # ── 6. te_integration ─────────────────────────────────────────────
+            log_fn("[scc-reset] 6/6 te_integration")
             try:
                 _go(["Experience and Insights", "Account Management"])
                 if "account management" not in page.inner_text("body").lower():
@@ -5036,6 +4859,14 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                 }""")
                 log_fn(f"[cdfmc-nav] State after {label}: portal={state['portalText'][:200]!r} errors={state['errors']} portalErrors={state['portalErrors']}")
 
+            def _otp_error():
+                """Return True if cdFMC is showing an OTP-mismatch / stale-OTP error."""
+                txt = (_fmc_tab.evaluate("""() => {
+                    const p = document.querySelector('#backdraft-fragments');
+                    return p ? p.innerText : '';
+                }""") or "").lower()
+                return "otp was issued for a different application" in txt or "cannot be redeemed" in txt
+
             _submitted = False
 
             # Method 0: regular Playwright click on portal's Create button
@@ -5117,6 +4948,8 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
 
             if not _submitted:
                 _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_create_stuck_{pod_id}.png"))
+                if _otp_error():
+                    return False, "cdFMC Create dialog: OTP was issued for a different application — old pxGrid instance still active; delete it manually in cdFMC and re-run"
                 return False, "cdFMC Create dialog did not close — check cdfmc_create_stuck screenshot"
 
             _fmc_tab.wait_for_timeout(2000)
@@ -5467,6 +5300,18 @@ def _sgt_verify_watcher():
                         continue
                     Path(_trig_file).unlink(missing_ok=True)
                     log(_pod_id, f"[sgt-verify] Watcher picked up SGT trigger for {_pod_id}")
+                    # Mark step as running immediately so dashboard shows progress
+                    _ensure_ise_table()
+                    _dbc = _db()
+                    _dbc.execute(
+                        "INSERT INTO ise_steps (pod_id, step_name, status, result, started_at) "
+                        "VALUES (?,?,?,?,?) ON CONFLICT(pod_id,step_name) DO UPDATE SET "
+                        "status=excluded.status, result=excluded.result, started_at=excluded.started_at",
+                        (_pod_id, "ise_sgt_verify", "running",
+                         "SGT verify in progress — waiting up to 20 min for SGTs to propagate...",
+                         datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+                    )
+                    _dbc.commit(); _dbc.close()
                     _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
                     if not _session_path.exists():
                         _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
@@ -5477,6 +5322,15 @@ def _sgt_verify_watcher():
                         )
                         _res = {"ok": _ok, "message": _msg}
                     log(_pod_id, f"[sgt-verify] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+                    # Update final status in ise_steps
+                    _dbc2 = _db()
+                    _dbc2.execute(
+                        "UPDATE ise_steps SET status=?, result=?, completed_at=? "
+                        "WHERE pod_id=? AND step_name='ise_sgt_verify'",
+                        ("completed" if _res["ok"] else "failed", _res["message"],
+                         datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), _pod_id)
+                    )
+                    _dbc2.commit(); _dbc2.close()
                     _result_path = DATA_DIR / "data" / f"ise_sgt_result_{_pod_id}.json"
                     Path(_result_path).write_text(json.dumps(_res))
                 except Exception as _e:
@@ -8768,8 +8622,6 @@ const SCC_AUTO_ITEMS = [
     desc: 'Secure Access → Resources → DNS Servers. Delete PseudoCo DNS.' },
   { key: 'epp_posture_profiles', label: 'EPP Posture Profile deleted',
     desc: 'Secure Access → Secure → Endpoint Posture Profile. Delete PseudoCo Windows profile.' },
-  { key: 'logging_settings',     label: 'Logging disabled',
-    desc: 'Secure Access → Secure → Access Policy. Edit "For all Internet access" — disable Logging.' },
   { key: 'ravpn_profiles',       label: 'RAVPN Profile deleted',
     desc: 'Secure Access → Connect → End User Connectivity → Virtual Private Network. Delete PseudoCo_RA_VPN_Profile.' },
   { key: 'dlp_rules',            label: 'DLP Policy cleared',
@@ -11084,10 +10936,13 @@ function renderIseGrid(podId, data) {
 }
 
 async function iseRun(podId, fromStep) {
-  // Start the poller immediately — don't wait for the first status fetch.
-  // The Docker container takes a few seconds to update the DB to 'running',
-  // so checking status synchronously right after POST would still show the
-  // old state and the poller would never start.
+  // Disable the Run button immediately to prevent double-clicks triggering
+  // multiple containers. The button re-enables when the poller next renders.
+  const _runBtn = document.getElementById('ise-run-btn');
+  if (_runBtn) { _runBtn.disabled = true; _runBtn.textContent = '⏳ Starting…'; }
+
+  // Start the poller immediately — the server now pre-writes step 1 as
+  // 'running' before the container starts, so the first poll will show it.
   _iseStartPoller(podId);
   await fetch('/api/ise/run/' + podId, {
     method: 'POST',

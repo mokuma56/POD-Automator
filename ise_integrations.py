@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-import random
 import re
 import sqlite3
 import time
@@ -283,7 +282,7 @@ async def _ise_dismiss_session_info(page):
 async def _ise_login(page, log) -> bool:
     """Navigate to ISE admin and log in. Returns True on success."""
     try:
-        await page.goto(f"{ISE_URL}/admin/", wait_until="domcontentloaded", timeout=180000)
+        await page.goto(f"{ISE_URL}/admin/", wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(3000)
 
         # Dismiss pre-login banner ("Accept" button) if present — ISE shows a
@@ -602,7 +601,7 @@ async def _navigate_to_integration_catalog(page, log) -> bool:
     try:
         # Correct hash URL (found from live ISE DOM inspection)
         await page.goto(f"{ISE_URL}/admin/#administration/administration_integration_catalog/integration_catalog",
-                        wait_until="domcontentloaded", timeout=120000)
+                        wait_until="domcontentloaded", timeout=60000)
         try:
             await page.wait_for_selector('button[data-label="More details"]', timeout=30000)
         except Exception:
@@ -1236,7 +1235,23 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             _vis_diag = await page.evaluate("""() => {
                 const reg = document.getElementById('pxCloud_region');
                 const name = document.getElementById('pxCloud_deviceName');
-                const deregBtn = Array.from(document.querySelectorAll('*')).find(el =>
+
+                // Scope Deregister + connected checks to the pxGrid Cloud section only.
+                // Searching the whole page finds Deregister buttons from other ISE features
+                // (e.g. Smart Licensing) causing false-positive skip guard triggers.
+                function pxCloudSection() {
+                    const form = document.getElementById('pxCloudRegistrationForm')
+                               || document.querySelector('[id*="pxCloud"]');
+                    if (!form) return document.body;
+                    let p = form.parentElement;
+                    for (let i = 0; i < 8 && p && p !== document.body; i++) {
+                        p = p.parentElement;
+                    }
+                    return p || document.body;
+                }
+                const pxSection = pxCloudSection();
+
+                const deregBtn = Array.from(pxSection.querySelectorAll('*')).find(el =>
                     el.children.length === 0 && (el.textContent || '').trim() === 'Deregister'
                 );
                 function hiddenAncestor(el) {
@@ -1250,39 +1265,59 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     }
                     return null;
                 }
-                const pageTextLower = document.body.innerText.toLowerCase();
+                const pxSectionText = pxSection.innerText.toLowerCase();
                 return {
                     region_in_dom: !!reg,
                     region_hidden_ancestor: reg ? hiddenAncestor(reg) : 'n/a',
                     name_in_dom: !!name,
                     name_hidden_ancestor: name ? hiddenAncestor(name) : 'n/a',
                     deregister_visible: !!deregBtn,
-                    pxgrid_connected: pageTextLower.includes('connected'),
+                    pxgrid_connected: pxSectionText.includes('connected'),
                     page_text_snippet: document.body.innerText.slice(0, 300).split('\\n').join(' '),
                 };
             }""")
             log(f"Form visibility diag: {_vis_diag}")
 
-            # Skip conditions:
-            # 1. Deregister visible + "connected" in page — fully connected, definitely skip
-            # 2. Deregister visible + org account name (pseudoco-N) in page — registered but
-            #    tunnel still establishing; skip re-registration (would just deregister+re-register
-            #    uselessly and cost another OAuth round-trip)
-            # deregister_visible alone is NOT safe — other services on the same Deployment edit
-            # page have their own Deregister buttons (false positive risk).
-            _org_num_skip = str(creds.get("org_number", "")).strip()
-            _page_has_org = f"pseudoco-{_org_num_skip}" in (_vis_diag or {}).get('page_text_snippet', '').lower() if (_vis_diag and _org_num_skip) else False
-            # Also check full body for org since snippet is only 300 chars
-            if not _page_has_org and _vis_diag and _org_num_skip:
-                try:
-                    _full_pt = (await page.inner_text("body")).lower()
-                    _page_has_org = f"pseudoco-{_org_num_skip}" in _full_pt
-                except Exception:
-                    pass
-            if _vis_diag and _vis_diag.get('deregister_visible') and (_vis_diag.get('pxgrid_connected') or _page_has_org):
-                _reason = "Connected confirmed" if _vis_diag.get('pxgrid_connected') else "org account present (tunnel establishing)"
-                log(f"Deregister + {_reason} — pxGrid Cloud already registered; skipping")
-                return True, f"{_SKIP_PREFIX} pxGrid Cloud already registered (Deregister button present)"
+            # If ISE is already showing Deregister AND page confirms Connected,
+            # registration is complete — skip.  Deregister alone is not enough:
+            # the service can be enabled (Deregister in DOM) without the OAuth
+            # portal registration having completed (no "connected" text).
+            if _vis_diag and _vis_diag.get('deregister_visible') and _vis_diag.get('pxgrid_connected'):
+                log("Deregister button visible + Connected status confirmed — ISE is already registered to pxGrid Cloud")
+                return True, f"{_SKIP_PREFIX} pxGrid Cloud already registered and {_reason} — skipping re-registration"
+            if _vis_diag and _vis_diag.get('deregister_visible') and not _vis_diag.get('pxgrid_connected'):
+                log("Deregister button in DOM but NOT connected — deregistering first for a clean re-registration")
+                _dreg_result = await page.evaluate("""() => {
+                    for (const el of document.querySelectorAll('button, input[type="button"]')) {
+                        if ((el.textContent || el.value || '').trim() === 'Deregister') {
+                            el.click(); return 'clicked:' + (el.id || el.className || 'btn');
+                        }
+                    }
+                    return null;
+                }""")
+                log(f"Deregister click: {_dreg_result}")
+                await page.wait_for_timeout(2000)
+                for _csel in ['button:has-text("Yes")', 'button:has-text("OK")', 'button:has-text("Confirm")']:
+                    try:
+                        if await page.locator(_csel).first.is_visible(timeout=2000):
+                            await page.locator(_csel).first.click()
+                            log(f"Confirmed deregister dialog: {_csel}")
+                            await page.wait_for_timeout(1000)
+                            break
+                    except Exception:
+                        pass
+                _sv_dreg = await page.evaluate("""() => {
+                    if (typeof dijit !== 'undefined') {
+                        const w = dijit.registry.toArray().find(w => (w.label||'').trim()==='Save');
+                        if (w) { w.onClick(); return 'dijit:' + w.id; }
+                    }
+                    return null;
+                }""")
+                log(f"Save after deregister: {_sv_dreg}")
+                await page.wait_for_timeout(4000)
+                await page.reload()
+                await page.wait_for_timeout(5000)
+                log("Deregistered + reloaded — proceeding with fresh registration")
 
             # If region field is hidden, try to reveal it by scrolling to it directly
             if _vis_diag and _vis_diag.get('region_hidden_ancestor'):
@@ -1862,16 +1897,8 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 if _attempt % 3 == 2:
                     await page.screenshot(path=f"/pipeline/host-data/ise_pxgrid_poll_{_attempt + 1}.png", full_page=False)
 
-            # Timed out — check if registration itself succeeded (Deregister button present
-            # AND our org account visible).  "could not connect" is a transient
-            # post-registration state; the pxGrid Cloud tunnel may establish asynchronously.
-            # Registration with Cisco DNA Portal = sufficient for step 2 to proceed.
+            # Timed out after 3 min
             await page.screenshot(path="/pipeline/host-data/ise_pxgrid_register_final.png", full_page=True)
-            _final_pt = (await page.inner_text("body")).lower()
-            _registered_ok = ("deregister" in _final_pt and f"pseudoco-{org_number}" in _final_pt)
-            if _registered_ok:
-                log("Poll timed out but Deregister + org account confirm ISE registered with Cisco DNA Portal — continuing")
-                return True, f"pxGrid Cloud registered (PseudoCo-{org_number}); tunnel establishing asynchronously"
             return False, "pxGrid Cloud registration saved but ISE not connected after 3 min — check ise_pxgrid_register_final.png"
 
         except Exception as e:
@@ -2020,20 +2047,34 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                 await more_btns.first.click(timeout=10000, force=True)
                 _fmc_nav_ok = True
             else:
-                # Available tiles empty — FMC already activated.
-                # Look for it in the "Activated integrations" table (link text).
+                # Available tiles empty — all integrations already activated.
+                # FMC appears in the "Activated integrations" table as a clickable
+                # link — same pattern as step 3 uses for Cisco Security Cloud.
+                # Wait for the table to render before searching (up to 20s).
+                log("Available catalog empty — waiting for Activated integrations table to render...")
+                try:
+                    await page.wait_for_selector(
+                        ':text("Firewall Management Center")', timeout=20000)
+                except Exception:
+                    pass
+
                 _body = (await page.inner_text("body")).lower()
-                log(f"Available catalog empty (body snippet: {_body[:120]!r})")
+                log(f"Available catalog empty (body snippet: {_body[:200]!r})")
+
                 for fmc_sel in [
+                    'a:has-text("Firewall Management Center")',
+                    'td:has-text("Firewall Management Center") a',
                     ':text("Firewall Management Center")',
-                    ':text("Cisco Firepower")',
+                    'a:has-text("Cisco Secure Firewall Management Center")',
+                    ':text("Cisco Secure Firewall Management Center")',
                     'a:has-text("Firewall")',
-                    ':text("FMC")',
+                    ':text("Cisco Firepower")',
                 ]:
                     try:
                         el = page.locator(fmc_sel).first
-                        if await el.is_visible(timeout=3000):
-                            await el.click()
+                        if await el.is_visible(timeout=5000):
+                            await el.scroll_into_view_if_needed()
+                            await el.click(timeout=10000)
                             log(f"Clicked FMC in Activated integrations via {fmc_sel!r}")
                             _fmc_nav_ok = True
                             await page.wait_for_timeout(2000)
@@ -2042,7 +2083,6 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                         continue
 
                 if not _fmc_nav_ok:
-                    # ISE can't reach catalog at all — soft-fail
                     await page.screenshot(path="/pipeline/host-data/ise_cdfmc_no_fmc.png", full_page=True)
                     return True, f"{_SKIP_PREFIX} FMC not found in catalog (ISE error/no internet) — cdFMC integration skipped"
 
@@ -2059,6 +2099,65 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
 
             # Check page state
             page_text = (await page.inner_text("body")).lower()
+
+            # ── If already Active → Deactivate first to get a fresh OTP ────────
+            # An existing active instance causes cdFMC to reject the new OTP with
+            # "OTP was issued for a different application". Deactivating here ensures
+            # ISE issues a clean OTP tied to the new cdFMC instance name.
+            try:
+                _deact_vis = await page.locator('button:has-text("Deactivate")').first.is_visible(timeout=3000)
+            except Exception:
+                _deact_vis = False
+            if _deact_vis:
+                log("FMC → cdFMC integration already Active — deactivating first to obtain a fresh OTP...")
+                _da_found = False
+                for _da_sel in ['button:has-text("Deactivate")', 'a:has-text("Deactivate")', ':text("Deactivate")']:
+                    try:
+                        _da_btn = page.locator(_da_sel).first
+                        if await _da_btn.is_visible(timeout=5000):
+                            await _da_btn.scroll_into_view_if_needed()
+                            await _da_btn.click(force=True)
+                            _da_found = True
+                            log(f"Clicked Deactivate via: {_da_sel}")
+                            break
+                    except Exception:
+                        continue
+                if not _da_found:
+                    _js_da = await page.evaluate("""() => {
+                        const el = Array.from(document.querySelectorAll('button, a, span'))
+                            .find(e => e.innerText && e.innerText.trim() === 'Deactivate');
+                        if (el) { el.click(); return el.tagName; }
+                        return null;
+                    }""")
+                    if _js_da:
+                        log(f"JS Deactivate fallback: {_js_da}")
+                    else:
+                        log("WARNING: Deactivate button not found — proceeding anyway")
+                # Confirm deactivation dialog if one appears
+                await page.wait_for_timeout(1500)
+                for _conf_sel in ['button:has-text("Deactivate App")', 'button:has-text("Deactivate")',
+                                   'button:has-text("Yes")', 'button:has-text("OK")']:
+                    try:
+                        _c = page.locator(_conf_sel).first
+                        if await _c.is_visible(timeout=3000):
+                            await _c.click()
+                            log(f"Confirmed deactivation dialog via {_conf_sel!r}")
+                            break
+                    except Exception:
+                        continue
+                # Wait for Inactive state (page must transition before we can Activate)
+                log("Waiting for Inactive status / Existing instances radio (post-deactivate)...")
+                for _ws in ['text=Inactive', 'text=Existing instances', 'input[type="radio"]']:
+                    try:
+                        await page.wait_for_selector(_ws, timeout=20000)
+                        log(f"Post-deactivate transition confirmed via {_ws!r} ✓")
+                        break
+                    except Exception:
+                        continue
+                log("Waiting 5s for ISE to fully settle post-deactivate...")
+                await page.wait_for_timeout(5000)
+                await page.screenshot(path="/pipeline/host-data/ise_cdfmc_post_deactivate.png", full_page=True)
+                log("Post-deactivate screenshot: ise_cdfmc_post_deactivate.png")
 
             # Check if pxGrid Cloud not yet enabled
             if "enable pxgrid cloud and register" in page_text:
@@ -2196,8 +2295,7 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
             # Docker VPN breaks Okta silent-renew — same as step 2.
             # Hand off OTP to host dashboard via file IPC; host navigates SCC
             # to find cdFMC management UI and submits the OTP.
-            _suffix = datetime.datetime.now().strftime("%m%d") + str(random.randint(100, 999))
-            instance_name = f"ISE-FMC-{pod_id}-{_suffix}"
+            instance_name = f"ISE-FMC-POD-{pod_id}"
             _ipc_ok, _ipc_msg = _scc_file_ipc_cdfmc(pod_id, otp_token, instance_name, log)
             if not _ipc_ok:
                 return False, _ipc_msg
@@ -2261,8 +2359,7 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
             except Exception:
                 pass
 
-            _suffix = datetime.datetime.now().strftime("%m%d") + str(random.randint(100, 999))
-            instance_name = f"ISE-FMC-{pod_id}-{_suffix}"
+            instance_name = f"ISE-FMC-POD-{pod_id}"
             log("Creating pxGrid Application Instance")
             await fmc_page.locator('button:has-text("Create pxGrid Application Instance")').first.click(timeout=10000)
             await fmc_page.wait_for_timeout(2000)
