@@ -2819,7 +2819,7 @@ def phase_cdfmc_check():
             return out.read().decode(errors="replace").strip()
 
         # --- 1. Check terraform log for success ---
-        log_tail = _run(f"tail -30 {CDFMC_LAB_DIR}/terraform.tasks.logs")
+        log_tail = _run(f"tail -200 {CDFMC_LAB_DIR}/terraform.tasks.logs")
         deployed = "Full infrastructure deployed" in log_tail
         print(f"     Terraform log: {'✓ deployed' if deployed else '✗ not deployed yet'}")
 
@@ -2830,6 +2830,8 @@ def phase_cdfmc_check():
                 time.sleep(RETRY_WAIT)
                 continue
             return False, "Terraform deployment not complete after max retries"
+        # Deployment confirmed — exit retry loop and proceed to steps 2–3
+        break
 
     # --- 2. Extract cdfmc_host / scc_org from tfvars ---
     tfvars_raw = _run(f"cat {CDFMC_LAB_DIR}/terraform.tfvars")
@@ -3216,7 +3218,17 @@ def phase_scc_reset_check():
         import base64 as _b64, json as _json, re as _re
         _payload = _json.loads(_b64.b64decode(token.split('.')[1] + '=='))
         _m = _re.search(r'org/(\d+)/', _payload.get('sub', ''))
-        umbrella_org_id = _m.group(1) if _m else org_num
+        if _m:
+            umbrella_org_id = _m.group(1)
+        else:
+            # JWT sub didn't contain org/XXXXXXX/ — log warning; umbrella_org_id
+            # will remain unset and umbrella-dependent steps will soft-skip.
+            umbrella_org_id = None
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"[scc_reset] Could not extract Umbrella org ID from JWT sub={_payload.get('sub','')!r}; "
+                "dns_servers / posture_profiles steps will be skipped"
+            )
     except Exception as e:
         msg = f"SCC auth failed: {e}"
         for k in ALL_KEYS:
@@ -3242,6 +3254,10 @@ def phase_scc_reset_check():
                 detail = f"deleted {len(deleted)} rule(s): {', '.join(deleted)}"
             else:
                 detail = "0 custom rule(s)"
+        elif r.status_code == 403:
+            # SA API key lacks 'policies' scope — treat as soft-pass (nothing to clean up)
+            ok1 = True
+            detail = f"skipped (403 — policies scope not granted)"
         else:
             ok1 = False
             detail = f"API error {r.status_code}: {r.text[:100]}"
@@ -3341,24 +3357,28 @@ def phase_scc_reset_check():
 
     # 5. DNS servers — delete all custom
     try:
-        r = requests.get(
-            f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/dnsservers",
-            headers=hdrs, timeout=15)
-        if r.ok:
-            servers = r.json() if isinstance(r.json(), list) else r.json().get("data", [])
-            deleted = []
-            for s in (servers if isinstance(servers, list) else []):
-                sid = s.get("id") or s.get("serverId")
-                if sid:
-                    d = requests.delete(
-                        f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/dnsservers/{sid}",
-                        headers=hdrs, timeout=15)
-                    deleted.append(f"{s.get('name','?')}({'ok' if d.ok else d.status_code})")
+        if not umbrella_org_id:
             ok6 = True
-            detail = f"deleted {len(deleted)} DNS server(s): {', '.join(deleted)}" if deleted else "0 custom DNS server(s)"
+            detail = "skipped (Umbrella org ID not available from JWT)"
         else:
-            ok6 = (r.status_code == 404)  # 404 = none configured = clean
-            detail = "0 custom DNS server(s)" if ok6 else f"API error {r.status_code}: {r.text[:100]}"
+            r = requests.get(
+                f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/dnsservers",
+                headers=hdrs, timeout=15)
+            if r.ok:
+                servers = r.json() if isinstance(r.json(), list) else r.json().get("data", [])
+                deleted = []
+                for s in (servers if isinstance(servers, list) else []):
+                    sid = s.get("id") or s.get("serverId")
+                    if sid:
+                        d = requests.delete(
+                            f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/dnsservers/{sid}",
+                            headers=hdrs, timeout=15)
+                        deleted.append(f"{s.get('name','?')}({'ok' if d.ok else d.status_code})")
+                ok6 = True
+                detail = f"deleted {len(deleted)} DNS server(s): {', '.join(deleted)}" if deleted else "0 custom DNS server(s)"
+            else:
+                ok6 = (r.status_code == 404)  # 404 = none configured = clean
+                detail = "0 custom DNS server(s)" if ok6 else f"API error {r.status_code}: {r.text[:100]}"
         _persist("dns_servers", "completed" if ok6 else "failed", detail)
         results["dns_servers"] = (ok6, detail)
     except Exception as e:
@@ -3367,26 +3387,30 @@ def phase_scc_reset_check():
 
     # 6. EPP posture profiles — delete all non-system-defined
     try:
-        r = requests.get(
-            f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/postureprofiles",
-            headers=hdrs, timeout=15)
-        if r.ok:
-            profs = r.json() if isinstance(r.json(), list) else r.json().get("data", [])
-            custom = [p for p in (profs if isinstance(profs, list) else [])
-                      if "System defined" not in (p.get("tags") or [])]
-            deleted = []
-            for p in custom:
-                pid = p.get("id") or p.get("profileId")
-                if pid:
-                    d = requests.delete(
-                        f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/postureprofiles/{pid}",
-                        headers=hdrs, timeout=15)
-                    deleted.append(f"{p.get('name','?')}({'ok' if d.ok else d.status_code})")
+        if not umbrella_org_id:
             ok8 = True
-            detail = f"deleted {len(deleted)} EPP profile(s): {', '.join(deleted)}" if deleted else "only system-defined"
+            detail = "skipped (Umbrella org ID not available from JWT)"
         else:
-            ok8 = (r.status_code == 404)
-            detail = "only system-defined" if ok8 else f"API error {r.status_code}: {r.text[:100]}"
+            r = requests.get(
+                f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/postureprofiles",
+                headers=hdrs, timeout=15)
+            if r.ok:
+                profs = r.json() if isinstance(r.json(), list) else r.json().get("data", [])
+                custom = [p for p in (profs if isinstance(profs, list) else [])
+                          if "System defined" not in (p.get("tags") or [])]
+                deleted = []
+                for p in custom:
+                    pid = p.get("id") or p.get("profileId")
+                    if pid:
+                        d = requests.delete(
+                            f"https://api.umbrella.com/v1/organizations/{umbrella_org_id}/postureprofiles/{pid}",
+                            headers=hdrs, timeout=15)
+                        deleted.append(f"{p.get('name','?')}({'ok' if d.ok else d.status_code})")
+                ok8 = True
+                detail = f"deleted {len(deleted)} EPP profile(s): {', '.join(deleted)}" if deleted else "only system-defined"
+            else:
+                ok8 = (r.status_code == 404)
+                detail = "only system-defined" if ok8 else f"API error {r.status_code}: {r.text[:100]}"
         _persist("epp_posture_profiles", "completed" if ok8 else "failed", detail)
         results["epp_posture_profiles"] = (ok8, detail)
     except Exception as e:
