@@ -4018,25 +4018,41 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                         # Poll up to ~15s for React content to render the Directories section.
                         # domcontentloaded fires early; the accordion items load via API calls
                         # and may take several seconds to appear in the DOM.
+                        # IMPORTANT: check the Directories SECTION text only, not the full body.
+                        # The left nav always contains "Duo Security" which causes a false match
+                        # on the full body even when the Directories section is completely empty.
                         _body = ""
+                        _dirs_text = ""
                         for _pi in range(5):  # 5 × 3s = 15s max
                             _body = page.evaluate("() => document.body.textContent") or ""
-                            if _profile.lower() in _body.lower():
+                            # Scoped check: walk up 5 levels from the "Directories" heading
+                            try:
+                                _dirs_el = page.locator('text="Directories"').first
+                                if _dirs_el.is_visible(timeout=1000):
+                                    _dirs_text = (_dirs_el.evaluate(
+                                        "el => { let p=el; for(let i=0;i<5;i++){p=p.parentElement;} return p.textContent||''; }"
+                                    ) or "").lower()
+                            except Exception:
+                                _dirs_text = ""
+                            # Use scoped text if available, fall back to full body
+                            _search_text = _dirs_text if _dirs_text else _body.lower()
+                            if _profile.lower() in _search_text:
                                 break
                             if _pi < 4:
                                 log_fn(f"[scc-reset] {_profile}: waiting for content"
                                        f" (attempt {_pi+1}/5, {len(_body)} chars so far)...")
                                 page.wait_for_timeout(3000)
-                        if _profile.lower() not in _body.lower():
+                        _search_text = _dirs_text if _dirs_text else _body.lower()
+                        if _profile.lower() not in _search_text:
                             # Not found after 15s — distinguish truly-clean vs page-not-rendered
                             _page_loaded = len(_body) > 500
                             if _page_loaded:
-                                log_fn(f"[scc-reset] {_profile}: not found after 15s"
-                                       f" ({len(_body)} chars) — already clean")
+                                log_fn(f"[scc-reset] {_profile}: not found in Directories section"
+                                       f" after 15s ({len(_body)} chars body) — already clean")
                                 continue  # truly not there
                             else:
                                 log_fn(f"[scc-reset] {_profile}: page did not render"
-                                       f" (only {len(_body)} chars) — marking failed")
+                                        f" (only {len(_body)} chars) — marking failed")
                                 _failed_saml.append(_profile)
                                 continue
                         # Use JS to find the accordion toggle by its DIRECT text node.
@@ -6320,7 +6336,16 @@ def delete_pod(pod_id):
 
 @app.route("/api/reset-pipeline/<pod_id>", methods=["POST"])
 def reset_pipeline(pod_id):
-    """Reset all pipeline steps and session data so the pipeline can be re-run fresh."""
+    """Reset all pipeline steps and session data so the pipeline can be re-run fresh.
+    Also stops the pipeline container so Run All launches a clean new one."""
+    # Stop the pipeline container if it's running
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", f"pipeline-{pod_id}"],
+            capture_output=True, timeout=15
+        )
+    except Exception:
+        pass
     conn = _db()
     _delete_all_pod_data(conn, pod_id)
     conn.execute("""UPDATE pods SET status='pending', sdwan_online='', notes='',
@@ -7451,11 +7476,30 @@ function updateSortHeaders() {
   icon.textContent = statusSortDir === 'asc' ? '↑' : statusSortDir === 'desc' ? '↓' : '⇅';
 }
 
+const _rowCache = {};  // podId -> last rendered HTML string
+const _stepCache = {};  // podId+stepName -> last rendered HTML string
+
 function renderTable(pods) {
   // Apply current sort
   const sorted = sortPods([...pods]);
   const tbody = document.getElementById('pod-rows');
-  tbody.innerHTML = sorted.map(p => {
+
+  // ── Diff-based update — only replace rows that actually changed ──────────
+  // This prevents the entire table from flashing/jumping every 5s when
+  // multiple pipelines are running simultaneously.
+
+  // Build a set of pod_ids in the new data
+  const newIds = sorted.map(p => p.pod_id);
+
+  // Remove rows for pods no longer present
+  Array.from(tbody.querySelectorAll('tr[data-pod-id]')).forEach(tr => {
+    if (!newIds.includes(tr.dataset.podId)) {
+      tr.remove();
+      delete _rowCache[tr.dataset.podId];
+    }
+  });
+
+  sorted.forEach((p, idx) => {
     const pipe = pipelinePhase(p);
     const serial = p.router_serial || '-';
     const barColor = pipe.state === 'done' ? '#00e68a'
@@ -7477,7 +7521,8 @@ function renderTable(pods) {
       : hasWarn && p.sdwan_online === 'yes' ? '<span class="badge warn">WARN</span>'
       : p.sdwan_online === 'yes'            ? '<span class="badge running">Partial</span>'
       : '<span class="badge pending">Pending</span>';
-    return `<tr>
+
+    const newHtml = `<tr data-pod-id="${p.pod_id}">
       <td class="pod-id" onclick="showPipeline('${p.pod_id}')">
         ${p.pod_number ? '<span style="color:#00bceb;font-weight:700">POD-' + p.pod_number + '</span><br><span style="color:#445566;font-size:10px">ID:' + p.pod_id.replace('POD-','') + '</span>' : p.pod_id}
       </td>
@@ -7499,7 +7544,32 @@ function renderTable(pods) {
       </td>
       <td class="notes" title="${(p.notes||'').replace(/"/g,'&quot;')}">${p.notes || '-'}</td>
     </tr>`;
-  }).join('');
+
+    // Only update this row if its content changed (skip if identical to avoid DOM thrash)
+    const existing = tbody.querySelector('tr[data-pod-id="' + p.pod_id + '"]');
+    if (!existing) {
+      // New row — insert at correct sorted position
+      const refRow = tbody.querySelectorAll('tr[data-pod-id]')[idx];
+      const tmp = document.createElement('tbody');
+      tmp.innerHTML = newHtml;
+      const newTr = tmp.firstElementChild;
+      if (refRow) tbody.insertBefore(newTr, refRow);
+      else tbody.appendChild(newTr);
+      _rowCache[p.pod_id] = newHtml;
+    } else if (_rowCache[p.pod_id] !== newHtml) {
+      // Row changed — only replace if the user isn't focused inside this row
+      const active = document.activeElement;
+      if (active && existing.contains(active)) {
+        // User is typing in this row — skip update to avoid losing focus
+        return;
+      }
+      const tmp = document.createElement('tbody');
+      tmp.innerHTML = newHtml;
+      tbody.replaceChild(tmp.firstElementChild, existing);
+      _rowCache[p.pod_id] = newHtml;
+    }
+    // else: identical — no DOM update needed
+  });
 }
 
 async function runPod(podId) {
@@ -7714,42 +7784,89 @@ async function loadSteps(podId) {
   const CTRL_MODE_EST_SECS = 540;
 
   const grid = document.getElementById('pipeline-grid');
-  grid.innerHTML = PIPELINE_ORDER.map(name => {
-    const step = steps.find(s => s.step_name === name);
-    const st = step ? step.status : 'pending';
-    const result = step && step.result ? step.result.slice(0, 60) : '';
-    const idx = PIPELINE_ORDER.indexOf(name) + 1;
-    const label = name.replace(/_/g, ' ');
-    const duration = formatDur(step?.started_at, step?.completed_at);
-    const durHtml = duration ? '<div class="step-dur">' + duration + '</div>' : '';
-    const cardBorder = st === 'skipped' || (SOFT_FAIL_STEPS.has(name) && st === 'completed' && result && result.includes('FAIL')) ? 'border-left:3px solid #ffa502;' : st === 'failed' ? 'border-left:3px solid #ff4757;' : '';
+  const switchingPod = grid._podId !== podId;
 
-    // Live elapsed + progress bar for controller_mode_enable while running
-    let rebootHtml = '';
-    if (name === 'controller_mode_enable' && st === 'running' && step?.started_at) {
-      const elapsedSec = Math.floor((Date.now() - new Date(step.started_at + 'Z').getTime()) / 1000);
-      const pct = Math.min(99, Math.round(elapsedSec / CTRL_MODE_EST_SECS * 100));
-      const remaining = Math.max(0, CTRL_MODE_EST_SECS - elapsedSec);
-      const remStr = remaining > 0 ? '~' + Math.ceil(remaining / 60) + 'm remaining' : 'any moment now...';
-      const elStr = elapsedSec >= 60
-        ? Math.floor(elapsedSec/60) + 'm ' + (elapsedSec%60) + 's elapsed'
-        : elapsedSec + 's elapsed';
-      rebootHtml =
-        '<div class="step-dur" style="color:#ffa502">' + elStr + '</div>' +
-        '<div class="step-reboot-bar-bg"><div class="step-reboot-bar-fill" style="width:' + pct + '%"></div></div>' +
-        '<div class="step-reboot-eta">' + pct + '% &mdash; ' + remStr + '</div>';
-    }
-
-    return '<div class="step-card" style="' + cardBorder + '">' +
-      '<div class="step-num">Phase ' + idx + '/' + total + '</div>' +
-      '<div class="step-name">' + label + '</div>' +
-      pipelineBadge(st, step?.result || '', name) +
-      '<div class="step-result">' + result + '</div>' +
-      durHtml +
-      rebootHtml +
-      '<span class="started-at" data-time="' + (step?.started_at || '') + '" style="display:none"></span>' +
-      '</div>';
-  }).join('');
+  // If switching to a different POD, replace all at once (no diff cascade)
+  // If same POD, diff-update only changed cards to avoid flashing
+  if (switchingPod) {
+    grid.innerHTML = PIPELINE_ORDER.map((name, i) => {
+      const step = steps.find(s => s.step_name === name);
+      const st = step ? step.status : 'pending';
+      const result = step && step.result ? step.result.slice(0, 60) : '';
+      const idx = i + 1;
+      const label = name.replace(/_/g, ' ');
+      const duration = formatDur(step?.started_at, step?.completed_at);
+      const durHtml = duration ? '<div class="step-dur">' + duration + '</div>' : '';
+      const cardBorder = st === 'skipped' || (SOFT_FAIL_STEPS.has(name) && st === 'completed' && result && result.includes('FAIL')) ? 'border-left:3px solid #ffa502;' : st === 'failed' ? 'border-left:3px solid #ff4757;' : '';
+      let rebootHtml = '';
+      if (name === 'controller_mode_enable' && st === 'running' && step?.started_at) {
+        const elapsedSec = Math.floor((Date.now() - new Date(step.started_at + 'Z').getTime()) / 1000);
+        const pct = Math.min(99, Math.round(elapsedSec / CTRL_MODE_EST_SECS * 100));
+        const remaining = Math.max(0, CTRL_MODE_EST_SECS - elapsedSec);
+        const remStr = remaining > 0 ? '~' + Math.ceil(remaining / 60) + 'm remaining' : 'any moment now...';
+        const elStr = elapsedSec >= 60 ? Math.floor(elapsedSec/60) + 'm ' + (elapsedSec%60) + 's elapsed' : elapsedSec + 's elapsed';
+        rebootHtml = '<div class="step-dur" style="color:#ffa502">' + elStr + '</div>' +
+          '<div class="step-reboot-bar-bg"><div class="step-reboot-bar-fill" style="width:' + pct + '%"></div></div>' +
+          '<div class="step-reboot-eta">' + pct + '% &mdash; ' + remStr + '</div>';
+      }
+      return '<div class="step-card" style="' + cardBorder + '">' +
+        '<div class="step-num">Phase ' + idx + '/' + total + '</div>' +
+        '<div class="step-name">' + label + '</div>' +
+        pipelineBadge(st, step?.result || '', name) +
+        '<div class="step-result">' + result + '</div>' +
+        durHtml + rebootHtml +
+        '<span class="started-at" data-time="' + (step?.started_at || '') + '" style="display:none"></span>' +
+        '</div>';
+    }).join('');
+    grid._podId = podId;
+    // Clear step cache for old POD — stale keys would block updates on next view
+    Object.keys(_stepCache).forEach(k => { if (!k.startsWith(podId + '|')) delete _stepCache[k]; });
+  } else {
+    // Same POD — diff-update only cards that changed to avoid flashing
+    PIPELINE_ORDER.forEach((name, i) => {
+      const step = steps.find(s => s.step_name === name);
+      const st = step ? step.status : 'pending';
+      const result = step && step.result ? step.result.slice(0, 60) : '';
+      const idx = i + 1;
+      const label = name.replace(/_/g, ' ');
+      const duration = formatDur(step?.started_at, step?.completed_at);
+      const durHtml = duration ? '<div class="step-dur">' + duration + '</div>' : '';
+      const cardBorder = st === 'skipped' || (SOFT_FAIL_STEPS.has(name) && st === 'completed' && result && result.includes('FAIL')) ? 'border-left:3px solid #ffa502;' : st === 'failed' ? 'border-left:3px solid #ff4757;' : '';
+      let rebootHtml = '';
+      if (name === 'controller_mode_enable' && st === 'running' && step?.started_at) {
+        const elapsedSec = Math.floor((Date.now() - new Date(step.started_at + 'Z').getTime()) / 1000);
+        const pct = Math.min(99, Math.round(elapsedSec / CTRL_MODE_EST_SECS * 100));
+        const remaining = Math.max(0, CTRL_MODE_EST_SECS - elapsedSec);
+        const remStr = remaining > 0 ? '~' + Math.ceil(remaining / 60) + 'm remaining' : 'any moment now...';
+        const elStr = elapsedSec >= 60 ? Math.floor(elapsedSec/60) + 'm ' + (elapsedSec%60) + 's elapsed' : elapsedSec + 's elapsed';
+        rebootHtml = '<div class="step-dur" style="color:#ffa502">' + elStr + '</div>' +
+          '<div class="step-reboot-bar-bg"><div class="step-reboot-bar-fill" style="width:' + pct + '%"></div></div>' +
+          '<div class="step-reboot-eta">' + pct + '% &mdash; ' + remStr + '</div>';
+      }
+      const newCardHtml = '<div class="step-card" style="' + cardBorder + '">' +
+        '<div class="step-num">Phase ' + idx + '/' + total + '</div>' +
+        '<div class="step-name">' + label + '</div>' +
+        pipelineBadge(st, step?.result || '', name) +
+        '<div class="step-result">' + result + '</div>' +
+        durHtml + rebootHtml +
+        '<span class="started-at" data-time="' + (step?.started_at || '') + '" style="display:none"></span>' +
+        '</div>';
+      const cacheKey = podId + '|' + name;
+      const existing = grid.children[i];
+      if (!existing) {
+        const tmp = document.createElement('div');
+        tmp.innerHTML = newCardHtml;
+        grid.appendChild(tmp.firstElementChild);
+        _stepCache[cacheKey] = newCardHtml;
+      } else if (_stepCache[cacheKey] !== newCardHtml) {
+        const tmp = document.createElement('div');
+        tmp.innerHTML = newCardHtml;
+        grid.replaceChild(tmp.firstElementChild, existing);
+        _stepCache[cacheKey] = newCardHtml;
+      }
+      // else: identical — no DOM update needed
+    });
+  }
 
   // Auto-poll steps while pipeline is running (keeps countdown live on any tab)
   if (running) {

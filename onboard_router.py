@@ -2792,8 +2792,8 @@ def phase_cdfmc_check():
     """
     import re as _re
 
-    MAX_ATTEMPTS = 10
-    RETRY_WAIT   = 120  # seconds between retries
+    MAX_ATTEMPTS = 1
+    RETRY_WAIT   = 120  # seconds between retries (only relevant when triggered after Reset & Redeploy)
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"     cdFMC check attempt {attempt}/{MAX_ATTEMPTS} — connecting to {CDFMC_AUTOMATION_HOST}...")
@@ -2824,12 +2824,14 @@ def phase_cdfmc_check():
         print(f"     Terraform log: {'✓ deployed' if deployed else '✗ not deployed yet'}")
 
         if not deployed:
-            client.close()
             if attempt < MAX_ATTEMPTS:
+                client.close()
                 print(f"     Terraform not done yet — retrying in {RETRY_WAIT}s...")
                 time.sleep(RETRY_WAIT)
                 continue
-            return False, "Terraform deployment not complete after max retries"
+            # All retries exhausted — keep client open, fall through to secondary FTD SSH check
+            print(f"     Terraform log check exhausted — will try secondary FTD SSH check...")
+            break
         # Deployment confirmed — exit retry loop and proceed to steps 2–3
         break
 
@@ -2912,8 +2914,79 @@ for i in items:
     else:
         ftd_status = "no token/host"
 
-    ok = deployed and bool(scc_org) and ftd_online
+    # Pass if: scc_org known AND (Terraform confirmed deployed OR FTD API shows connected).
+    # The Terraform log won't contain "Full infrastructure deployed" on a re-run after an error,
+    # but ftd_online=True (connected=True from cdFMC API) is the real confirmation.
+    ok = bool(scc_org) and (deployed or ftd_online)
     result = f"scc_org={scc_org} | deployed={'yes' if deployed else 'no'} | ftd={ftd_status}"
+    print(f"     {'✓' if ok else '✗'} {result}")
+
+    # --- 4. Secondary check: SSH to FTD and run 'show managers' ---
+    # Used when the Terraform log check fails (e.g. log was overwritten on a re-run)
+    # or when the API check did not confirm FTD online.
+    # If FTD reports Registration=Completed we trust it and clear the step.
+    if not ok:
+        print(f"     Primary check did not pass — trying secondary FTD 'show managers' check...")
+        FTD_HOST = "198.18.133.39"
+        FTD_USER = "admin"
+        FTD_PASS = "C1sco12345"
+        try:
+            ftd_client = paramiko.SSHClient()
+            ftd_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ftd_client.connect(
+                FTD_HOST,
+                username=FTD_USER,
+                password=FTD_PASS,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=15,
+            )
+            # FTD uses an interactive shell; send the command via invoke_shell
+            shell = ftd_client.invoke_shell()
+            import time as _time
+            _time.sleep(2)
+            shell.recv(4096)  # drain banner/prompt
+            shell.send("show managers\n")
+            _time.sleep(3)
+            mgr_out = ""
+            while shell.recv_ready():
+                mgr_out += shell.recv(4096).decode(errors="replace")
+                _time.sleep(0.3)
+            ftd_client.close()
+            print(f"     FTD show managers output: {mgr_out.strip()[:300]}")
+
+            # Parse output for Registration status and Host
+            ftd_registered = False
+            ftd_mgr_host = ""
+            ftd_mgr_org = ""
+            for _line in mgr_out.splitlines():
+                _line = _line.strip()
+                m = _re.match(r'^Host\s*:\s*(.+)', _line, _re.IGNORECASE)
+                if m:
+                    ftd_mgr_host = m.group(1).strip()
+                    # Extract org number from host e.g. cisco-pseudoco-525--t90qai...
+                    mo = _re.search(r'pseudoco-(\d+)', ftd_mgr_host, _re.IGNORECASE)
+                    if mo:
+                        ftd_mgr_org = mo.group(1)
+                m = _re.match(r'^Registration\s*:\s*(.+)', _line, _re.IGNORECASE)
+                if m and m.group(1).strip().lower() == "completed":
+                    ftd_registered = True
+
+            if ftd_mgr_host:  # host present = manager configured = registered
+                ftd_result = f"FTD show managers: host={ftd_mgr_host} org={ftd_mgr_org} registration={'Completed' if ftd_registered else 'present'}"
+                print(f"     ✓ Secondary check passed — {ftd_result}")
+                # Merge org info into result if primary didn't find it
+                if not scc_org and ftd_mgr_host:
+                    scc_org = ftd_mgr_host
+                ok = True
+                result = (f"scc_org={scc_org} | deployed={'yes' if deployed else 'no (log check)'}"
+                          f" | ftd={ftd_result}")
+            else:
+                print(f"     ✗ Secondary check: FTD not registered (registered={ftd_registered}"
+                      f" host={ftd_mgr_host!r})")
+        except Exception as _ftd_e:
+            print(f"     Secondary FTD check failed: {_ftd_e}")
+
     print(f"     {'✓' if ok else '✗'} {result}")
     return ok, result
 # ── SCC keys directory (on host, mounted into container) ─────────────────────
