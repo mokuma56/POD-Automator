@@ -7113,7 +7113,8 @@ DASHBOARD_HTML = """
    <div class="summary" id="summary"></div>
 
    <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-     <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
+     <button class="btn-start-all" id="btn-check-update" onclick="checkForUpdates()" style="background:#1a3a1a;border:1px solid #22c55e;color:#22c55e;">&#8593; Check for Updates</button>
+      <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
      <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
       <button class="btn-start-all" id="btn-full-reset" onclick="fullReset()" style="background:#7f1d1d;border-color:#ef4444;color:#fca5a5;">&#9888; Full Reset</button>
      <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
@@ -11156,7 +11157,7 @@ async function iseRefreshSessions(podId) {
     } else {
       if (cancelBtn) cancelBtn.style.display = 'none';
       if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
-      if (badge) { badge.style.color = '#ff4757'; badge.textContent = '\u26a0 Error: ' + (d.message || 'unknown'); }
+       if (badge) { badge.style.color = '#ff4757'; badge.textContent = '\u26a0 Error: ' + (d.message || 'unknown'); }
     }
   } catch (e) {
     if (cancelBtn) cancelBtn.style.display = 'none';
@@ -11164,7 +11165,68 @@ async function iseRefreshSessions(podId) {
     if (badge) { badge.style.color = '#ff4757'; badge.textContent = '\u26a0 Request failed'; }
   }
 }
+
+// ── Check for Updates ────────────────────────────────────────────────────────
+function checkForUpdates() {
+  const modal = document.getElementById('update-modal');
+  const log   = document.getElementById('update-log');
+  const btn   = document.getElementById('update-close-btn');
+  const title = document.getElementById('update-title');
+  log.textContent = '';
+  title.textContent = 'Checking for updates...';
+  btn.style.display = 'none';
+  modal.style.display = 'flex';
+
+  const src = new EventSource('/api/update');
+  let willRestart = false;
+
+  src.onmessage = function(e) {
+    const line = e.data;
+    log.textContent += line + '\n';
+    log.scrollTop = log.scrollHeight;
+
+    if (line.startsWith('DONE:restart')) {
+      willRestart = true;
+      src.close();
+      title.textContent = 'Update complete — restarting dashboard...';
+      log.textContent += '\nDashboard is restarting. Page will reload automatically in 6 seconds...\n';
+      setTimeout(() => { window.location.reload(); }, 6000);
+    } else if (line.startsWith('DONE:no-restart')) {
+      src.close();
+      title.textContent = 'Already up to date';
+      btn.style.display = 'inline-block';
+    } else if (line.startsWith('ERROR:')) {
+      src.close();
+      title.textContent = '\u26a0 Update failed';
+      title.style.color = '#ff4757';
+      btn.style.display = 'inline-block';
+    }
+  };
+
+  src.onerror = function() {
+    src.close();
+    if (willRestart) return; // expected — dashboard restarted
+    log.textContent += '\n[connection closed]\n';
+    title.textContent = 'Connection lost';
+    btn.style.display = 'inline-block';
+  };
+}
 </script>
+
+<!-- Update modal -->
+<div id="update-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:9999;align-items:center;justify-content:center;">
+  <div style="background:#0d1e30;border:1px solid #22c55e;border-radius:10px;padding:24px;width:640px;max-width:95vw;display:flex;flex-direction:column;gap:12px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <span id="update-title" style="font-size:15px;font-weight:700;color:#22c55e;">Checking for updates...</span>
+      <span style="font-size:11px;color:#667788;">POD Automator Auto-Update</span>
+    </div>
+    <pre id="update-log" style="background:#060f18;color:#a3e6a0;font-family:'Courier New',monospace;font-size:11px;padding:14px;border-radius:6px;height:320px;overflow-y:auto;margin:0;white-space:pre-wrap;word-break:break-all;"></pre>
+    <div style="display:flex;justify-content:flex-end;">
+      <button id="update-close-btn" onclick="document.getElementById('update-modal').style.display='none'" style="display:none;background:#1a3a1a;border:1px solid #22c55e;color:#22c55e;padding:8px 20px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">Close</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
 """
@@ -11296,6 +11358,30 @@ def api_kb_reembed():
         return jsonify({"error": "KB unavailable"}), 503
     threading.Thread(target=_kb.reembed_all, daemon=True).start()
     return jsonify({"ok": True, "message": "Re-embedding started in background"})
+
+@app.route("/api/update")
+def api_update():
+    """SSE stream — runs update.sh and streams output line by line."""
+    import subprocess, os
+    script = os.path.join(os.path.dirname(__file__), "update.sh")
+    def generate():
+        try:
+            proc = subprocess.Popen(
+                ["bash", script],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                cwd=os.path.dirname(__file__)
+            )
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                yield f"data: {line}\n\n"
+            proc.wait()
+            if proc.returncode != 0:
+                yield "data: ERROR:update.sh exited with non-zero status\n\n"
+        except Exception as e:
+            yield f"data: ERROR:{e}\n\n"
+    return app.response_class(generate(), mimetype="text/event-stream",
+                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False)
