@@ -11182,14 +11182,14 @@ function checkForUpdates() {
 
   src.onmessage = function(e) {
     const line = e.data;
-    log.textContent += line + '\n';
+    log.textContent += line + '\\n';
     log.scrollTop = log.scrollHeight;
 
     if (line.startsWith('DONE:restart')) {
       willRestart = true;
       src.close();
       title.textContent = 'Update complete — restarting dashboard...';
-      log.textContent += '\nDashboard is restarting. Page will reload automatically in 6 seconds...\n';
+      log.textContent += '\\nDashboard is restarting. Page will reload automatically in 6 seconds...\\n';
       setTimeout(() => { window.location.reload(); }, 6000);
     } else if (line.startsWith('DONE:no-restart')) {
       src.close();
@@ -11206,7 +11206,7 @@ function checkForUpdates() {
   src.onerror = function() {
     src.close();
     if (willRestart) return; // expected — dashboard restarted
-    log.textContent += '\n[connection closed]\n';
+    log.textContent += '\\n[connection closed]\\n';
     title.textContent = 'Connection lost';
     btn.style.display = 'inline-block';
   };
