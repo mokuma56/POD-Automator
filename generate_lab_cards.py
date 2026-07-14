@@ -123,7 +123,7 @@ def _draw_card(c: canvas.Canvas, idx: int, pod: dict):
         ("VPN Host",     pod.get("vpn_host", "")),
         ("Username",     pod.get("vpn_username", "")),
         ("Password",     pod.get("vpn_password", "")),
-        ("Jump Host",    "RDP: 198.18.133.35"),
+        ("Jump Host",    "RDP: 198.18.133.36"),
         ("JH User",      r"corp.pseudoco.com\demouser"),
         ("JH Password",  "C1sco12345"),
     ]
