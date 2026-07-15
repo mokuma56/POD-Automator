@@ -7294,6 +7294,28 @@ DASHBOARD_HTML = """
   </div>
 </div>
 
+<!-- ── KB Token Setup Modal ────────────────────────────────────────────────── -->
+<div id="kb-token-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:10200;align-items:center;justify-content:center;">
+  <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:28px 28px 24px;width:min(480px,92vw);">
+    <div style="font-size:15px;font-weight:700;color:#00bceb;margin-bottom:6px;">&#128273; Shared KB Token Required</div>
+    <div style="font-size:12px;color:#8899aa;margin-bottom:18px;line-height:1.6;">
+      To contribute articles to the shared KB, you need a GitHub Personal Access Token
+      with <code style="background:#0d1117;padding:1px 5px;border-radius:3px;">public_repo</code> scope.<br><br>
+      Enter the token your proctor lead gave you. It will be saved locally and never shared.
+    </div>
+    <input id="kb-token-input" type="password"
+      placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+      style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:9px 12px;border-radius:4px;font-size:13px;font-family:monospace;box-sizing:border-box;margin-bottom:10px;">
+    <div id="kb-token-error" style="color:#e74c3c;font-size:11px;min-height:16px;margin-bottom:10px;"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button onclick="document.getElementById('kb-token-modal').style.display='none'"
+        style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;">Cancel</button>
+      <button id="kb-token-save-btn" onclick="kbSaveToken()"
+        style="background:#00bceb;color:#000;border:none;padding:7px 20px;border-radius:4px;cursor:pointer;font-weight:700;">Save &amp; Contribute</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const PIPELINE_ORDER = [
   "detect_pod_number",
@@ -11252,7 +11274,67 @@ function kbUploadImage(input) {
   input.value = '';
 }
 
+// ── KB Token & Contribute ─────────────────────────────────────────────────────
+
+let _kbPendingContributeId  = null;
+let _kbPendingContributeBtn = null;
+
 async function kbContribute(articleId, btn) {
+  // Check if a token is already saved; if not, open the token setup modal first
+  let hasToken = false;
+  try {
+    const r = await fetch('/api/kb/token');
+    const d = await r.json();
+    hasToken = !!d.has_token;
+  } catch(e) {}
+
+  if (!hasToken) {
+    _kbPendingContributeId  = articleId;
+    _kbPendingContributeBtn = btn;
+    document.getElementById('kb-token-input').value = '';
+    document.getElementById('kb-token-error').textContent = '';
+    document.getElementById('kb-token-modal').style.display = 'flex';
+    return;
+  }
+  await _kbDoContribute(articleId, btn);
+}
+
+async function kbSaveToken() {
+  const token = document.getElementById('kb-token-input').value.trim();
+  const errEl = document.getElementById('kb-token-error');
+  if (!token) { errEl.textContent = 'Please paste your token.'; return; }
+  if (!token.startsWith('gh')) { errEl.textContent = 'Token should start with "gh".'; return; }
+
+  const saveBtn = document.getElementById('kb-token-save-btn');
+  saveBtn.textContent = 'Saving...'; saveBtn.disabled = true;
+
+  try {
+    const r = await fetch('/api/kb/token', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token})
+    });
+    const d = await r.json();
+    if (!d.ok) { errEl.textContent = 'Failed to save token.'; saveBtn.textContent = 'Save & Contribute'; saveBtn.disabled = false; return; }
+  } catch(e) {
+    errEl.textContent = 'Error: ' + e;
+    saveBtn.textContent = 'Save & Contribute'; saveBtn.disabled = false;
+    return;
+  }
+
+  document.getElementById('kb-token-modal').style.display = 'none';
+  saveBtn.textContent = 'Save & Contribute'; saveBtn.disabled = false;
+
+  // Retry the pending contribute if there was one
+  if (_kbPendingContributeId !== null) {
+    const id  = _kbPendingContributeId;
+    const btn = _kbPendingContributeBtn;
+    _kbPendingContributeId  = null;
+    _kbPendingContributeBtn = null;
+    await _kbDoContribute(id, btn);
+  }
+}
+
+async function _kbDoContribute(articleId, btn) {
   const origText = btn.textContent;
   btn.textContent = 'Sending...'; btn.disabled = true;
   try {
@@ -11265,6 +11347,15 @@ async function kbContribute(articleId, btn) {
       btn.style.color = '#2ecc71';
       btn.style.borderColor = '#2ecc71';
       setTimeout(() => { btn.textContent = origText; btn.disabled = false; btn.style.color=''; btn.style.borderColor=''; }, 3000);
+    } else if (d.message && d.message.includes('401')) {
+      // Token was rejected — clear it and re-prompt
+      await fetch('/api/kb/token', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{"token":""}'});
+      btn.textContent = origText; btn.disabled = false;
+      _kbPendingContributeId  = articleId;
+      _kbPendingContributeBtn = btn;
+      document.getElementById('kb-token-input').value = '';
+      document.getElementById('kb-token-error').textContent = 'Token rejected (401) - please enter a valid token.';
+      document.getElementById('kb-token-modal').style.display = 'flex';
     } else {
       alert('Contribute failed: ' + (d.message || 'Unknown error'));
       btn.textContent = origText; btn.disabled = false;
