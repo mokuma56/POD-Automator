@@ -7026,58 +7026,76 @@ DASHBOARD_HTML = """
   <span class="refresh-btn" onclick="location.reload()">&#x21bb; Refresh</span>
   <span class="auto-refresh">(auto 5s)</span>
 
-   <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:20px;">
+   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px;">
 
     <!-- CSV Upload -->
     <div class="upload-section" style="margin-bottom:0;">
-      <h3>Upload Event Details CSV</h3>
+      <h3>Upload Event CSV</h3>
       <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()"
            ondragover="this.classList.add('dragover'); event.preventDefault()"
            ondragleave="this.classList.remove('dragover')"
            ondrop="event.preventDefault(); handleFile(event.dataTransfer.files[0])">
-        <div>Click or drop CSV file here</div>
+        <div style="font-size:12px;">Click or drop CSV here</div>
         <div class="hint">EventsDetails.csv from dCloud</div>
         <input type="file" id="file-input" accept=".csv" onchange="handleFile(this.files[0])">
       </div>
       <div class="upload-result" id="upload-result"></div>
     </div>
 
+    <!-- Knowledge Base card -->
+    <div class="upload-section" style="margin-bottom:0;cursor:pointer;" id="kb-top-card" onclick="openKbPanel()">
+      <h3 style="display:flex;align-items:center;justify-content:space-between;">
+        <span>&#128218; Knowledge Base</span>
+        <span id="kb-top-count" style="font-size:11px;color:#445566;background:#0d1e30;border:1px solid #1a3a5a;border-radius:10px;padding:1px 8px;">...</span>
+      </h3>
+      <div style="font-size:11px;color:#667788;margin-bottom:8px;line-height:1.5;">
+        Shared proctor KB — troubleshooting notes &amp; pipeline fixes, synced across all installs.
+      </div>
+      <div id="kb-top-recent" style="font-size:11px;color:#445566;">Loading...</div>
+      <div style="margin-top:8px;display:flex;gap:6px;">
+        <button onclick="event.stopPropagation();openKbPanel(true)"
+          style="flex:1;padding:5px 0;background:#0d1e30;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">+ New Article</button>
+        <button onclick="event.stopPropagation();openKbPanel()"
+          style="flex:1;padding:5px 0;background:#0d1e30;border:1px solid #445566;color:#c9d1d9;border-radius:4px;cursor:pointer;font-size:11px;">Search</button>
+      </div>
+    </div>
+
     <!-- Switch Image -->
     <div class="upload-section" style="margin-bottom:0;" id="upgrade-config-section">
       <h3>Switch Image (C9300)</h3>
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
         <input id="switch-golden-input" type="text" placeholder="Golden e.g. 17.12.1"
-          style="flex:1;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:5px 8px;font-size:12px;">
+          style="flex:1;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
         <button onclick="setGoldenVersion('switch')"
-          style="padding:5px 10px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">Set</button>
+          style="padding:4px 8px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">Set</button>
       </div>
-      <div class="upload-zone" style="padding:10px;" onclick="document.getElementById('switch-bin-input').click()"
+      <div class="upload-zone" style="padding:8px;" onclick="document.getElementById('switch-bin-input').click()"
            ondragover="this.classList.add('dragover');event.preventDefault()"
            ondragleave="this.classList.remove('dragover')"
            ondrop="event.preventDefault();uploadImage(event.dataTransfer.files[0],'switch')">
-        <div style="font-size:12px">Click or drop switch .bin here</div>
+        <div style="font-size:11px">Click or drop switch .bin here</div>
         <input type="file" id="switch-bin-input" accept=".bin" onchange="uploadImage(this.files[0],'switch')" style="display:none">
       </div>
-      <div id="switch-image-status" style="font-size:11px;color:#667788;margin-top:6px;"></div>
+      <div id="switch-image-status" style="font-size:11px;color:#667788;margin-top:4px;"></div>
     </div>
 
     <!-- Router Image -->
     <div class="upload-section" style="margin-bottom:0;">
       <h3>Router Image (C8231-G2)</h3>
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
         <input id="router-golden-input" type="text" placeholder="Golden e.g. 17.18.2"
-          style="flex:1;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:5px 8px;font-size:12px;">
+          style="flex:1;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
         <button onclick="setGoldenVersion('router')"
-          style="padding:5px 10px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">Set</button>
+          style="padding:4px 8px;background:#1a2a3a;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">Set</button>
       </div>
-      <div class="upload-zone" style="padding:10px;" onclick="document.getElementById('router-bin-input').click()"
+      <div class="upload-zone" style="padding:8px;" onclick="document.getElementById('router-bin-input').click()"
            ondragover="this.classList.add('dragover');event.preventDefault()"
            ondragleave="this.classList.remove('dragover')"
            ondrop="event.preventDefault();uploadImage(event.dataTransfer.files[0],'router')">
-        <div style="font-size:12px">Click or drop router .bin here</div>
+        <div style="font-size:11px">Click or drop router .bin here</div>
         <input type="file" id="router-bin-input" accept=".bin" onchange="uploadImage(this.files[0],'router')" style="display:none">
       </div>
-      <div id="router-image-status" style="font-size:11px;color:#667788;margin-top:6px;"></div>
+      <div id="router-image-status" style="font-size:11px;color:#667788;margin-top:4px;"></div>
     </div>
 
    </div>
@@ -10752,8 +10770,57 @@ load();
 setInterval(load, 5000);
 loadUpgradeConfig();
 initOrgCredsList();
+loadKbTopCard();
+setInterval(loadKbTopCard, 30000);
 
 // ── Knowledge Base ────────────────────────────────────────────────────────────
+
+async function loadKbTopCard() {
+  try {
+    const r = await fetch('/api/kb/status');
+    const st = await r.json();
+    const countEl = document.getElementById('kb-top-count');
+    if (countEl) countEl.textContent = (st.published || 0) + ' articles';
+  } catch(e) {}
+
+  try {
+    const r = await fetch('/api/kb/articles?status=published&limit=3');
+    const arts = await r.json();
+    const el = document.getElementById('kb-top-recent');
+    if (!el) return;
+    if (!arts.length) { el.textContent = 'No articles yet — be the first to contribute!'; return; }
+    el.innerHTML = arts.map(a =>
+      '<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#8899aa;margin-bottom:2px;">&#8250; ' + a.title + '</div>'
+    ).join('');
+  } catch(e) {}
+}
+
+function openKbPanel(newArticle) {
+  // Switch to a POD detail panel if one is open, else just scroll to it.
+  // The KB tab lives inside the detail panel — activate it.
+  const detailEl = document.getElementById('detail-pod-id');
+  const kbTabBtn = Array.from(document.querySelectorAll('.tab-btn')).find(b => b.textContent.includes('Knowledge'));
+  if (kbTabBtn) {
+    kbTabBtn.click();
+    kbTabBtn.scrollIntoView({behavior:'smooth', block:'nearest'});
+    if (newArticle) setTimeout(() => { const a = document.getElementById('kb-add-btn'); if(a) a.click(); }, 400);
+    return;
+  }
+  // No panel open — scroll to stats bar so user knows to open a POD first
+  const stats = document.querySelector('.stats-bar') || document.querySelector('h1');
+  if (stats) stats.scrollIntoView({behavior:'smooth'});
+  // Show a brief tooltip near the KB card
+  const card = document.getElementById('kb-top-card');
+  if (card) {
+    const tip = document.createElement('div');
+    tip.textContent = 'Open any POD row first, then click the Knowledge Base tab';
+    tip.style.cssText = 'position:absolute;background:#1a2d4a;color:#c9d1d9;border:1px solid #02c8ff;border-radius:4px;padding:6px 10px;font-size:11px;z-index:9999;white-space:nowrap;margin-top:4px;';
+    card.style.position = 'relative';
+    card.appendChild(tip);
+    setTimeout(() => tip.remove(), 3000);
+  }
+}
+
 let _kbCurrentId = null;
 
 async function loadKbTab() {
