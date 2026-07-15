@@ -10847,7 +10847,7 @@ function kbRenderArticleBody(body) {
       '<br><img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0;border:1px solid #30363d;"><br>')
     .replace(/!\[([^\]]*)\]\((https:\/\/raw\.githubusercontent[^)]+)\)/g,
       '<br><img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0;border:1px solid #30363d;"><br>')
-    .replace(/\n/g,'<br>');
+    .replace(/\\n/g,'<br>');
 }
 
 async function loadKbTopCard() {
