@@ -10788,6 +10788,68 @@ setInterval(loadKbTopCard, 30000);
 
 // ── Knowledge Base ────────────────────────────────────────────────────────────
 
+// Shared category list and color map — single source of truth for all KB modals
+const KB_CATEGORIES = [
+  "General",
+  "SDA Fabric Provisioning",
+  "EVPN Fabric Provisioning",
+  "EVPN Catalyst Center Discovery",
+  "Configure & Test WLC",
+  "Macro / Micro Segmentation",
+  "Enable SGTs",
+  "Connect Infrastructure",
+  "Connect DUO IDP",
+  "Secure Private Access Configuration",
+  "Secure Internet Access Configure",
+  "Secure SD-WAN Local Enforcement",
+  "Secure Firewall - SGT Enforcement",
+  "Experience Insights Integration",
+  "NDFC - DC Fabric Deployment",
+  "Install Thousandeyes Agents on Leaf Switches",
+];
+
+const KB_CAT_COLORS = {
+  "General":                                    "#667788",
+  "SDA Fabric Provisioning":                    "#2ecc71",
+  "EVPN Fabric Provisioning":                   "#00bceb",
+  "EVPN Catalyst Center Discovery":             "#0097b2",
+  "Configure & Test WLC":                       "#9b59b6",
+  "Macro / Micro Segmentation":                 "#e74c3c",
+  "Enable SGTs":                                "#e67e22",
+  "Connect Infrastructure":                     "#3498db",
+  "Connect DUO IDP":                            "#1abc9c",
+  "Secure Private Access Configuration":        "#c0392b",
+  "Secure Internet Access Configure":           "#f39c12",
+  "Secure SD-WAN Local Enforcement":            "#27ae60",
+  "Secure Firewall - SGT Enforcement":          "#a93226",
+  "Experience Insights Integration":            "#8e44ad",
+  "NDFC - DC Fabric Deployment":               "#2980b9",
+  "Install Thousandeyes Agents on Leaf Switches": "#16a085",
+};
+
+function kbCategoryOptions(selected) {
+  return KB_CATEGORIES.map(c =>
+    '<option value="' + c + '"' + (c === (selected||'General') ? ' selected' : '') + '>' + c + '</option>'
+  ).join('');
+}
+
+function kbCatColor(cat) {
+  return KB_CAT_COLORS[cat] || '#667788';
+}
+
+function kbRenderArticleBody(body) {
+  // Convert ![alt](/api/kb/image/...) and raw.githubusercontent image URLs to <img> tags,
+  // then escape remaining HTML and convert newlines to <br>
+  const escaped = (body || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return escaped
+    .replace(/!\[([^\]]*)\]\((\/api\/kb\/image\/[^)]+)\)/g,
+      '<br><img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0;border:1px solid #30363d;"><br>')
+    .replace(/!\[([^\]]*)\]\((https:\/\/raw\.githubusercontent[^)]+)\)/g,
+      '<br><img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0;border:1px solid #30363d;"><br>')
+    .replace(/\n/g,'<br>');
+}
+
 async function loadKbTopCard() {
   try {
     const r = await fetch('/api/kb/status');
@@ -10851,13 +10913,18 @@ async function loadKbStandalone() {
     + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;width:680px;max-height:85vh;overflow-y:auto;">'
     + '<div style="font-size:16px;font-weight:700;color:#00bceb;margin-bottom:14px;" id="kb-sa-modal-title">New Article</div>'
     + '<input id="kb-sa-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:14px;margin-bottom:10px;box-sizing:border-box;">'
-    + '<textarea id="kb-sa-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:10px;box-sizing:border-box;resize:vertical;"></textarea>'
+    + '<textarea id="kb-sa-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:6px;box-sizing:border-box;resize:vertical;"></textarea>'
+    + '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;">'
+    + '<label id="kb-sa-img-label" style="background:#1a2a1a;color:#27ae60;border:1px solid #27ae6055;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128247; Add Screenshot'
+    + '<input type="file" id="kb-sa-img-input" accept="image/*" style="display:none;" onchange="kbSaUploadImage(this)"></label>'
+    + '<span id="kb-sa-img-status" style="font-size:11px;color:#667788;"></span>'
+    + '</div>'
     + '<div style="display:flex;gap:8px;margin-bottom:14px;">'
     + '<input id="kb-sa-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
-    + '<select id="kb-sa-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
-    + '<option>general</option><option>sdwan</option><option>switches</option><option>infrastructure</option>'
-    + '<option>troubleshooting</option><option>procedure</option></select>'
-    + '</div>'
+     + '<select id="kb-sa-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
+     + kbCategoryOptions()
+     + '</select>'
+     + '</div>'
     + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
     + '<button id="kb-sa-m-delete" style="background:#c0392b;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;display:none;">Delete</button>'
     + '<button id="kb-sa-m-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;margin-left:auto;">Cancel</button>'
@@ -10908,9 +10975,8 @@ async function refreshKbSaList() {
     return;
   }
 
-  const catColors = {sdwan:'#00bceb',switches:'#2ecc71',infrastructure:'#f39c12',troubleshooting:'#e74c3c',procedure:'#9b59b6',general:'#667788'};
   el.innerHTML = articles.map(a => {
-    const cc = catColors[a.category||'general'] || '#667788';
+    const cc = kbCatColor(a.category||'General');
     const score = a.score != null ? ' <span style="color:#556677;font-size:10px;">&#8212; ' + (a.score*100).toFixed(0) + '% match</span>' : '';
     const preview = (a.body||'').replace(/[#*`]/g,'').substring(0,120).trim();
     return '<div style="background:#0d1117;border:1px solid #1e2d40;border-radius:6px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:8px;">'
@@ -10940,7 +11006,7 @@ function kbSaOpenModal(art) {
   document.getElementById('kb-sa-m-title').value    = art ? (art.title||'')    : '';
   document.getElementById('kb-sa-m-body').value     = art ? (art.body||'')     : '';
   document.getElementById('kb-sa-m-tags').value     = art ? (art.tags||'')     : '';
-  document.getElementById('kb-sa-m-category').value = art ? (art.category||'general') : 'general';
+  document.getElementById('kb-sa-m-category').value = art ? (art.category||'General') : 'General';
   const del = document.getElementById('kb-sa-m-delete');
   if (!art) _kbSaCurrentId = null;
   if (del) del.style.display = art ? 'inline-block' : 'none';
@@ -11012,13 +11078,18 @@ async function loadKbTab() {
     + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;width:680px;max-height:85vh;overflow-y:auto;">'
     + '<div style="font-size:16px;font-weight:700;color:#00bceb;margin-bottom:14px;" id="kb-modal-title">New Article</div>'
     + '<input id="kb-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:14px;margin-bottom:10px;box-sizing:border-box;">'
-    + '<textarea id="kb-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:10px;box-sizing:border-box;resize:vertical;"></textarea>'
+    + '<textarea id="kb-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:6px;box-sizing:border-box;resize:vertical;"></textarea>'
+     + '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;">'
+     + '<label id="kb-img-label" style="background:#1a2a1a;color:#27ae60;border:1px solid #27ae6055;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128247; Add Screenshot'
+     + '<input type="file" id="kb-img-input" accept="image/*" style="display:none;" onchange="kbUploadImage(this)"></label>'
+     + '<span id="kb-img-status" style="font-size:11px;color:#667788;"></span>'
+     + '</div>'
     + '<div style="display:flex;gap:8px;margin-bottom:14px;">'
     + '<input id="kb-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
-    + '<select id="kb-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
-    + '<option>general</option><option>sdwan</option><option>switches</option><option>infrastructure</option>'
-    + '<option>troubleshooting</option><option>procedure</option></select>'
-    + '</div>'
+     + '<select id="kb-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
+     + kbCategoryOptions()
+     + '</select>'
+     + '</div>'
     + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
     + '<button id="kb-m-delete" style="background:#c0392b;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;display:none;">Delete</button>'
     + '<button id="kb-m-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;margin-left:auto;">Cancel</button>'
@@ -11072,14 +11143,9 @@ async function refreshKbList() {
     return;
   }
 
-  const catColors = {
-    'sdwan':'#00bceb','switches':'#2ecc71','infrastructure':'#f39c12',
-    'troubleshooting':'#e74c3c','procedure':'#9b59b6','general':'#667788'
-  };
-
   el.innerHTML = articles.map(a => {
-    const cat = a.category || 'general';
-    const cc  = catColors[cat] || '#667788';
+    const cat = a.category || 'General';
+    const cc  = kbCatColor(cat);
     const score = a.score != null ? ' <span style="color:#556677;font-size:10px;">&#8212; ' + (a.score*100).toFixed(0) + '% match</span>' : '';
     const preview = (a.body||'').replace(/[#*`]/g,'').substring(0,120).trim();
     return '<div style="background:#0d1117;border:1px solid #1e2d40;border-radius:6px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:8px;">'
@@ -11112,7 +11178,7 @@ function kbOpenModal(art) {
   document.getElementById('kb-m-title').value    = art ? (art.title||'')    : '';
   document.getElementById('kb-m-body').value     = art ? (art.body||'')     : '';
   document.getElementById('kb-m-tags').value     = art ? (art.tags||'')     : '';
-  document.getElementById('kb-m-category').value = art ? (art.category||'general') : 'general';
+  document.getElementById('kb-m-category').value = art ? (art.category||'General') : 'General';
   if (!art) _kbCurrentId = null;
   if (delBtn) delBtn.style.display = art ? 'inline-block' : 'none';
   modal.style.display = 'flex';
@@ -11151,6 +11217,39 @@ async function kbDeleteArticle() {
   _kbCurrentId = null;
   await refreshKbList();
   loadKbTab();
+}
+
+async function kbUploadImageToTextarea(file, textareaId, statusId) {
+  const status = document.getElementById(statusId);
+  if (status) { status.textContent = 'Uploading...'; status.style.color = '#00bceb'; }
+  const fd = new FormData();
+  fd.append('image', file);
+  try {
+    const r = await fetch('/api/kb/image-upload', {method:'POST', body: fd});
+    const d = await r.json();
+    if (d.ok) {
+      const ta = document.getElementById(textareaId);
+      const md = '\n![' + file.name.replace(/\.[^.]+$/,'') + '](/api/kb/image/' + d.filename + ')\n';
+      ta.value += md;
+      if (status) { status.textContent = '\u2713 Inserted'; status.style.color = '#27ae60'; setTimeout(() => { status.textContent = ''; }, 2500); }
+    } else {
+      if (status) { status.textContent = 'Upload failed: ' + (d.error||''); status.style.color = '#e74c3c'; }
+    }
+  } catch(e) {
+    if (status) { status.textContent = 'Upload error: ' + e; status.style.color = '#e74c3c'; }
+  }
+}
+
+function kbSaUploadImage(input) {
+  if (!input.files || !input.files[0]) return;
+  kbUploadImageToTextarea(input.files[0], 'kb-sa-m-body', 'kb-sa-img-status');
+  input.value = '';
+}
+
+function kbUploadImage(input) {
+  if (!input.files || !input.files[0]) return;
+  kbUploadImageToTextarea(input.files[0], 'kb-m-body', 'kb-img-status');
+  input.value = '';
 }
 
 async function kbContribute(articleId, btn) {
@@ -11662,6 +11761,35 @@ def api_kb_contribute(article_id):
     if result["ok"] and data.get("token"):
         _kb_sync.save_token(data["token"])
     return jsonify(result), 200 if result["ok"] else 400
+
+
+KB_IMAGES_DIR = Path(__file__).parent / "data" / "kb_images"
+KB_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+@app.route("/api/kb/image-upload", methods=["POST"])
+def api_kb_image_upload():
+    """Upload a screenshot for a KB article. Saves to data/kb_images/."""
+    import uuid as _uuid
+    f = request.files.get("image")
+    if not f:
+        return jsonify({"ok": False, "error": "No file provided"}), 400
+    ext = Path(f.filename).suffix.lower() or ".png"
+    if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        return jsonify({"ok": False, "error": "Unsupported file type"}), 400
+    filename = _uuid.uuid4().hex[:8] + "_" + Path(f.filename).name
+    # Sanitise filename
+    filename = "".join(c if c.isalnum() or c in "-_." else "_" for c in filename)
+    dest = KB_IMAGES_DIR / filename
+    f.save(str(dest))
+    return jsonify({"ok": True, "filename": filename})
+
+
+@app.route("/api/kb/image/<path:filename>")
+def api_kb_image_serve(filename):
+    """Serve a locally-stored KB article image."""
+    import flask
+    safe = Path(filename).name  # strip any path traversal
+    return flask.send_from_directory(str(KB_IMAGES_DIR), safe)
 
 
 @app.route("/api/update")
