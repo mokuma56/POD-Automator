@@ -298,6 +298,7 @@ pod-automator/
 ├── run_dashboard.sh                      # Auto-restart wrapper for Flask dashboard
 ├── kb.py                                 # Knowledge base — SQLite + embeddings + Ollama RAG
 ├── kb_seed.py                            # KB seeder — AGENTS.md import + ingest_text() API
+├── kb_sync.py                            # Shared KB sync — pulls from/pushes to POD-Automator-KB repo
 ├── generate_lab_cards.py                 # reportlab PDF generator for lab detail cards
 ├── base_configs/
 │   ├── border_spine.txt                  # Baseline config for C9300-48UB Border Spine
@@ -480,63 +481,59 @@ Mac (develop) ──git push──► GitHub (mokuma56/POD-Automator)
 
 ---
 
-## Knowledge Base Setup
+## Knowledge Base
 
-The Knowledge Base requires **Ollama** running on the proctor's local Mac.
-Search works without Ollama — only AI-assisted answers require it.
+The dashboard includes a built-in Knowledge Base shared across all proctors.
+Articles are stored locally in SQLite and synced from the shared GitHub repo
+[`mokuma56/POD-Automator-KB`](https://github.com/mokuma56/POD-Automator-KB)
+automatically on every **Check for Updates**.
 
-### 1. Install Ollama (Mac)
+### How Articles Are Shared
+
+| Action | How |
+|--------|-----|
+| Pull new articles | Automatic — happens on every Check for Updates and on dashboard startup |
+| Write an article | Dashboard → Knowledge Base tab → **+ New Article** |
+| Share with all proctors | Click **🌐 Contribute** on any published article — pushes to the shared GitHub repo |
+
+No GitHub account or token setup required — a shared write token is built into the tool.
+
+### Searching and Asking
+
+- **Search bar** — semantic search across all published articles
+- **Ask bar** — natural language question; requires [Ollama](https://ollama.com) running locally with `llama3.2` pulled
+
+### Optional: AI-Assisted Answers (Ollama)
+
+Search works without Ollama. For AI answers:
 ```bash
 brew install ollama
-# or
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-### 2. Start Ollama and pull the model
-```bash
 ollama serve &
 ollama pull llama3.2
 ```
 
-### 3. Install Python dependencies
-```bash
-uv sync   # picks up sentence-transformers and ollama from pyproject.toml
-```
-
-### 4. Seed the KB from AGENTS.md
+### Seeding from AGENTS.md
 ```bash
 uv run python3 kb_seed.py seed
 ```
-
-### 5. Use it
-- Open the dashboard → click any POD row → **Knowledge Base** tab
-- **Search bar** — semantic search across all published articles
-- **Ask bar** — natural language question answered by Ollama using KB context
-- **Paste Doc button** — paste any documentation text to add it to the KB
-- **Seed from AGENTS.md button** — re-import all known issues (idempotent)
-
-### Adding knowledge from the OpenCode chat
-Paste any documentation or issue description here in chat and say
-"add this to the KB" — it will be ingested via `kb_seed.ingest_text()`
-directly without going through the dashboard.
 
 ### CLI
 ```bash
-# Seed from AGENTS.md
-uv run python3 kb_seed.py seed
-
-# Check KB status
-uv run python3 kb.py status
-
-# Ask a question from the CLI
-uv run python3 kb.py ask "why does the router boot with no config"
-
-# Ingest a file
-uv run python3 kb_seed.py ingest path/to/doc.txt "My Doc Title" "tag1,tag2"
-
-# Rebuild all embeddings (after changing embed model)
-uv run python3 kb.py reembed
+uv run python3 kb_sync.py pull          # pull new articles from shared KB
+uv run python3 kb_sync.py status        # compare local vs shared article count
+uv run python3 kb_sync.py push <id>     # push one article by local DB id
+uv run python3 kb.py status             # local KB stats
+uv run python3 kb.py ask "question"     # CLI question (requires Ollama)
 ```
+
+### Shared KB Repo
+
+Articles contributed by all proctors are collected at:
+**https://github.com/mokuma56/POD-Automator-KB**
+
+The repo is public — anyone can read it. The shared write token (baked into
+`kb_sync.py`) allows any proctor to push articles via the Contribute button
+without a personal GitHub account.
 
 ---
 
