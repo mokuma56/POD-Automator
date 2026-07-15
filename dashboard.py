@@ -11229,7 +11229,7 @@ async function kbUploadImageToTextarea(file, textareaId, statusId) {
     const d = await r.json();
     if (d.ok) {
       const ta = document.getElementById(textareaId);
-      const md = '\n![' + file.name.replace(/\.[^.]+$/,'') + '](/api/kb/image/' + d.filename + ')\n';
+      const md = '\\n![' + file.name.replace(/\.[^.]+$/,'') + '](/api/kb/image/' + d.filename + ')\\n';
       ta.value += md;
       if (status) { status.textContent = '\u2713 Inserted'; status.style.color = '#27ae60'; setTimeout(() => { status.textContent = ''; }, 2500); }
     } else {
