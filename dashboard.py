@@ -7274,12 +7274,25 @@ DASHBOARD_HTML = """
       </div>
     </div>
 
-    <div class="tab-content" id="tab-kb">
-      <div id="kb-grid" style="padding:16px;min-height:300px;">
-        <div style="color:#667788;font-size:13px;">Loading knowledge base...</div>
-      </div>
+     <div class="tab-content" id="tab-kb">
+       <div id="kb-grid" style="padding:16px;min-height:300px;">
+         <div style="color:#667788;font-size:13px;">Loading knowledge base...</div>
+       </div>
+     </div>
+   </div>
+
+<!-- ── Standalone KB Modal (top-level, always accessible) ─────────────────── -->
+<div id="kb-standalone-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.80);z-index:10000;align-items:flex-start;justify-content:center;padding-top:48px;overflow-y:auto;">
+  <div style="background:#0d1117;border:1px solid #30363d;border-radius:10px;width:min(820px,95vw);margin:0 auto 48px auto;position:relative;">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid #21262d;">
+      <span style="font-size:16px;font-weight:700;color:#00bceb;">&#128218; Proctor Knowledge Base</span>
+      <button onclick="closeKbModal()" style="background:none;border:none;color:#667788;font-size:20px;cursor:pointer;line-height:1;">&times;</button>
+    </div>
+    <div id="kb-standalone-grid" style="padding:20px;min-height:300px;">
+      <div style="color:#667788;font-size:13px;">Loading...</div>
     </div>
   </div>
+</div>
 
 <script>
 const PIPELINE_ORDER = [
@@ -10796,29 +10809,175 @@ async function loadKbTopCard() {
 }
 
 function openKbPanel(newArticle) {
-  // Switch to a POD detail panel if one is open, else just scroll to it.
-  // The KB tab lives inside the detail panel — activate it.
-  const detailEl = document.getElementById('detail-pod-id');
-  const kbTabBtn = Array.from(document.querySelectorAll('.tab-btn')).find(b => b.textContent.includes('Knowledge'));
-  if (kbTabBtn) {
-    kbTabBtn.click();
-    kbTabBtn.scrollIntoView({behavior:'smooth', block:'nearest'});
-    if (newArticle) setTimeout(() => { const a = document.getElementById('kb-add-btn'); if(a) a.click(); }, 400);
+  const modal = document.getElementById('kb-standalone-modal');
+  modal.style.display = 'flex';
+  loadKbStandalone();
+  if (newArticle) setTimeout(() => { const a = document.getElementById('kb-sa-add-btn'); if(a) a.click(); }, 400);
+}
+
+function closeKbModal() {
+  document.getElementById('kb-standalone-modal').style.display = 'none';
+}
+
+// Close on backdrop click
+document.getElementById('kb-standalone-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeKbModal();
+});
+
+async function loadKbStandalone() {
+  const grid = document.getElementById('kb-standalone-grid');
+  if (!grid) return;
+
+  let st = {};
+  try { const r = await fetch('/api/kb/status'); st = await r.json(); } catch(e) {}
+
+  let html = '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">'
+    + '<span style="font-size:13px;color:#667788;">' + (st.published||0) + ' articles</span>'
+    + '<span style="font-size:11px;color:#27ae60;">&#127757; Connected to Shared KB</span>'
+    + '<button id="kb-sa-add-btn" style="margin-left:auto;background:#27ae60;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">+ New Article</button>'
+    + '</div>';
+
+  html += '<div style="display:flex;gap:8px;margin-bottom:14px;">'
+    + '<input id="kb-sa-search-input" type="text" placeholder="Search articles..." '
+    + 'style="flex:1;background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:8px 12px;border-radius:4px;font-size:13px;">'
+    + '<button id="kb-sa-search-btn" style="background:#02c8ff;color:#000;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-weight:600;font-size:13px;">Search</button>'
+    + '</div>'
+    + '<div id="kb-sa-answer" style="display:none;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:12px;margin-bottom:14px;font-size:13px;color:#c9d1d9;white-space:pre-wrap;"></div>';
+
+  html += '<div id="kb-sa-articles-list"></div>';
+
+  // Article modal (reuse same structure, different IDs)
+  html += '<div id="kb-sa-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.80);z-index:10100;align-items:center;justify-content:center;">'
+    + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;width:680px;max-height:85vh;overflow-y:auto;">'
+    + '<div style="font-size:16px;font-weight:700;color:#00bceb;margin-bottom:14px;" id="kb-sa-modal-title">New Article</div>'
+    + '<input id="kb-sa-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:14px;margin-bottom:10px;box-sizing:border-box;">'
+    + '<textarea id="kb-sa-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:10px;box-sizing:border-box;resize:vertical;"></textarea>'
+    + '<div style="display:flex;gap:8px;margin-bottom:14px;">'
+    + '<input id="kb-sa-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
+    + '<select id="kb-sa-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
+    + '<option>general</option><option>sdwan</option><option>switches</option><option>infrastructure</option>'
+    + '<option>troubleshooting</option><option>procedure</option></select>'
+    + '</div>'
+    + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
+    + '<button id="kb-sa-m-delete" style="background:#c0392b;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;display:none;">Delete</button>'
+    + '<button id="kb-sa-m-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;margin-left:auto;">Cancel</button>'
+    + '<button id="kb-sa-m-save" style="background:#00bceb;color:#000;border:none;padding:7px 20px;border-radius:4px;cursor:pointer;font-weight:700;">Save</button>'
+    + '</div></div></div>';
+
+  grid.innerHTML = html;
+  await refreshKbSaList();
+
+  setTimeout(() => {
+    const si  = document.getElementById('kb-sa-search-input');
+    const sb  = document.getElementById('kb-sa-search-btn');
+    const ab  = document.getElementById('kb-sa-add-btn');
+    if (ab) ab.onclick = () => kbSaOpenModal(null);
+    if (sb) sb.onclick = () => refreshKbSaList();
+    if (si) si.onkeydown = e => { if (e.key === 'Enter') refreshKbSaList(); };
+
+    const mc = document.getElementById('kb-sa-m-cancel');
+    const ms = document.getElementById('kb-sa-m-save');
+    const md = document.getElementById('kb-sa-m-delete');
+    if (mc) mc.onclick = () => { document.getElementById('kb-sa-modal').style.display = 'none'; };
+    if (ms) ms.onclick = kbSaSaveModal;
+    if (md) md.onclick = kbSaDeleteArticle;
+  }, 0);
+}
+
+let _kbSaCurrentId = null;
+
+async function refreshKbSaList() {
+  const el = document.getElementById('kb-sa-articles-list');
+  if (!el) return;
+  const q = (document.getElementById('kb-sa-search-input') || {value:''}).value.trim();
+  let articles = [];
+  try {
+    if (q) {
+      const r = await fetch('/api/kb/search?q=' + encodeURIComponent(q) + '&status=published&top_k=20');
+      articles = (await r.json()).results || [];
+    } else {
+      const r = await fetch('/api/kb/articles?status=published&limit=200');
+      articles = await r.json();
+    }
+  } catch(e) { el.innerHTML = '<div style="color:#e74c3c;padding:20px;">Error: ' + e + '</div>'; return; }
+
+  if (!articles.length) {
+    el.innerHTML = q
+      ? '<div style="color:#667788;padding:20px;">No articles matched.</div>'
+      : '<div style="color:#667788;padding:20px;">No articles yet. Click <b style="color:#00bceb">+ New Article</b> to add the first one.</div>';
     return;
   }
-  // No panel open — scroll to stats bar so user knows to open a POD first
-  const stats = document.querySelector('.stats-bar') || document.querySelector('h1');
-  if (stats) stats.scrollIntoView({behavior:'smooth'});
-  // Show a brief tooltip near the KB card
-  const card = document.getElementById('kb-top-card');
-  if (card) {
-    const tip = document.createElement('div');
-    tip.textContent = 'Open any POD row first, then click the Knowledge Base tab';
-    tip.style.cssText = 'position:absolute;background:#1a2d4a;color:#c9d1d9;border:1px solid #02c8ff;border-radius:4px;padding:6px 10px;font-size:11px;z-index:9999;white-space:nowrap;margin-top:4px;';
-    card.style.position = 'relative';
-    card.appendChild(tip);
-    setTimeout(() => tip.remove(), 3000);
+
+  const catColors = {sdwan:'#00bceb',switches:'#2ecc71',infrastructure:'#f39c12',troubleshooting:'#e74c3c',procedure:'#9b59b6',general:'#667788'};
+  el.innerHTML = articles.map(a => {
+    const cc = catColors[a.category||'general'] || '#667788';
+    const score = a.score != null ? ' <span style="color:#556677;font-size:10px;">&#8212; ' + (a.score*100).toFixed(0) + '% match</span>' : '';
+    const preview = (a.body||'').replace(/[#*`]/g,'').substring(0,120).trim();
+    return '<div style="background:#0d1117;border:1px solid #1e2d40;border-radius:6px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:8px;">'
+      + '<div style="flex:1;cursor:pointer;" onclick="kbSaViewArticle(' + a.id + ')">'
+      + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
+      + '<span style="background:' + cc + '22;color:' + cc + ';border:1px solid ' + cc + '44;border-radius:3px;padding:1px 7px;font-size:10px;font-weight:700;text-transform:uppercase;">' + (a.category||'general') + '</span>'
+      + '<span style="font-size:13px;font-weight:600;color:#c9d1d9;">' + a.title + score + '</span>'
+      + (a.tags ? '<span style="margin-left:auto;font-size:10px;color:#445566;">' + a.tags + '</span>' : '')
+      + '</div>'
+      + (preview ? '<div style="font-size:11px;color:#556677;margin-top:2px;">' + preview + (a.body.length > 120 ? '...' : '') + '</div>' : '')
+      + '</div>'
+      + '<button title="Contribute to Shared KB" '
+      + 'style="flex-shrink:0;background:#1a3a1a;color:#27ae60;border:1px solid #27ae6055;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;white-space:nowrap;" '
+      + 'onclick="event.stopPropagation();kbContribute(' + a.id + ',this)">&#127757; Contribute</button>'
+      + '</div>';
+  }).join('');
+}
+
+async function kbSaViewArticle(id) {
+  _kbSaCurrentId = id;
+  const r = await fetch('/api/kb/article/' + id);
+  kbSaOpenModal(await r.json());
+}
+
+function kbSaOpenModal(art) {
+  document.getElementById('kb-sa-modal-title').textContent = art ? 'Edit Article' : 'New Article';
+  document.getElementById('kb-sa-m-title').value    = art ? (art.title||'')    : '';
+  document.getElementById('kb-sa-m-body').value     = art ? (art.body||'')     : '';
+  document.getElementById('kb-sa-m-tags').value     = art ? (art.tags||'')     : '';
+  document.getElementById('kb-sa-m-category').value = art ? (art.category||'general') : 'general';
+  const del = document.getElementById('kb-sa-m-delete');
+  if (!art) _kbSaCurrentId = null;
+  if (del) del.style.display = art ? 'inline-block' : 'none';
+  document.getElementById('kb-sa-modal').style.display = 'flex';
+}
+
+async function kbSaSaveModal() {
+  const payload = {
+    title:    document.getElementById('kb-sa-m-title').value.trim(),
+    body:     document.getElementById('kb-sa-m-body').value.trim(),
+    tags:     document.getElementById('kb-sa-m-tags').value.trim(),
+    category: document.getElementById('kb-sa-m-category').value,
+    status:   'published',
+  };
+  if (!payload.title || !payload.body) { alert('Title and body are required.'); return; }
+  const btn = document.getElementById('kb-sa-m-save');
+  btn.textContent = 'Saving...'; btn.disabled = true;
+  if (_kbSaCurrentId) {
+    await fetch('/api/kb/article/' + _kbSaCurrentId, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  } else {
+    await fetch('/api/kb/article', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
   }
+  btn.textContent = 'Save'; btn.disabled = false;
+  document.getElementById('kb-sa-modal').style.display = 'none';
+  _kbSaCurrentId = null;
+  await refreshKbSaList();
+  loadKbTopCard();
+}
+
+async function kbSaDeleteArticle() {
+  if (!_kbSaCurrentId) return;
+  if (!confirm('Delete this article?')) return;
+  await fetch('/api/kb/article/' + _kbSaCurrentId, {method:'DELETE'});
+  document.getElementById('kb-sa-modal').style.display = 'none';
+  _kbSaCurrentId = null;
+  await refreshKbSaList();
+  loadKbTopCard();
 }
 
 let _kbCurrentId = null;
