@@ -7389,7 +7389,7 @@ async function load() {
      else if (tabName === 'sda')       loadSdaStatus(detailId);
      else if (tabName === 'duo')       loadDuoStatus(detailId);
      else if (tabName === 'ise')       loadIseStatus(detailId);
-     else if (tabName === 'scc')       loadSccChecklist(detailId);
+     else if (tabName === 'scc')       { if (!window._sccResetRunning) loadSccChecklist(detailId); }
      else if (tabName === 'baseconfig') loadBaseConfig(detailId);
      // logs tab has its own 2s poller; kb tab is static
   }
@@ -9200,6 +9200,7 @@ async function sccAutoReset(podId) {
   const status = document.getElementById('scc-auto-reset-status');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Running...'; }
   if (status) { status.style.color = '#ffa502'; status.textContent = 'Automation running — navigating SCC (may take 2-3 min)...'; }
+  window._sccResetRunning = true;  // block global load() from re-rendering SCC tab
   try {
     const res = await fetch('/api/scc/manual-reset/' + podId, { method: 'POST' });
     const d = await res.json();
@@ -9214,6 +9215,7 @@ async function sccAutoReset(podId) {
         if (st) st.textContent = 'Running... (' + (polls * 5) + 's elapsed)';
         if (polls >= 42) { // 3.5 min max
           clearInterval(poller);
+          window._sccResetRunning = false;
           const b = document.getElementById('scc-auto-reset-btn');
           if (b) { b.disabled = false; b.textContent = '▶ Auto-Reset All'; }
           await loadSccChecklist(podId);
@@ -9222,10 +9224,12 @@ async function sccAutoReset(podId) {
         }
       }, 5000);
     } else {
+      window._sccResetRunning = false;
       if (status) { status.style.color = '#ff4757'; status.textContent = 'Failed to start: ' + (d.message || JSON.stringify(d)); }
       if (btn) { btn.disabled = false; btn.textContent = '▶ Auto-Reset All'; }
     }
   } catch(e) {
+    window._sccResetRunning = false;
     if (status) { status.style.color = '#ff4757'; status.textContent = 'Error: ' + e; }
     if (btn) { btn.disabled = false; btn.textContent = '▶ Auto-Reset All'; }
   }
@@ -9289,6 +9293,7 @@ async function sccRecheck(podId) {
     + '<div style="padding:0 20px;"><button onclick="sccRecheckCancel(&quot;' + podId + '&quot;)" '
     + 'class="btn-reconnect" style="background:#3d0a0a;border-color:#ff4757;color:#ff4757;font-size:11px;margin-top:8px;">&#x2715; Cancel</button></div>';
 
+  window._sccResetRunning = true;  // block global load() from re-rendering SCC tab
   const poller = setInterval(async () => {
     polls++;
     try {
@@ -9298,11 +9303,13 @@ async function sccRecheck(podId) {
       const statusEl = document.getElementById('scc-recheck-status');
       if (scc && scc.status !== 'running') {
         clearInterval(poller);
+        window._sccResetRunning = false;
         loadSccChecklist(podId);
         return;
       }
       if (polls >= MAX_POLLS) {
         clearInterval(poller);
+        window._sccResetRunning = false;
         // Write timeout to DB then reload
         await fetch('/api/scc/recheck-timeout/' + podId, { method: 'POST' });
         loadSccChecklist(podId);
@@ -9316,6 +9323,7 @@ async function sccRecheck(podId) {
 
 async function sccRecheckCancel(podId) {
   if (window._sccRecheckPoller) clearInterval(window._sccRecheckPoller);
+  window._sccResetRunning = false;
   await fetch('/api/scc/recheck-timeout/' + podId, { method: 'POST' });
   loadSccChecklist(podId);
 }
@@ -9330,6 +9338,11 @@ function switchTab(btn, name) {
   if (name !== 'sda') {
     if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
     if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
+  }
+  // Leaving SCC tab — clear the reset-running lock so global load() resumes normally
+  if (name !== 'scc') {
+    window._sccResetRunning = false;
+    if (window._sccRecheckPoller) { clearInterval(window._sccRecheckPoller); window._sccRecheckPoller = null; }
   }
 
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
