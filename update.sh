@@ -74,7 +74,11 @@ else
     log "No pipeline code changes — Docker rebuild not needed"
 fi
 
-# ── 7. Schedule dashboard restart ────────────────────────────────────────────
+# ── 7. Sync shared Knowledge Base articles ───────────────────────────────────
+log "Syncing shared Knowledge Base articles..."
+uv run python3 kb_sync.py pull 2>&1 | while IFS= read -r line; do log "$line"; done || true
+
+# ── 8. Schedule dashboard restart ────────────────────────────────────────────
 log "Update complete. Restarting dashboard in 3 seconds..."
 echo "DONE:restart"
 

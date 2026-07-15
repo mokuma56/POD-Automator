@@ -12,6 +12,15 @@ try:
     import kb_seed as _kb_seed
     _kb.ensure_kb_table(_kb.DB_PATH)
     _KB_AVAILABLE = True
+    # Background pull of shared KB articles on startup (non-blocking)
+    try:
+        import kb_sync as _kb_sync
+        threading.Thread(
+            target=lambda: _kb_sync.pull(db_path=_kb.DB_PATH, verbose=False),
+            daemon=True, name="kb-sync-startup"
+        ).start()
+    except Exception:
+        pass
 except Exception as _kb_err:
     _KB_AVAILABLE = False
     _kb_err_msg = str(_kb_err)
@@ -10768,6 +10777,22 @@ async function loadKbTab() {
     + '</div>'
     + '<div id="kb-answer" style="display:none;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:12px;margin-bottom:14px;font-size:13px;color:#c9d1d9;white-space:pre-wrap;"></div>';
 
+  // KB Settings strip (GitHub token)
+  let tokenSaved = false;
+  try { const tr = await fetch('/api/kb/token'); const td = await tr.json(); tokenSaved = td.has_token; } catch(e) {}
+  html += '<details id="kb-settings" style="margin-bottom:14px;border:1px solid #1e2d40;border-radius:4px;padding:8px 12px;">'
+    + '<summary style="cursor:pointer;font-size:12px;font-weight:600;color:#667788;">&#9881; KB Settings'
+    + (tokenSaved ? ' <span style="color:#27ae60;font-size:10px;">\u2713 GitHub token saved</span>' : ' <span style="color:#e67e22;font-size:10px;">&#9888; No token — needed to Contribute</span>')
+    + '</summary>'
+    + '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;">'
+    + '<input id="kb-token-input" type="password" placeholder="GitHub Personal Access Token (public_repo scope)" '
+    + 'style="flex:1;background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
+    + '<button id="kb-token-save-btn" style="background:#27ae60;color:#fff;border:none;padding:7px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">Save Token</button>'
+    + '<button id="kb-token-clear-btn" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 14px;border-radius:4px;cursor:pointer;font-size:12px;">Clear</button>'
+    + '</div>'
+    + '<div style="margin-top:6px;font-size:11px;color:#445566;">Generate a token at github.com/settings/tokens/new — check <b>public_repo</b> scope only.</div>'
+    + '</details>';
+
   html += '<div id="kb-articles-list"></div>';
 
   // Article modal
@@ -10798,6 +10823,20 @@ async function loadKbTab() {
     if (addBtn)      addBtn.onclick      = () => kbOpenModal(null);
     if (searchBtn)   searchBtn.onclick   = () => refreshKbList();
     if (searchInput) searchInput.onkeydown = e => { if (e.key === 'Enter') refreshKbList(); };
+
+    const tokenSaveBtn  = document.getElementById('kb-token-save-btn');
+    const tokenClearBtn = document.getElementById('kb-token-clear-btn');
+    if (tokenSaveBtn) tokenSaveBtn.onclick = async () => {
+      const tok = (document.getElementById('kb-token-input') || {value:''}).value.trim();
+      if (!tok) { alert('Enter a token first.'); return; }
+      const r = await fetch('/api/kb/token', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: tok})});
+      const d = await r.json();
+      if (d.ok) { tokenSaveBtn.textContent = '\u2713 Saved!'; setTimeout(() => loadKbTab(), 1200); }
+    };
+    if (tokenClearBtn) tokenClearBtn.onclick = async () => {
+      await fetch('/api/kb/token', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: ''})});
+      loadKbTab();
+    };
 
     const mCancel = document.getElementById('kb-m-cancel');
     const mSave   = document.getElementById('kb-m-save');
@@ -10845,14 +10884,18 @@ async function refreshKbList() {
     const cc  = catColors[cat] || '#667788';
     const score = a.score != null ? ' <span style="color:#556677;font-size:10px;">&#8212; ' + (a.score*100).toFixed(0) + '% match</span>' : '';
     const preview = (a.body||'').replace(/[#*`]/g,'').substring(0,120).trim();
-    return '<div style="background:#0d1117;border:1px solid #1e2d40;border-radius:6px;padding:12px 16px;margin-bottom:8px;cursor:pointer;" '
-      + 'onclick="kbViewArticle(' + a.id + ')">'
+    return '<div style="background:#0d1117;border:1px solid #1e2d40;border-radius:6px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:8px;">'
+      + '<div style="flex:1;cursor:pointer;" onclick="kbViewArticle(' + a.id + ')">'
       + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
       + '<span style="background:' + cc + '22;color:' + cc + ';border:1px solid ' + cc + '44;border-radius:3px;padding:1px 7px;font-size:10px;font-weight:700;text-transform:uppercase;">' + cat + '</span>'
       + '<span style="font-size:13px;font-weight:600;color:#c9d1d9;">' + a.title + score + '</span>'
       + (a.tags ? '<span style="margin-left:auto;font-size:10px;color:#445566;">' + a.tags + '</span>' : '')
       + '</div>'
       + (preview ? '<div style="font-size:11px;color:#556677;margin-top:2px;">' + preview + (a.body.length > 120 ? '...' : '') + '</div>' : '')
+      + '</div>'
+      + '<button title="Contribute this article to the Shared KB" '
+      + 'style="flex-shrink:0;background:#1a3a1a;color:#27ae60;border:1px solid #27ae6055;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;white-space:nowrap;" '
+      + 'onclick="event.stopPropagation();kbContribute(' + a.id + ',this)">&#127757; Contribute</button>'
       + '</div>';
   }).join('');
 }
@@ -10910,6 +10953,41 @@ async function kbDeleteArticle() {
   _kbCurrentId = null;
   await refreshKbList();
   loadKbTab();
+}
+
+async function kbContribute(articleId, btn) {
+  // Check if a token is already saved; if not, prompt for one.
+  let tokenToUse = '';
+  try {
+    const tr = await fetch('/api/kb/token');
+    const td = await tr.json();
+    if (!td.has_token) {
+      tokenToUse = prompt('Enter your GitHub Personal Access Token (public_repo scope) to contribute this article to the shared KB.\n\nYou can save it permanently in KB Settings.');
+      if (!tokenToUse) return;
+    }
+  } catch(e) {}
+
+  const origText = btn.textContent;
+  btn.textContent = 'Sending...'; btn.disabled = true;
+  try {
+    const body = tokenToUse ? JSON.stringify({token: tokenToUse}) : '{}';
+    const r = await fetch('/api/kb/contribute/' + articleId, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body
+    });
+    const d = await r.json();
+    if (d.ok) {
+      btn.textContent = '\u2713 Contributed!';
+      btn.style.color = '#2ecc71';
+      btn.style.borderColor = '#2ecc71';
+      setTimeout(() => { btn.textContent = origText; btn.disabled = false; btn.style.color=''; btn.style.borderColor=''; }, 3000);
+    } else {
+      alert('Contribute failed: ' + (d.message || 'Unknown error'));
+      btn.textContent = origText; btn.disabled = false;
+    }
+  } catch(e) {
+    alert('Contribute error: ' + e);
+    btn.textContent = origText; btn.disabled = false;
+  }
 }
 
 // Hook into switchTab to load KB when selected
@@ -11358,6 +11436,47 @@ def api_kb_reembed():
         return jsonify({"error": "KB unavailable"}), 503
     threading.Thread(target=_kb.reembed_all, daemon=True).start()
     return jsonify({"ok": True, "message": "Re-embedding started in background"})
+
+@app.route("/api/kb/token", methods=["GET", "POST"])
+def api_kb_token():
+    """GET: check whether a token is saved. POST: save/clear the token."""
+    import kb_sync as _kb_sync
+    token_file = _kb_sync.TOKEN_FILE
+    if request.method == "POST":
+        data  = request.json or {}
+        token = data.get("token", "").strip()
+        if token:
+            _kb_sync.save_token(token)
+            return jsonify({"ok": True, "saved": True})
+        else:
+            try:
+                token_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return jsonify({"ok": True, "saved": False})
+    # GET
+    has_token = token_file.exists() and bool(token_file.read_text().strip())
+    return jsonify({"has_token": has_token})
+
+
+@app.route("/api/kb/contribute/<int:article_id>", methods=["POST"])
+def api_kb_contribute(article_id):
+    """Push a published article to the shared POD-Automator-KB GitHub repo."""
+    import kb_sync as _kb_sync
+    if not _KB_AVAILABLE:
+        return jsonify({"ok": False, "message": "KB unavailable"}), 503
+    data  = request.json or {}
+    token = data.get("token", "").strip()
+    if not token:
+        token = _kb_sync._load_token()
+    if not token:
+        return jsonify({"ok": False, "message": "No GitHub token — enter one in KB Settings"}), 400
+    result = _kb_sync.push_article(article_id, token=token)
+    # If caller supplied token and push succeeded, persist it for future use
+    if result["ok"] and data.get("token"):
+        _kb_sync.save_token(data["token"])
+    return jsonify(result), 200 if result["ok"] else 400
+
 
 @app.route("/api/update")
 def api_update():
