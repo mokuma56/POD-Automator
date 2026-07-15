@@ -10777,21 +10777,7 @@ async function loadKbTab() {
     + '</div>'
     + '<div id="kb-answer" style="display:none;background:#0d1117;border:1px solid #2a3040;border-radius:4px;padding:12px;margin-bottom:14px;font-size:13px;color:#c9d1d9;white-space:pre-wrap;"></div>';
 
-  // KB Settings strip (GitHub token)
-  let tokenSaved = false;
-  try { const tr = await fetch('/api/kb/token'); const td = await tr.json(); tokenSaved = td.has_token; } catch(e) {}
-  html += '<details id="kb-settings" style="margin-bottom:14px;border:1px solid #1e2d40;border-radius:4px;padding:8px 12px;">'
-    + '<summary style="cursor:pointer;font-size:12px;font-weight:600;color:#667788;">&#9881; KB Settings'
-    + (tokenSaved ? ' <span style="color:#27ae60;font-size:10px;">\u2713 GitHub token saved</span>' : ' <span style="color:#e67e22;font-size:10px;">&#9888; No token — needed to Contribute</span>')
-    + '</summary>'
-    + '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;">'
-    + '<input id="kb-token-input" type="password" placeholder="GitHub Personal Access Token (public_repo scope)" '
-    + 'style="flex:1;background:#0d1117;border:1px solid #2a3040;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
-    + '<button id="kb-token-save-btn" style="background:#27ae60;color:#fff;border:none;padding:7px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">Save Token</button>'
-    + '<button id="kb-token-clear-btn" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 14px;border-radius:4px;cursor:pointer;font-size:12px;">Clear</button>'
-    + '</div>'
-    + '<div style="margin-top:6px;font-size:11px;color:#445566;">Generate a token at github.com/settings/tokens/new — check <b>public_repo</b> scope only.</div>'
-    + '</details>';
+  html += '<div style="margin-bottom:12px;font-size:11px;color:#27ae60;">&#127757; Connected to Shared KB &mdash; <span style="color:#445566;">mokuma56/POD-Automator-KB</span></div>';
 
   html += '<div id="kb-articles-list"></div>';
 
@@ -10823,20 +10809,6 @@ async function loadKbTab() {
     if (addBtn)      addBtn.onclick      = () => kbOpenModal(null);
     if (searchBtn)   searchBtn.onclick   = () => refreshKbList();
     if (searchInput) searchInput.onkeydown = e => { if (e.key === 'Enter') refreshKbList(); };
-
-    const tokenSaveBtn  = document.getElementById('kb-token-save-btn');
-    const tokenClearBtn = document.getElementById('kb-token-clear-btn');
-    if (tokenSaveBtn) tokenSaveBtn.onclick = async () => {
-      const tok = (document.getElementById('kb-token-input') || {value:''}).value.trim();
-      if (!tok) { alert('Enter a token first.'); return; }
-      const r = await fetch('/api/kb/token', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: tok})});
-      const d = await r.json();
-      if (d.ok) { tokenSaveBtn.textContent = '\u2713 Saved!'; setTimeout(() => loadKbTab(), 1200); }
-    };
-    if (tokenClearBtn) tokenClearBtn.onclick = async () => {
-      await fetch('/api/kb/token', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: ''})});
-      loadKbTab();
-    };
 
     const mCancel = document.getElementById('kb-m-cancel');
     const mSave   = document.getElementById('kb-m-save');
@@ -10956,23 +10928,11 @@ async function kbDeleteArticle() {
 }
 
 async function kbContribute(articleId, btn) {
-  // Check if a token is already saved; if not, prompt for one.
-  let tokenToUse = '';
-  try {
-    const tr = await fetch('/api/kb/token');
-    const td = await tr.json();
-    if (!td.has_token) {
-      tokenToUse = prompt('Enter your GitHub Personal Access Token (public_repo scope) to contribute this article to the shared KB.\n\nYou can save it permanently in KB Settings.');
-      if (!tokenToUse) return;
-    }
-  } catch(e) {}
-
   const origText = btn.textContent;
   btn.textContent = 'Sending...'; btn.disabled = true;
   try {
-    const body = tokenToUse ? JSON.stringify({token: tokenToUse}) : '{}';
     const r = await fetch('/api/kb/contribute/' + articleId, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
     });
     const d = await r.json();
     if (d.ok) {
