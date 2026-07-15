@@ -48,15 +48,15 @@ KB_IMAGES_DIR = SCRIPT_DIR / "data" / "kb_images"
 # ── Token helpers ─────────────────────────────────────────────────────────────
 
 def _load_token() -> str:
-    """Return GitHub token from env var, token file, or built-in fallback."""
+    """Return GitHub token from env var or token file. Empty string if not set."""
     t = os.environ.get("GITHUB_KB_TOKEN", "").strip()
     if t:
         return t
     if TOKEN_FILE.exists():
-        return TOKEN_FILE.read_text().strip()
-    # Built-in shared write token (public_repo scope only - KB repo writes)
-    import base64
-    return base64.b64decode("Z2hwXzNQYlFMRHY1RWhnVnp5eE1JRlZwYU5LWW9sZm9DYjJ3WlJEeQ==").decode()
+        t = TOKEN_FILE.read_text().strip()
+        if t:
+            return t
+    return ""
 
 
 def save_token(token: str):
