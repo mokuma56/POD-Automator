@@ -113,7 +113,7 @@ Single-page Flask dashboard at `http://localhost:5050`:
   - **🔒 Duo** — Duo integration card (SESSION REFRESH or FULL SETUP mode, 7 steps)
   - **Base Config Reset** — push baseline config to switches via Telnet
   - **Upgrade** — per-device version status and upgrade trigger
-  - **Knowledge Base** — semantic search + AI-assisted answers
+- **Knowledge Base card** — top dashboard card showing article count and recent titles; opens standalone full-screen modal with search, create, edit, delete, and Contribute — no POD row required
 - **Software Upgrade Images card** — configure golden versions, upload firmware `.bin` files
 - **Clickable SSH** — click any switch name to open macOS Terminal.app with SSH
   connected through the Docker VPN (password automated via `sshpass`)
@@ -488,13 +488,27 @@ Articles are stored locally in SQLite and synced from the shared GitHub repo
 [`mokuma56/POD-Automator-KB`](https://github.com/mokuma56/POD-Automator-KB)
 automatically on every **Check for Updates**.
 
+### KB Card — Main Dashboard
+
+The **📚 Knowledge Base** card sits in the top card row alongside the CSV upload
+and firmware image cards. It shows:
+
+- Live article count badge
+- Three most recent article titles
+- **+ New Article** button — opens the KB modal directly into the new article form
+- **Search** button — opens the KB modal to the article list
+
+Clicking the card or either button opens a **full-screen modal overlay** — no POD
+row needs to be open first. The modal has full search, create, edit, delete, and
+Contribute functionality.
+
 ### How Articles Are Shared
 
 | Action | How |
 |--------|-----|
-| Pull new articles | Automatic — happens on every Check for Updates and on dashboard startup |
-| Write an article | Dashboard → Knowledge Base tab → **+ New Article** |
-| Share with all proctors | Click **🌐 Contribute** on any published article — pushes to the shared GitHub repo |
+| Pull new articles | Automatic — on every Check for Updates and dashboard startup |
+| Write an article | KB card → **+ New Article** (or Knowledge Base tab in any POD detail panel) |
+| Share with all proctors | Click **🌐 Contribute** on any article row |
 
 No GitHub account or token setup required — a shared write token is built into the tool.
 
