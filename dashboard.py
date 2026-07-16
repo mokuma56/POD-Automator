@@ -10943,24 +10943,28 @@ async function loadKbStandalone() {
 
   html += '<div id="kb-sa-articles-list"></div>';
 
-  // Article modal (reuse same structure, different IDs)
-  html += '<div id="kb-sa-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.80);z-index:10100;align-items:center;justify-content:center;">'
-    + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;width:680px;max-height:85vh;overflow-y:auto;">'
-    + '<div style="font-size:16px;font-weight:700;color:#00bceb;margin-bottom:14px;" id="kb-sa-modal-title">New Article</div>'
-    + '<input id="kb-sa-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:14px;margin-bottom:10px;box-sizing:border-box;">'
-    + '<textarea id="kb-sa-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:6px;box-sizing:border-box;resize:vertical;"></textarea>'
-    + '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;">'
-    + '<label id="kb-sa-img-label" style="background:#1a2a1a;color:#27ae60;border:1px solid #27ae6055;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128247; Add Screenshot'
-    + '<input type="file" id="kb-sa-img-input" accept="image/*" style="display:none;" onchange="kbSaUploadImage(this)"></label>'
-    + '<span id="kb-sa-img-status" style="font-size:11px;color:#667788;"></span>'
-    + '</div>'
-    + '<div style="display:flex;gap:8px;margin-bottom:14px;">'
-    + '<input id="kb-sa-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
-     + '<select id="kb-sa-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
-     + kbCategoryOptions()
-     + '</select>'
+   // Article modal (reuse same structure, different IDs)
+   html += '<div id="kb-sa-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.80);z-index:10100;align-items:center;justify-content:center;">'
+     + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;width:680px;max-height:85vh;overflow-y:auto;">'
+     + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">'
+     + '<div style="font-size:16px;font-weight:700;color:#00bceb;flex:1;" id="kb-sa-modal-title">New Article</div>'
+     + '<button id="kb-sa-m-edit-btn" onclick="kbSaSwitchToEdit()" style="display:none;background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:12px;">&#9998; Edit</button>'
      + '</div>'
-    + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
+     + '<div id="kb-sa-view-body" style="display:none;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:12px 14px;font-size:13px;color:#c9d1d9;line-height:1.7;margin-bottom:10px;min-height:80px;"></div>'
+     + '<input id="kb-sa-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:14px;margin-bottom:10px;box-sizing:border-box;">'
+     + '<textarea id="kb-sa-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:6px;box-sizing:border-box;resize:vertical;"></textarea>'
+     + '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;" id="kb-sa-img-row">'
+     + '<label id="kb-sa-img-label" style="background:#1a2a1a;color:#27ae60;border:1px solid #27ae6055;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128247; Add Screenshot'
+     + '<input type="file" id="kb-sa-img-input" accept="image/*" style="display:none;" onchange="kbSaUploadImage(this)"></label>'
+     + '<span id="kb-sa-img-status" style="font-size:11px;color:#667788;"></span>'
+     + '</div>'
+     + '<div style="display:flex;gap:8px;margin-bottom:14px;" id="kb-sa-meta-row">'
+     + '<input id="kb-sa-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
+      + '<select id="kb-sa-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
+      + kbCategoryOptions()
+      + '</select>'
+      + '</div>'
+     + '<div style="display:flex;gap:8px;justify-content:flex-end;" id="kb-sa-action-row">'
     + '<button id="kb-sa-m-delete" style="background:#c0392b;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;display:none;">Delete</button>'
     + '<button id="kb-sa-m-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;margin-left:auto;">Cancel</button>'
     + '<button id="kb-sa-m-save" style="background:#00bceb;color:#000;border:none;padding:7px 20px;border-radius:4px;cursor:pointer;font-weight:700;">Save</button>'
@@ -11037,15 +11041,59 @@ async function kbSaViewArticle(id) {
 }
 
 function kbSaOpenModal(art) {
-  document.getElementById('kb-sa-modal-title').textContent = art ? 'Edit Article' : 'New Article';
+  const isNew = !art;
+  document.getElementById('kb-sa-modal-title').textContent = isNew ? 'New Article' : art.title;
   document.getElementById('kb-sa-m-title').value    = art ? (art.title||'')    : '';
   document.getElementById('kb-sa-m-body').value     = art ? (art.body||'')     : '';
   document.getElementById('kb-sa-m-tags').value     = art ? (art.tags||'')     : '';
   document.getElementById('kb-sa-m-category').value = art ? (art.category||'General') : 'General';
-  const del = document.getElementById('kb-sa-m-delete');
+  const del     = document.getElementById('kb-sa-m-delete');
+  const editBtn = document.getElementById('kb-sa-m-edit-btn');
+  const viewDiv = document.getElementById('kb-sa-view-body');
+  const titleIn = document.getElementById('kb-sa-m-title');
+  const bodyTA  = document.getElementById('kb-sa-m-body');
+  const imgRow  = document.getElementById('kb-sa-img-row');
+  const metaRow = document.getElementById('kb-sa-meta-row');
   if (!art) _kbSaCurrentId = null;
   if (del) del.style.display = art ? 'inline-block' : 'none';
+
+  const saveBtn = document.getElementById('kb-sa-m-save');
+  if (isNew) {
+    // New article — show edit form directly
+    viewDiv.style.display  = 'none';
+    editBtn.style.display  = 'none';
+    titleIn.style.display  = '';
+    bodyTA.style.display   = '';
+    imgRow.style.display   = 'flex';
+    metaRow.style.display  = 'flex';
+    if (saveBtn) saveBtn.style.display = '';
+  } else {
+    // Existing article — show rendered view, hide edit form
+    viewDiv.innerHTML = kbRenderArticleBody(art.body || '');
+    viewDiv.style.display  = 'block';
+    editBtn.style.display  = 'inline-block';
+    titleIn.style.display  = 'none';
+    bodyTA.style.display   = 'none';
+    imgRow.style.display   = 'none';
+    metaRow.style.display  = 'none';
+    if (saveBtn) saveBtn.style.display = 'none';
+    if (del) del.style.display = 'none';
+  }
   document.getElementById('kb-sa-modal').style.display = 'flex';
+}
+
+function kbSaSwitchToEdit() {
+  document.getElementById('kb-sa-modal-title').textContent = 'Edit Article';
+  document.getElementById('kb-sa-view-body').style.display  = 'none';
+  document.getElementById('kb-sa-m-edit-btn').style.display = 'none';
+  document.getElementById('kb-sa-m-title').style.display    = '';
+  document.getElementById('kb-sa-m-body').style.display     = '';
+  document.getElementById('kb-sa-img-row').style.display    = 'flex';
+  document.getElementById('kb-sa-meta-row').style.display   = 'flex';
+  const saveBtn = document.getElementById('kb-sa-m-save');
+  const delBtn  = document.getElementById('kb-sa-m-delete');
+  if (saveBtn) saveBtn.style.display = '';
+  if (delBtn && _kbSaCurrentId) delBtn.style.display = 'inline-block';
 }
 
 async function kbSaSaveModal() {
@@ -11108,28 +11156,32 @@ async function loadKbTab() {
 
   html += '<div id="kb-articles-list"></div>';
 
-  // Article modal
-  html += '<div id="kb-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:center;justify-content:center;">'
-    + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;width:680px;max-height:85vh;overflow-y:auto;">'
-    + '<div style="font-size:16px;font-weight:700;color:#00bceb;margin-bottom:14px;" id="kb-modal-title">New Article</div>'
-    + '<input id="kb-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:14px;margin-bottom:10px;box-sizing:border-box;">'
-    + '<textarea id="kb-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:6px;box-sizing:border-box;resize:vertical;"></textarea>'
-     + '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;">'
-     + '<label id="kb-img-label" style="background:#1a2a1a;color:#27ae60;border:1px solid #27ae6055;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128247; Add Screenshot'
-     + '<input type="file" id="kb-img-input" accept="image/*" style="display:none;" onchange="kbUploadImage(this)"></label>'
-     + '<span id="kb-img-status" style="font-size:11px;color:#667788;"></span>'
+   // Article modal
+   html += '<div id="kb-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:center;justify-content:center;">'
+     + '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;width:680px;max-height:85vh;overflow-y:auto;">'
+     + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">'
+     + '<div style="font-size:16px;font-weight:700;color:#00bceb;flex:1;" id="kb-modal-title">New Article</div>'
+     + '<button id="kb-m-edit-btn" onclick="kbSwitchToEdit()" style="display:none;background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:12px;">&#9998; Edit</button>'
      + '</div>'
-    + '<div style="display:flex;gap:8px;margin-bottom:14px;">'
-    + '<input id="kb-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
-     + '<select id="kb-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
-     + kbCategoryOptions()
-     + '</select>'
-     + '</div>'
-    + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
-    + '<button id="kb-m-delete" style="background:#c0392b;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;display:none;">Delete</button>'
-    + '<button id="kb-m-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;margin-left:auto;">Cancel</button>'
-    + '<button id="kb-m-save" style="background:#00bceb;color:#000;border:none;padding:7px 20px;border-radius:4px;cursor:pointer;font-weight:700;">Save</button>'
-    + '</div></div></div>';
+     + '<div id="kb-view-body" style="display:none;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:12px 14px;font-size:13px;color:#c9d1d9;line-height:1.7;margin-bottom:10px;min-height:80px;"></div>'
+     + '<input id="kb-m-title" placeholder="Title" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:14px;margin-bottom:10px;box-sizing:border-box;">'
+     + '<textarea id="kb-m-body" rows="14" placeholder="Write your notes here..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:13px;font-family:monospace;margin-bottom:6px;box-sizing:border-box;resize:vertical;"></textarea>'
+      + '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;" id="kb-img-row">'
+      + '<label id="kb-img-label" style="background:#1a2a1a;color:#27ae60;border:1px solid #27ae6055;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128247; Add Screenshot'
+      + '<input type="file" id="kb-img-input" accept="image/*" style="display:none;" onchange="kbUploadImage(this)"></label>'
+      + '<span id="kb-img-status" style="font-size:11px;color:#667788;"></span>'
+      + '</div>'
+     + '<div style="display:flex;gap:8px;margin-bottom:14px;" id="kb-meta-row">'
+     + '<input id="kb-m-tags" placeholder="Tags (comma separated)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 10px;border-radius:4px;font-size:12px;">'
+      + '<select id="kb-m-category" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px 8px;border-radius:4px;font-size:12px;">'
+      + kbCategoryOptions()
+      + '</select>'
+      + '</div>'
+     + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
+     + '<button id="kb-m-delete" style="background:#c0392b;color:#fff;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;display:none;">Delete</button>'
+     + '<button id="kb-m-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:7px 16px;border-radius:4px;cursor:pointer;margin-left:auto;">Cancel</button>'
+     + '<button id="kb-m-save" style="background:#00bceb;color:#000;border:none;padding:7px 20px;border-radius:4px;cursor:pointer;font-weight:700;">Save</button>'
+     + '</div></div></div>';
 
   grid.innerHTML = html;
   await refreshKbList();
@@ -11207,16 +11259,60 @@ async function kbViewArticle(id) {
 }
 
 function kbOpenModal(art) {
+  const isNew   = !art;
   const modal   = document.getElementById('kb-modal');
   const delBtn  = document.getElementById('kb-m-delete');
-  document.getElementById('kb-modal-title').textContent = art ? 'Edit Article' : 'New Article';
+  const editBtn = document.getElementById('kb-m-edit-btn');
+  const viewDiv = document.getElementById('kb-view-body');
+  const titleIn = document.getElementById('kb-m-title');
+  const bodyTA  = document.getElementById('kb-m-body');
+  const imgRow  = document.getElementById('kb-img-row');
+  const metaRow = document.getElementById('kb-meta-row');
+
+  document.getElementById('kb-modal-title').textContent = isNew ? 'New Article' : art.title;
   document.getElementById('kb-m-title').value    = art ? (art.title||'')    : '';
   document.getElementById('kb-m-body').value     = art ? (art.body||'')     : '';
   document.getElementById('kb-m-tags').value     = art ? (art.tags||'')     : '';
   document.getElementById('kb-m-category').value = art ? (art.category||'General') : 'General';
   if (!art) _kbCurrentId = null;
   if (delBtn) delBtn.style.display = art ? 'inline-block' : 'none';
+
+  const saveBtn = document.getElementById('kb-m-save');
+  if (isNew) {
+    viewDiv.style.display  = 'none';
+    editBtn.style.display  = 'none';
+    titleIn.style.display  = '';
+    bodyTA.style.display   = '';
+    imgRow.style.display   = 'flex';
+    metaRow.style.display  = 'flex';
+    if (saveBtn) saveBtn.style.display = '';
+    if (delBtn) delBtn.style.display = 'none';
+  } else {
+    viewDiv.innerHTML = kbRenderArticleBody(art.body || '');
+    viewDiv.style.display  = 'block';
+    editBtn.style.display  = 'inline-block';
+    titleIn.style.display  = 'none';
+    bodyTA.style.display   = 'none';
+    imgRow.style.display   = 'none';
+    metaRow.style.display  = 'none';
+    if (saveBtn) saveBtn.style.display = 'none';
+    if (delBtn) delBtn.style.display = 'none';
+  }
   modal.style.display = 'flex';
+}
+
+function kbSwitchToEdit() {
+  document.getElementById('kb-modal-title').textContent = 'Edit Article';
+  document.getElementById('kb-view-body').style.display  = 'none';
+  document.getElementById('kb-m-edit-btn').style.display = 'none';
+  document.getElementById('kb-m-title').style.display    = '';
+  document.getElementById('kb-m-body').style.display     = '';
+  document.getElementById('kb-img-row').style.display    = 'flex';
+  document.getElementById('kb-meta-row').style.display   = 'flex';
+  const saveBtn = document.getElementById('kb-m-save');
+  const delBtn  = document.getElementById('kb-m-delete');
+  if (saveBtn) saveBtn.style.display = '';
+  if (delBtn && _kbCurrentId) delBtn.style.display = 'inline-block';
 }
 
 async function kbSaveModal() {

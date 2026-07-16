@@ -94,20 +94,34 @@ def pull(db_path=None, verbose=True) -> dict:
         if verbose: print(f"[kb-sync] ERROR: {msg}")
         return {"imported": 0, "skipped": 0, "error": msg}
 
-    # Get existing titles to avoid duplicates
-    existing_titles = {
-        a["title"] for a in _kb.list_articles(db_path, status=None, limit=10000)
+    # Get existing articles (title -> id+body) for upsert logic
+    existing = {
+        a["title"]: a
+        for a in _kb.list_articles(db_path, status=None, limit=10000)
     }
 
-    imported = skipped = 0
+    imported = skipped = updated = 0
     for art in remote_articles:
         title = (art.get("title") or "").strip()
         body  = (art.get("body")  or "").strip()
         if not title or not body:
             skipped += 1
             continue
-        if title in existing_titles:
-            skipped += 1
+        if title in existing:
+            local = existing[title]
+            if (local.get("body") or "").strip() != body:
+                _kb.update_article(
+                    db_path=db_path,
+                    article_id=local["id"],
+                    body=body,
+                    tags=art.get("tags", local.get("tags", "")),
+                    category=art.get("category", local.get("category", "General")),
+                    status="published",
+                )
+                if verbose: print(f"[kb-sync] updated: {title[:70]}")
+                updated += 1
+            else:
+                skipped += 1
             continue
         _kb.add_article(
             db_path=db_path,
@@ -121,9 +135,9 @@ def pull(db_path=None, verbose=True) -> dict:
         imported += 1
 
     if verbose:
-        print(f"[kb-sync] done - {imported} imported, {skipped} skipped")
+        print(f"[kb-sync] done - {imported} imported, {updated} updated, {skipped} skipped")
 
-    return {"imported": imported, "skipped": skipped, "error": None}
+    return {"imported": imported, "updated": updated, "skipped": skipped, "error": None}
 
 
 # ── Image push helper ─────────────────────────────────────────────────────────
