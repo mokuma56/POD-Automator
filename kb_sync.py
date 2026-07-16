@@ -258,14 +258,17 @@ def push_article(article_id: int, token: str = "", db_path=None) -> dict:
         "created_at": art.get("created_at", ""),
     }
 
-    # Avoid duplicate titles
+    # Upsert: replace existing entry if title matches, otherwise append
     existing_titles = {a.get("title") for a in current_articles}
     if new_record["title"] in existing_titles:
-        return {"ok": False,
-                "message": f"An article with this title already exists in the shared KB: '{new_record['title']}'",
-                "commit_sha": None}
-
-    updated_articles = current_articles + [new_record]
+        updated_articles = [
+            new_record if a.get("title") == new_record["title"] else a
+            for a in current_articles
+        ]
+        commit_verb = "update"
+    else:
+        updated_articles = current_articles + [new_record]
+        commit_verb = "add"
 
     # 4. Commit updated articles.json
     new_content = base64.b64encode(
@@ -273,7 +276,7 @@ def push_article(article_id: int, token: str = "", db_path=None) -> dict:
     ).decode()
 
     payload = json.dumps({
-        "message": f"kb: add article '{new_record['title'][:60]}'",
+        "message": f"kb: {commit_verb} article '{new_record['title'][:60]}'",
         "content": new_content,
         "sha": current_sha,
     }).encode()
@@ -287,7 +290,7 @@ def push_article(article_id: int, token: str = "", db_path=None) -> dict:
             result = json.loads(resp.read().decode())
         sha = result.get("commit", {}).get("sha", "")
         return {"ok": True,
-                "message": f"Article contributed successfully (commit {sha[:7]})",
+                "message": f"Article {'updated' if commit_verb == 'update' else 'contributed'} successfully (commit {sha[:7]})",
                 "commit_sha": sha}
     except urllib.error.HTTPError as e:
         body_err = e.read().decode()
