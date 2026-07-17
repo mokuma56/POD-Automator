@@ -10873,16 +10873,24 @@ function kbCatColor(cat) {
 }
 
 function kbRenderArticleBody(body) {
-  // Convert ![alt](/api/kb/image/...) and raw.githubusercontent image URLs to <img> tags,
-  // then escape remaining HTML and convert newlines to <br>
-  const escaped = (body || '')
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  return escaped
-    .replace(/!\[([^\]]*)\]\((\/api\/kb\/image\/[^)]+)\)/g,
-      '<br><img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0;border:1px solid #30363d;"><br>')
-    .replace(/!\[([^\]]*)\]\((https:\/\/raw\.githubusercontent[^)]+)\)/g,
-      '<br><img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0;border:1px solid #30363d;"><br>')
-    .replace(/\\n/g,'<br>');
+   // Convert ![alt](url) to <img> for images or a download link for other files.
+   // Supports /api/kb/image/ local URLs and raw.githubusercontent URLs.
+   const IMG_EXTS = /\.(png|jpg|jpeg|gif|webp)$/i;
+   function _kbRenderMedia(alt, url) {
+     const fname = url.split('/').pop().split('?')[0];
+     if (IMG_EXTS.test(fname)) {
+       return '<br><img src="' + url + '" alt="' + alt + '" style="max-width:100%;border-radius:4px;margin:8px 0;border:1px solid #30363d;"><br>';
+     }
+     // Non-image — render as download link
+     const label = alt || fname;
+     return '<br><a href="' + url + '" download="' + fname + '" style="display:inline-flex;align-items:center;gap:6px;background:#1a2233;border:1px solid #30363d;border-radius:4px;padding:5px 12px;color:#00bceb;font-size:12px;text-decoration:none;margin:6px 0;">&#128206; ' + label + '</a><br>';
+   }
+   const escaped = (body || '')
+     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+   return escaped
+     .replace(/!\[([^\]]*)\]\((\/api\/kb\/image\/[^)]+)\)/g, (_, alt, url) => _kbRenderMedia(alt, url))
+     .replace(/!\[([^\]]*)\]\((https:\/\/raw\.githubusercontent[^)]+)\)/g, (_, alt, url) => _kbRenderMedia(alt, url))
+     .replace(/\\n/g,'<br>');
 }
 
 async function loadKbTopCard() {
@@ -10956,6 +10964,8 @@ async function loadKbStandalone() {
      + '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;" id="kb-sa-img-row">'
      + '<label id="kb-sa-img-label" style="background:#1a2a1a;color:#27ae60;border:1px solid #27ae6055;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128247; Add Screenshot'
      + '<input type="file" id="kb-sa-img-input" accept="image/*" style="display:none;" onchange="kbSaUploadImage(this)"></label>'
+     + '<label id="kb-sa-file-label" style="background:#1a2233;color:#00bceb;border:1px solid #00bceb55;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128206; Attach File'
+     + '<input type="file" id="kb-sa-file-input" accept=".txt,.log,.cfg,.conf,.json,.csv,.yaml,.yml,.xml,.py,.js,.sh,.md" style="display:none;" onchange="kbSaUploadFile(this)"></label>'
      + '<span id="kb-sa-img-status" style="font-size:11px;color:#667788;"></span>'
      + '</div>'
      + '<div style="display:flex;gap:8px;margin-bottom:14px;" id="kb-sa-meta-row">'
@@ -11169,6 +11179,8 @@ async function loadKbTab() {
       + '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;" id="kb-img-row">'
       + '<label id="kb-img-label" style="background:#1a2a1a;color:#27ae60;border:1px solid #27ae6055;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128247; Add Screenshot'
       + '<input type="file" id="kb-img-input" accept="image/*" style="display:none;" onchange="kbUploadImage(this)"></label>'
+      + '<label id="kb-file-label" style="background:#1a2233;color:#00bceb;border:1px solid #00bceb55;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">&#128206; Attach File'
+      + '<input type="file" id="kb-file-input" accept=".txt,.log,.cfg,.conf,.json,.csv,.yaml,.yml,.xml,.py,.js,.sh,.md" style="display:none;" onchange="kbUploadFile(this)"></label>'
       + '<span id="kb-img-status" style="font-size:11px;color:#667788;"></span>'
       + '</div>'
      + '<div style="display:flex;gap:8px;margin-bottom:14px;" id="kb-meta-row">'
@@ -11371,15 +11383,48 @@ async function kbUploadImageToTextarea(file, textareaId, statusId) {
   }
 }
 
+async function kbUploadFileToTextarea(file, textareaId, statusId) {
+  const status = document.getElementById(statusId);
+  if (status) { status.textContent = 'Uploading...'; status.style.color = '#00bceb'; }
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch('/api/kb/image-upload', {method:'POST', body: fd});
+    const d = await r.json();
+    if (d.ok) {
+      const ta = document.getElementById(textareaId);
+      const md = '\\n![' + file.name + '](/api/kb/image/' + d.filename + ')\\n';
+      ta.value += md;
+      if (status) { status.textContent = '\u2713 Attached'; status.style.color = '#27ae60'; setTimeout(() => { status.textContent = ''; }, 2500); }
+    } else {
+      if (status) { status.textContent = 'Upload failed: ' + (d.error||''); status.style.color = '#e74c3c'; }
+    }
+  } catch(e) {
+    if (status) { status.textContent = 'Upload error: ' + e; status.style.color = '#e74c3c'; }
+  }
+}
+
 function kbSaUploadImage(input) {
   if (!input.files || !input.files[0]) return;
   kbUploadImageToTextarea(input.files[0], 'kb-sa-m-body', 'kb-sa-img-status');
   input.value = '';
 }
 
+function kbSaUploadFile(input) {
+  if (!input.files || !input.files[0]) return;
+  kbUploadFileToTextarea(input.files[0], 'kb-sa-m-body', 'kb-sa-img-status');
+  input.value = '';
+}
+
 function kbUploadImage(input) {
   if (!input.files || !input.files[0]) return;
   kbUploadImageToTextarea(input.files[0], 'kb-m-body', 'kb-img-status');
+  input.value = '';
+}
+
+function kbUploadFile(input) {
+  if (!input.files || !input.files[0]) return;
+  kbUploadFileToTextarea(input.files[0], 'kb-m-body', 'kb-img-status');
   input.value = '';
 }
 
@@ -11968,20 +12013,23 @@ KB_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.route("/api/kb/image-upload", methods=["POST"])
 def api_kb_image_upload():
-    """Upload a screenshot for a KB article. Saves to data/kb_images/."""
+    """Upload a screenshot or file attachment for a KB article. Saves to data/kb_images/."""
     import uuid as _uuid
-    f = request.files.get("image")
+    f = request.files.get("image") or request.files.get("file")
     if not f:
         return jsonify({"ok": False, "error": "No file provided"}), 400
-    ext = Path(f.filename).suffix.lower() or ".png"
-    if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
-        return jsonify({"ok": False, "error": "Unsupported file type"}), 400
+    ext = Path(f.filename).suffix.lower() or ".bin"
+    # Blocked extensions for security
+    blocked = {".exe", ".bat", ".sh", ".ps1", ".cmd", ".msi", ".dll", ".so"}
+    if ext in blocked:
+        return jsonify({"ok": False, "error": f"File type {ext} not allowed"}), 400
     filename = _uuid.uuid4().hex[:8] + "_" + Path(f.filename).name
     # Sanitise filename
     filename = "".join(c if c.isalnum() or c in "-_." else "_" for c in filename)
     dest = KB_IMAGES_DIR / filename
     f.save(str(dest))
-    return jsonify({"ok": True, "filename": filename})
+    img_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+    return jsonify({"ok": True, "filename": filename, "is_image": ext in img_exts})
 
 
 @app.route("/api/kb/image/<path:filename>")
