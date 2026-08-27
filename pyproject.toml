@@ -20,4 +20,5 @@ dependencies = [
     "netmiko>=4.3",
     "playwright>=1.40",
     "fastmcp>=2.0",
+    "python-docx>=1.2.0",
 ]

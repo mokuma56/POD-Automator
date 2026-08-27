@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pod-automator": {
+      "command": "uv",
+      "args": ["run", "python3", "pod_automator.py"],
+      "cwd": "/Users/maokuma/sw_projects/pod_automator"
+    }
+  }
+}
