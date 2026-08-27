@@ -12,6 +12,48 @@ data/bootstrap/*.cfg
 data/*.har
 data/images/*.bin
 *.db
+# DB backups/copies — hold the org_credentials table (VPN passwords)
+*.db.*
+*.db-shm
+*.db-wal
 dist/
 build/
 data/kb_token.txt
+
+# ---- Session state and credentials (never commit) ----
+# Authenticated browser profiles — contain live cisco.com session cookies,
+# Local Storage, and IndexedDB for security.cisco.com
+data/*chrome_profile/
+data/*_profile/
+# Saved Playwright/API session blobs
+data/*session*.json
+data/scc_session_*.json
+data/ise_scc_otp_*.json
+*_token.txt
+*_token.rtf
+*-Token.rtf
+*KB-Token*
+
+# ---- Per-org API credentials (never commit) ----
+# Despite the "template" name these files hold live Duo ikey/skey, SCC API
+# key/secret + bearer token, and Smart Account API credentials.
+data/org_credentials*.csv
+org_credentials*.csv
+
+# ---- KB attachments (runtime uploads, not source) ----
+# Screenshots pasted into KB articles routinely show SCC/ISE/Duo session state.
+data/kb_images/*
+!data/kb_images/.gitkeep
+
+# ---- Playwright debug artifacts ----
+# Screenshots are captured mid-session against SCC/ISE/cdFMC and can show
+# session state, org names, and credentials
+# NOTE: use ** so subdirectories are covered, not just data/ itself
+data/**/*.png
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.log
+
+# ---- Editor / OS cruft ----
+~$*.docx
+~$*.xlsx
