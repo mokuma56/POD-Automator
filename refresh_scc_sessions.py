@@ -144,10 +144,12 @@ def run(db_path: str, log=None):
         except Exception as e:
             _log(f"  Initial navigation warning (continuing): {e}")
 
-        # ── 3. Wait until authenticated (okta-token-storage non-empty) ───────
-        # Detection uses ctx.storage_state() — checks ALL origins including
-        # security.cisco.com even if the active page is still on sign-on domain
-        # (e.g. during the OAuth callback redirect chain).
+        # ── 3. Wait until authenticated on security.cisco.com ────────────────
+        # SCC may redirect to Application Portal (appcenter.cisco.com) after
+        # Okta SSO login. We detect either:
+        #   A) Already on security.cisco.com with okta tokens
+        #   B) On appcenter.cisco.com (Application Portal) — click the
+        #      Secure Access / Security Cloud tile to navigate to SCC
         _log("Waiting for authentication (up to 5 minutes)...")
         deadline = time.time() + 300
         org_page_ready = False
@@ -155,39 +157,119 @@ def run(db_path: str, log=None):
         while time.time() < deadline:
             time.sleep(2)
 
-            # Primary: check storage_state for okta tokens in any origin
             try:
-                _state = ctx.storage_state()
-                for _origin in _state.get("origins", []):
-                    for _item in _origin.get("localStorage", []):
-                        if _item.get("name") == "okta-token-storage":
+                cur_url = ctx.pages[0].url if ctx.pages else ""
+            except Exception:
+                cur_url = ""
+
+            # Case A: already on SCC — check for okta tokens in ANY origin
+            if "security.cisco.com" in cur_url:
+                try:
+                    _state = ctx.storage_state()
+                    # Check all origins — SCC may store tokens under its own origin
+                    # or under an auth subdomain
+                    for _origin in _state.get("origins", []):
+                        for _item in _origin.get("localStorage", []):
+                            if _item.get("name") == "okta-token-storage":
+                                try:
+                                    _tok = json.loads(_item.get("value", "{}"))
+                                    if _tok and len(_tok) > 0:
+                                        _log(f"Authenticated on SCC (origin={_origin.get('origin','?')[:50]}) — URL: {cur_url[:80]}")
+                                        try:
+                                            ctx.pages[0].screenshot(
+                                                path=str(DATA_DIR / "scc_auth_state.png"))
+                                        except Exception:
+                                            pass
+                                        org_page_ready = True
+                                except Exception:
+                                    pass
+                        if org_page_ready:
+                            break
+
+                    # Fallback: if we're on SCC and cookies exist, that's enough
+                    # (some SCC versions use cookie-only auth, no localStorage tokens)
+                    if not org_page_ready:
+                        _cookies = _state.get("cookies", [])
+                        _scc_cookies = [c for c in _cookies if "cisco.com" in c.get("domain", "")]
+                        if len(_scc_cookies) >= 5:
+                            _log(f"Authenticated on SCC via cookies ({len(_scc_cookies)} cisco.com cookies) — URL: {cur_url[:80]}")
                             try:
-                                _tok = json.loads(_item.get("value", "{}"))
-                                if _tok and len(_tok) > 0:
-                                    _cur_url = ctx.pages[0].url if ctx.pages else "unknown"
-                                    _log(f"Authenticated (storage_state) — URL: {_cur_url[:80]}")
-                                    try:
-                                        ctx.pages[0].screenshot(
-                                            path=str(DATA_DIR / "scc_auth_state.png"))
-                                    except Exception:
-                                        pass
-                                    org_page_ready = True
+                                ctx.pages[0].screenshot(
+                                    path=str(DATA_DIR / "scc_auth_state.png"))
                             except Exception:
                                 pass
+                            org_page_ready = True
+                except Exception:
+                    pass
                 if org_page_ready:
                     break
-            except Exception as _e:
-                pass  # context not ready yet
 
-            # Fallback: log current page URLs for diagnostics
+                # On SCC but no tokens yet — page may still be loading
+                _log(f"  On SCC, waiting for tokens... ({cur_url[:60]})")
+                continue
+
+            # Case B: Application Portal — find and click Secure Access tile
+            if "appcenter.cisco.com" in cur_url or "myapps.cisco.com" in cur_url:
+                _log(f"  On Application Portal ({cur_url[:60]}) — looking for Secure Access tile...")
+                try:
+                    pg = ctx.pages[0]
+                    # Try various selectors for the SCC/Secure Access app tile
+                    _clicked = False
+                    for _sel in [
+                        'a[href*="security.cisco.com"]',
+                        'a[href*="secure-access"]',
+                        '[title*="Secure Access"]',
+                        '[aria-label*="Secure Access"]',
+                        'text=Secure Access',
+                        'text=Security Cloud',
+                        'text=Cisco Security Cloud',
+                    ]:
+                        try:
+                            el = pg.locator(_sel).first
+                            if el.is_visible(timeout=1000):
+                                el.click()
+                                _log(f"  Clicked tile: {_sel}")
+                                pg.wait_for_load_state("domcontentloaded", timeout=15000)
+                                _clicked = True
+                                break
+                        except Exception:
+                            pass
+
+                    if not _clicked:
+                        # JS scan for any link containing security.cisco.com
+                        try:
+                            _href = pg.evaluate("""() => {
+                                const links = Array.from(document.querySelectorAll('a[href]'));
+                                const scc = links.find(l => l.href && l.href.includes('security.cisco.com'));
+                                if (scc) { scc.click(); return scc.href; }
+                                return null;
+                            }""")
+                            if _href:
+                                _log(f"  JS clicked SCC link: {_href[:60]}")
+                                pg.wait_for_load_state("domcontentloaded", timeout=15000)
+                                _clicked = True
+                        except Exception:
+                            pass
+
+                    if not _clicked:
+                        _log("  Could not find SCC tile — please click 'Secure Access' in the browser window")
+                    time.sleep(2)
+                    continue
+                except Exception as _e:
+                    _log(f"  App Portal navigation error: {_e}")
+                    continue
+
+            # Still on login/SSO/Duo pages — just log and wait
             try:
                 for pg in ctx.pages:
                     try:
                         url = pg.url
-                        if "sign-on" in url or "duosecurity" in url:
+                        if "sign-on" in url or "duosecurity" in url or "okta" in url:
                             _log(f"  Waiting for login... ({url[:80]})")
-                        elif "security.cisco.com" in url:
-                            _log(f"  On SCC, waiting for tokens... ({url[:60]})")
+                        elif "appcenter" in url or "myapps" in url:
+                            pass  # handled above next loop
+                        else:
+                            _log(f"  Waiting... ({url[:60]})")
                     except Exception:
                         pass
             except Exception:
@@ -252,6 +334,43 @@ def run(db_path: str, log=None):
                 pg.goto("https://security.cisco.com", timeout=30_000,
                         wait_until="domcontentloaded")
                 pg.wait_for_timeout(2500)
+
+                # If redirected to Application Portal, click through to SCC
+                _nav_deadline = time.time() + 30
+                while time.time() < _nav_deadline:
+                    _pg_url = pg.url
+                    if "security.cisco.com" in _pg_url:
+                        break
+                    if "appcenter.cisco.com" in _pg_url or "myapps.cisco.com" in _pg_url:
+                        _log(f"  Redirected to App Portal — clicking through to SCC...")
+                        _clicked = False
+                        for _sel in [
+                            'a[href*="security.cisco.com"]',
+                            'text=Secure Access',
+                            'text=Security Cloud',
+                            '[title*="Secure Access"]',
+                        ]:
+                            try:
+                                el = pg.locator(_sel).first
+                                if el.is_visible(timeout=800):
+                                    el.click()
+                                    pg.wait_for_load_state("domcontentloaded", timeout=15000)
+                                    _clicked = True
+                                    break
+                            except Exception:
+                                pass
+                        if not _clicked:
+                            try:
+                                pg.evaluate("""() => {
+                                    const l = Array.from(document.querySelectorAll('a[href]'))
+                                        .find(a => a.href.includes('security.cisco.com'));
+                                    if (l) l.click();
+                                }""")
+                                pg.wait_for_load_state("domcontentloaded", timeout=15000)
+                            except Exception:
+                                pass
+                    pg.wait_for_timeout(1500)
+                _log(f"  SCC navigation complete → {pg.url[:80]}")
 
                 # ── Select the correct POD org in the picker ──────────────────
                 _switched = False

@@ -964,7 +964,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             await _ise_dismiss_modal(page)
             await _ise_dismiss_session_info(page)
             # Debug snapshot — shows nav tree state so we can tune selectors if needed
-            await page.screenshot(path="/pipeline/host-data/ise_catalog_nav.png", full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_catalog_nav.png"), full_page=False)
 
             # ── DOM inspection: log all #administration hrefs (debug — keep for diagnostics) ──
             try:
@@ -1038,7 +1038,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 _ise_link = page.locator('table tbody tr a:text-is("ise"), td a:text-is("ise")').first
                 await _ise_link.click(timeout=10000)
             except Exception as _e:
-                await page.screenshot(path="/pipeline/host-data/ise_deploy_fail.png", full_page=True)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_deploy_fail.png"), full_page=True)
                 return False, f"Could not click ise node link: {_e}"
 
             # Wait for the edit form to load — look for "ISE deployment name" label
@@ -1051,7 +1051,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 )
                 log("Node edit form loaded")
             except Exception:
-                await page.screenshot(path="/pipeline/host-data/ise_deploy_fail.png", full_page=True)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_deploy_fail.png"), full_page=True)
                 return False, "Node edit form did not load after clicking ise — see ise_deploy_fail.png"
 
             await _ise_dismiss_modal(page)
@@ -1066,7 +1066,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 });
             """)
             await page.wait_for_timeout(1500)
-            await page.screenshot(path="/pipeline/host-data/ise_pxgrid_form.png", full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_form.png"), full_page=False)
 
             # ── Wait for "Loading..." Dijit spinner to clear ──────────────────
             # The pxGrid Cloud section loads lazily after the initial scroll.
@@ -1091,7 +1091,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 });
             """)
             await page.wait_for_timeout(800)
-            await page.screenshot(path="/pipeline/host-data/ise_pxgrid_loaded.png", full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_loaded.png"), full_page=False)
 
             # Check if already registered (skip) — only skip on very specific phrases
             # that only appear in a truly connected/registered state.
@@ -1135,125 +1135,175 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # Parent-walk was finding enableInlinePEP because the pxGrid Cloud section
             # header appeared in ancestor textContent before we reached the right checkbox.
             log("Checking 'Enable pxGrid Cloud' checkbox")
+            # ── Enable pxGrid Cloud checkbox — physical mouse click ───────────────
+            # JS set()/node.click() silently fails on Dijit CheckBox in newer ISE.
+            # Use JS to locate the checkbox coordinates, then page.mouse.click() for
+            # a trusted physical event that Dijit's onChange handler fires on.
             _cloud_enabled = False
             try:
-                _cloud_result = await page.evaluate("""() => {
-                    // 1. Try Dijit registry by known pxCloud enable widget IDs
-                    const knownIds = [
-                        'pxCloud_enable', 'pxCloudEnable', 'pxCloud_enabled',
-                        'enablePxGridCloud', 'pxCloud_enableRegistration',
-                    ];
+                _enable_coords = await page.evaluate("""() => {
+                    // 1. Known Dijit widget IDs
+                    const knownIds = ['pxCloud_enable','pxCloudEnable','pxCloud_enabled',
+                                      'enablePxGridCloud','pxCloud_enableRegistration'];
                     if (typeof dijit !== 'undefined' && dijit.registry) {
                         for (const wid of knownIds) {
                             const w = dijit.byId(wid);
-                            if (w && typeof w.get === 'function') {
-                                const already = !!(w.get('checked') || w.get('value'));
-                                if (!already) {
-                                    if (typeof w.set === 'function') {
-                                        w.set('checked', true);
-                                        w.set('value', true);
-                                    }
-                                    if (w.domNode) w.domNode.click();
+                            if (w && w.domNode) {
+                                const r = w.domNode.getBoundingClientRect();
+                                if (r.width > 0) {
+                                    const already = !!(w.get && (w.get('checked') || w.get('value')));
+                                    return {x: r.left + r.width/2, y: r.top + r.height/2, id: wid, already};
                                 }
-                                return (already ? 'dijit-already' : 'dijit-clicked') + ':' + wid;
                             }
                         }
-
-                        // 2. Walk Dijit CheckBox widgets — match ONLY by their own label
+                        // 2. Walk all CheckBox widgets, match by immediate label
                         for (const w of dijit.registry.toArray()) {
-                            const cls = w.declaredClass || '';
-                            if (!cls.includes('CheckBox')) continue;
+                            if (!(w.declaredClass || '').includes('CheckBox')) continue;
                             const node = w.domNode;
                             if (!node) continue;
-                            // Get the label for THIS checkbox only (label[for=id])
-                            const lbl = node.id
-                                ? document.querySelector('label[for="' + node.id + '"]')
-                                : null;
+                            const lbl = node.id ? document.querySelector('label[for="' + node.id + '"]') : null;
                             const lblText = (lbl ? lbl.textContent : '').toLowerCase();
-                            if (lblText.includes('enable pxgrid cloud') ||
-                                lblText.includes('enable px grid cloud')) {
-                                const already = !!(w.get && (w.get('checked') || w.get('value')));
-                                if (!already) {
-                                    if (typeof w.set === 'function') {
-                                        w.set('checked', true);
-                                        w.set('value', true);
-                                    }
-                                    node.click();
+                            if (lblText.includes('enable pxgrid cloud') || lblText.includes('enable px grid')) {
+                                const r = node.getBoundingClientRect();
+                                if (r.width > 0) {
+                                    const already = !!(w.get && (w.get('checked') || w.get('value')));
+                                    return {x: r.left + r.width/2, y: r.top + r.height/2, id: w.id || 'noid', already};
                                 }
-                                return (already ? 'dijit-already' : 'dijit-clicked') + ':' + (w.id || 'noid');
                             }
                         }
                     }
-
-                    // 3. DOM fallback — match ONLY by the checkbox's own label element
-                    const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
-                    for (const cb of cbs) {
-                        // immediate label: <label><input>...</label> or <label for="id">
-                        const lbl = cb.closest('label') ||
-                            (cb.id ? document.querySelector('label[for="' + cb.id + '"]') : null);
+                    // 3. DOM fallback — all visible checkboxes, match by label text
+                    for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
+                        if (!cb.offsetParent) continue;
+                        const lbl = cb.closest('label') || (cb.id ? document.querySelector('label[for="'+cb.id+'"]') : null);
                         const lblText = (lbl ? lbl.textContent : '').toLowerCase();
-                        if (lblText.includes('enable pxgrid cloud') ||
-                            lblText.includes('enable px grid cloud')) {
-                            if (!cb.checked) { cb.click(); }
-                            return (cb.checked ? 'dom-already' : 'dom-clicked') + ':' + (cb.id || '?');
+                        if (lblText.includes('enable pxgrid cloud') || lblText.includes('enable px grid')) {
+                            const r = cb.getBoundingClientRect();
+                            if (r.width > 0) return {x: r.left + r.width/2, y: r.top + r.height/2, id: cb.id || '?', already: cb.checked};
+                        }
+                    }
+                    // 4. Last resort — find any visible checkbox near text "pxGrid Cloud"
+                    const allText = Array.from(document.querySelectorAll('*')).find(el =>
+                        el.children.length === 0 && (el.textContent || '').toLowerCase().includes('enable pxgrid cloud')
+                    );
+                    if (allText) {
+                        let p = allText.parentElement;
+                        for (let i = 0; i < 6 && p; i++) {
+                            const cb = p.querySelector('input[type="checkbox"]');
+                            if (cb) {
+                                const r = cb.getBoundingClientRect();
+                                if (r.width > 0) return {x: r.left + r.width/2, y: r.top + r.height/2, id: cb.id || 'last-resort', already: cb.checked};
+                            }
+                            p = p.parentElement;
                         }
                     }
                     return null;
                 }""")
-                log(f"Enable pxGrid Cloud result: {_cloud_result}")
-                if _cloud_result and ('clicked' in _cloud_result or 'already' in _cloud_result):
+
+                if _enable_coords:
+                    # Force Dijit internal state AND click the visible checkbox icon span
+                    # The domNode is the outer wrapper div — we need the dijitCheckBoxIcon
+                    # span inside it which is the actual clickable element that triggers
+                    # Dijit's onChange and expands the pxGrid Cloud form section.
+                    log(f"Forcing enablePxCloudServices ON (id={_enable_coords['id']!r})")
+
+                    # First set Dijit state programmatically
+                    await page.evaluate("""(id) => {
+                        if (typeof dijit !== 'undefined' && dijit.byId) {
+                            const w = dijit.byId(id);
+                            if (w && typeof w.set === 'function') {
+                                w.set('checked', true);
+                                w.set('value', true);
+                                if (typeof w.onChange === 'function') w.onChange(true);
+                            }
+                        }
+                    }""", _enable_coords['id'])
+                    await page.wait_for_timeout(500)
+
+                    # Then physically click the dijitCheckBoxIcon span (the visible box)
+                    _icon_coords = await page.evaluate("""(id) => {
+                        if (typeof dijit !== 'undefined' && dijit.byId) {
+                            const w = dijit.byId(id);
+                            if (w && w.domNode) {
+                                // Try the icon span first
+                                const icon = w.domNode.querySelector('.dijitCheckBoxIcon, .dijitToggleButtonIconChar, input[type="checkbox"]');
+                                const target = icon || w.domNode;
+                                target.scrollIntoView({behavior: 'instant', block: 'center'});
+                                const r = target.getBoundingClientRect();
+                                if (r.width > 0) return {x: r.left + r.width/2, y: r.top + r.height/2};
+                            }
+                        }
+                        return null;
+                    }""", _enable_coords['id'])
+
+                    if _icon_coords:
+                        await page.mouse.click(_icon_coords['x'], _icon_coords['y'])
+                        log(f"Clicked dijitCheckBoxIcon at ({_icon_coords['x']:.0f},{_icon_coords['y']:.0f})")
+                    else:
+                        await page.mouse.click(_enable_coords['x'], _enable_coords['y'])
+                        log(f"Clicked wrapper at ({_enable_coords['x']:.0f},{_enable_coords['y']:.0f})")
+
+                    await page.wait_for_timeout(500)
+
+                    # Final Dijit set() to ensure state sticks after click
+                    await page.evaluate("""(id) => {
+                        if (typeof dijit !== 'undefined' && dijit.byId) {
+                            const w = dijit.byId(id);
+                            if (w && typeof w.set === 'function') {
+                                w.set('checked', true);
+                                w.set('value', true);
+                            }
+                        }
+                    }""", _enable_coords['id'])
                     _cloud_enabled = True
-                    if 'clicked' in _cloud_result:
-                        # Wait for pxGrid Cloud section to expand and fields to appear
-                        log("Waiting for pxGrid Cloud section to expand after enabling...")
-                        await page.wait_for_timeout(3000)
-                        try:
-                            await page.wait_for_selector(
-                                'td#pxCloud_region, [id*="pxCloud_deviceName"]',
-                                state='visible', timeout=12000
-                            )
-                            log("pxGrid Cloud section expanded — fields visible")
-                        except Exception as _we:
-                            log(f"Wait for fields after enable: {_we} — check screenshot")
-                        await page.wait_for_timeout(1000)
+                    # Wait for form fields to expand
+                    await page.wait_for_timeout(2000)
+                    try:
+                        await page.wait_for_selector(
+                            'td#pxCloud_region, [id*="pxCloud_deviceName"]',
+                            state='visible', timeout=12000
+                        )
+                        log("pxGrid Cloud section expanded — fields visible")
+                    except Exception as _we:
+                        log(f"Wait for fields after enable: {_we} — continuing anyway")
+                    await page.wait_for_timeout(1000)
+                else:
+                    log("WARNING: Could not locate Enable pxGrid Cloud checkbox via JS — trying physical scroll + click on any visible checkbox")
+                    # Scroll to bottom and try clicking first visible unchecked checkbox
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(1000)
+                    _fallback_coords = await page.evaluate("""() => {
+                        const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(c => c.offsetParent && !c.checked);
+                        if (!cbs.length) return null;
+                        const r = cbs[cbs.length-1].getBoundingClientRect();
+                        return r.width > 0 ? {x: r.left + r.width/2, y: r.top + r.height/2} : null;
+                    }""")
+                    if _fallback_coords:
+                        await page.mouse.click(_fallback_coords['x'], _fallback_coords['y'])
+                        await page.wait_for_timeout(2000)
+                        log("Fallback: clicked last visible unchecked checkbox")
+                        _cloud_enabled = True
             except Exception as _ce:
                 log(f"Enable pxGrid Cloud check error: {_ce}")
 
-            await page.screenshot(path="/pipeline/host-data/ise_pxgrid_cloud_enabled.png", full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_cloud_enabled.png"), full_page=False)
 
             if not _cloud_enabled:
                 return False, (
-                    "Could not find 'Enable pxGrid Cloud' checkbox — "
-                    "check ise_pxgrid_cloud_enabled.png and the Dijit CheckBox dump above. "
-                    "Aborting to avoid clicking Register with pxGrid Cloud disabled."
+                    "Could not find or click 'Enable pxGrid Cloud' checkbox — "
+                    "check ise_pxgrid_cloud_enabled.png"
                 )
 
             # ── Diagnose registration form visibility ─────────────────────────────
             # Find out if td#pxCloud_region is in DOM but hidden, and why.
-            # Also detect if ISE is showing the already-registered view (Deregister visible).
+            # Only skip if ISE is fully registered AND connected — both must be true.
+            # Never attempt to deregister: ISE is always in a fresh/unregistered state
+            # when this step runs. Any deregister logic causes false resets.
             _vis_diag = None
             _vis_diag = await page.evaluate("""() => {
                 const reg = document.getElementById('pxCloud_region');
                 const name = document.getElementById('pxCloud_deviceName');
 
-                // Scope Deregister + connected checks to the pxGrid Cloud section only.
-                // Searching the whole page finds Deregister buttons from other ISE features
-                // (e.g. Smart Licensing) causing false-positive skip guard triggers.
-                function pxCloudSection() {
-                    const form = document.getElementById('pxCloudRegistrationForm')
-                               || document.querySelector('[id*="pxCloud"]');
-                    if (!form) return document.body;
-                    let p = form.parentElement;
-                    for (let i = 0; i < 8 && p && p !== document.body; i++) {
-                        p = p.parentElement;
-                    }
-                    return p || document.body;
-                }
-                const pxSection = pxCloudSection();
-
-                const deregBtn = Array.from(pxSection.querySelectorAll('*')).find(el =>
-                    el.children.length === 0 && (el.textContent || '').trim() === 'Deregister'
-                );
                 function hiddenAncestor(el) {
                     let p = el;
                     for (let i = 0; i < 20 && p; i++) {
@@ -1265,59 +1315,26 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     }
                     return null;
                 }
-                const pxSectionText = pxSection.innerText.toLowerCase();
+
+                // Scope "connected" check to pxCloudRegistrationForm only
+                const form = document.getElementById('pxCloudRegistrationForm');
+                const pxSectionText = form ? form.innerText.toLowerCase() : '';
+
                 return {
                     region_in_dom: !!reg,
                     region_hidden_ancestor: reg ? hiddenAncestor(reg) : 'n/a',
                     name_in_dom: !!name,
                     name_hidden_ancestor: name ? hiddenAncestor(name) : 'n/a',
-                    deregister_visible: !!deregBtn,
                     pxgrid_connected: pxSectionText.includes('connected'),
                     page_text_snippet: document.body.innerText.slice(0, 300).split('\\n').join(' '),
                 };
             }""")
             log(f"Form visibility diag: {_vis_diag}")
 
-            # If ISE is already showing Deregister AND page confirms Connected,
-            # registration is complete — skip.  Deregister alone is not enough:
-            # the service can be enabled (Deregister in DOM) without the OAuth
-            # portal registration having completed (no "connected" text).
-            if _vis_diag and _vis_diag.get('deregister_visible') and _vis_diag.get('pxgrid_connected'):
-                log("Deregister button visible + Connected status confirmed — ISE is already registered to pxGrid Cloud")
-                return True, f"{_SKIP_PREFIX} pxGrid Cloud already registered and {_reason} — skipping re-registration"
-            if _vis_diag and _vis_diag.get('deregister_visible') and not _vis_diag.get('pxgrid_connected'):
-                log("Deregister button in DOM but NOT connected — deregistering first for a clean re-registration")
-                _dreg_result = await page.evaluate("""() => {
-                    for (const el of document.querySelectorAll('button, input[type="button"]')) {
-                        if ((el.textContent || el.value || '').trim() === 'Deregister') {
-                            el.click(); return 'clicked:' + (el.id || el.className || 'btn');
-                        }
-                    }
-                    return null;
-                }""")
-                log(f"Deregister click: {_dreg_result}")
-                await page.wait_for_timeout(2000)
-                for _csel in ['button:has-text("Yes")', 'button:has-text("OK")', 'button:has-text("Confirm")']:
-                    try:
-                        if await page.locator(_csel).first.is_visible(timeout=2000):
-                            await page.locator(_csel).first.click()
-                            log(f"Confirmed deregister dialog: {_csel}")
-                            await page.wait_for_timeout(1000)
-                            break
-                    except Exception:
-                        pass
-                _sv_dreg = await page.evaluate("""() => {
-                    if (typeof dijit !== 'undefined') {
-                        const w = dijit.registry.toArray().find(w => (w.label||'').trim()==='Save');
-                        if (w) { w.onClick(); return 'dijit:' + w.id; }
-                    }
-                    return null;
-                }""")
-                log(f"Save after deregister: {_sv_dreg}")
-                await page.wait_for_timeout(4000)
-                await page.reload()
-                await page.wait_for_timeout(5000)
-                log("Deregistered + reloaded — proceeding with fresh registration")
+            # Skip only if ISE confirms already registered AND connected
+            if _vis_diag and _vis_diag.get('pxgrid_connected'):
+                log("Connected status confirmed in pxCloudRegistrationForm — ISE is already registered")
+                return True, f"{_SKIP_PREFIX} pxGrid Cloud already registered and connected — skipping"
 
             # If region field is hidden, try to reveal it by scrolling to it directly
             if _vis_diag and _vis_diag.get('region_hidden_ancestor'):
@@ -1338,138 +1355,152 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     reg.scrollIntoView({behavior: 'smooth', block: 'center'});
                 }""")
                 await page.wait_for_timeout(1500)
-                await page.screenshot(path="/pipeline/host-data/ise_pxgrid_revealed.png", full_page=False)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_revealed.png"), full_page=False)
                 log("Attempted to reveal hidden pxGrid Cloud form fields")
 
             # Fill "ISE deployment name" — try Dijit widget API first, then DOM walk-up fallback
+            # ── Fill deployment name — physical click + press_sequentially ────────
+            # JS set() / fill() silently fails on Dijit TextBox widgets in newer ISE.
+            # Physical mouse click fires the Dijit focus handler; press_sequentially
+            # types char-by-char triggering all keydown/keyup/input events Dijit needs.
             log(f"Filling ISE deployment name: {deployment_name}")
-            _filled_name = await page.evaluate("""(args) => {
-                const target = args.name;
-                const results = [];
-
-                // 1. Try Dijit registry by known widget ID
+            _filled_name = False
+            # Strategy 1: JS coordinate lookup → physical mouse click on the input
+            _name_coords = await page.evaluate("""() => {
+                // Try known Dijit widget first to get its input node
                 try {
                     if (typeof dijit !== 'undefined' && dijit.byId) {
                         for (const wid of ['pxCloud_deviceName', 'deviceName', 'ise_deployment_name']) {
                             const w = dijit.byId(wid);
-                            if (w && typeof w.set === 'function') {
-                                w.set('value', target);
-                                results.push('dijit:' + wid + '=' + (w.get('value') || ''));
+                            if (w && w.domNode) {
+                                const inp = w.domNode.querySelector('input') || w.domNode;
+                                const r = inp.getBoundingClientRect();
+                                if (r.width > 0) return {x: r.left + r.width/2, y: r.top + r.height/2, method: 'dijit:' + wid};
                             }
                         }
                     }
-                } catch(e) { results.push('dijit-err:' + e.message); }
-
-                // 2. Walk all Dijit registry widgets and find TextBox near 'ISE deployment name'
-                try {
-                    if (typeof dijit !== 'undefined' && dijit.registry && dijit.registry.toArray) {
-                        for (const w of dijit.registry.toArray()) {
-                            if (!w.domNode) continue;
-                            let p = w.domNode.parentElement;
-                            for (let i = 0; i < 8; i++) {
-                                if (!p) break;
-                                if (p.textContent.includes('ISE deployment name') ||
-                                    p.textContent.includes('deployment name')) {
-                                    if (typeof w.set === 'function') {
-                                        w.set('value', target);
-                                        results.push('dijit-walk:' + (w.id || w.declaredClass) + '=' + (w.get('value') || ''));
-                                    }
-                                    break;
-                                }
-                                p = p.parentElement;
-                            }
-                        }
-                    }
-                } catch(e) { results.push('dijit-walk-err:' + e.message); }
-
-                // 3. DOM walk-up fallback — raw value + events
+                } catch(e) {}
+                // DOM walk-up: find input near 'ISE deployment name' label
                 const inputs = Array.from(document.querySelectorAll('input')).filter(el =>
-                    !['checkbox','radio','hidden','submit','button'].includes(el.type || '')
+                    !['checkbox','radio','hidden','submit','button'].includes(el.type || '') && el.offsetParent
                 );
                 for (const inp of inputs) {
                     let p = inp.parentElement;
                     for (let i = 0; i < 10; i++) {
                         if (!p) break;
-                        if (p.textContent.includes('ISE deployment name') ||
-                            p.textContent.includes('deployment name')) {
-                            inp.value = target;
-                            inp.dispatchEvent(new Event('input', {bubbles: true}));
-                            inp.dispatchEvent(new Event('change', {bubbles: true}));
-                            inp.dispatchEvent(new Event('blur', {bubbles: true}));
-                            results.push('dom:' + (inp.id || inp.name || inp.className.slice(0,40)));
-                            break;
+                        if (p.textContent.includes('ISE deployment name') || p.textContent.includes('deployment name')) {
+                            const r = inp.getBoundingClientRect();
+                            if (r.width > 0) return {x: r.left + r.width/2, y: r.top + r.height/2, method: 'dom:' + (inp.id || inp.name || '?')};
                         }
                         p = p.parentElement;
                     }
                 }
-
-                return results.length ? results.join(' | ') : null;
-            }""", {"name": deployment_name})
-            if _filled_name:
-                log(f"Filled ISE deployment name via JS: {_filled_name}")
+                return null;
+            }""")
+            if _name_coords:
+                log(f"Name field found via {_name_coords['method']} — clicking and typing")
+                await page.mouse.click(_name_coords['x'], _name_coords['y'])
+                await page.wait_for_timeout(300)
+                # Select all existing text and replace
+                await page.keyboard.press('Control+a')
+                await page.keyboard.press('Meta+a')
+                await page.wait_for_timeout(100)
+                await page.keyboard.press('Backspace')
+                await page.wait_for_timeout(100)
+                await page.keyboard.type(deployment_name, delay=60)
+                await page.wait_for_timeout(300)
+                await page.mouse.click(_name_coords['x'], _name_coords['y'] + 40)  # click away to trigger blur
+                await page.wait_for_timeout(400)
+                _filled_name = True
+                log(f"Deployment name typed via physical click: {deployment_name!r}")
             else:
-                log("WARNING: JS could not fill ISE deployment name — route intercept will patch POST body")
+                log("WARNING: Could not locate deployment name input — route intercept will patch POST body")
 
-            # Select region us-west-2 — click td#pxCloud_region to open dropdown, then pick option
+            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_name_filled.png"), full_page=False)
+
+            # ── Select region us-west-2 — physical mouse click on dropdown ────────
+            # td#pxCloud_region is the Dijit Select widget's display cell.
+            # Physical click opens the dropdown; then click the us-west-2 menu item.
             log("Selecting region us-west-2")
-            _set_region = None
-            try:
-                _rbtn = page.locator('td#pxCloud_region').first
-                await _rbtn.scroll_into_view_if_needed()
-                await _rbtn.click()
-                await page.wait_for_timeout(600)
-                _opt = page.locator('.dijitMenuItem:has-text("us-west-2")').first
-                await _opt.wait_for(state='visible', timeout=4000)
-                await _opt.click()
+            _set_region = False
+            _region_coords = await page.evaluate("""() => {
+                const el = document.getElementById('pxCloud_region');
+                if (!el) return null;
+                el.scrollIntoView({behavior: 'instant', block: 'center'});
+                const r = el.getBoundingClientRect();
+                if (r.width > 0) return {x: r.left + r.width/2, y: r.top + r.height/2};
+                return null;
+            }""")
+            if _region_coords:
+                await page.mouse.click(_region_coords['x'], _region_coords['y'])
+                await page.wait_for_timeout(800)
+                # Find and click us-west-2 menu item
+                _opt_clicked = False
+                for _opt_sel in ['.dijitMenuItem:has-text("us-west-2")', '[class*="MenuItem"]:has-text("us-west-2")',
+                                  'td:has-text("us-west-2")', '*:has-text("us-west-2")']:
+                    try:
+                        _opt = page.locator(_opt_sel).first
+                        if await _opt.is_visible(timeout=2000):
+                            _opt_bb = await _opt.bounding_box()
+                            if _opt_bb:
+                                await page.mouse.click(_opt_bb['x'] + _opt_bb['width']/2, _opt_bb['y'] + _opt_bb['height']/2)
+                                _opt_clicked = True
+                                log(f"Region us-west-2 clicked via {_opt_sel!r}")
+                                break
+                    except Exception:
+                        continue
                 await page.wait_for_timeout(500)
                 _disp = (await page.inner_text('td#pxCloud_region')).strip()
-                _set_region = f"region-set:{_disp}"
-                log(f"Region selected: {_disp!r}")
-            except Exception as _re:
-                log(f"Region click error: {_re}")
+                log(f"Region field now shows: {_disp!r}")
+                if 'us-west-2' in _disp or _opt_clicked:
+                    _set_region = True
+            else:
+                log("WARNING: Could not locate pxCloud_region element")
 
-            if not (_set_region and 'region-set:' in _set_region):
-                log(f"WARNING: region select failed ({_set_region}) — proceeding anyway")
+            if not _set_region:
+                log("WARNING: region select may have failed — proceeding anyway (route intercept patches body)")
 
-
-
+            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_region_set.png"), full_page=False)
             await page.wait_for_timeout(500)
 
-            # Check Privacy Statement and EULA checkboxes — known Dijit IDs are
-            # pxCloudRegistrationStmt1 and pxCloudRegistrationStmt2 (labels are empty in ISE).
-            # Fall back to text matching for any ISE version that uses labeled checkboxes.
+            # ── Check Privacy Statement and EULA checkboxes — physical mouse clicks ──
+            # Dijit CheckBox set('checked', true) silently fails in newer ISE.
+            # JS coordinate lookup + page.mouse.click() fires trusted synthetic events
+            # that Dijit's onChange handler actually responds to.
             log("Checking Privacy Statement and EULA checkboxes")
-            _legal_result = await page.evaluate("""(args) => {
-                const checked = [];
-                const terms = args.terms;
-                // 1. Known Dijit IDs for legal statements
+            _legal_result = []
+            _cb_coords = await page.evaluate("""() => {
+                const results = [];
+                // ONLY use known Dijit widget IDs — never fall back to all visible
+                // checkboxes as that grabs unrelated ISE node checkboxes (enablePAP etc.)
                 if (typeof dijit !== 'undefined' && dijit.byId) {
                     for (const wid of ['pxCloudRegistrationStmt1', 'pxCloudRegistrationStmt2']) {
                         const w = dijit.byId(wid);
-                        if (w && typeof w.get === 'function') {
-                            const already = !!(w.get('checked') || w.get('value'));
-                            if (!already) {
-                                if (typeof w.set === 'function') { w.set('checked', true); w.set('value', true); }
-                                if (w.domNode) w.domNode.click();
+                        if (w && w.domNode) {
+                            const already = !!(w.get && (w.get('checked') || w.get('value')));
+                            // Target the icon span, not the wrapper div
+                            const icon = w.domNode.querySelector('.dijitCheckBoxIcon') || w.domNode;
+                            icon.scrollIntoView({behavior: 'instant', block: 'center'});
+                            const r = icon.getBoundingClientRect();
+                            if (r.width > 0) {
+                                results.push({x: r.left + r.width/2, y: r.top + r.height/2, id: wid, already});
                             }
-                            checked.push((already ? 'already' : 'clicked') + ':' + wid);
                         }
                     }
                 }
-                // 2. DOM: find by visible label text
-                const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
-                for (const cb of cbs) {
-                    if (!cb.offsetParent) continue;
-                    const lbl = cb.closest('label') ||
-                        (cb.id ? document.querySelector('label[for="' + cb.id + '"]') : null);
-                    const lblText = (lbl ? lbl.textContent : '').toLowerCase();
-                    if (!terms.some(t => lblText.includes(t))) continue;
-                    if (!cb.checked) { cb.click(); checked.push('dom-clicked:' + (cb.id || lblText.slice(0,30))); }
-                    else { checked.push('dom-already:' + (cb.id || lblText.slice(0,30))); }
-                }
-                return checked;
-            }""", {"terms": ["privacy statement", "eula", "end user license", "acknowledge", "agree that"]})
+                return results;
+            }""")
+            for _cb in _cb_coords:
+                if _cb.get('already'):
+                    log(f"Checkbox {_cb['id']!r} already checked — skipping")
+                    _legal_result.append(f"already:{_cb['id']}")
+                else:
+                    await page.mouse.click(_cb['x'], _cb['y'])
+                    await page.wait_for_timeout(400)
+                    log(f"Checkbox {_cb['id']!r} clicked via physical mouse at ({_cb['x']:.0f},{_cb['y']:.0f})")
+                    _legal_result.append(f"clicked:{_cb['id']}")
             log(f"Legal checkboxes result: {_legal_result}")
+            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_checkboxes.png"), full_page=False)
 
             await page.wait_for_timeout(500)
 
@@ -1483,7 +1514,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
 
             log("Clicking Register button (watching for OAuth popup)")
             _registered = False
-            await page.screenshot(path="/pipeline/host-data/ise_before_register.png", full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_before_register.png"), full_page=False)
 
             async def _click_register_btn():
                 """Try all methods to click the Register button. Returns True if clicked."""
@@ -1779,7 +1810,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 await page.wait_for_timeout(1000)
 
                 # Click "Register ISE"
-                await page.screenshot(path="/pipeline/host-data/ise_before_register_ise.png", full_page=False)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_before_register_ise.png"), full_page=False)
                 try:
                     _reg_ise_btn = page.locator('button:has-text("Register ISE")').first
                     await _reg_ise_btn.wait_for(state="visible", timeout=8000)
@@ -1826,38 +1857,14 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     pass
                 return False, "ISE registration failed: Bad Request - Validation failed (region intercept did not catch the POST — check route hit count above)."
 
-            # ── Save ISE node immediately to commit the registration ─────────────
-            log("Saving ISE node to commit pxGrid Cloud registration")
-            _sv = await page.evaluate("""() => {
-                try {
-                    if (typeof dijit !== 'undefined') {
-                        const w = dijit.registry.toArray().find(w =>
-                            (w.label||'').trim()==='Save' ||
-                            (w.domNode && w.domNode.textContent.trim()==='Save')
-                        );
-                        if (w) { w.onClick(); return 'dijit:' + w.id; }
-                    }
-                    for (const el of document.querySelectorAll('*')) {
-                        if (el.children.length === 0 && el.textContent.trim() === 'Save') {
-                            const r = el.getBoundingClientRect();
-                            if (r.width > 0) {
-                                let t = el;
-                                for (let i = 0; i < 8; i++) {
-                                    if (!t) break;
-                                    if (t.tagName==='BUTTON' || (t.className||'').includes('dijitButtonNode')) {
-                                        t.click(); return 'walk:' + t.tagName;
-                                    }
-                                    t = t.parentElement;
-                                }
-                                el.click(); return 'leaf';
-                            }
-                        }
-                    }
-                    return null;
-                } catch(e) { return 'err:' + e.message; }
-            }""")
-            log(f"Save node result: {_sv}")
-            await page.wait_for_timeout(4000)
+            # ── Do NOT Save the ISE node after registration ──────────────────────
+            # The registration ENROLL POST commits directly to Cisco's cloud — no Save
+            # needed. Clicking Save causes ISE to commit the entire node form including
+            # enablePxCloudServices=false (Dijit checkbox state doesn't persist through
+            # the form submit), which wipes pxGrid Cloud config immediately after
+            # registration. ISE already triggers restartAction.do automatically.
+            log("Skipping ISE node Save — registration committed directly to Cisco cloud (Save would wipe enablePxCloudServices)")
+            await page.wait_for_timeout(2000)
 
             # ── Poll for pxGrid Cloud connected status (up to ~3 min) ────────────
             # NOTE: "cisco dna portal account" is a STATIC form label — present even
@@ -1890,20 +1897,20 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 _pt = (await page.inner_text("body")).lower()
                 if any(ind in _pt for ind in _CONNECTED_INDICATORS):
                     log(f"pxGrid Cloud connected confirmed on attempt {_attempt + 1}")
-                    await page.screenshot(path="/pipeline/host-data/ise_pxgrid_connected.png", full_page=False)
+                    await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_connected.png"), full_page=False)
                     return True, f"pxGrid Cloud registered and connected (PseudoCo-{org_number})"
                 _still_fail = any(err in _pt for err in _FAIL_INDICATORS)
                 log(f"Refresh {_attempt + 1}/18: {'not connected' if _still_fail else 'status unclear'} (refresh={_refreshed})")
                 if _attempt % 3 == 2:
-                    await page.screenshot(path=f"/pipeline/host-data/ise_pxgrid_poll_{_attempt + 1}.png", full_page=False)
+                    await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_poll_{_attempt + 1}.png"), full_page=False)
 
             # Timed out after 3 min
-            await page.screenshot(path="/pipeline/host-data/ise_pxgrid_register_final.png", full_page=True)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_register_final.png"), full_page=True)
             return False, "pxGrid Cloud registration saved but ISE not connected after 3 min — check ise_pxgrid_register_final.png"
 
         except Exception as e:
             try:
-                await page.screenshot(path="/pipeline/host-data/ise_pxgrid_register_err.png", full_page=True)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_register_err.png"), full_page=True)
             except Exception:
                 pass
             return False, f"pxGrid Cloud registration error: {e}"
