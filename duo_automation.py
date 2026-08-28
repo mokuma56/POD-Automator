@@ -7970,14 +7970,31 @@ def duo_run_card(
             except Exception:
                 return "unknown"
 
+        nonlocal enroll_blob
+
+        # The enrollment command is a ONE-TIME code that Duo expires eight hours
+        # after it is generated, so a stored blob is worthless on the next run —
+        # the EXE still reports "All secrets stored successfully" but DRPC then
+        # fails with 401 Invalid signature. Always mint a fresh one.
+        _log("harvesting a fresh enrollment command (the stored one is single-use)")
+        h_ok, h_msg = duo_harvest_sso_enrollment(pod_id, db_path, log=_log)
+        if h_ok:
+            try:
+                with _sq.connect(db_path) as _c:
+                    _c.row_factory = _sq.Row
+                    _r = _c.execute("SELECT authproxy_enroll_blob FROM org_credentials "
+                                    "WHERE org_number=?", (org_num,)).fetchone()
+                if _r and (_r["authproxy_enroll_blob"] or "").strip():
+                    enroll_blob = _r["authproxy_enroll_blob"].strip()
+                    _log(f"fresh blob ({len(enroll_blob)} chars)")
+            except Exception as e:
+                _log(f"could not re-read blob: {e}")
+        else:
+            _log(f"harvest failed ({h_msg[:100]}) — falling back to the stored blob")
+
         if not enroll_blob:
             return False, (
-                "authproxy_enroll_blob not set in DB — "
-                "go to Duo Admin portal → Applications → SSO Settings → "
-                "External Authentication Sources → Active Directory → "
-                "Auth Proxy → Step 2 → click 'Generate Command', "
-                "copy the base64 argument, and paste it into the "
-                "dashboard org credentials card under 'authproxy_enroll_blob'."
+                f"no enrollment blob available and harvesting one failed: {h_msg[:160]}"
             )
 
         # Warn if blob is stale — enrollment blobs are one-time codes.
