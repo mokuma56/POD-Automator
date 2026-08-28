@@ -3114,23 +3114,30 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
     ikey, skey, host = (oc.get("duo_ikey", ""), oc.get("duo_skey", ""), oc.get("duo_host", ""))
     removed = []
 
+    stuck = []
     if ikey and skey and host:
-        # Users and groups first — deleting the sync that owns them can
-        # otherwise leave them orphaned in the org.
+        # Directory-synced users and groups are OWNED by the AD sync and the API
+        # rejects deleting them (400) while it exists — the sync has to go first,
+        # and only the UI can remove it. Count real successes, never the number
+        # attempted: reporting len(items) claimed "8 users deleted" when all
+        # eight had failed.
         for path, label, idfield in (("/admin/v1/users", "user", "user_id"),
                                      ("/admin/v1/groups", "group", "group_id")):
             try:
                 items = _duo_request(ikey, skey, host, "GET", path).get("response", [])
+                gone = 0
                 for it in items:
                     try:
-                        _duo_request(ikey, skey, host, "DELETE",
-                                     f"{path}/{it[idfield]}")
+                        _duo_request(ikey, skey, host, "DELETE", f"{path}/{it[idfield]}")
+                        gone += 1
                     except Exception as e:
                         _log(f"WARN: could not delete {label} "
                              f"{it.get('username') or it.get('name')}: {str(e)[:70]}")
-                if items:
-                    removed.append(f"{len(items)} {label}s")
-                    _log(f"deleted {len(items)} {label}s")
+                if gone:
+                    removed.append(f"{gone} {label}s")
+                if gone < len(items):
+                    stuck.append(f"{len(items) - gone} {label}s")
+                _log(f"{label}s: deleted {gone}/{len(items)}")
             except Exception as e:
                 _log(f"WARN: listing {label}s failed: {str(e)[:80]}")
 
@@ -3156,7 +3163,7 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
 
     CLEAR = ["authproxy_ikey", "authproxy_skey", "authproxy_cfg", "authproxy_sso_cfg",
              "authproxy_enroll_blob", "authproxy_blob_saved_at", "sa_scim_token",
-             "duo_saml_app_ikey", "sa_saml_profile_id"]
+             "sa_scim_url", "duo_saml_app_ikey", "sa_saml_profile_id"]
     if not keep_bootstrap:
         CLEAR += ["duo_ikey", "duo_skey", "duo_host", "duo_admin_host", "duo_admin_email",
                   "duo_admin_password", "duo_admin_totp_secret", "duo_passkey_cred",
@@ -3172,9 +3179,17 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
 
     note = ("bootstrap state kept (admin/passkey/TOTP/Admin API)"
             if keep_bootstrap else "bootstrap state ALSO cleared")
-    return True, (f"org {org_num} rolled back — {', '.join(removed) or 'nothing to remove'}; "
-                  f"{note}. NOTE: the AD directory sync and the Secure Access IdP "
-                  f"directory must be deleted in their UIs — neither exposes a delete API.")
+    detail = (f"org {org_num}: removed {', '.join(removed) or 'nothing'}; {note}")
+    if stuck:
+        # Be explicit rather than implying a clean slate.
+        return False, (f"{detail}. STILL PRESENT: {', '.join(stuck)} — these are "
+                       f"owned by the AD directory sync and cannot be deleted via "
+                       f"the API. Delete the directory sync in Duo (Users -> "
+                       f"External Directories -> Delete Directory Sync) and the "
+                       f"Secure Access IdP directory, then re-run.")
+    return True, (f"{detail}. NOTE: the AD directory sync and the Secure Access IdP "
+                  f"directory must be deleted in their UIs — neither exposes a "
+                  f"delete API.")
 
 
 def _scc_open_session(ctx, idac_url: str, log=None):
