@@ -1830,31 +1830,58 @@ asyncio.run(get_url())
 """
 
 
-def fetch_idac_url_from_dcloud(log=None) -> str:
+def fetch_idac_url_from_dcloud(log=None, pod_id: str = "",
+                               allow_rotation: bool = False) -> str:
     """
     Connect to jump host via WinRM, run idac_sdk on it to generate a fresh
-    iDAC auto-login URL.  Must be called from within a VPN container
-    (host has no VPN; jump host 198.18.133.36 is only reachable via VPN).
+    iDAC auto-login URL.
+
+    *** DESTRUCTIVE — REPROVISIONS THE ENTIRE POD IDENTITY ***
+
+    Every idac_sdk run mints a brand new Duo org AND a new SCC org AND a new
+    Meraki org, orphaning whatever was configured against the old ones. It is
+    not a read operation and it is not idempotent. Calling it repeatedly walked
+    one pod from SCC org 517 to 502 and abandoned six Duo orgs.
+
+    Because of that it is guarded: callers must pass allow_rotation=True and
+    mean it. To READ the pod's existing accounts, load the stored
+    org_credentials.idac_url instead — that is read-only and does not rotate.
+
+    The jump host is only reachable inside a POD's VPN namespace. Pass *pod_id*
+    when calling from the Mac (the dashboard runs duo_run_card in a thread
+    there) so the session is proxied through vpn-{pod_id}; omit it when already
+    running inside the pipeline container.
 
     Returns the iDAC URL string, or raises RuntimeError on failure.
     """
     import base64
-    import winrm
+
+    if not allow_rotation:
+        raise RuntimeError(
+            "fetch_idac_url_from_dcloud() would reprovision this pod's Duo, SCC "
+            "and Meraki orgs. Use the stored org_credentials.idac_url to read "
+            "existing accounts, or pass allow_rotation=True if you really do "
+            "want brand new orgs."
+        )
 
     _log = log or (lambda s: print(f"     [fetch-idac] {s}"))
     _log(f"WinRM → {JUMP_HOST_IP}: generating fresh iDAC URL via idac_sdk")
 
-    sess = winrm.Session(
-        JUMP_HOST_IP,
-        auth=JUMP_HOST_WINRM_CREDS,
-        transport="ntlm",
-        # Proven working values: 30/20. read_timeout_sec is also used as the
-        # HTTP connect timeout by pywinrm/requests, so large values cause
-        # ConnectTimeout failures. winrm polls repeatedly, so long-running
-        # commands (idac_sdk ~4min) complete across multiple 20-second poll windows.
-        read_timeout_sec=30,
-        operation_timeout_sec=20,
-    )
+    if pod_id:
+        sess = _winrm_connect_jump(pod_id, log=log)
+    else:
+        import winrm
+        sess = winrm.Session(
+            JUMP_HOST_IP,
+            auth=JUMP_HOST_WINRM_CREDS,
+            transport="ntlm",
+            # Proven working values: 30/20. read_timeout_sec is also used as the
+            # HTTP connect timeout by pywinrm/requests, so large values cause
+            # ConnectTimeout failures. winrm polls repeatedly, so long-running
+            # commands (idac_sdk ~4min) complete across multiple 20-second poll windows.
+            read_timeout_sec=30,
+            operation_timeout_sec=20,
+        )
 
     # Write the Python script to a temp file via PowerShell (base64 avoids
     # all quoting / line-ending issues when embedding multiline strings).
@@ -2025,25 +2052,46 @@ def _pw_activate_duo_admin(idac_url: str, log=None):
         page.wait_for_timeout(4000)  # adaptive cards finish rendering
 
         # ── Extract email + suggested password from Duo section ───────────────
-        email = page.evaluate("""() => {
-            const paras = Array.from(document.querySelectorAll('p'));
-            for (let i = 0; i < paras.length - 1; i++) {
-                if (paras[i].textContent.trim() === 'Email') {
-                    const v = paras[i+1].textContent.trim();
-                    if (v.includes('@')) return v;
+        # The iDAC page renders Adaptive Cards as <div class="ac-textBlock">,
+        # not <p> — an earlier <p>-based lookup matched nothing and always
+        # raised "Could not extract Duo admin credentials".
+        #
+        # It must also be anchored on the "Cisco Duo" heading. The card lists
+        # several accounts and the label "Email" appears under each one
+        # (ThousandEyes first, then Cisco Duo, then IOT/PROD users), so taking
+        # the first match returns the ThousandEyes address. Scan only the
+        # window between "Cisco Duo" and the next account's heading.
+        creds = page.evaluate("""() => {
+            const blocks = Array.from(
+                document.querySelectorAll('.ac-textBlock, p, div')
+            ).filter(e => e.children.length === 0)          // leaf nodes only
+             .map(e => e.textContent.trim())
+             .filter(t => t.length > 0);
+
+            const start = blocks.findIndex(t => /^Cisco Duo$/i.test(t));
+            if (start === -1) return {email: '', password: '', anchor: false};
+
+            // Stop before the per-user emails that follow the admin block.
+            let end = blocks.length;
+            for (let i = start + 1; i < blocks.length; i++) {
+                if (/^(IOT|PROD|MAIN)\\s+User\\s+Email$/i.test(blocks[i])) { end = i; break; }
+            }
+
+            let email = '', password = '';
+            for (let i = start; i < end - 1; i++) {
+                if (!email && /^Email$/i.test(blocks[i]) && blocks[i+1].includes('@')) {
+                    email = blocks[i+1];
+                }
+                if (!password && /^Suggested\\s+Password$/i.test(blocks[i])) {
+                    password = blocks[i+1];
                 }
             }
-            return '';
+            return {email, password, anchor: true};
         }""")
-        password = page.evaluate("""() => {
-            const paras = Array.from(document.querySelectorAll('p'));
-            for (let i = 0; i < paras.length - 1; i++) {
-                if (paras[i].textContent.trim() === 'Suggested Password') {
-                    return paras[i+1].textContent.trim();
-                }
-            }
-            return '';
-        }""")
+        if not creds.get("anchor"):
+            _log("WARN: no 'Cisco Duo' section found on iDAC page")
+        email    = creds.get("email", "")
+        password = creds.get("password", "")
         if not email or not password:
             raise RuntimeError(
                 f"Could not extract Duo admin credentials from iDAC page "
@@ -2106,6 +2154,1383 @@ def _pw_activate_duo_admin(idac_url: str, log=None):
         _log(f"activation done (final url={activation_page.url[:80]})")
         browser.close()
         return email, password
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Passkey bootstrap — log into a fresh Duo org with no phone and no pre-existing
+# Admin API credentials.
+#
+# Duo's admin activation offers two second factors: Passkey and Duo Mobile.
+# Duo Mobile is a dead end for automation — /push/v2/activation/<code> now
+# rejects unsigned enrollment ("Signature type is not supported", code 40112),
+# so _duo_enroll_totp_device() cannot register a virtual device any more.
+#
+# Passkey is WebAuthn, and Chrome DevTools Protocol exposes a virtual
+# authenticator. We enroll one, export the credential, and replay it on every
+# later login. That closes the bootstrap loop: activate -> passkey -> log in ->
+# create an Admin API app -> harvest ikey/skey/host.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_VIRTUAL_AUTH_OPTS = {
+    "protocol": "ctap2",
+    "ctap2Version": "ctap2_1",
+    "transport": "internal",
+    "hasResidentKey": True,
+    "hasUserVerification": True,
+    "isUserVerified": True,            # simulate a successful biometric gesture
+    "automaticPresenceSimulation": True,
+    "backupEligibility": True,
+    "backupState": True,
+}
+
+
+def _pw_add_virtual_authenticator(ctx, page):
+    """Attach a CDP virtual authenticator. Returns (cdp_session, authenticator_id)."""
+    cdp = ctx.new_cdp_session(page)
+    cdp.send("WebAuthn.enable", {"enableUI": False})
+    auth_id = cdp.send(
+        "WebAuthn.addVirtualAuthenticator", {"options": _VIRTUAL_AUTH_OPTS}
+    )["authenticatorId"]
+    return cdp, auth_id
+
+
+def _pw_load_passkey(ctx, page, credentials: list, hwm: int = 0):
+    """Attach a virtual authenticator preloaded with a previously exported passkey.
+
+    WebAuthn clone detection: the relying party stores the highest signCount it
+    has seen and rejects any assertion that is not strictly greater. Restoring
+    the enrollment-time counter therefore succeeds exactly once and every later
+    login fails with "Passkey authentication failed". Always restore above the
+    stored high-water mark, and persist the new mark after each login.
+    """
+    cdp, auth_id = _pw_add_virtual_authenticator(ctx, page)
+    base = int(hwm or 0) + 50
+    for c in credentials:
+        cdp.send("WebAuthn.addCredential", {
+            "authenticatorId": auth_id,
+            "credential": {
+                "credentialId":         c["credentialId"],
+                "isResidentCredential": c.get("isResidentCredential", False),
+                "rpId":                 c.get("rpId"),
+                "privateKey":           c["privateKey"],
+                "userHandle":           c.get("userHandle") or "",
+                "signCount":            base,
+            },
+        })
+    return cdp, auth_id, base
+
+
+def _pw_read_signcount(cdp, auth_id: int, fallback: int = 0) -> int:
+    """Current signCount high-water mark for the virtual authenticator."""
+    try:
+        creds = cdp.send("WebAuthn.getCredentials", {"authenticatorId": auth_id})
+        return max([c.get("signCount", 0) for c in creds.get("credentials", [])]
+                   or [fallback])
+    except Exception:
+        return fallback
+
+
+def _pw_duo_admin_login_passkey(page, admin_host: str, email: str, password: str,
+                                log=None) -> bool:
+    """Drive the two-step Duo admin login. Assumes a passkey authenticator is attached.
+
+    Returns True when we land inside the admin panel.
+    """
+    _log = log or (lambda s: print(f"     [duo-login] {s}"))
+    page.goto(f"https://{admin_host}", wait_until="load", timeout=45_000)
+    page.wait_for_timeout(3_000)
+
+    page.fill('input[type="email"]', email)
+    page.get_by_role("button", name="Continue").click()
+    page.wait_for_timeout(4_000)
+
+    page.fill('input[type="password"]', password)
+    # "Log in as someone else" also contains "Log in" — a substring match hits it
+    # and resets the flow back to the email step, looping forever. Match exactly.
+    page.get_by_role("button", name="Log in", exact=True).click()
+    page.wait_for_timeout(9_000)
+
+    # Once the admin has more than one second factor (e.g. after
+    # duo_provision_admin_totp adds a hardware token) Duo inserts a
+    # "Select login option" page instead of going straight to the only method.
+    if "/login" in page.url:
+        body = page.evaluate("() => document.body.innerText")
+        if "Select login option" in body or "Confirm your identity" in body:
+            _log("method chooser shown — selecting Passkey")
+            page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('button,a'))
+                    .find(x => /^passkey$/i.test((x.innerText || '').trim()));
+                if (b) b.click();
+            }""")
+            page.wait_for_timeout(9_000)
+
+    if "/login" in page.url:
+        body = page.evaluate("() => document.body.innerText.slice(0, 200)")
+        _log(f"login failed: {body.strip()[:140]!r}")
+        return False
+    _log(f"logged in -> {page.url[:70]}")
+    return True
+
+
+def _pw_capture_copy_buttons(page) -> list:
+    """Click every 'Copy' button and return the values they wrote.
+
+    Duo renders Admin API credentials behind clipboard buttons rather than as
+    text — the secret key never appears in innerText or an input value. Hook
+    both the async clipboard API and execCommand('copy') to capture them.
+    """
+    page.evaluate("""() => {
+        if (window.__copyHooked) return;
+        window.__copyHooked = true;
+        window.__copied = [];
+        if (navigator.clipboard) {
+            const orig = navigator.clipboard.writeText;
+            navigator.clipboard.writeText = function (t) {
+                window.__copied.push(t);
+                return orig ? orig.call(navigator.clipboard, t) : Promise.resolve();
+            };
+        }
+        const ec = document.execCommand.bind(document);
+        document.execCommand = function (c, ...rest) {
+            if (String(c).toLowerCase() === 'copy') {
+                const sel = window.getSelection && window.getSelection().toString();
+                if (sel) window.__copied.push(sel);
+                const ae = document.activeElement;
+                if (ae && ae.value) window.__copied.push(ae.value);
+            }
+            return ec(c, ...rest);
+        };
+    }""")
+    idxs = page.evaluate("""() => Array.from(document.querySelectorAll('button'))
+        .map((b, i) => ({i, t: (b.innerText || '').trim()}))
+        .filter(x => /^copy$/i.test(x.t)).map(x => x.i)""")
+    for i in idxs:
+        page.evaluate(f"() => document.querySelectorAll('button')[{i}].click()")
+        page.wait_for_timeout(900)
+    return page.evaluate("() => window.__copied || []")
+
+
+def _pw_create_admin_api_app(page, admin_host: str, log=None) -> dict:
+    """Create the Admin API application and return {ikey, skey, host}.
+
+    A new Admin API app has no permissions until they are granted and saved —
+    without that every call returns 403.
+    """
+    _log = log or (lambda s: print(f"     [admin-api] {s}"))
+
+    page.goto(f"https://{admin_host}/applications/protect/types",
+              wait_until="load", timeout=40_000)
+    page.wait_for_timeout(6_000)
+
+    # input[type=search] is the GLOBAL site search. The list filter is the text
+    # input placeholdered "Search applications" — filling the wrong one leaves
+    # the list unfiltered and the first Add button creates a random application.
+    try:
+        page.locator('input[placeholder*="Search applications"]').first.fill("Admin API")
+        page.wait_for_timeout(4_000)
+    except Exception as e:
+        _log(f"could not filter list: {type(e).__name__}")
+
+    # Match the heading exactly — "Cisco ISE Admin API" is a decoy entry.
+    res = page.evaluate("""() => {
+        const hs = Array.from(document.querySelectorAll('h3'))
+            .filter(h => (h.textContent || '').trim().toLowerCase() === 'admin api');
+        if (!hs.length) return {ok: false, reason: 'no exact "Admin API" heading'};
+        let n = hs[0];
+        for (let i = 0; i < 6 && n; i++) {
+            n = n.parentElement;
+            if (!n) break;
+            const btn = Array.from(n.querySelectorAll('button,a'))
+                .find(x => /^add$/i.test((x.innerText || '').trim()));
+            if (btn) { btn.click(); return {ok: true}; }
+        }
+        return {ok: false, reason: 'no Add control near heading'};
+    }""")
+    if not res.get("ok"):
+        raise RuntimeError(f"could not add Admin API application: {res.get('reason')}")
+    page.wait_for_timeout(9_000)
+    _log(f"application created: {page.url[-24:]}")
+
+    granted = page.evaluate("""() => {
+        const on = [];
+        document.querySelectorAll('input[type=checkbox]').forEach(cb => {
+            const lab = (cb.closest('label')?.innerText ||
+                document.querySelector(`label[for="${cb.id}"]`)?.innerText ||
+                cb.name || '').trim();
+            if (/grant/i.test(lab) || /grant/i.test(cb.name || '')) {
+                if (!cb.checked) cb.click();
+                on.push((lab.split('\\n')[0] || cb.name).slice(0, 40));
+            }
+        });
+        const save = Array.from(document.querySelectorAll('button,input[type=submit]'))
+            .find(b => /^save/i.test((b.innerText || b.value || '').trim()));
+        if (save) save.click();
+        return on;
+    }""")
+    _log(f"granted {len(granted)} permissions: {', '.join(granted[:4])}...")
+    page.wait_for_timeout(8_000)
+
+    vals = _pw_capture_copy_buttons(page)
+    ikey = next((v for v in vals if v.startswith("DI") and len(v) == 20), "")
+    host = next((v for v in vals if "duosecurity.com" in v), "")
+    skey = next((v for v in vals if len(v) >= 32 and v not in (ikey, host)), "")
+    if not (ikey and skey and host):
+        raise RuntimeError(
+            f"could not harvest Admin API credentials "
+            f"(ikey={bool(ikey)}, skey_len={len(skey)}, host={bool(host)})"
+        )
+    _log(f"harvested ikey={ikey} skey({len(skey)}) host={host}")
+    return {"ikey": ikey, "skey": skey, "host": host}
+
+
+def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Bring a fresh Duo org from nothing to usable Admin API credentials.
+
+    iDAC -> activate admin -> enrol virtual passkey -> log in -> create Admin API
+    app -> harvest ikey/skey/host. Everything is persisted to org_credentials so
+    later runs reuse the passkey instead of re-activating.
+
+    Requires WinRM to the jump host (idac_sdk mints the iDAC URL there).
+    """
+    import json as _json
+    import re as _re
+    import sqlite3 as _sq
+
+    from playwright.sync_api import sync_playwright
+
+    _log = log or (lambda s: print(f"  [duo-bootstrap] {s}"))
+    duo_ensure_table(db_path)
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        org_num = m.group(1)
+        row = conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                           (org_num,)).fetchone()
+        oc = dict(row) if row else {}
+
+    if oc.get("duo_ikey") and oc.get("duo_skey") and oc.get("duo_host"):
+        return True, f"org {org_num} already has Admin API credentials — nothing to do"
+
+    # DESTRUCTIVE: each idac_sdk run reprovisions the whole pod identity — a new
+    # Duo org AND a new SCC org AND a new Meraki org. Never mint a URL when one
+    # is already stored; loading a stored URL is read-only and keeps the pod's
+    # current orgs intact.
+    idac = (oc.get("idac_url") or "").strip()
+    if idac:
+        _log(f"org {org_num}: reusing stored iDAC URL (minting a new one would "
+             f"rotate the pod's Duo/SCC/Meraki orgs)")
+    else:
+        _log(f"org {org_num}: no stored iDAC URL — minting one via jump host "
+             f"(this provisions fresh Duo/SCC/Meraki orgs)")
+        idac = fetch_idac_url_from_dcloud(log=_log, pod_id=pod_id,
+                                          allow_rotation=True)
+
+    # _pw_activate_duo_admin() runs its own sync_playwright(); nesting a second
+    # one raises "Sync API inside the asyncio loop". Activate first, then open
+    # our own browser for the passkey work.
+    email, password = _pw_activate_duo_admin(idac, log=_log)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = browser.new_context(ignore_https_errors=True,
+                                  viewport={"width": 1500, "height": 1100},
+                                  permissions=["clipboard-read", "clipboard-write"])
+        try:
+            page = ctx.new_page()
+
+            # Re-open the activation tab to enrol the passkey — the activation
+            # helper closed its own browser.
+            admin_host = ""
+            page.goto(idac, wait_until="load", timeout=45_000)
+            page.wait_for_timeout(4_000)
+            with ctx.expect_page(timeout=25_000) as info:
+                for btn in page.locator("button").all():
+                    try:
+                        if "Activate Account" in btn.inner_text():
+                            btn.click()
+                            break
+                    except Exception:
+                        pass
+            act = info.value
+            act.wait_for_load_state("load", timeout=20_000)
+            act.wait_for_timeout(2_500)
+            admin_host = act.url.split("/")[2]
+            cdp2, auth2 = _pw_add_virtual_authenticator(ctx, act)
+
+            for label in ("Continue", "Skip for now"):
+                try:
+                    act.get_by_role("button", name=label, exact=False).first.click(timeout=6_000)
+                    act.wait_for_timeout(3_000)
+                except Exception:
+                    pass
+            try:
+                act.get_by_role("button", name="Add Passkey", exact=False).first.click(timeout=10_000)
+            except Exception:
+                act.evaluate("""() => {
+                    const b = Array.from(document.querySelectorAll('button,a'))
+                        .find(x => /add passkey/i.test(x.innerText || ''));
+                    if (b) b.click();
+                }""")
+            act.wait_for_timeout(6_000)
+
+            creds = cdp2.send("WebAuthn.getCredentials",
+                              {"authenticatorId": auth2}).get("credentials", [])
+            if not creds:
+                return False, "passkey enrolment produced no credential"
+            _log(f"passkey enrolled ({len(creds)} credential, rpId={creds[0].get('rpId')})")
+            hwm = _pw_read_signcount(cdp2, auth2)
+
+            with _sq.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE org_credentials SET duo_admin_email=?, duo_admin_password=?, "
+                    "duo_admin_host=?, duo_passkey_cred=?, duo_passkey_hwm=?, idac_url=?, "
+                    "updated_at=datetime('now') WHERE org_number=?",
+                    (email, password, admin_host, _json.dumps(creds), hwm, idac, org_num),
+                )
+            _log("passkey + admin credentials persisted")
+
+            page2 = ctx.new_page()
+            cdp3, auth3, base = _pw_load_passkey(ctx, page2, creds, hwm)
+            if not _pw_duo_admin_login_passkey(page2, admin_host, email, password, log=_log):
+                return False, "passkey login failed after enrolment"
+            hwm = _pw_read_signcount(cdp3, auth3, base)
+
+            api = _pw_create_admin_api_app(page2, admin_host, log=_log)
+
+            with _sq.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE org_credentials SET duo_ikey=?, duo_skey=?, duo_host=?, "
+                    "duo_passkey_hwm=?, updated_at=datetime('now') WHERE org_number=?",
+                    (api["ikey"], api["skey"], api["host"], hwm, org_num),
+                )
+            return True, (f"org {org_num} bootstrapped — admin={email} "
+                          f"ikey={api['ikey']} host={api['host']}")
+        finally:
+            browser.close()
+
+
+def duo_harvest_sso_enrollment(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Automate lab guide section 2: SSO External Auth Source + enrollment blob.
+
+    Replaces the two copy/paste steps a proctor does by hand:
+      * step 21 - the ``[sso]`` config block appended to authproxy.cfg on AD1
+      * step 23 - the Auth Proxy enrollment command ("Generate command")
+
+    Both are clipboard-only in the Duo UI, so the values are captured by hooking
+    ``navigator.clipboard.writeText`` and ``execCommand('copy')`` rather than
+    scraped from the DOM.
+
+    Note the blob is a *one-time* code and Duo expires it eight hours after
+    generation — harvest it as part of the run that consumes it, never cache it
+    across sessions.
+    """
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: print(f"  [duo-sso] {s}"))
+    duo_ensure_table(db_path)
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        org_num = m.group(1)
+
+    pw = br = None
+    try:
+        pw, br, ctx, page = duo_passkey_login(pod_id, db_path, log=_log)
+        host = page.url.split("/")[2]
+
+        # ── Find or create the Active Directory auth source ───────────────────
+        page.goto(f"https://{host}/sso?selected_tab=authentication_sources",
+                  wait_until="load", timeout=35_000)
+        page.wait_for_timeout(4_000)
+        src = page.evaluate(r"""() => {
+            const a = Array.from(document.querySelectorAll('a'))
+                .find(x => /\/sso\/authsources\/ldap\//.test(x.getAttribute('href') || ''));
+            return a ? a.getAttribute('href') : '';
+        }""")
+
+        if src:
+            _log(f"existing AD auth source: {src.rsplit('/', 1)[-1]}")
+        else:
+            _log("no AD auth source — creating one")
+            page.goto(f"https://{host}/sso/authsources/add", wait_until="load", timeout=35_000)
+            page.wait_for_timeout(4_000)
+            page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('button,a'))
+                    .find(x => /^add active directory$/i.test((x.innerText || '').trim()));
+                if (b) b.click();
+            }""")
+            page.wait_for_timeout(4_000)
+            # The privacy gate is a required checkbox; the button silently
+            # no-ops until it is ticked.
+            page.evaluate("""() => document.querySelectorAll('input[type=checkbox]')
+                .forEach(cb => { if (!cb.checked) cb.click(); })""")
+            page.wait_for_timeout(1_500)
+            page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('button,a'))
+                    .find(x => /^configure active directory$/i.test((x.innerText || '').trim()));
+                if (b) b.click();
+            }""")
+            page.wait_for_timeout(6_000)
+            if "/sso/authsources/ldap/" not in page.url:
+                return False, f"AD source creation did not land on a source page ({page.url[-60:]})"
+            src = page.url.split("?")[0]
+            _log(f"created AD auth source {src.rsplit('/', 1)[-1]}")
+
+        if not page.url.startswith("http") or "/authsources/ldap/" not in page.url:
+            page.goto(f"https://{host}{src}" if src.startswith("/") else src,
+                      wait_until="load", timeout=35_000)
+            page.wait_for_timeout(4_000)
+
+        # ── Add an Authentication Proxy under that source ─────────────────────
+        if "/authproxies/" not in page.url:
+            page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('button,a'))
+                    .find(x => /^add authentication proxy$/i.test((x.innerText || '').trim()));
+                if (b) b.click();
+            }""")
+            page.wait_for_timeout(6_000)
+        if "/authproxies/" not in page.url:
+            return False, f"could not open an Authentication Proxy page ({page.url[-60:]})"
+        _log(f"auth proxy page: {page.url.rsplit('/', 1)[-1]}")
+
+        # ── Generate the enrollment command ───────────────────────────────────
+        # The confirm button inside the modal carries the SAME label as the
+        # trigger ("Generate command"); "Generate new command" is only the
+        # dialog title. Scope the second click to the <dialog>.
+        page.evaluate("""() => {
+            const b = Array.from(document.querySelectorAll('button'))
+                .find(x => /^generate command$/i.test((x.innerText || '').trim()));
+            if (b) b.click();
+        }""")
+        page.wait_for_timeout(3_500)
+        confirmed = page.evaluate("""() => {
+            const d = document.querySelector('dialog[open], dialog, .cds-modal');
+            if (!d) return false;
+            const b = Array.from(d.querySelectorAll('button'))
+                .find(x => /^generate command$/i.test((x.innerText || '').trim()));
+            if (b) { b.click(); return true; }
+            return false;
+        }""")
+        _log(f"generate-command dialog confirmed: {confirmed}")
+        page.wait_for_timeout(9_000)
+
+        values = _pw_capture_copy_buttons(page)
+        sso_cfg = next((v for v in values if "[sso]" in v), "")
+        blob = ""
+        for v in values:
+            m2 = _re.search(
+                r"authproxy_update_sso_enrollment_code\.exe[\"'\s]+([A-Za-z0-9+/=]{20,})", v)
+            if m2:
+                blob = m2.group(1)
+                break
+
+        if not blob:
+            return False, (f"captured {len(values)} clipboard value(s) but no enrollment "
+                           f"blob (sso_cfg={'yes' if sso_cfg else 'no'})")
+
+        with _sq.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE org_credentials SET authproxy_enroll_blob=?, "
+                "authproxy_blob_saved_at=datetime('now') WHERE org_number=?",
+                (blob, org_num))
+            if sso_cfg:
+                conn.execute(
+                    "UPDATE org_credentials SET authproxy_sso_cfg=? WHERE org_number=?",
+                    (sso_cfg, org_num))
+        _log(f"blob ({len(blob)} chars) and [sso] block persisted")
+        return True, (f"harvested enrollment blob ({len(blob)} chars)"
+                      + (f" + [sso] block ({len(sso_cfg)} chars)" if sso_cfg else ""))
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+
+
+def duo_sync_now(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Run a full AD directory sync by clicking "Sync Now" in the Duo admin UI.
+
+    Duo's Admin API has no working full-sync endpoint here: the documented
+    per-user route, POST /admin/v1/users/directorysync/{dkey}/syncuser, returns
+    404 for every key on this deployment (the directory key, the connection id,
+    and the connector ikey were all tried). The UI action works and imports the
+    whole scope in seconds, so drive that instead.
+
+    Requires the sync to have at least one group selected — with no scope Duo
+    imports nobody and reports success anyway.
+    """
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: print(f"  [duo-sync] {s}"))
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {})
+    ikey, skey, host_api = (oc.get("duo_ikey", ""), oc.get("duo_skey", ""),
+                            oc.get("duo_host", ""))
+
+    def _counts():
+        u = len(_duo_request(ikey, skey, host_api, "GET", "/admin/v1/users").get("response", []))
+        g = len(_duo_request(ikey, skey, host_api, "GET", "/admin/v1/groups").get("response", []))
+        return u, g
+
+    before_u, before_g = _counts()
+    _log(f"before sync: users={before_u} groups={before_g}")
+
+    pw = br = None
+    try:
+        pw, br, ctx, page = duo_passkey_login(pod_id, db_path, log=_log)
+        host = page.url.split("/")[2]
+        page.goto(f"https://{host}/users/directories?tab=directory-syncs",
+                  wait_until="load", timeout=35_000)
+        page.wait_for_timeout(4_000)
+        href = page.evaluate(r"""() => {
+            const a = Array.from(document.querySelectorAll('a'))
+                .find(x => /\/users\/directorysync\/[A-Z0-9]{20}$/.test(x.getAttribute('href') || ''));
+            return a ? a.getAttribute('href') : '';
+        }""")
+        if not href:
+            return False, "no directory sync found — run duo_setup_external_directory first"
+        page.goto(f"https://{host}{href}", wait_until="load", timeout=35_000)
+        page.wait_for_timeout(7_000)
+
+        clicked = page.evaluate("""() => {
+            const b = Array.from(document.querySelectorAll('button'))
+                .find(x => /^sync now$/i.test((x.innerText || '').trim()));
+            if (b && !b.disabled) { b.click(); return true; }
+            return false;
+        }""")
+        if not clicked:
+            return False, "'Sync Now' button not available (is the connection healthy?)"
+        _log("clicked Sync Now")
+        page.wait_for_timeout(4_000)
+        # Some builds confirm in a modal; harmless when absent.
+        page.evaluate("""() => {
+            const d = document.querySelector('dialog[open], dialog, .cds-modal');
+            if (!d) return;
+            const b = Array.from(d.querySelectorAll('button'))
+                .find(x => /^(sync|sync now|confirm|ok)$/i.test((x.innerText || '').trim()));
+            if (b) b.click();
+        }""")
+
+        for i in range(6):
+            page.wait_for_timeout(10_000)
+            u, g = _counts()
+            _log(f"+{(i + 1) * 10}s users={u} groups={g}")
+            if u > before_u or (u and g):
+                return True, f"directory sync complete — {u} users, {g} groups"
+        u, g = _counts()
+        return (u > 0), f"sync ran but users={u} groups={g} after 60s"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+
+
+def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Automate lab guide section 2 part 1: the AD External Directory that syncs users.
+
+    This is a DIFFERENT Duo object from the SSO External Authentication Source
+    handled by duo_harvest_sso_enrollment(). The guide configures both and they
+    look alike, but only this one populates Users/Groups — without it the org
+    stays empty and /admin/v1/users/directorysync/{dirkey}/syncuser returns 404.
+
+    Critically, the AD-connection page issues its OWN ikey/skey (exposed only via
+    clipboard buttons). They are not the radius Auth Proxy integration's keys —
+    building [cloud] from the wrong pair is what leaves the proxy unregistered as
+    a directory-sync connector.
+
+    Flow: Users -> External Directories -> Add -> Active Directory -> Add new
+    connection -> capture keys -> write [cloud] to AD1 -> restart proxy -> fill
+    DC/port/baseDN -> Save -> Test -> groups -> attributes -> Complete Setup.
+    """
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: print(f"  [duo-extdir] {s}"))
+    AD_GROUPS = ("IoT", "MAIN", "PROD")
+    CFG = r"C:\Program Files\Duo Security Authentication Proxy\conf\authproxy.cfg"
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        org_num = m.group(1)
+        _oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                                (org_num,)).fetchone() or {})
+    oc_ikey = _oc.get("duo_ikey", "")
+    oc_skey = _oc.get("duo_skey", "")
+    oc_host = _oc.get("duo_host", "")
+
+    pw = br = None
+    try:
+        pw, br, ctx, page = duo_passkey_login(pod_id, db_path, log=_log)
+        host = page.url.split("/")[2]
+
+        # ── Reuse an existing AD connection if one is already present ─────────
+        page.goto(f"https://{host}/users/directories?tab=directory-syncs",
+                  wait_until="load", timeout=35_000)
+        page.wait_for_timeout(4_000)
+        conn_href = page.evaluate(r"""() => {
+            const a = Array.from(document.querySelectorAll('a'))
+                .find(x => /\/users\/directories\/ad-connection\//.test(x.getAttribute('href') || ''));
+            return a ? a.getAttribute('href') : '';
+        }""")
+
+        if conn_href:
+            _log(f"reusing AD connection {conn_href.rsplit('/', 1)[-1][:24]}")
+            page.goto(f"https://{host}{conn_href}", wait_until="load", timeout=35_000)
+        else:
+            _log("creating a new AD directory sync")
+            page.goto(f"https://{host}/users/directorysync/new/ad",
+                      wait_until="load", timeout=35_000)
+            page.wait_for_timeout(4_000)
+            # Radio 1 = "Add new connection"; Continue is inert until one is picked.
+            page.evaluate("""() => {
+                const rs = document.querySelectorAll('input[type=radio]');
+                if (rs[1]) rs[1].click();
+            }""")
+            page.wait_for_timeout(2_000)
+            page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('button'))
+                    .find(x => /^continue$/i.test((x.innerText || '').trim()));
+                if (b) b.click();
+            }""")
+            page.wait_for_timeout(9_000)
+        if "/ad-connection/" not in page.url:
+            return False, f"did not reach an AD connection page ({page.url[-60:]})"
+        conn_url = page.url
+        _log(f"connection page: {conn_url.split('/')[-1][:44]}")
+
+        # ── Capture this connection's own credentials ─────────────────────────
+        # A freshly-created connection renders its keys and an editable form. An
+        # already-saved one renders read-only: the keys hide behind "Show
+        # details" and the DC/port/baseDN inputs do not exist until "Edit" is
+        # clicked. Handle both layouts.
+        page.wait_for_timeout(3_000)
+        revealed = page.evaluate("""() => {
+            const b = Array.from(document.querySelectorAll('button,a'))
+                .find(x => /^show details$/i.test((x.innerText || '').trim()));
+            if (b) { b.click(); return true; }
+            return false;
+        }""")
+        if revealed:
+            _log("expanded 'Show details' to reveal connection keys")
+            page.wait_for_timeout(3_000)
+
+        vals = _pw_capture_copy_buttons(page)
+        ikey = next((v for v in vals if _re.fullmatch(r"DI[A-Z0-9]{18}", v)), "")
+        apih = next((v for v in vals if "duosecurity.com" in v), "")
+        skey = next((v for v in vals if len(v) == 40 and v != ikey), "")
+        if not (ikey and skey and apih):
+            return False, (f"could not capture directory-sync credentials "
+                           f"(ikey={bool(ikey)} skey={len(skey)} host={bool(apih)})")
+        _log(f"directory-sync ikey={ikey} host={apih}")
+
+        # ── Rewrite [cloud] on AD1 with THESE keys, then restart the proxy ────
+        ws = _winrm_connect_for_pod(pod_id, log=_log)
+        try:
+            cur = ws.run_ps(f"Get-Content '{CFG}' -Raw").std_out.decode(errors="replace")
+            # Plain LDAP bind against AD needs a UPN, not a bare sAMAccountName —
+            # a bare "administrator" returns
+            # "LDAPInvalidCredentials 80090308 ... AcceptSecurityContext error".
+            # Same UPN-bind rule the AD verification code follows.
+            upn = (AD_WINRM_USER if "@" in AD_WINRM_USER
+                   else f"{AD_WINRM_USER}@corp.pseudoco.com")
+            cloud = ("[cloud]\n"
+                     f"ikey={ikey}\n"
+                     f"skey={skey}\n"
+                     f"api_host={apih}\n"
+                     f"service_account_username={upn}\n"
+                     f"service_account_password={AD_WINRM_PASS}\n")
+            # Replace any existing [cloud] stanza instead of appending a second.
+            rest = _re.sub(r"\[cloud\].*?(?=^\[|\Z)", "", cur, flags=_re.S | _re.M).strip()
+            # Preserve the SSO stanza — the enrollment step needs its rikey, and
+            # an earlier merge dropped it.
+            if "[sso]" not in rest:
+                with _sq.connect(db_path) as c2:
+                    c2.row_factory = _sq.Row
+                    row = c2.execute("SELECT authproxy_sso_cfg FROM org_credentials "
+                                     "WHERE org_number=?", (org_num,)).fetchone()
+                sso = (row["authproxy_sso_cfg"] or "").strip() if row else ""
+                if sso:
+                    rest = (rest + "\n\n" + sso).strip()
+                    _log("restored [sso] stanza from org_credentials")
+            merged = cloud + ("\n" + rest + "\n" if rest else "")
+            # ad_client binds with the same UPN.
+            merged = _re.sub(r"^service_account_username=(?!.*@)(.+)$",
+                             lambda m: f"service_account_username={m.group(1)}@corp.pseudoco.com",
+                             merged, flags=_re.M)
+            ok, msg = _winrm_put_bytes(ws, merged.encode("utf-8"), CFG, log=_log)
+            if not ok:
+                return False, f"authproxy.cfg write failed: {msg}"
+            r = ws.run_ps("Restart-Service DuoAuthProxy -Force; Start-Sleep -Seconds 10;"
+                          "(Get-Service DuoAuthProxy).Status")
+            _log(f"DuoAuthProxy: {r.std_out.decode(errors='replace').strip()}")
+        finally:
+            if hasattr(ws, "close"):
+                ws.close()
+
+        # ── Fill the directory configuration and save ─────────────────────────
+        # Re-navigate: the proxy restart can leave the cached form detached.
+        page.goto(conn_url, wait_until="load", timeout=35_000)
+        page.wait_for_timeout(6_000)
+
+        # A saved connection is read-only until "Edit" is clicked — the inputs
+        # are not merely disabled, they are absent, so fill() times out waiting
+        # for a selector that will never appear.
+        if not page.locator('input[name="servers.0.host"]').count():
+            clicked = page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('button,a'))
+                    .find(x => /^edit$/i.test((x.innerText || '').trim()));
+                if (b) { b.click(); return true; }
+                return false;
+            }""")
+            _log(f"form was read-only; clicked Edit: {clicked}")
+            page.wait_for_timeout(5_000)
+
+        try:
+            page.fill('input[name="servers.0.host"]', AD_DC_IP, timeout=20_000)
+            page.fill('input[name="servers.0.port"]', "389", timeout=10_000)
+            page.fill('input[name="baseDn"]', "DC=corp,DC=pseudoco,DC=com", timeout=10_000)
+            _log(f"directory config filled ({AD_DC_IP}:389, DC=corp,DC=pseudoco,DC=com)")
+        except Exception as e:
+            return False, (f"could not fill directory configuration ({type(e).__name__}) — "
+                           f"inputs present: {page.locator('input:not([type=hidden])').count()}")
+        page.evaluate("""() => {
+            document.querySelectorAll('input[type=radio]').forEach(r => {
+                const lab = (r.closest('label')?.innerText ||
+                    document.querySelector('label[for="'+r.id+'"]')?.innerText || '').trim();
+                if (r.name === 'authType' && /^plain/i.test(lab) && !r.checked) r.click();
+                if (r.name === 'transportType' && /^clear/i.test(lab) && !r.checked) r.click();
+            });
+        }""")
+        page.evaluate("""() => {const b=Array.from(document.querySelectorAll('button'))
+            .find(x=>/^save$/i.test((x.innerText||'').trim())); if(b)b.click();}""")
+        page.wait_for_timeout(8_000)
+        page.evaluate("""() => {const b=Array.from(document.querySelectorAll('button'))
+            .find(x=>/^test connection$/i.test((x.innerText||'').trim())); if(b)b.click();}""")
+        page.wait_for_timeout(15_000)
+
+        body = page.evaluate("() => document.body.innerText")
+        connected = "Not connected" not in body and "Connected" in body
+        _log(f"connection status: {'Connected' if connected else 'Not connected'}")
+        if not connected:
+            return False, (f"AD connection configured (ikey={ikey}) but status is "
+                           f"NOT connected — check the proxy log on AD1 for an LDAP "
+                           f"bind failure")
+
+        # ── Groups + attributes + Complete Setup on the sync itself ───────────
+        # Without at least one group the sync has no scope and imports nobody.
+        dirkey = ""
+        page.goto(f"https://{host}/users/directories?tab=directory-syncs",
+                  wait_until="load", timeout=35_000)
+        page.wait_for_timeout(4_000)
+        href = page.evaluate(r"""() => {
+            const a = Array.from(document.querySelectorAll('a'))
+                .find(x => /\/users\/directorysync\/[A-Z0-9]{20}$/.test(x.getAttribute('href') || ''));
+            return a ? a.getAttribute('href') : '';
+        }""")
+        if href:
+            dirkey = href.rsplit("/", 1)[-1]
+            page.goto(f"https://{host}{href}", wait_until="load", timeout=35_000)
+            page.wait_for_timeout(6_000)
+            _log(f"sync page: {dirkey}")
+
+            # Groups may already be selected from a previous run (or by hand).
+            # Duo names them "IoT (from AD sync ...)", so match on prefix.
+            existing = []
+            try:
+                gs = _duo_request(oc_ikey, oc_skey, oc_host, "GET",
+                                  "/admin/v1/groups").get("response", [])
+                existing = [g.get("name", "") for g in gs
+                            if any(g.get("name", "").lower().startswith(w.lower())
+                                   for w in AD_GROUPS)]
+            except Exception:
+                pass
+            if len(existing) >= len(AD_GROUPS):
+                _log(f"groups already configured: {existing}")
+                return True, (f"AD directory sync Connected (ikey={ikey}, dc={AD_DC_IP}, "
+                              f"dirkey={dirkey}) — groups already configured: {existing}")
+
+            picked = page.evaluate("""(wanted) => {
+                // Open the AD group picker, then tick the lab's three groups.
+                const opener = Array.from(document.querySelectorAll('button,a,div'))
+                    .find(x => /select ad groups/i.test((x.innerText || '').trim()) &&
+                               (x.innerText || '').trim().length < 40);
+                if (opener) opener.click();
+                const out = [];
+                document.querySelectorAll('input[type=checkbox]').forEach(cb => {
+                    const lab = (cb.closest('label')?.innerText ||
+                        document.querySelector('label[for="'+cb.id+'"]')?.innerText ||
+                        (cb.parentElement && cb.parentElement.innerText) || '').trim();
+                    if (wanted.some(w => lab.toLowerCase() === w.toLowerCase()) && !cb.checked) {
+                        cb.click(); out.push(lab.slice(0, 24));
+                    }
+                });
+                return {opened: !!opener, picked: out};
+            }""", list(AD_GROUPS))
+            _log(f"group picker opened={picked.get('opened')} selected={picked.get('picked')}")
+            page.wait_for_timeout(3_000)
+
+            # Guide: First Name -> givenname, Last Name -> sn.
+            attrs = page.evaluate("""() => {
+                const set = (name, val) => {
+                    const i = document.querySelector('input[name="'+name+'"]');
+                    if (i && !i.value) { i.value = val;
+                        i.dispatchEvent(new Event('input', {bubbles:true}));
+                        i.dispatchEvent(new Event('change', {bubbles:true}));
+                        return name+'='+val; }
+                    return i ? name+'(kept '+i.value+')' : name+'(absent)';
+                };
+                return [set('username_attribute','samaccountname'),
+                        set('email_attribute','mail'),
+                        set('realname_attribute','displayname')];
+            }""")
+            _log(f"attributes: {attrs}")
+
+            done = page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('button'))
+                    .find(x => /^complete setup$/i.test((x.innerText || '').trim()));
+                if (b && !b.disabled) { b.click(); return 'clicked'; }
+                return b ? 'disabled' : 'absent';
+            }""")
+            _log(f"Complete Setup: {done}")
+            page.wait_for_timeout(10_000)
+
+        # Report what actually happened. Claiming the groups were selected when
+        # the picker matched nothing would repeat the ad_sync false-green bug:
+        # the connection can be healthy while the sync still has no scope, and
+        # Complete Setup stays disabled until at least one group is chosen.
+        groups_ok = bool(picked.get("picked")) if href else False
+        detail = (f"AD directory sync Connected (ikey={ikey}, dc={AD_DC_IP}, "
+                  f"dirkey={dirkey or 'n/a'})")
+        if groups_ok and done == "clicked":
+            return True, f"{detail} — groups {picked['picked']} selected, setup completed"
+        return False, (f"{detail} — but NO groups selected (picker matched none) and "
+                       f"Complete Setup is {done}; the sync has no scope so no users "
+                       f"will import. Add {'/'.join(AD_GROUPS)} in the Duo UI.")
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+
+
+def duo_provision_admin_totp(pod_id: str, db_path: str, serial: str = "",
+                             log=None) -> tuple[bool, str]:
+    """Give the org's Duo admin a TOTP hardware token, and keep the secret.
+
+    This is how a *human* logs into the Duo Admin Panel from Jumphost1 with no
+    phone and no TPM:
+
+      email -> password -> "Hardware token" -> 6-digit code
+
+    Windows Hello is not an option on the pod jump hosts (VMs with no TPM), and
+    Duo Push needs a phone. A TOTP token is the only phone-free second factor
+    Duo offers whose secret we control, which means the dashboard can render the
+    current code directly — the proctor needs no authenticator app at all.
+
+    Duo expects the secret as a hex string; base32 is rejected with HTTP 400.
+    Codes are plain TOTP-SHA1-6 over the *decoded* bytes (30s step).
+    """
+    import base64 as _b64
+    import os as _os
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: print(f"  [duo-totp] {s}"))
+    duo_ensure_table(db_path)
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        org_num = m.group(1)
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (org_num,)).fetchone() or {})
+
+    ikey, skey, host = (oc.get("duo_ikey", "").strip(),
+                        oc.get("duo_skey", "").strip(),
+                        oc.get("duo_host", "").strip())
+    email = oc.get("duo_admin_email", "").strip()
+    if not (ikey and skey and host):
+        return False, "no Admin API credentials — run duo_passkey_bootstrap first"
+    if not email:
+        return False, "duo_admin_email not set — run duo_passkey_bootstrap first"
+
+    raw = _os.urandom(20)
+    secret_hex = raw.hex()
+    secret_b32 = _b64.b32encode(raw).decode()
+    serial = serial or f"POD{org_num}-PROCTOR"
+
+    try:
+        tok = _duo_request(ikey, skey, host, "POST", "/admin/v1/tokens",
+                           params={"type": "t6", "serial": serial,
+                                   "secret": secret_hex}).get("response", {})
+        token_id = tok.get("token_id")
+        if not token_id:
+            return False, f"token creation returned no token_id: {tok}"
+        _log(f"created TOTP token {token_id} (serial={serial})")
+
+        admin_id = _duo_get_admin_id(ikey, skey, host, email, log=_log)
+        _duo_request(ikey, skey, host, "POST", f"/admin/v1/admins/{admin_id}",
+                     params={"token_id": token_id})
+
+        # Confirm the binding from the token side — the admin PATCH returns 200
+        # even when nothing was linked.
+        back = _duo_request(ikey, skey, host, "GET",
+                            f"/admin/v1/tokens/{token_id}").get("response", {})
+        bound = [a.get("email") for a in back.get("admins", [])]
+        if email not in bound:
+            return False, f"token {token_id} created but not bound to {email}"
+        _log(f"token bound to {email}")
+    except Exception as e:
+        return False, f"token provisioning failed: {e}"
+
+    with _sq.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE org_credentials SET duo_admin_totp_secret=?, "
+            "updated_at=datetime('now') WHERE org_number=?",
+            (secret_b32, org_num),
+        )
+    return True, (f"TOTP token {serial} bound to {email} — "
+                  f"current code {_totp_generate(secret_b32)}")
+
+
+_TOTP_PAGE_HTML = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Duo Admin Login - __POD__</title>
+<style>
+ body{font-family:"Segoe UI",Arial,sans-serif;background:#0d1117;color:#cdd6e0;
+      margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
+ .card{background:#141b24;border:1px solid #1c2733;border-radius:10px;padding:28px 34px;min-width:430px}
+ h1{font-size:17px;margin:0 0 4px;color:#02c8ff}
+ .sub{font-size:12px;color:#8899aa;margin-bottom:18px}
+ .row{display:grid;grid-template-columns:82px 1fr;gap:6px 12px;font-size:13px;margin-bottom:6px;align-items:center}
+ .lbl{color:#8899aa}
+ .val{font-family:Consolas,monospace;color:#cdd6e0;word-break:break-all}
+ .codebox{margin-top:20px;padding:16px;background:#0d1117;border:1px solid #1c2733;border-radius:8px;text-align:center}
+ #code{font-family:Consolas,monospace;font-size:44px;font-weight:700;letter-spacing:9px;color:#00e68a}
+ #code.warn{color:#ffb74d}
+ #secs{font-size:12px;color:#8899aa;margin-top:6px}
+ button{margin-top:14px;background:#02c8ff;color:#000;border:0;padding:9px 22px;
+        border-radius:5px;font-size:14px;font-weight:600;cursor:pointer}
+ button:active{transform:translateY(1px)}
+ .hint{margin-top:16px;font-size:12px;color:#8899aa;line-height:1.5}
+ a{color:#02c8ff}
+</style></head><body><div class="card">
+ <h1>Duo Admin Panel Login</h1>
+ <div class="sub">__POD__ &mdash; no phone required</div>
+ <div class="row"><span class="lbl">URL</span><span class="val"><a href="__URL__" target="_blank">__URL__</a></span></div>
+ <div class="row"><span class="lbl">Email</span><span class="val">__EMAIL__</span></div>
+ <div class="row"><span class="lbl">Password</span><span class="val">__PASSWORD__</span></div>
+ <div class="codebox">
+   <div id="code">------</div>
+   <div id="secs">&nbsp;</div>
+   <button id="copy">Copy passcode</button>
+ </div>
+ <div class="hint">At the Duo prompt choose <b>Hardware token</b>, then paste this passcode.
+   It changes every 30 seconds &mdash; if it expires, just copy the new one.</div>
+</div>
+<script>
+var SECRET = "__SECRET__";             // base32 (var, not const — ES5 only)
+// SHA-1 / HMAC are implemented inline on purpose. crypto.subtle is only exposed
+// in a "secure context" and Chrome restricts it for some file:// origins, which
+// left the page stuck on "------" with no error. Plain JS works everywhere.
+function sha1(bytes){
+  var ml=bytes.length*8;
+  var buf=new Uint8Array(((bytes.length+9+63)>>6)<<6);
+  buf.set(bytes); buf[bytes.length]=0x80;
+  var dv=new DataView(buf.buffer);
+  dv.setUint32(buf.length-8,Math.floor(ml/4294967296));
+  dv.setUint32(buf.length-4,ml>>>0);
+  var h0=0x67452301,h1=0xEFCDAB89,h2=0x98BADCFE,h3=0x10325476,h4=0xC3D2E1F0;
+  var w=new Uint32Array(80),i,j,a,b,c,d,e,f,k,t,n;
+  for(i=0;i<buf.length;i+=64){
+    for(j=0;j<16;j++){ w[j]=dv.getUint32(i+j*4); }
+    for(j=16;j<80;j++){ n=w[j-3]^w[j-8]^w[j-14]^w[j-16]; w[j]=(n<<1)|(n>>>31); }
+    a=h0;b=h1;c=h2;d=h3;e=h4;
+    for(j=0;j<80;j++){
+      if(j<20){f=(b&c)|((~b)&d);k=0x5A827999;}
+      else if(j<40){f=b^c^d;k=0x6ED9EBA1;}
+      else if(j<60){f=(b&c)|(b&d)|(c&d);k=0x8F1BBCDC;}
+      else{f=b^c^d;k=0xCA62C1D6;}
+      t=(((a<<5)|(a>>>27))+f+e+k+w[j])>>>0;
+      e=d;d=c;c=((b<<30)|(b>>>2))>>>0;b=a;a=t;
+    }
+    h0=(h0+a)>>>0;h1=(h1+b)>>>0;h2=(h2+c)>>>0;h3=(h3+d)>>>0;h4=(h4+e)>>>0;
+  }
+  var out=new Uint8Array(20),odv=new DataView(out.buffer);
+  odv.setUint32(0,h0);odv.setUint32(4,h1);odv.setUint32(8,h2);odv.setUint32(12,h3);odv.setUint32(16,h4);
+  return out;
+}
+function hmacSha1(key,msg){
+  var B=64, k=key.length>B?sha1(key):key, n;
+  var pk=new Uint8Array(B); pk.set(k);
+  var oi=new Uint8Array(B), ii=new Uint8Array(B);
+  for(n=0;n<B;n++){oi[n]=pk[n]^0x5c; ii[n]=pk[n]^0x36;}
+  var inner=new Uint8Array(B+msg.length); inner.set(ii); inner.set(msg,B);
+  var ih=sha1(inner);
+  var outer=new Uint8Array(B+20); outer.set(oi); outer.set(ih,B);
+  return sha1(outer);
+}
+function pad(s,n){s=String(s);while(s.length<n){s="0"+s;}return s;}
+function b32(s){s=s.replace(/=+$/,"").toUpperCase();
+  var A="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",bits="",i,c,idx;
+  for(i=0;i<s.length;i++){c=s.charAt(i);idx=A.indexOf(c);if(idx<0)continue;
+    bits+=pad(idx.toString(2),5);}
+  var out=[];for(i=0;i+8<=bits.length;i+=8){out.push(parseInt(bits.substr(i,8),2));}
+  return new Uint8Array(out);}
+function totp(){
+  var ctr=Math.floor(Date.now()/1000/30);
+  var msg=new Uint8Array(8); var dv=new DataView(msg.buffer);
+  dv.setUint32(0,Math.floor(ctr/4294967296)); dv.setUint32(4,ctr>>>0);
+  var sig=hmacSha1(b32(SECRET),msg);
+  var off=sig[19]&0xf;
+  var v=(((sig[off]&0x7f)<<24)|(sig[off+1]<<16)|(sig[off+2]<<8)|sig[off+3])>>>0;
+  return pad(v%1000000,6);
+}
+function tick(){
+  var el=document.getElementById("code");
+  try{
+    el.textContent=totp();
+    var left=30-Math.floor(Date.now()/1000)%30;
+    document.getElementById("secs").textContent="changes in "+left+"s";
+    el.className=left<=5?"warn":"";
+  }catch(e){
+    // Never fail silently — a blank code with no explanation is unhelpable.
+    el.textContent="ERROR";
+    el.className="warn";
+    document.getElementById("secs").textContent=String(e&&e.message?e.message:e);
+  }
+}
+document.getElementById("copy").onclick=function(){
+  var t=document.getElementById("code").textContent.replace(/^\s+|\s+$/g,"");
+  var done=function(){
+    var b=document.getElementById("copy");b.textContent="Copied!";
+    setTimeout(function(){b.textContent="Copy passcode";},1400);
+  };
+  var fallback=function(){
+    var ta=document.createElement("textarea");ta.value=t;document.body.appendChild(ta);
+    ta.select();try{document.execCommand("copy");}catch(e){}ta.parentNode.removeChild(ta);done();
+  };
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(done,fallback);
+  }else{fallback();}
+};
+tick();setInterval(tick,1000);
+</script></body></html>
+"""
+
+
+def _winrm_put_bytes(sess, data: bytes, dest: str, log=None) -> tuple[bool, str]:
+    """Upload bytes to a Windows host over WinRM.
+
+    WinRM caps the command line far below the size of a typical file, so the
+    payload is appended to a temp file in base64 chunks and decoded in place.
+    """
+    import base64 as _b64
+
+    _log = log or (lambda s: None)
+    b64 = _b64.b64encode(data).decode()
+    tmp = rf"C:\Windows\Temp\_put_{abs(hash(dest)) % 10**8}.b64"
+    # powershell -EncodedCommand caps the command line near 8k chars, and WinRM
+    # encodes the script as UTF-16 base64, so the usable payload per call is
+    # roughly a third of that. 2000 stays well inside it while keeping the
+    # number of round trips (and therefore failure opportunities) low.
+    CHUNK = 2000
+
+    sess.run_ps(f"Remove-Item '{tmp}' -ErrorAction SilentlyContinue")
+    chunks = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)]
+    for n, part in enumerate(chunks):
+        # When proxied through a Docker container each chunk is its own
+        # `docker exec`, and those occasionally die (observed rc=137). Retry
+        # rather than abandoning a nearly-complete upload.
+        last = ""
+        for attempt in range(3):
+            r = sess.run_ps(f"Add-Content -Path '{tmp}' -Value '{part}' -NoNewline")
+            if r.status_code == 0:
+                break
+            last = ((r.std_err or b"").decode(errors="replace").strip()
+                    or (r.std_out or b"").decode(errors="replace").strip()
+                    or f"rc={r.status_code}")
+            _log(f"chunk {n + 1}/{len(chunks)} attempt {attempt + 1} failed ({last[:80]}) — retrying")
+        else:
+            return False, f"chunk {n + 1}/{len(chunks)} failed after 3 attempts: {last[:180]}"
+    r = sess.run_ps(
+        f"$b=[System.Convert]::FromBase64String((Get-Content '{tmp}' -Raw));"
+        f"[System.IO.File]::WriteAllBytes('{dest}', $b);"
+        f"Remove-Item '{tmp}' -ErrorAction SilentlyContinue;"
+        f"if (Test-Path '{dest}') {{ 'WROTE ' + (Get-Item '{dest}').Length }} else {{ 'FAILED' }}"
+    )
+    out = r.std_out.decode(errors="replace").strip()
+    if not out.startswith("WROTE"):
+        return False, f"{out[:120]} {r.std_err.decode(errors='replace')[:120]}"
+    _log(f"{out} bytes -> {dest}")
+    return True, out
+
+
+def _fetch_duo_logo_from_ad1(pod_id: str = "", log=None) -> bytes:
+    """Pull Duo's own logo .ico off AD1 (shipped with the Authentication Proxy).
+
+    Using the vendor asset beats approximating one, and it is already present in
+    every pod because the Auth Proxy is preinstalled.
+    """
+    import base64 as _b64
+
+    _log = log or (lambda s: None)
+    ico = (r"C:\Program Files\Duo Security Authentication Proxy\bin"
+           r"\local_proxy_manager-win32-x64\resources\app\assets\images\Duo-Logo.ico")
+    sess = (_winrm_connect_for_pod(pod_id, log=log) if pod_id
+            else _winrm_connect(AD_DC_IP, AD_WINRM_USER, AD_WINRM_PASS))
+    try:
+        r = sess.run_ps(
+            f"if (Test-Path '{ico}') {{ "
+            f"[Convert]::ToBase64String([IO.File]::ReadAllBytes('{ico}')) }} else {{ 'MISSING' }}"
+        )
+        out = r.std_out.decode(errors="replace").strip()
+        if not out or out == "MISSING":
+            raise RuntimeError("Duo-Logo.ico not found on AD1")
+        data = _b64.b64decode(out)
+        _log(f"fetched Duo-Logo.ico from AD1 ({len(data)} bytes)")
+        return data
+    finally:
+        # Release the proxy container before the caller opens its own.
+        try:
+            if hasattr(sess, "close"):
+                sess.close()
+        except Exception:
+            pass
+
+
+def duo_publish_totp_page(pod_id: str, db_path: str,
+                          dest: str = r"C:\Users\Public\Duo-Login.html",
+                          log=None) -> tuple[bool, str]:
+    """Publish a self-contained Duo passcode page onto the jump host.
+
+    Students work from Jumphost1 and have no access to POD Automator, so the
+    dashboard's passcode panel is useless to them. This writes a standalone HTML
+    file to the jump host's Public Desktop that computes the TOTP locally in the
+    browser (SubtleCrypto HMAC-SHA1) — no network calls, no dependencies, and a
+    Copy button so the code can be pasted straight into Duo.
+
+    NOTE: the page embeds the org's TOTP secret, so anyone with access to the
+    jump host can derive codes. That is the intent here (the student *is* the
+    pod's Duo admin), but do not use this pattern for shared or non-lab orgs.
+    """
+    import base64 as _b64
+    import re as _re
+    import sqlite3 as _sq
+
+    import winrm
+
+    _log = log or (lambda s: print(f"  [duo-page] {s}"))
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {})
+
+    secret = (oc.get("duo_admin_totp_secret") or "").strip()
+    email = (oc.get("duo_admin_email") or "").strip()
+    host = (oc.get("duo_admin_host") or "").strip()
+    password = (oc.get("duo_admin_password") or "").strip()
+    if not secret:
+        return False, "no TOTP secret — run duo_provision_admin_totp first"
+
+    html = (_TOTP_PAGE_HTML
+            .replace("__POD__", pod_id)
+            .replace("__URL__", f"https://{host}" if host else "")
+            .replace("__EMAIL__", email)
+            .replace("__PASSWORD__", password)
+            .replace("__SECRET__", secret))
+
+    icon_path = r"C:\Users\Public\Duo-Logo.ico"
+    lnk = r"C:\Users\Public\Desktop\Duo Login.lnk"
+    sess = None
+    try:
+        # Pod-aware: works both inside the pipeline container and from the Mac
+        # (where the dashboard runs the card and has no VPN of its own).
+        sess = _winrm_connect_jump(pod_id, log=_log)
+        ok, msg = _winrm_put_bytes(sess, html.encode("utf-8"), dest, log=_log)
+        if not ok:
+            return False, f"page write failed: {msg}"
+
+        # Desktop entry: a .lnk shortcut rather than the raw .html, because an
+        # .html file always shows the default browser's icon and cannot carry a
+        # custom one. A shortcut can, via IconLocation.
+        # Duo's logo lives on AD1, but the jump host cannot fetch it itself:
+        # WinRM will not delegate credentials on to a second host without
+        # CredSSP ("A specified logon session does not exist"), so an SMB
+        # Copy-Item from jumper1 to AD1 always fails. Relay the bytes instead,
+        # and only when the icon is not already staged — the .ico never changes,
+        # and the relay is the expensive part (~15 chunked round trips, which
+        # can OOM the proxy container when run from the Mac).
+        r = sess.run_ps(f"if (Test-Path '{icon_path}') {{ 'PRESENT' }} else {{ 'ABSENT' }}")
+        icon_ok = "PRESENT" in r.std_out.decode(errors="replace")
+        if icon_ok:
+            _log("Duo logo already staged on jump host")
+        else:
+            try:
+                ico = _fetch_duo_logo_from_ad1(pod_id=pod_id, log=_log)
+                icon_ok, icon_msg = _winrm_put_bytes(sess, ico, icon_path, log=_log)
+                if not icon_ok:
+                    _log(f"icon relay failed ({icon_msg[:90]}) — using browser icon")
+            except Exception as e:
+                _log(f"could not stage Duo logo ({type(e).__name__}: {e}) — using browser icon")
+
+        # Target Chrome explicitly rather than the .html. The jump hosts ship
+        # with .html associated to the Internet Explorer AppX handler, which
+        # cannot run this page — pointing at chrome.exe makes the shortcut
+        # independent of file associations. Falls back to the bare .html if
+        # Chrome is missing.
+        icon_line = (f"$s.IconLocation = '{icon_path},0';" if icon_ok else "")
+        r = sess.run_ps(
+            "$chrome = @('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',"
+            "'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe') |"
+            " Where-Object { Test-Path $_ } | Select-Object -First 1;"
+            f"$w = New-Object -ComObject WScript.Shell;"
+            f"$s = $w.CreateShortcut('{lnk}');"
+            f"if ($chrome) {{ $s.TargetPath = $chrome; $s.Arguments = '\"{dest}\"' }}"
+            f" else {{ $s.TargetPath = '{dest}' }};"
+            f"$s.Description = 'Duo Admin Panel passcode for this pod';"
+            f"{icon_line}"
+            f"$s.Save();"
+            f"if (Test-Path '{lnk}') {{ if ($chrome) {{ 'SHORTCUT OK (chrome)' }} "
+            f"else {{ 'SHORTCUT OK (default handler)' }} }} else {{ 'SHORTCUT FAILED' }}"
+        )
+        sc = r.std_out.decode(errors="replace").strip()
+        _log(f"{sc} -> {lnk} (icon={'Duo logo' if icon_ok else 'default'})")
+
+        # Older builds of this dropped the raw .html on the Desktop; remove it so
+        # students see one entry, not two.
+        sess.run_ps(r"Remove-Item 'C:\Users\Public\Desktop\Duo-Login.html' "
+                    r"-ErrorAction SilentlyContinue")
+    except Exception as e:
+        return False, f"WinRM publish failed: {type(e).__name__}: {e}"
+    finally:
+        # DockerWinRMSession holds a background container; a plain winrm.Session
+        # has no close(). Release either without caring which we got.
+        try:
+            if sess is not None and hasattr(sess, "close"):
+                sess.close()
+        except Exception:
+            pass
+
+    return True, f"published {dest} on {JUMP_HOST_IP} (current code {_totp_generate(secret)})"
+
+
+def duo_admin_totp_code(pod_id: str, db_path: str) -> str:
+    """Current 6-digit Duo admin login code for this POD (for the dashboard)."""
+    import re as _re
+    import sqlite3 as _sq
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        org_num = _re.search(r"pseudoco-(\d+)", (pod["scc_org"] or "")).group(1)
+        row = conn.execute("SELECT duo_admin_totp_secret FROM org_credentials "
+                           "WHERE org_number=?", (org_num,)).fetchone()
+    secret = (row["duo_admin_totp_secret"] or "").strip() if row else ""
+    if not secret:
+        raise RuntimeError(f"org {org_num} has no TOTP secret — "
+                           "run duo_provision_admin_totp first")
+    return _totp_generate(secret)
+
+
+def duo_passkey_login(pod_id: str, db_path: str, log=None):
+    """Open an authenticated Duo admin session using the stored passkey.
+
+    Returns (playwright, browser, ctx, page) — the caller must close them and is
+    responsible for persisting the updated signCount via duo_passkey_save_hwm().
+    """
+    import json as _json
+    import re as _re
+    import sqlite3 as _sq
+
+    from playwright.sync_api import sync_playwright
+
+    _log = log or (lambda s: print(f"  [duo-login] {s}"))
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        org_num = _re.search(r"pseudoco-(\d+)", (pod["scc_org"] or "")).group(1)
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (org_num,)).fetchone())
+
+    creds = _json.loads(oc.get("duo_passkey_cred") or "[]")
+    if not creds:
+        raise RuntimeError(f"org {org_num} has no stored passkey — run duo_passkey_bootstrap first")
+
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+    ctx = browser.new_context(ignore_https_errors=True,
+                              viewport={"width": 1500, "height": 1100},
+                              permissions=["clipboard-read", "clipboard-write"])
+    page = ctx.new_page()
+    cdp, auth_id, base = _pw_load_passkey(ctx, page, creds, oc.get("duo_passkey_hwm") or 0)
+    ok = _pw_duo_admin_login_passkey(page, oc["duo_admin_host"], oc["duo_admin_email"],
+                                     oc["duo_admin_password"], log=_log)
+    hwm = _pw_read_signcount(cdp, auth_id, base)
+    with _sq.connect(db_path) as conn:
+        conn.execute("UPDATE org_credentials SET duo_passkey_hwm=? WHERE org_number=?",
+                     (hwm, org_num))
+    if not ok:
+        browser.close()
+        pw.stop()
+        raise RuntimeError("passkey login failed")
+    return pw, browser, ctx, page
 
 
 def _pw_duo_admin_login_totp(admin_host: str, email: str, password: str,
@@ -2903,6 +4328,22 @@ def _winrm_connect_for_pod(pod_id: str,
     if _os.path.exists("/.dockerenv"):
         return _winrm_connect(ad_ip, user, pw)
     return DockerWinRMSession(ad_ip, user, pw, pod_id, log=log)
+
+
+def _winrm_connect_jump(pod_id: str, log=None):
+    """WinRM session to the POD's jump host, valid from either runtime context.
+
+    The 198.18.x.x lab addresses only resolve inside a POD's VPN namespace. The
+    dashboard runs duo_run_card in a thread on the Mac, which has no VPN, so a
+    raw winrm.Session to JUMP_HOST_IP fails there. Mirror
+    _winrm_connect_for_pod: direct inside the pipeline container, proxied
+    through vpn-{pod_id} otherwise.
+    """
+    import os as _os
+    user, pw = JUMP_HOST_WINRM_CREDS
+    if _os.path.exists("/.dockerenv"):
+        return _winrm_connect(JUMP_HOST_IP, user, pw)
+    return DockerWinRMSession(JUMP_HOST_IP, user, pw, pod_id, log=log)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -5013,7 +6454,13 @@ def duo_trigger_ad_sync(
         if failed:
             msg += f"; failed: {','.join(failed)}"
         return True, msg
-    return True, f"directory sync trigger failed for all users (soft-fail): {failed}"
+    # A total failure must not report green. This previously returned ok=True,
+    # so the card showed ad_sync ✓ while every syncuser call 404'd and the Duo
+    # org stayed empty — the card looked healthy with zero users synced.
+    # A partial failure is still tolerated above; only "nothing worked" fails.
+    return False, (f"directory sync failed for all {len(failed)} users — "
+                   f"the Auth Proxy is not registered as a directory-sync "
+                   f"connector (check the [cloud] ikey/skey in authproxy.cfg): {failed}")
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -5387,6 +6834,7 @@ def duo_ext_dir_and_sso_setup(
 # ──────────────────────────────────────────────────────────────────────────────
 
 DUO_CARD_STEPS = [
+    "bootstrap",
     "org_setup",
     "authproxy_push",
     "ad_sync",
@@ -5398,6 +6846,7 @@ DUO_CARD_STEPS = [
 ]
 
 DUO_CARD_LABELS = {
+    "bootstrap":       "Duo Org Bootstrap",
     "org_setup":       "Duo Org Setup",
     "authproxy_push":  "Auth Proxy Config Push",
     "ad_sync":         "AD Directory Sync",
@@ -6228,6 +7677,26 @@ def duo_ensure_table(db_path: str) -> None:
         if "authproxy_blob_saved_at" not in cols:
             c.execute("ALTER TABLE org_credentials ADD COLUMN authproxy_blob_saved_at TIMESTAMP DEFAULT NULL")
 
+        # Duo admin bootstrap state (see duo_passkey_bootstrap).
+        # duo_passkey_cred    - JSON WebAuthn credential from the virtual authenticator
+        # duo_passkey_hwm     - signCount high-water mark; see the note in
+        #                       _pw_load_passkey() about WebAuthn clone detection
+        for _c, _type in (
+            ("idac_url",            "TEXT DEFAULT ''"),
+            ("duo_admin_email",     "TEXT DEFAULT ''"),
+            ("duo_admin_password",  "TEXT DEFAULT ''"),
+            ("duo_passkey_cred",    "TEXT DEFAULT ''"),
+            ("duo_passkey_hwm",     "INTEGER DEFAULT 0"),
+            ("duo_admin_host",      "TEXT DEFAULT ''"),
+            ("duo_admin_totp_secret", "TEXT DEFAULT ''"),
+            ("authproxy_sso_cfg",    "TEXT DEFAULT ''"),
+        ):
+            if _c not in cols:
+                try:
+                    c.execute(f"ALTER TABLE org_credentials ADD COLUMN {_c} {_type}")
+                except Exception:
+                    pass
+
 
 def _duo_step_set(pod_id: str, step: str, status: str, result: str, db_path: str,
                   started_at: str = None, completed_at: str = None) -> None:
@@ -6295,8 +7764,13 @@ def duo_run_card(
     enroll_blob   = oc.get("authproxy_enroll_blob", "").strip()
     blob_saved_at = oc.get("authproxy_blob_saved_at", "") or ""
 
-    if not duo_ikey or not duo_skey or not duo_host:
-        return False, "Duo Admin API credentials (ikey/skey/host) not set in DB"
+    # A fresh dCloud session has no Duo credentials at all — the org does not
+    # exist until the iDAC card is activated. Bootstrap creates it, so this can
+    # no longer be a hard gate before the first step runs; only the steps that
+    # actually need the Admin API are blocked (see _need_api below).
+    needs_bootstrap = not (duo_ikey and duo_skey and duo_host)
+    if needs_bootstrap:
+        _log("no Duo Admin API credentials — bootstrap step will create them")
 
     # ── Detect mode ───────────────────────────────────────────────────────────
     # SCC / SA / Duo orgs are permanently coupled — never torn down.
@@ -6329,7 +7803,64 @@ def duo_run_card(
 
     # ── Step functions ────────────────────────────────────────────────────────
 
+    def step_bootstrap():
+        """Create the Duo org's admin + Admin API credentials if they don't exist.
+
+        Idempotent — returns immediately when credentials are already present, so
+        re-running the card on an established org costs nothing.
+        """
+        nonlocal duo_ikey, duo_skey, duo_host
+        parts = []
+        if needs_bootstrap:
+            ok, msg = duo_passkey_bootstrap(pod_id, db_path, log=_log)
+            if not ok:
+                return False, msg
+            parts.append(msg)
+            # Re-read what bootstrap just persisted so later steps see it.
+            try:
+                with _sq.connect(db_path) as conn:
+                    conn.row_factory = _sq.Row
+                    row = conn.execute(
+                        "SELECT duo_ikey, duo_skey, duo_host FROM org_credentials "
+                        "WHERE org_number=?", (org_num,)
+                    ).fetchone()
+                if row:
+                    duo_ikey = (row["duo_ikey"] or "").strip()
+                    duo_skey = (row["duo_skey"] or "").strip()
+                    duo_host = (row["duo_host"] or "").strip()
+            except Exception as e:
+                return False, f"bootstrapped but could not re-read credentials: {e}"
+        else:
+            parts.append("already bootstrapped")
+
+        # Students work from Jumphost1 and never see this dashboard, so the
+        # proctor-facing passcode panel is no use to them. Make sure the org has
+        # a TOTP token and republish the standalone login page on the jump host
+        # on every run — a pod reset or reimage wipes the Public Desktop.
+        try:
+            with _sq.connect(db_path) as conn:
+                conn.row_factory = _sq.Row
+                srow = conn.execute(
+                    "SELECT duo_admin_totp_secret FROM org_credentials WHERE org_number=?",
+                    (org_num,)).fetchone()
+            has_totp = bool((srow["duo_admin_totp_secret"] or "").strip()) if srow else False
+            if not has_totp:
+                tok_ok, tok_msg = duo_provision_admin_totp(pod_id, db_path, log=_log)
+                parts.append(f"totp: {tok_msg}" if tok_ok else f"totp FAILED: {tok_msg}")
+            else:
+                parts.append("totp: token already provisioned")
+
+            pg_ok, pg_msg = duo_publish_totp_page(pod_id, db_path, log=_log)
+            parts.append(f"jumphost page: {'ok' if pg_ok else 'FAILED — ' + pg_msg}")
+        except Exception as e:
+            # Non-fatal: the Duo org itself is usable without the student page.
+            parts.append(f"student login page skipped ({type(e).__name__}: {e})")
+
+        return True, " | ".join(parts)
+
     def step_org_setup():
+        if not (duo_ikey and duo_skey and duo_host):
+            return False, "no Admin API credentials — bootstrap step must run first"
         if is_refresh:
             ok, msg = duo_verify_credentials(duo_ikey, duo_skey, duo_host)
             return ok, f"verify only: {msg}"
@@ -6346,7 +7877,26 @@ def duo_run_card(
         return duo_push_authproxy_config(pod_id, db_path, log=_log)
 
     def step_ad_sync():
-        return duo_trigger_ad_sync(duo_ikey, duo_skey, duo_host, log=_log)
+        """Import AD users/groups into Duo.
+
+        Uses the admin UI's "Sync Now" action. The Admin API's per-user route
+        (/admin/v1/users/directorysync/{dkey}/syncuser) 404s on this deployment
+        for every key we can supply, so it is only a fallback for deployments
+        where it does exist.
+        """
+        # authproxy_push runs earlier in the card and rewrites [cloud] from the
+        # *radius* Auth Proxy integration, which de-registers the directory-sync
+        # connector and drops [sso]. Re-assert the correct config here before
+        # syncing, otherwise "Sync Now" is unavailable and every user 404s.
+        ed_ok, ed_msg = duo_setup_external_directory(pod_id, db_path, log=_log)
+        _log(f"directory config: {'ok' if ed_ok else 'PROBLEM'} — {ed_msg[:110]}")
+
+        ok, msg = duo_sync_now(pod_id, db_path, log=_log)
+        if ok:
+            return True, msg
+        _log(f"Sync Now path failed ({msg[:90]}) — trying the per-user API")
+        ok2, msg2 = duo_trigger_ad_sync(duo_ikey, duo_skey, duo_host, log=_log)
+        return ok2, (msg2 if ok2 else f"{msg}; API fallback also failed: {msg2[:110]}")
 
     def step_saml_scim_config():
         """
@@ -6583,6 +8133,7 @@ def duo_run_card(
             return False, f"WinRM verify error: {e}"
 
     step_fns = {
+        "bootstrap":        step_bootstrap,
         "org_setup":        step_org_setup,
         "authproxy_push":   step_authproxy_push,
         "ad_sync":          step_ad_sync,
@@ -6601,8 +8152,11 @@ def duo_run_card(
         results.append(f"{step}={'OK' if ok else 'FAIL'}")
         if not ok:
             final_ok = False
-            # Non-fatal steps: continue even on failure
-            if step in ("scim_push", "verify", "saml_scim_config"):
+            # Non-fatal steps: report the failure but keep going.
+            # ad_sync is here because the later steps (SSO enrollment, verify)
+            # are independent of user sync — but it must still show red rather
+            # than the old soft-fail ok=True, which hid an empty Duo org.
+            if step in ("scim_push", "verify", "saml_scim_config", "ad_sync"):
                 continue
             # Fatal steps: stop on first hard failure
             _log(f"  Hard failure at {step} — stopping")
