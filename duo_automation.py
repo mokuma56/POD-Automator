@@ -2665,6 +2665,739 @@ def duo_harvest_sso_enrollment(pod_id: str, db_path: str, log=None) -> tuple[boo
             pass
 
 
+def _duo_mclick(page, selector: str = "", text: str = "", exact: bool = True) -> bool:
+    """Click with a REAL mouse event, by CSS selector or visible text.
+
+    Duo's newer admin-panel components (the user-access radios, Save on the
+    Single Sign-On tab) ignore JS element.click() exactly like SCC does — the
+    control looks clicked but nothing persists. Coordinates + mouse.click()
+    is the only reliable route.
+    """
+    if selector:
+        box = page.evaluate(f"""() => {{
+            const e = document.querySelector({selector!r});
+            if (!e || !e.getClientRects().length) return null;
+            e.scrollIntoView({{block:'center'}});
+            const r = e.getBoundingClientRect();
+            return {{x: r.x + r.width/2, y: r.y + r.height/2}};
+        }}""")
+    else:
+        box = page.evaluate(f"""() => {{
+            const want = {text!r}.toLowerCase();
+            const e = Array.from(document.querySelectorAll('button,a,[role=button],label,div,span'))
+                .filter(x => x.getClientRects().length)
+                .filter(x => {{
+                    const t = (x.innerText||'').trim().toLowerCase();
+                    return {str(exact).lower()} ? t === want : t.includes(want);
+                }})
+                .sort((a,b) => (a.innerText||'').length - (b.innerText||'').length)[0];
+            if (!e) return null;
+            e.scrollIntoView({{block:'center'}});
+            const r = e.getBoundingClientRect();
+            return {{x: r.x + r.width/2, y: r.y + r.height/2}};
+        }}""")
+    if not box:
+        return False
+    page.mouse.click(box["x"], box["y"])
+    page.wait_for_timeout(3_000)
+    return True
+
+
+def duo_setup_secure_access_app(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Lab guide section 3 (Duo side): the "Cisco Secure Access" application.
+
+    Generating the SCIM token in Secure Access is only half of section 3. The
+    thing that actually provisions users is this Duo application: its
+    Provisioning tab takes the SCIM Base URL + Token, and once connected Duo
+    pushes its users and groups into Secure Access. Without it SA stays empty
+    no matter how healthy the token looks.
+
+    Picks the plain "Cisco Secure Access" entry — NOT "Cisco Secure Access
+    VPN", which is a separate application configured later for the VPN profile.
+    """
+    import json as _json
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: print(f"  [duo-sa-app] {s}"))
+    AD_GROUPS = ("IoT", "MAIN", "PROD")
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        org_num = m.group(1)
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (org_num,)).fetchone() or {})
+
+    scim_tok = (oc.get("sa_scim_token") or "").strip()
+    scim_url = (oc.get("sa_scim_url") or "").strip() or "https://api.sse.cisco.com/identity/v2/scim"
+    if not scim_tok:
+        return False, "no sa_scim_token — run the SCIM generation step first"
+
+    pw = br = None
+    try:
+        pw, br, ctx, page = duo_passkey_login(pod_id, db_path, log=_log)
+        host = page.url.split("/")[2]
+
+        # ── Find or create the application ────────────────────────────────────
+        page.goto(f"https://{host}/applications", wait_until="load", timeout=40_000)
+        page.wait_for_timeout(5_000)
+        existing = page.evaluate(r"""() => {
+            const row = Array.from(document.querySelectorAll('tr'))
+                .find(r => /cisco secure access/i.test(r.innerText||'') &&
+                           !/vpn/i.test(r.innerText||''));
+            if (!row) return '';
+            const a = row.querySelector('a[href*="/applications/"]');
+            return a ? a.getAttribute('href') : '';
+        }""")
+
+        if existing:
+            _log(f"reusing existing application {existing.rsplit('/',1)[-1]}")
+            page.goto(f"https://{host}{existing}", wait_until="load", timeout=40_000)
+        else:
+            _log("creating the Cisco Secure Access application")
+            page.goto(f"https://{host}/applications/protect/types",
+                      wait_until="load", timeout=40_000)
+            page.wait_for_timeout(6_000)
+            try:
+                page.locator('input[placeholder*="Search applications"]').first.fill(
+                    "Cisco Secure Access")
+                page.wait_for_timeout(4_000)
+            except Exception as e:
+                _log(f"could not filter the catalogue: {type(e).__name__}")
+            res = page.evaluate("""() => {
+                // exact heading, excluding the separate "... VPN" application
+                const hs = Array.from(document.querySelectorAll('h3'))
+                    .filter(h => (h.textContent||'').trim().toLowerCase() === 'cisco secure access');
+                if (!hs.length) return {ok:false, reason:'no exact "Cisco Secure Access" heading'};
+                let n = hs[0];
+                for (let i = 0; i < 6 && n; i++) {
+                    n = n.parentElement; if (!n) break;
+                    const btn = Array.from(n.querySelectorAll('button,a'))
+                        .find(x => /^add$/i.test((x.innerText||'').trim()));
+                    if (btn) { btn.click(); return {ok:true}; }
+                }
+                return {ok:false, reason:'no Add control beside the heading'};
+            }""")
+            if not res.get("ok"):
+                return False, f"could not add the application: {res.get('reason')}"
+            page.wait_for_timeout(9_000)
+            _log(f"application created: {page.url.rsplit('/',1)[-1]}")
+
+        app_url = page.url.split("?")[0]
+        app_ikey = app_url.rsplit("/", 1)[-1]
+
+        # ── Provisioning tab: Base URL + Token, then connect ──────────────────
+        page.evaluate("""() => {
+            const b = Array.from(document.querySelectorAll('a,button,[role=tab]'))
+                .find(x => (x.innerText||'').trim().toLowerCase() === 'provisioning');
+            if (b) b.click();
+        }""")
+        # Wait for the tab to actually render — filling before this returns null
+        # selectors and silently skips baseUrl/token.
+        for _ in range(12):
+            page.wait_for_timeout(4_000)
+            if page.evaluate("""() => !!document.querySelector('input[name="credentials.baseUrl"]')"""):
+                break
+        else:
+            return False, "Provisioning tab never rendered its Base URL field"
+        _log("provisioning tab ready")
+
+        # Exact field names. Keyword matching put the token in BOTH fields,
+        # because the Base URL's surrounding label also contains "Token".
+        filled = page.evaluate("""(cfg) => {
+            const set = (el, v) => {
+                // The native setter must come from the element's OWN prototype;
+                // using HTMLInputElement's on a <textarea> throws
+                // "Illegal invocation".
+                const proto = el.tagName === 'TEXTAREA'
+                    ? window.HTMLTextAreaElement.prototype
+                    : window.HTMLInputElement.prototype;
+                Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+            };
+            const out = [];
+            const url = document.querySelector('input[name="credentials.baseUrl"]');
+            const tok = document.querySelector('input[name="credentials.credentialDetail.token"]');
+            if (url) { set(url, cfg.url); out.push('baseUrl'); }
+            if (tok) { set(tok, cfg.tok); out.push('token'); }
+            // NB: user access is NOT set here. The user-access-control radios
+            // are present in the DOM from this tab, but they belong to the
+            // Single Sign-On tab and only persist via that tab's own Save —
+            // clicking them from Provisioning silently does nothing.
+            return out;
+        }""", {"url": scim_url, "tok": scim_tok})
+        _log(f"provisioning fields filled: {filled or 'none found'}")
+        page.wait_for_timeout(2_500)
+
+        connected = page.evaluate("""() => {
+            const b = Array.from(document.querySelectorAll('button'))
+                .find(x => /connect to application|^connect$/i.test((x.innerText||'').trim()));
+            if (b && !b.disabled) { b.click(); return true; }
+            return false;
+        }""")
+        _log(f"'Connect to application' clicked: {connected}")
+        page.wait_for_timeout(10_000)
+
+        # ── Attribute mapping ─────────────────────────────────────────────────
+        # Lab guide section 3: add displayName, emails, name.familyName and
+        # name.givenName, then map the userName application attribute to the
+        # user's Email Address. Without the email mapping the identity arrives
+        # in Secure Access in the wrong form and SSO authentication fails.
+        mapped = []
+        try:
+            for _ in range(3):
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(2_500)
+            if _duo_mclick(page, text="Edit mappings"):
+                page.wait_for_timeout(6_000)
+                mapped = page.evaluate("""(wanted) => {
+                    const out = [];
+                    wanted.forEach(w => {
+                        const cb = document.querySelector(
+                            'input[name="' + w + '-attribute-input"]');
+                        if (cb && !cb.checked) { cb.click(); out.push(w); }
+                    });
+                    return out;
+                }""", ["displayName", "emails", "name.familyName", "name.givenName"])
+                _log(f"optional attributes checked: {mapped or 'already set'}")
+                page.wait_for_timeout(2_000)
+                _duo_mclick(page, text="Save mapping")
+                page.wait_for_timeout(7_000)
+        except Exception as e:
+            _log(f"attribute mapping: {type(e).__name__}: {str(e)[:70]}")
+
+        # userName -> Email Address on the mapping table row.
+        email_mapped = False
+        try:
+            for _ in range(3):
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(2_000)
+            email_mapped = page.evaluate("""() => {
+                // the row whose application attribute is userName
+                const rows = Array.from(document.querySelectorAll('tr'))
+                    .filter(r => /username/i.test(r.innerText||''));
+                for (const r of rows) {
+                    const sel = r.querySelector('select');
+                    if (sel) {
+                        const opt = Array.from(sel.options)
+                            .find(o => /e-?mail/i.test(o.text));
+                        if (opt) {
+                            const setter = Object.getOwnPropertyDescriptor(
+                                window.HTMLSelectElement.prototype, 'value').set;
+                            setter.call(sel, opt.value);
+                            sel.dispatchEvent(new Event('change', {bubbles:true}));
+                            return opt.text;
+                        }
+                    }
+                }
+                return false;
+            }""")
+            _log(f"userName -> Email Address: {email_mapped or 'control not found'}")
+            if email_mapped:
+                _duo_mclick(page, text="Save")
+                page.wait_for_timeout(6_000)
+        except Exception as e:
+            _log(f"email mapping: {type(e).__name__}: {str(e)[:70]}")
+
+        # ── Group scope ───────────────────────────────────────────────────────
+        # Connecting is not enough: with no groups selected Duo has nothing in
+        # scope and pushes zero users, while the UI still reports "Enabled" and
+        # "successfully connected". Same trap as the AD directory sync.
+        picked = []
+        try:
+            # Attribute mapping and Groups only render AFTER "Connect to
+            # application" succeeds, and they sit below the fold — so wait for
+            # the section and scroll to it before touching anything.
+            for _ in range(12):
+                body = page.evaluate("() => document.body.innerText")
+                if "Select existing groups" in body:
+                    break
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(5_000)
+            page.evaluate("""() => {
+                const el = Array.from(document.querySelectorAll('*'))
+                    .find(e => e.children.length === 0 &&
+                          /^Groups$/i.test((e.textContent||'').trim()));
+                if (el) el.scrollIntoView({block: 'center'});
+            }""")
+            page.wait_for_timeout(3_000)
+
+            # groupSource has two options: manualGroups ("Select groups") and
+            # SSOPermittedGroups. Pick by value, not position.
+            page.evaluate("""() => {
+                const r = Array.from(document.querySelectorAll('input[name="groupSource"]'))
+                    .find(x => (x.value||'').toLowerCase().startsWith('manual'));
+                if (r && !r.checked) r.click();
+            }""")
+            page.wait_for_timeout(2_500)
+
+            # The picker's name is a fresh UUID on every render, so identify it
+            # structurally: the text input that is none of the known fields.
+            KNOWN = ("credentials.baseUrl", "credentials.credentialDetail.token",
+                     "iname", "entity_id", "acs_url")
+            for g in AD_GROUPS:
+                sel = page.evaluate("""(known) => {
+                    const i = Array.from(document.querySelectorAll('input[type=text]'))
+                        .filter(x => x.getClientRects().length)
+                        .find(x => !known.includes(x.name) &&
+                                   (x.placeholder||'').toLowerCase() !== 'username' &&
+                                   x.id !== 'global-search-input');
+                    if (!i) return null;
+                    i.setAttribute('data-pick', '1');
+                    return true;
+                }""", list(KNOWN))
+                if not sel:
+                    _log("group picker input not found")
+                    break
+                box = page.locator('input[data-pick="1"]').first
+                box.click()
+                box.fill(g)
+                page.wait_for_timeout(3_500)
+                hit = page.evaluate(f"""() => {{
+                    const t = {g!r}.toLowerCase();
+                    const e = Array.from(document.querySelectorAll('li,[role=option],.cds-menu-item'))
+                        .filter(x => x.getClientRects().length)
+                        .find(x => (x.innerText||'').trim().toLowerCase().startsWith(t));
+                    if (e) {{ e.click(); return (e.innerText||'').trim().slice(0,32); }}
+                    return null;
+                }}""")
+                if hit:
+                    picked.append(hit)
+                page.evaluate("""() => document.querySelectorAll('[data-pick]')
+                    .forEach(e => e.removeAttribute('data-pick'))""")
+                page.wait_for_timeout(2_000)
+        except Exception as e:
+            _log(f"group selection: {type(e).__name__}: {str(e)[:70]}")
+        _log(f"groups mapped: {picked or 'NONE'}")
+
+        # ── Save + enable ─────────────────────────────────────────────────────
+        page.evaluate("""() => {
+            const b = Array.from(document.querySelectorAll('button'))
+                .find(x => /save and enable|^save$/i.test((x.innerText||'').trim()));
+            if (b) b.click();
+        }""")
+        page.wait_for_timeout(10_000)
+
+        # Validate the OUTCOME, not the clicks: users must actually reach SA.
+        import requests as _rq
+        total = -1
+        for _ in range(6):
+            page.wait_for_timeout(10_000)
+            try:
+                r = _rq.get("https://api.sse.cisco.com/identity/v2/scim/Users",
+                            headers={"Authorization": f"Bearer {scim_tok}"}, timeout=20)
+                if r.ok:
+                    total = r.json().get("totalResults", 0)
+                    _log(f"Secure Access users: {total}")
+                    if total > 0:
+                        break
+            except Exception:
+                pass
+        ok = total > 0
+
+        with _sq.connect(db_path) as conn:
+            conn.execute("UPDATE org_credentials SET duo_saml_app_ikey=?, "
+                         "updated_at=datetime('now') WHERE org_number=?",
+                         (app_ikey, org_num))
+        _log(f"stored duo_saml_app_ikey={app_ikey}")
+
+        # ── Single Sign-On tab: enable the app for all users ──────────────────
+        # Lab guide section 4: "In the User access section, click the radio
+        # button to Enable for all users." This lives on the SSO tab and needs
+        # that tab's Save; doing it from Provisioning does not persist.
+        access_ok = False
+        try:
+            page.goto(app_url, wait_until="load", timeout=40_000)
+            page.wait_for_timeout(6_000)
+            page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('a,button,[role=tab]'))
+                    .find(x => /single sign-?on/i.test((x.innerText||'').trim()));
+                if (b) b.click();
+            }""")
+            for _ in range(10):
+                page.wait_for_timeout(4_000)
+                if page.evaluate("""() => !!document.querySelector('#user-access-radio-all-users')"""):
+                    break
+            # Real mouse events — a JS .click() on this radio leaves it visually
+            # selected but never persists.
+            clicked = _duo_mclick(page, selector="#user-access-radio-all-users")
+            now_checked = page.evaluate(
+                """() => {const r = document.querySelector('#user-access-radio-all-users');
+                          return !!(r && r.checked);}""")
+            _log(f"clicked 'Enable for all users': {clicked} (checked={now_checked})")
+            page.wait_for_timeout(2_000)
+            _duo_mclick(page, text="Save")
+            page.wait_for_timeout(8_000)
+
+            # Re-load and confirm it persisted rather than trusting the click.
+            page.goto(app_url, wait_until="load", timeout=40_000)
+            page.wait_for_timeout(6_000)
+            page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('a,button,[role=tab]'))
+                    .find(x => /single sign-?on/i.test((x.innerText||'').trim()));
+                if (b) b.click();
+            }""")
+            page.wait_for_timeout(7_000)
+            access_ok = bool(page.evaluate(
+                """() => {const r = document.querySelector('#user-access-radio-all-users');
+                          return r && r.checked;}"""))
+            _log(f"user access 'Enable for all users' persisted: {access_ok}")
+        except Exception as e:
+            _log(f"user-access step: {type(e).__name__}: {str(e)[:70]}")
+
+        if ok and not access_ok:
+            return False, (f"Cisco Secure Access app {app_ikey} is provisioning "
+                           f"{total} users, but 'Enable for all users' did not "
+                           f"persist on the Single Sign-On tab — users cannot "
+                           f"authenticate through the app")
+        if ok:
+            return True, (f"Cisco Secure Access app {app_ikey} provisioning "
+                          f"{total} users to SA (groups: {', '.join(picked) or 'preexisting'}), "
+                          f"enabled for all users")
+        return False, (f"Cisco Secure Access app {app_ikey} configured "
+                       f"(fields={filled}, connect={connected}, groups={picked or 'NONE'}) "
+                       f"but Secure Access still reports {total} users — provisioning "
+                       f"has no effective scope")
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+
+
+def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True,
+                          log=None) -> tuple[bool, str]:
+    """Undo everything the Duo card built, so a run can be tested from scratch.
+
+    With *keep_bootstrap* (the default) the org itself is preserved — admin
+    account, passkey, TOTP token and Admin API credentials all survive, because
+    activation is one-time per org and cannot be repeated. Everything the card
+    creates on top of that is removed:
+
+      Duo   - synced users, synced groups, the Auth Proxy integration
+      SA    - nothing here (IdP directories must be removed in the SCC UI)
+      DB    - authproxy_*, sa_scim_token, duo_saml_app_ikey
+
+    Set keep_bootstrap=False to also clear the org's identity columns, but note
+    that a fresh org can then only be obtained by rotating (which reprovisions
+    SCC and Meraki too) — see fetch_idac_url_from_dcloud.
+    """
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: print(f"  [duo-rollback] {s}"))
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        org_num = m.group(1)
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (org_num,)).fetchone() or {})
+
+    ikey, skey, host = (oc.get("duo_ikey", ""), oc.get("duo_skey", ""), oc.get("duo_host", ""))
+    removed = []
+
+    if ikey and skey and host:
+        # Users and groups first — deleting the sync that owns them can
+        # otherwise leave them orphaned in the org.
+        for path, label, idfield in (("/admin/v1/users", "user", "user_id"),
+                                     ("/admin/v1/groups", "group", "group_id")):
+            try:
+                items = _duo_request(ikey, skey, host, "GET", path).get("response", [])
+                for it in items:
+                    try:
+                        _duo_request(ikey, skey, host, "DELETE",
+                                     f"{path}/{it[idfield]}")
+                    except Exception as e:
+                        _log(f"WARN: could not delete {label} "
+                             f"{it.get('username') or it.get('name')}: {str(e)[:70]}")
+                if items:
+                    removed.append(f"{len(items)} {label}s")
+                    _log(f"deleted {len(items)} {label}s")
+            except Exception as e:
+                _log(f"WARN: listing {label}s failed: {str(e)[:80]}")
+
+        # The radius Auth Proxy integration is recreated by authproxy_push.
+        # The Admin API app is NOT touched — it is bootstrap state.
+        try:
+            ints = _duo_request(ikey, skey, host, "GET",
+                                "/admin/v1/integrations").get("response", [])
+            for i in ints:
+                if i.get("type") == "adminapi":
+                    continue
+                try:
+                    _duo_request(ikey, skey, host, "DELETE",
+                                 f"/admin/v1/integrations/{i['integration_key']}")
+                    removed.append(i.get("name") or i.get("type"))
+                    _log(f"deleted integration {i.get('name')} [{i.get('type')}]")
+                except Exception as e:
+                    _log(f"WARN: could not delete {i.get('name')}: {str(e)[:70]}")
+        except Exception as e:
+            _log(f"WARN: listing integrations failed: {str(e)[:80]}")
+    else:
+        _log("no Admin API credentials — skipping the Duo-side cleanup")
+
+    CLEAR = ["authproxy_ikey", "authproxy_skey", "authproxy_cfg", "authproxy_sso_cfg",
+             "authproxy_enroll_blob", "authproxy_blob_saved_at", "sa_scim_token",
+             "duo_saml_app_ikey", "sa_saml_profile_id"]
+    if not keep_bootstrap:
+        CLEAR += ["duo_ikey", "duo_skey", "duo_host", "duo_admin_host", "duo_admin_email",
+                  "duo_admin_password", "duo_admin_totp_secret", "duo_passkey_cred",
+                  "duo_passkey_hwm", "idac_url"]
+    # Column names are from the fixed CLEAR list above, never user input.
+    assignments = ", ".join(f"{c}=''" for c in CLEAR)
+    with _sq.connect(db_path) as conn:
+        conn.execute(
+            f"UPDATE org_credentials SET {assignments}, updated_at=datetime('now') "
+            f"WHERE org_number=?", (org_num,))
+        conn.execute("DELETE FROM duo_steps WHERE pod_id=?", (pod_id,))
+    _log(f"cleared {len(CLEAR)} DB columns and the duo_steps rows")
+
+    note = ("bootstrap state kept (admin/passkey/TOTP/Admin API)"
+            if keep_bootstrap else "bootstrap state ALSO cleared")
+    return True, (f"org {org_num} rolled back — {', '.join(removed) or 'nothing to remove'}; "
+                  f"{note}. NOTE: the AD directory sync and the Secure Access IdP "
+                  f"directory must be deleted in their UIs — neither exposes a delete API.")
+
+
+def _scc_open_session(ctx, idac_url: str, log=None):
+    """Open an authenticated SCC tab via the iDAC card's SAML auto-login.
+
+    No password is involved and no org is rotated — loading a stored iDAC URL
+    is read-only (only idac_sdk reprovisions).  Returns (page, enterprise_id).
+    """
+    _log = log or (lambda s: None)
+    pg = ctx.new_page()
+    pg.goto(idac_url, wait_until="load", timeout=45_000)
+    pg.wait_for_timeout(5_000)
+    with ctx.expect_page(timeout=25_000) as info:
+        pg.evaluate("""() => {const b=Array.from(document.querySelectorAll('button,a'))
+            .find(x=>/^view$/i.test((x.innerText||'').trim())); if(b)b.click();}""")
+    t = info.value
+    t.wait_for_load_state("load", timeout=30_000)
+    for _ in range(18):
+        t.wait_for_timeout(5_000)
+        if "enterpriseId=" in t.url:
+            break
+    if "enterpriseId=" not in t.url:
+        raise RuntimeError("SCC session never settled (no enterpriseId)")
+    ent = t.url.split("enterpriseId=")[1].split("&")[0]
+    _log(f"SCC session established (enterprise {ent[:8]}…)")
+    return t, ent
+
+
+def _scc_text(p, tries=3):
+    """innerText, tolerating the redirect chain tearing down the context."""
+    for _ in range(tries):
+        try:
+            return p.evaluate("() => document.body.innerText")
+        except Exception:
+            p.wait_for_timeout(2_500)
+    return ""
+
+
+def _scc_wait(p, needle, tries=18):
+    """Wait for real content. The SPA renders its nav shell ~30s early, so a
+    text-length check returns long before the page is usable."""
+    for _ in range(tries):
+        if needle.lower() in _scc_text(p).lower():
+            return True
+        p.wait_for_timeout(5_000)
+    return False
+
+
+def _scc_click(p, text, exact=True):
+    """Locate by visible text, then click with a REAL mouse event.
+
+    SCC is React and ignores JS element.click() (documented in CLAUDE.md), so
+    everything here goes through coordinates + page.mouse.click().
+    """
+    box = p.evaluate(f"""() => {{
+        const want = {text!r}.toLowerCase();
+        const els = Array.from(document.querySelectorAll(
+            'button,a,[role=button],[role=tab],[role=option],[role=radio],label,div,span,li'));
+        const hit = els.filter(e => {{
+            const t = (e.innerText||'').trim().toLowerCase();
+            if (!t || t.length > 400) return false;
+            return {str(exact).lower()} ? t === want : t.includes(want);
+        }}).filter(e => e.getClientRects().length)
+          .sort((a,b) => (a.innerText||'').length - (b.innerText||'').length)[0];
+        if (!hit) return null;
+        hit.scrollIntoView({{block:'center'}});
+        const r = hit.getBoundingClientRect();
+        return {{x: r.x + r.width/2, y: r.y + r.height/2}};
+    }}""")
+    if not box:
+        return False
+    p.mouse.click(box["x"], box["y"])
+    p.wait_for_timeout(6_000)
+    return True
+
+
+def sa_generate_scim_token_ui(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Generate the Secure Access SCIM token for this pod's org, unattended.
+
+    There is no API for this. Secure Access exposes no SCIM or provisioning
+    scope at all (the API-key catalogue is Admin/Deployments/Investigate/
+    Policies/Reports — 92 scopes, none of them provisioning), so
+    /identity/v2/organizations/{org}/scim/token always returns 403 no matter
+    how the key is built. The UI wizard is the only source.
+
+    The token is displayed once and never shown again — but it is rendered as
+    an input value, so it can be read straight out of the DOM. No clipboard,
+    no operator. That is what makes this automatable per-pod, which matters
+    because every pod gets a brand new org.
+    """
+    import re as _re
+    import sqlite3 as _sq
+    import time as _t
+
+    from playwright.sync_api import sync_playwright
+
+    _log = log or (lambda s: print(f"  [sa-scim] {s}"))
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        org_num = m.group(1)
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (org_num,)).fetchone() or {})
+
+    idac = (oc.get("idac_url") or "").strip()
+    sa_org = (oc.get("sa_org_id") or "").strip()
+    if not idac:
+        return False, "no stored idac_url — cannot open an SCC session"
+    if not sa_org:
+        return False, f"org {org_num} has no sa_org_id"
+    if (oc.get("sa_scim_token") or "").strip():
+        return True, "SCIM token already present — nothing to do"
+
+    # Unique per run: Secure Access rejects a duplicate directory name, and a
+    # pod may already carry one from an earlier attempt.
+    name = f"Duo-{int(_t.time()) % 100000}"
+
+    pw = br = None
+    try:
+        pw = sync_playwright().start()
+        br = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = br.new_context(ignore_https_errors=True,
+                             viewport={"width": 1600, "height": 1200})
+        t, ent = _scc_open_session(ctx, idac, log=_log)
+
+        t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}"
+               f"/connect/users-and-groups?enterpriseId={ent}",
+               wait_until="load", timeout=45_000)
+        if not _scc_wait(t, "Configuration management"):
+            return False, "Configuration management never rendered"
+        _scc_click(t, "Configuration management")
+        if not _scc_wait(t, "Integrate directories"):
+            return False, "Directories card never rendered"
+
+        # NB: "Configure" belongs to the SSO authentication card below — the
+        # Directories action is "Integrate directories" itself.
+        _scc_click(t, "Integrate directories")
+        if not _scc_wait(t, "Provisioning Method", tries=12):
+            return False, "provisioning wizard did not open"
+
+        _scc_click(t, "Identity provider(IdP)", exact=False)
+        t.wait_for_timeout(3_000)
+        _scc_click(t, "Next")
+        if not _scc_wait(t, "IdP directory name", tries=12):
+            return False, "wizard did not reach the directory-name step"
+
+        # "profileName" is the input's id/placeholder, not necessarily its
+        # name, and Playwright's locator does not see it — drive it through
+        # React's native value setter so React state actually updates.
+        set_ok = False
+        for _ in range(12):
+            got = t.evaluate(f"""() => {{
+                const i = Array.from(document.querySelectorAll('input'))
+                    .find(x => [x.name, x.id, x.placeholder]
+                        .some(v => (v||'').toLowerCase() === 'profilename'));
+                if (!i) return false;
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(i, {name!r});
+                i.dispatchEvent(new Event('input', {{bubbles: true}}));
+                i.dispatchEvent(new Event('change', {{bubbles: true}}));
+                return i.value;
+            }}""")
+            if got:
+                set_ok = True
+                break
+            t.wait_for_timeout(3_000)
+        if not set_ok:
+            return False, "IdP directory name field never appeared"
+        _log(f"directory name: {name}")
+
+        t.wait_for_timeout(2_000)
+        _scc_click(t, "Select")           # provider dropdown is closed by default
+        t.wait_for_timeout(3_000)
+        _scc_click(t, "Duo")
+        t.wait_for_timeout(2_000)
+        _scc_click(t, "Next")
+        if not _scc_wait(t, "Generate Token", tries=12):
+            return False, "wizard did not reach the token step"
+
+        _scc_click(t, "Generate Token")
+        t.wait_for_timeout(12_000)
+
+        vals = t.evaluate("""() => Array.from(document.querySelectorAll('input,textarea'))
+            .map(i => i.value).filter(v => v && v.length > 20)""")
+        token = next((v for v in vals if len(v) >= 40 and not v.startswith("http")), "")
+        url = next((v for v in vals if v.startswith("http")), "")
+        if not token:
+            return False, f"token screen reached but no token in the DOM (values={len(vals)})"
+
+        # The provisioning URL is needed verbatim by the Duo application in
+        # section 3, so keep it rather than only logging it.
+        with _sq.connect(db_path) as conn:
+            try:
+                conn.execute("ALTER TABLE org_credentials ADD COLUMN "
+                             "sa_scim_url TEXT DEFAULT ''")
+            except Exception:
+                pass
+            conn.execute("UPDATE org_credentials SET sa_scim_token=?, sa_scim_url=?, "
+                         "updated_at=datetime('now') WHERE org_number=?",
+                         (token, url or "https://api.sse.cisco.com/identity/v2/scim",
+                          org_num))
+        _log(f"SCIM token stored ({len(token)} chars); provisioning URL {url or 'n/a'}")
+        _scc_click(t, "Done")
+        return True, f"SCIM token generated for org {org_num} ({len(token)} chars)"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+
+
 def duo_sync_now(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
     """Run a full AD directory sync by clicking "Sync Now" in the Duo admin UI.
 
@@ -7900,13 +8633,29 @@ def duo_run_card(
 
     def step_saml_scim_config():
         """
-        Verify SA SCIM is live by querying the SA SCIM /Users endpoint.
-        The Cisco Secure Access app + SCIM connector are configured once
-        manually per org and persist forever (permanent org model).
-        This step confirms users are present — if 0, SCIM isn't synced yet.
+        Ensure Secure Access SCIM provisioning exists, then verify it.
+
+        Every pod session gets a brand new SCC/SA org, so the SCIM token can
+        never be pre-seeded — it has to be generated per org. There is no API
+        for it (Secure Access exposes no provisioning scope), so this drives
+        the SCC UI and scrapes the once-only token out of the DOM.
         """
+        nonlocal scim_tok
         if not scim_tok:
-            return False, "sa_scim_token not set in DB — cannot verify SCIM"
+            _log("no SCIM token for this org — generating one via Secure Access")
+            g_ok, g_msg = sa_generate_scim_token_ui(pod_id, db_path, log=_log)
+            if not g_ok:
+                return False, f"could not generate SCIM token: {g_msg}"
+            try:
+                with _sq.connect(db_path) as _c:
+                    _c.row_factory = _sq.Row
+                    _r = _c.execute("SELECT sa_scim_token FROM org_credentials "
+                                    "WHERE org_number=?", (org_num,)).fetchone()
+                scim_tok = (_r["sa_scim_token"] or "").strip() if _r else ""
+            except Exception as e:
+                return False, f"generated token but could not re-read it: {e}"
+        if not scim_tok:
+            return False, "sa_scim_token still not set after generation"
         try:
             import requests as _req
             resp = _req.get(
@@ -7920,8 +8669,15 @@ def duo_run_card(
                 return False, f"SA SCIM: HTTP {resp.status_code} — {resp.text[:200]}"
             total = resp.json().get("totalResults", 0)
             if total == 0:
-                _log("SA SCIM: token valid — 0 users (step 6 will push)")
-                return True, "SA SCIM token valid (0 users — step 6 will push)"
+                # A valid token only proves Secure Access answers; it says
+                # nothing about whether provisioning is wired up. Deferring to
+                # "step 6 will push" hid a missing Duo application.
+                _log("SA SCIM: token valid but 0 users — provisioning not configured")
+                return False, (
+                    "SA SCIM token valid but 0 users provisioned — the Duo "
+                    "'Cisco Secure Access' application (Provisioning tab: Base URL "
+                    "+ Token) is missing, so nothing pushes users to SA."
+                )
             _log(f"SA SCIM: {total} users present ✓")
             return True, f"SA SCIM OK — {total} users synced"
         except Exception as e:
@@ -8105,12 +8861,20 @@ def duo_run_card(
                 return False, f"SA SCIM verify: HTTP {resp.status_code} — {resp.text[:120]}"
             total = resp.json().get("totalResults", 0)
             if total == 0:
-                # Soft-pass: Duo's connector will push users once AD sync propagates
-                _log("SA SCIM: 0 users — Duo connector will sync after AD sync; verify manually if auth fails")
-                return True, "SA SCIM: 0 users — Duo connector will push after AD sync propagates"
+                # This used to soft-pass on "Duo's connector will push once AD
+                # sync propagates". There is nothing to wait for: the push comes
+                # from the "Cisco Secure Access" application in Duo, and if that
+                # application does not exist the count stays 0 forever while the
+                # card reports success over an empty Secure Access org.
+                return False, (
+                    "SA SCIM reachable but 0 users — nothing is provisioning them. "
+                    "Duo needs the 'Cisco Secure Access' application with the SCIM "
+                    "Base URL + Token configured (lab guide section 3); check "
+                    "duo_saml_app_ikey in org_credentials."
+                )
             return True, f"SA SCIM: {total} users confirmed in SA ✓"
         except Exception as e:
-            return True, f"SA SCIM verify failed (soft-fail): {e}"
+            return False, f"SA SCIM verify failed: {e}"
 
     def step_verify():
         """WinRM: check DuoAuthProxy is Running AND DRPC is connected."""
