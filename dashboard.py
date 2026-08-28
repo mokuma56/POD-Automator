@@ -177,10 +177,20 @@ def _migrate():
             conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
         except Exception:
             pass
-    # Migration: drop obsolete columns (Playwright-only, no active code path uses these)
-    for _col in ("scc_org_uuid", "idac_url", "duo_admin_email", "duo_admin_password", "duo_totp_secret"):
+    # Duo admin activation state. These back the phone-free TOTP flow in
+    # duo_automation.py: fetch_idac_url_from_dcloud() -> _pw_activate_duo_admin()
+    # -> _duo_enroll_totp_device() -> _pw_duo_admin_login_totp().
+    #
+    # These were previously DROPped here as "obsolete, Playwright-only". That was
+    # wrong and self-reinforcing: the drop ran on every dashboard start, so the
+    # activation flow could never persist state, so the columns always looked
+    # unused. duo_automation.py:2346 writes duo_admin_email/duo_admin_password
+    # inside a try/except that only logs a WARN, so the failure was silent.
+    # Do not re-add a DROP here.
+    for _col in ("scc_org_uuid", "idac_url", "duo_admin_email",
+                 "duo_admin_password", "duo_totp_secret"):
         try:
-            conn.execute(f"ALTER TABLE org_credentials DROP COLUMN {_col}")
+            conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
         except Exception:
             pass
     # Global key-value config (CCO credentials etc.)
@@ -1747,7 +1757,46 @@ def api_duo_status(pod_id):
         c2.close()
     except Exception:
         pass
-    return jsonify({"steps": steps, "mode": mode})
+
+    # Duo Admin Panel login details for the proctor.
+    #
+    # The pod jump hosts are VMs with no TPM, so Windows Hello is unavailable,
+    # and Duo Push needs a phone. duo_provision_admin_totp() binds a TOTP
+    # hardware token whose secret we hold, which lets us render the current
+    # 6-digit code here — the proctor needs no authenticator app at all.
+    # Login is: email -> password -> "Hardware token" -> this code.
+    login = {}
+    try:
+        c3 = _db()
+        pod_row = c3.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        import re as _re_lg
+        m = _re_lg.search(r"pseudoco-(\d+)", (pod_row["scc_org"] or "")) if pod_row else None
+        if m:
+            oc = c3.execute(
+                "SELECT duo_admin_host, duo_admin_email, duo_admin_password, "
+                "duo_admin_totp_secret FROM org_credentials WHERE org_number=?",
+                (m.group(1),)
+            ).fetchone()
+            if oc and (oc["duo_admin_email"] or "").strip():
+                host = (oc["duo_admin_host"] or "").strip()
+                login = {
+                    "url":      f"https://{host}" if host else "",
+                    "email":    (oc["duo_admin_email"] or "").strip(),
+                    "password": (oc["duo_admin_password"] or "").strip(),
+                    "code":     "",
+                    "expires_in": 0,
+                }
+                secret = (oc["duo_admin_totp_secret"] or "").strip()
+                if secret:
+                    import time as _t
+                    import duo_automation as _da_totp
+                    login["code"] = _da_totp._totp_generate(secret)
+                    login["expires_in"] = 30 - (int(_t.time()) % 30)
+        c3.close()
+    except Exception:
+        pass
+
+    return jsonify({"steps": steps, "mode": mode, "login": login})
 
 
 @app.route("/api/duo/run/<pod_id>", methods=["POST"])
@@ -10002,8 +10051,9 @@ async function clearSda(podId) {
 
 // ── Duo Card JS ───────────────────────────────────────────────────────────────
 
-const DUO_CARD_STEPS = ['org_setup','authproxy_push','ad_sync','saml_scim_config','authproxy_enroll','scim_push','verify'];
+const DUO_CARD_STEPS = ['bootstrap','org_setup','authproxy_push','ad_sync','saml_scim_config','authproxy_enroll','scim_push','verify'];
 const DUO_CARD_LABELS = {
+  bootstrap:        'Duo Org Bootstrap',
   org_setup:        'Duo Org Setup',
   authproxy_push:   'Auth Proxy Push',
   ad_sync:          'AD Directory Sync',
@@ -10079,6 +10129,35 @@ function renderDuoGrid(podId, data) {
   html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
   html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
   html += '</div></div>';
+  // Duo Admin Panel login. The jump hosts are TPM-less VMs so Windows Hello is
+  // out and Duo Push needs a phone; the TOTP hardware token is the only
+  // phone-free factor, and we hold its secret, so show the live code here.
+  const lg = data.login || {};
+  if (lg.email) {
+    html += '<div style="background:#0d1117;border:1px solid #1c2733;border-radius:6px;padding:10px 12px;margin-bottom:14px;">';
+    html += '<div style="font-size:11px;color:#8899aa;margin-bottom:7px;">Duo Admin Panel login &mdash; choose <b style="color:#cdd6e0;">Hardware token</b> at the 2FA prompt</div>';
+    html += '<div style="display:grid;grid-template-columns:auto 1fr;gap:4px 10px;font-size:12px;align-items:center;">';
+    if (lg.url) {
+      html += '<span style="color:#8899aa;">URL</span>';
+      html += '<a href="' + lg.url + '" target="_blank" style="color:#02c8ff;text-decoration:none;">' + lg.url + '</a>';
+    }
+    html += '<span style="color:#8899aa;">Email</span>';
+    html += '<span style="color:#cdd6e0;font-family:monospace;" id="duo-lg-email">' + lg.email + '</span>';
+    html += '<span style="color:#8899aa;">Password</span>';
+    html += '<span style="color:#cdd6e0;font-family:monospace;" id="duo-lg-pw">' + (lg.password || '&mdash;') + '</span>';
+    if (lg.code) {
+      const secs = lg.expires_in || 0;
+      const codeColor = secs <= 5 ? '#ffb74d' : '#00e68a';
+      html += '<span style="color:#8899aa;">Passcode</span>';
+      html += '<span><span id="duo-totp-code" style="color:' + codeColor + ';font-family:monospace;font-size:18px;font-weight:700;letter-spacing:2px;">' + lg.code + '</span>';
+      html += '<span id="duo-totp-secs" style="color:#8899aa;font-size:11px;margin-left:8px;">rotates in ' + secs + 's</span>';
+      html += '<button id="duo-copy-code" style="background:#1c2733;color:#cdd6e0;border:none;padding:2px 9px;border-radius:3px;cursor:pointer;font-size:11px;margin-left:8px;">Copy</button></span>';
+    } else {
+      html += '<span style="color:#8899aa;">Passcode</span>';
+      html += '<span style="color:#ffb74d;font-size:11px;">no hardware token yet &mdash; run the bootstrap step</span>';
+    }
+    html += '</div></div>';
+  }
   // Step cards
   html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px;">';
   DUO_CARD_STEPS.forEach((s, i) => {
@@ -10110,6 +10189,36 @@ function renderDuoGrid(podId, data) {
     const resetBtn = document.getElementById('duo-reset-btn');
     if (runBtn)   runBtn.onclick   = () => duoRun(podId);
     if (resetBtn) resetBtn.onclick = () => duoReset(podId);
+
+    const copyBtn = document.getElementById('duo-copy-code');
+    if (copyBtn) {
+      copyBtn.onclick = () => {
+        const el = document.getElementById('duo-totp-code');
+        if (!el) return;
+        navigator.clipboard.writeText(el.textContent.trim());
+        copyBtn.textContent = 'Copied';
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+      };
+    }
+
+    // TOTP codes live 30s. Count down locally and refetch when the window
+    // rolls, so the displayed passcode is always the one Duo will accept.
+    if (window._duoTotpTimer) clearInterval(window._duoTotpTimer);
+    const secsEl = document.getElementById('duo-totp-secs');
+    if (secsEl) {
+      let left = (data.login || {}).expires_in || 0;
+      window._duoTotpTimer = setInterval(() => {
+        left -= 1;
+        if (left <= 0) {
+          clearInterval(window._duoTotpTimer);
+          loadDuoStatus(podId);
+          return;
+        }
+        secsEl.textContent = 'rotates in ' + left + 's';
+        const codeEl = document.getElementById('duo-totp-code');
+        if (codeEl) codeEl.style.color = left <= 5 ? '#ffb74d' : '#00e68a';
+      }, 1000);
+    }
   }, 0);
 }
 
