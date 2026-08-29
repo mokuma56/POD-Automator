@@ -1821,6 +1821,34 @@ def api_duo_run(pod_id):
     return jsonify({"status": "started", "pod_id": pod_id, "from_step": from_step})
 
 
+@app.route("/api/duo/logs/<pod_id>")
+def api_duo_logs(pod_id):
+    """Incremental Duo-card log lines for the live panel.
+
+    Filters to the "[duo]" prefix the card writes, and supports ?since=<id>
+    so the UI polls deltas instead of re-fetching the whole pipeline log,
+    which grows to thousands of lines over a POD's life.
+    """
+    try:
+        since = int(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        since = 0
+    try:
+        limit = min(int(request.args.get("limit", 400)), 2000)
+    except (TypeError, ValueError):
+        limit = 400
+    conn = _db()
+    rows = conn.execute(
+        "SELECT id, log_line, timestamp FROM pipeline_logs "
+        "WHERE pod_id=? AND id>? AND log_line LIKE '[duo]%' "
+        "ORDER BY id LIMIT ?",
+        (pod_id, since, limit),
+    ).fetchall()
+    conn.close()
+    out = [dict(r) for r in rows]
+    return jsonify({"lines": out, "last_id": out[-1]["id"] if out else since})
+
+
 @app.route("/api/duo/reset/<pod_id>", methods=["POST"])
 def api_duo_reset(pod_id):
     """Clear all Duo card step rows for a POD."""
@@ -7294,6 +7322,21 @@ DASHBOARD_HTML = """
          <div id="duo-grid" style="padding:16px;min-height:260px;">
            <div style="color:#667788;font-size:13px;">Select a POD to manage Duo integration</div>
          </div>
+         <!-- Sibling of #duo-grid on purpose: renderDuoGrid replaces that
+              element's innerHTML on every poll, which would wipe the log and
+              reset the scroll position mid-run. -->
+         <div id="duo-log-wrap" style="padding:0 16px 16px;display:none;">
+           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+             <span style="font-size:12px;font-weight:600;color:#cdd6e0;">Live log</span>
+             <span>
+               <label style="font-size:11px;color:#8899aa;cursor:pointer;">
+                 <input type="checkbox" id="duo-log-follow" checked style="vertical-align:middle;"> follow
+               </label>
+               <button id="duo-log-clear" style="background:#1c2733;color:#cdd6e0;border:none;padding:2px 9px;border-radius:3px;cursor:pointer;font-size:11px;margin-left:8px;">Clear</button>
+             </span>
+           </div>
+           <pre id="duo-log" style="background:#0d1117;border:1px solid #1c2733;border-radius:6px;padding:10px 12px;margin:0;max-height:260px;overflow:auto;font-size:11px;line-height:1.5;color:#9fb0c0;white-space:pre-wrap;word-break:break-word;"></pre>
+         </div>
        </div>
 
        <div class="tab-content" id="tab-ise">
@@ -9537,7 +9580,22 @@ function renderFabricGrid(podId, steps) {
     html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (FABRIC_STEP_TARGETS[s]||'') + '</div>';
     html += pipelineBadge(st);
     if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
-    if (dur)    html += '<div class="step-dur">' + dur + '</div>';
+    const est = DUO_STEP_SECS[s];
+    if (st === 'running') {
+      const t0 = duoStarted(info.started_at);
+      const el = t0 ? Math.round((Date.now() - t0) / 1000) : 0;
+      const left = est != null ? est - el : null;
+      // Past the estimate, say so rather than showing a negative countdown —
+      // these steps genuinely overrun and a stuck "0s" reads as hung.
+      html += '<div class="step-dur" style="color:#02c8ff;">' + duoEta(el) + ' elapsed'
+            + (left != null ? (left > 0 ? ' \u2022 ~' + duoEta(left) + ' left'
+                                        : ' \u2022 over est (~' + duoEta(est) + ')') : '')
+            + '</div>';
+    } else if (dur) {
+      html += '<div class="step-dur">' + dur + '</div>';
+    } else if (st === 'pending' && est != null) {
+      html += '<div class="step-dur" style="color:#667788;">~' + duoEta(est) + '</div>';
+    }
     html += '</div>';
   });
   html += '</div>';
@@ -10066,6 +10124,24 @@ const DUO_CARD_LABELS = {
   sso_test:         'SSO Login Test',
   verify:           'Verify Auth Proxy',
 };
+// Measured on a clean org, 2026-08-29. Spread is enormous (org_setup <1s vs
+// sso_saml ~390s), so a flat per-step estimate would be actively misleading.
+const DUO_STEP_SECS = {
+  bootstrap: 66, org_setup: 5, authproxy_push: 10, ad_sync: 220,
+  saml_scim_config: 320, authproxy_enroll: 70, scim_push: 5, sso_saml: 385,
+  sso_authsource: 245, mfa_policy: 125, sso_test: 90, verify: 20,
+};
+function duoEta(secs) {
+  if (secs == null || secs < 0) return '';
+  const m = Math.floor(secs / 60), r = Math.round(secs % 60);
+  return m ? m + 'm ' + (r < 10 ? '0' : '') + r + 's' : r + 's';
+}
+// Strict parse — a loose pattern picks up a trailing ':' and yields NaN.
+function duoStarted(ts) {
+  if (!ts || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(ts)) return null;
+  const t = new Date(ts).getTime();
+  return isNaN(t) ? null : t;
+}
 const DUO_REFRESH_ONLY = new Set(['saml_scim_config']);  // skipped in refresh mode
 
 async function loadDuoStatus(podId) {
@@ -10076,6 +10152,8 @@ async function loadDuoStatus(podId) {
   const r = await fetch('/api/duo/status/' + podId);
   const data = await r.json();
   renderDuoGrid(podId, data);
+  wireDuoLogControls();
+  pollDuoLogs(podId);
   const anyRunning = Object.values(data.steps || {}).some(s => (s||{}).status === 'running');
   if (anyRunning) _duoStartPoller(podId);
 }
@@ -10088,12 +10166,59 @@ function _duoStartPoller(podId) {
     const r = await fetch('/api/duo/status/' + podId);
     const data = await r.json();
     renderDuoGrid(podId, data);
+    wireDuoLogControls();
+    pollDuoLogs(podId);
     const anyRunning = Object.values(data.steps || {}).some(s => (s||{}).status === 'running');
-    if (!anyRunning || polls > 200) {
+    // A full card run is ~25 minutes; the old 200-poll cap (10 min) abandoned
+    // the card mid-run and left it looking frozen. 900 polls = 45 minutes.
+    if (!anyRunning || polls > 900) {
       clearInterval(window._duoPoller);
       window._duoPoller = null;
+      pollDuoLogs(podId);   // one last pass for the closing lines
     }
   }, 3000);
+}
+
+// ── Live log panel ───────────────────────────────────────────────────────────
+// Polls only "[duo]" lines, incrementally by id, so a long-lived POD's
+// pipeline_logs (thousands of rows) is not refetched every two seconds.
+async function pollDuoLogs(podId) {
+  const wrap = document.getElementById('duo-log-wrap');
+  const pre  = document.getElementById('duo-log');
+  if (!wrap || !pre) return;
+  if (window._duoLogPod !== podId) {   // POD switched — start clean
+    window._duoLogPod = podId;
+    window._duoLogSince = 0;
+    pre.textContent = '';
+  }
+  try {
+    const r = await fetch('/api/duo/logs/' + podId + '?since=' + (window._duoLogSince || 0));
+    if (!r.ok) return;
+    const d = await r.json();
+    wrap.style.display = 'block';
+    if (d.lines && d.lines.length) {
+      const follow = document.getElementById('duo-log-follow');
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+      d.lines.forEach(l => {
+        const t = (l.timestamp || '').substring(11, 19);
+        pre.textContent += (t ? t + '  ' : '') + (l.log_line || '').replace(/^\[duo\]\s*/, '') + '\n';
+      });
+      window._duoLogSince = d.last_id;
+      // Only autoscroll when the user has not scrolled up to read something.
+      if (!follow || (follow.checked && atBottom)) pre.scrollTop = pre.scrollHeight;
+    }
+  } catch (e) { /* transient fetch error — next tick retries */ }
+}
+
+function wireDuoLogControls() {
+  const clr = document.getElementById('duo-log-clear');
+  if (clr && !clr._wired) {
+    clr._wired = true;
+    clr.onclick = () => {
+      const pre = document.getElementById('duo-log');
+      if (pre) pre.textContent = '';
+    };
+  }
 }
 
 function renderDuoGrid(podId, data) {
@@ -10129,7 +10254,17 @@ function renderDuoGrid(podId, data) {
   // Progress bar
   html += '<div style="margin-bottom:14px;">';
   html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
-  html += '<span>' + labelText + '</span><span>' + pct + '% (' + done + '/' + total + ')</span></div>';
+  let remain = 0;
+  DUO_CARD_STEPS.forEach(s2 => {
+    const i2 = steps[s2] || {}, st2 = i2.status || 'pending', e2 = DUO_STEP_SECS[s2] || 0;
+    if (st2 === 'pending') remain += e2;
+    else if (st2 === 'running') {
+      const t0 = duoStarted(i2.started_at);
+      remain += Math.max(0, e2 - (t0 ? Math.round((Date.now() - t0) / 1000) : 0));
+    }
+  });
+  const remainTxt = (running && remain > 0) ? ' \u2022 ~' + duoEta(remain) + ' remaining' : '';
+  html += '<span>' + labelText + remainTxt + '</span><span>' + pct + '% (' + done + '/' + total + ')</span></div>';
   html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
   html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
   html += '</div></div>';

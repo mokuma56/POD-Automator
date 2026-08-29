@@ -10546,6 +10546,7 @@ def duo_run_card(
         Copy the base64 argument (not the full EXE path) and store it in
         the dashboard org credentials card under 'authproxy_enroll_blob'.
         """
+        import re as _re_ape
         import time as _te
 
         AUTHPROXY_LOG = (
@@ -10675,11 +10676,42 @@ def duo_run_card(
                     "External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command, "
                     "paste into org credentials card, then re-run this step."
                 )
-            # Unknown — service restarted but log unclear
-            return True, (
-                "enrollment ran, DRPC status unclear — check step 7 to confirm"
-                + blob_age_warn
-            )
+            # "Unknown" is not success. The log tail is normally just
+            # directory-sync polls, so this branch was the COMMON outcome and
+            # it passed on absence of evidence — the same soft green removed
+            # from verify. Ask the connectivity tool, which always has an
+            # answer, and require the [sso] section to exist at all: the
+            # enrollment EXE happily reports "All secrets stored successfully"
+            # with no section to put them in.
+            try:
+                cfg_txt = winrm_sess.run_ps(
+                    f"Get-Content '{AUTHPROXY_CFG_PATH}' -Raw"
+                ).std_out.decode(errors="replace")
+                if not _re_ape.search(r"^\[sso\]", cfg_txt, _re_ape.M):
+                    return False, ("enrollment ran but authproxy.cfg has no [sso] "
+                                   "section — the CloudSSO module cannot start"
+                                   + blob_age_warn)
+                tool = (r"C:\Program Files\Duo Security Authentication Proxy"
+                        r"\bin\authproxy_connectivity_tool.exe")
+                out = winrm_sess.run_ps(
+                    f"& '{tool}' 2>&1 | Out-String").std_out.decode(errors="replace")
+                summary = out.split("SUMMARY", 1)[1] if "SUMMARY" in out else ""
+                sso_bad = False
+                cur = None
+                for line in summary.splitlines():
+                    mm = _re_ape.search(r"Section \[([^\]]+)\]", line)
+                    if mm:
+                        cur = mm.group(1).strip().lower()
+                    elif cur == "sso" and "[error]" in line:
+                        sso_bad = True
+                if sso_bad:
+                    return False, ("enrollment ran but the [sso] section reports "
+                                   "connectivity errors" + blob_age_warn)
+                return True, ("enrollment OK — [sso] present, connectivity clean"
+                              + blob_age_warn)
+            except Exception as e:
+                return False, (f"enrollment ran but its state could not be "
+                               f"confirmed: {type(e).__name__}: {e}" + blob_age_warn)
 
         except Exception as e:
             return False, f"authproxy enrollment failed: {e}"
