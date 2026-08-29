@@ -10060,6 +10060,10 @@ const DUO_CARD_LABELS = {
   saml_scim_config: 'SA SAML + SCIM Config',
   authproxy_enroll: 'Auth Proxy Enroll',
   scim_push:        'SA SCIM Verify Users',
+  sso_saml:         'SAML Metadata Exchange',
+  sso_authsource:   'Duo SSO Auth Source',
+  mfa_policy:       'Lab MFA Policy',
+  sso_test:         'SSO Login Test',
   verify:           'Verify Auth Proxy',
 };
 const DUO_REFRESH_ONLY = new Set(['saml_scim_config']);  // skipped in refresh mode
