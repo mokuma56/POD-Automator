@@ -7719,6 +7719,491 @@ def duo_ext_dir_and_sso_setup(
     return True, f"External Directory + SSO Auth Proxy configured | {msg1} | {msg2}"
 
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lab guide section 4 — SAML metadata exchange between Duo and Secure Access.
+#
+# The two sides each need the other's metadata, and neither value can be
+# derived:
+#   * Duo's entity_id/acs_url are HIDDEN fields populated only by uploading
+#     Secure Access's Service Provider XML. Until they are set, Duo silently
+#     refuses to persist "Enable for all users".
+#   * Secure Access needs Duo's IdP metadata XML, which is offered as a
+#     download on the application page. It is NOT at a derivable URL — the
+#     SSO host carries a different hash and an extra segment than the admin
+#     host (admin-demodemo… vs sso-3d52ddf2.demo.sso…).
+#
+# Order therefore matters: pull the SP XML from the Secure Access wizard,
+# feed it to Duo, and only then take Duo's IdP XML back to Secure Access.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# cds comboboxes render their options as plain visible leaves — not <li>,
+# not [role=option] — so match on text among leaf nodes.
+_LEAF_HIT = """(pat) => {
+    const rx = new RegExp(pat, 'i');
+    const e = Array.from(document.querySelectorAll('*'))
+        .filter(x => x.getClientRects().length && x.children.length === 0 &&
+                     rx.test((x.innerText||'').trim()) &&
+                     !x.closest('nav') && !x.closest('header'))
+        .pop();
+    if (!e) return null;
+    e.scrollIntoView({block:'center'});
+    const r = e.getBoundingClientRect();
+    return {x:r.x+r.width/2, y:r.y+r.height/2, txt:(e.innerText||'').trim().slice(0,40)};
+}"""
+
+
+def _leaf_click(page, pattern: str, wait: int = 3_000) -> bool:
+    hit = page.evaluate(_LEAF_HIT, pattern)
+    if not hit:
+        return False
+    page.mouse.click(hit["x"], hit["y"])
+    page.wait_for_timeout(wait)
+    return True
+
+
+def _duo_form_submit(page, form_id: str = "modify-integration-form") -> bool:
+    """Submit a Duo settings form directly.
+
+    Duo's application page is ~5,400px tall and its Save button sits at the
+    very bottom. Neither a coordinate click nor Playwright's locator click
+    reaches it (scroll_into_view_if_needed times out on the sticky layout),
+    and both fail silently — no POST is issued at all. requestSubmit() posts
+    the form and its attached file the same way the button would.
+    """
+    res = page.evaluate("""(fid) => {
+        const f = document.getElementById(fid);
+        if (!f) return 'missing';
+        f.requestSubmit ? f.requestSubmit() : f.submit();
+        return 'ok';
+    }""", form_id)
+    if res != "ok":
+        return False
+    page.wait_for_timeout(12_000)
+    return True
+
+
+def _duo_read_field(page, name: str) -> str:
+    return page.evaluate("""(k) => {
+        const i = Array.from(document.querySelectorAll('input,textarea'))
+            .find(x => (x.name||'') === k);
+        return i ? i.value : '';
+    }""", name)
+
+
+def duo_download_idp_metadata(page, dest: str, log=None) -> str:
+    """Save Duo's IdP Security Metadata XML for the current application.
+
+    Replaces the old URL derivation, which guessed sso-{api-hash}.sso and was
+    wrong on both the hash and the host shape.
+    """
+    _log = log or (lambda s: print(f"     [duo-idp] {s}"))
+    with page.expect_download(timeout=40_000) as dl:
+        page.evaluate("""() => {
+            const b = Array.from(document.querySelectorAll('button,a'))
+                .find(x => /^download xml$/i.test((x.innerText||'').trim()));
+            if (b) b.click();
+        }""")
+    xml = open(dl.value.path(), "rb").read().decode("utf-8", "replace")
+    if "EntityDescriptor" not in xml:
+        raise RuntimeError(f"downloaded file is not SAML metadata ({len(xml)} bytes)")
+    with open(dest, "w") as fh:
+        fh.write(xml)
+    _log(f"IdP metadata saved ({len(xml)} bytes)")
+    return dest
+
+
+def duo_upload_sp_metadata(page, sp_path: str, log=None) -> tuple[bool, str]:
+    """Upload Secure Access's SP XML into Duo and confirm it took.
+
+    entity_id/acs_url are hidden fields; writing to them directly is discarded
+    on save, so the file control is the only way in.
+    """
+    _log = log or (lambda s: print(f"     [duo-sp] {s}"))
+    import re as _re
+
+    xml = open(sp_path).read()
+    m_e = _re.search(r'entityID="([^"]+)"', xml)
+    m_a = _re.search(r'AssertionConsumerService[^>]*Location="([^"]+)"', xml)
+    if not (m_e and m_a):
+        return False, "SP XML has no entityID / AssertionConsumerService"
+    want_e, want_a = m_e.group(1), m_a.group(1)
+
+    if page.locator('input[name="xml_file"]').count() == 0:
+        return False, "no Service Provider XML upload control on the application page"
+    page.locator('input[name="xml_file"]').first.set_input_files(sp_path)
+    page.wait_for_timeout(3_000)
+    if not _duo_form_submit(page):
+        return False, "could not submit the integration form"
+
+    page.reload(wait_until="load", timeout=45_000)
+    page.wait_for_timeout(9_000)
+    got_e, got_a = _duo_read_field(page, "entity_id"), _duo_read_field(page, "acs_url")
+    if got_e != want_e or got_a != want_a:
+        return False, (f"SP metadata did not persist — entity_id={got_e!r} "
+                       f"acs_url={got_a!r} (expected {want_e!r} / {want_a!r})")
+    _log(f"entity_id={got_e}")
+    return True, f"SP metadata applied (entity_id {got_e})"
+
+
+_EFAU = """() => {
+    const i = Array.from(document.querySelectorAll('input[type=checkbox],input[type=radio]'))
+        .find(x => { let n = x, t = '';
+            for (let k=0;k<4&&n;k++){ n=n.parentElement; if(!n) break;
+                t=(n.innerText||''); if(t) break; }
+            return /enable for all users/i.test(t); });
+    if (!i) return null;
+    i.setAttribute('data-ef','1');
+    return i.checked;
+}"""
+
+
+def duo_enable_for_all_users(page, log=None) -> tuple[bool, str]:
+    """Tick User Access -> Enable for all users, and prove it stuck.
+
+    This silently refuses to save while entity_id/acs_url are unset, so it
+    must run after duo_upload_sp_metadata().
+    """
+    _log = log or (lambda s: print(f"     [duo-access] {s}"))
+    state = page.evaluate(_EFAU)
+    if state is None:
+        return False, "'Enable for all users' control not present"
+    if state:
+        return True, "already enabled"
+    _duo_mclick(page, selector='input[data-ef="1"]')
+    page.wait_for_timeout(2_000)
+    if not _duo_form_submit(page):
+        return False, "could not submit the integration form"
+    page.reload(wait_until="load", timeout=45_000)
+    page.wait_for_timeout(9_000)
+    if not page.evaluate(_EFAU):
+        return False, ("'Enable for all users' did not persist — Duo drops it "
+                       "when the Service Provider XML is missing")
+    _log("enabled for all users")
+    return True, "enabled for all users"
+
+
+def duo_map_username_to_email(page, log=None) -> tuple[bool, str]:
+    """Provisioning -> Attribute mapping: userName carries the email address.
+
+    Lab guide: "Edit the userName Application attribute to be Email Address."
+    Without it the UPN reaching Secure Access is the sAMAccountName and SSO
+    cannot match the user. The visible table is read-only; the editable
+    control is the cds combobox on the row, identified by the hidden
+    attributeMapping.0.internalName field. Do NOT open "Edit mappings" — that
+    is the checklist of WHICH attributes to send, and its modal covers the row.
+    """
+    _log = log or (lambda s: print(f"     [duo-attr] {s}"))
+    page.evaluate("""() => {const b=Array.from(document.querySelectorAll('a,button,[role=tab]'))
+        .find(x => (x.innerText||'').trim().toLowerCase()==='provisioning'); if(b)b.click();}""")
+    page.wait_for_timeout(8_000)
+
+    if _duo_read_field(page, "attributeMapping.0.internalName") == "email":
+        return True, "already mapped to Email Address"
+
+    hit = page.evaluate("""() => {
+        const h = document.querySelector('input[name="attributeMapping.0.internalName"]');
+        if (!h) return null;
+        let row = h;
+        for (let k=0;k<8&&row;k++){ row=row.parentElement; if(!row) break;
+            if (row.querySelector('[role=combobox]')) break; }
+        const cb = row && row.querySelector('[role=combobox]');
+        if (!cb) return null;
+        cb.scrollIntoView({block:'center'});
+        const r = cb.getBoundingClientRect();
+        return {x:r.x+r.width/2, y:r.y+r.height/2, cur:(cb.innerText||'').trim()};
+    }""")
+    if not hit:
+        return False, "attribute-mapping combobox not found on the Provisioning tab"
+    page.mouse.click(hit["x"], hit["y"])
+    page.wait_for_timeout(4_000)
+    if not _leaf_click(page, "^email address$"):
+        return False, "'Email Address' not offered by the attribute combobox"
+    if not _duo_form_submit(page, "outbound-scim-configuration"):
+        return False, "could not submit the SCIM configuration form"
+
+    page.reload(wait_until="load", timeout=45_000)
+    page.wait_for_timeout(9_000)
+    page.evaluate("""() => {const b=Array.from(document.querySelectorAll('a,button,[role=tab]'))
+        .find(x => (x.innerText||'').trim().toLowerCase()==='provisioning'); if(b)b.click();}""")
+    page.wait_for_timeout(8_000)
+    got = _duo_read_field(page, "attributeMapping.0.internalName")
+    if got != "email":
+        return False, f"attribute mapping did not persist (internalName={got!r})"
+    _log("userName -> Email Address")
+    return True, "userName mapped to Email Address"
+
+
+# ── Secure Access SSO wizard ──────────────────────────────────────────────────
+
+def sa_sso_already_configured(t, sa_org: str, ent: str) -> bool:
+    """True when the SSO authentication card already lists a configuration.
+
+    Re-running the wizard over a live configuration is not idempotent — the
+    card switches its action from "Add SSO authentication" to "Configure",
+    which opens an edit view rather than the three-step wizard.
+    """
+    t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}/connect/users-and-groups"
+           f"?enterpriseId={ent}", wait_until="load", timeout=45_000)
+    _scc_wait(t, "Configuration management")
+    _scc_click(t, "Configuration management")
+    _scc_wait(t, "SSO authentication")
+    t.wait_for_timeout(6_000)
+    return "DuoSSO" in (_scc_text(t) or "").split("SSO authentication")[-1]
+
+
+def _sa_wizard_open(t, sa_org: str, ent: str, log=None) -> str:
+    """Open Connect -> Configuration management -> SSO authentication wizard.
+
+    Returns the Secure Access directory name (e.g. 'Duo-53678'), which is
+    generated per-org and so cannot be hardcoded.
+    """
+    import re as _re
+    _log = log or (lambda s: print(f"     [sa-sso] {s}"))
+    t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}/connect/users-and-groups"
+           f"?enterpriseId={ent}", wait_until="load", timeout=45_000)
+    _scc_wait(t, "Configuration management")
+    _scc_click(t, "Configuration management")
+    _scc_wait(t, "SSO authentication")
+    m = _re.search(r"Duo-\d+", _scc_text(t) or "")
+    dirname = m.group(0) if m else "Duo"
+    hit = t.evaluate("""() => {
+        const els = Array.from(document.querySelectorAll('div,section'))
+            .filter(e => /SSO authentication/i.test(e.innerText||'') &&
+                         (e.innerText||'').length < 600);
+        for (const e of els.reverse()) {
+            const b = Array.from(e.querySelectorAll('button,a'))
+                .find(x => /^(configure|add sso authentication)$/i.test((x.innerText||'').trim()));
+            if (b) { const r = b.getBoundingClientRect();
+                     return {x:r.x+r.width/2, y:r.y+r.height/2, t:(b.innerText||'').trim()}; }
+        }
+        return null;
+    }""")
+    if not hit:
+        raise RuntimeError("no Configure / Add SSO authentication control on the SSO card")
+    _log(f"wizard via {hit['t']!r}, directory {dirname}")
+    t.mouse.click(hit["x"], hit["y"])
+    t.wait_for_timeout(9_000)
+    return dirname
+
+
+def _sa_next_enabled(t) -> bool:
+    return bool(t.evaluate("""() => {
+        const b = Array.from(document.querySelectorAll('button'))
+            .find(x => /^next$/i.test((x.innerText||'').trim()));
+        return b ? !(b.disabled || b.getAttribute('aria-disabled')==='true') : false;
+    }"""))
+
+
+def _sa_wizard_to_step3(t, dirname: str, name: str = "DuoSSO", log=None) -> None:
+    """Walk wizard steps 1 and 2.
+
+    SAML is already selected on load — clicking the tile TOGGLES IT OFF, which
+    leaves Next permanently disabled. "authName" is the input's id/placeholder,
+    not its name attribute.
+    """
+    import re as _re
+    _log = log or (lambda s: print(f"     [sa-sso] {s}"))
+    t.evaluate("""(v) => {
+        const i = Array.from(document.querySelectorAll('input'))
+            .find(x => [x.name,x.id,x.placeholder]
+                .some(k => (k||'').toLowerCase() === 'authname'));
+        if (!i) return;
+        Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype,'value').set.call(i, v);
+        i.dispatchEvent(new Event('input',{bubbles:true}));
+        i.dispatchEvent(new Event('change',{bubbles:true}));
+    }""", name)
+    t.wait_for_timeout(1_500)
+    _leaf_click(t, "^select an option$", wait=4_000)     # User Directory
+    _leaf_click(t, f"^{_re.escape(dirname)}$")
+    if not _sa_next_enabled(t):
+        # Secure Access allows one SSO configuration per directory, so a
+        # directory already backing a configuration disappears from this
+        # dropdown entirely ("No matches found") rather than erroring.
+        if "No matches found" in (_scc_text(t) or ""):
+            raise RuntimeError(
+                f"user directory {dirname!r} is already bound to an SSO "
+                "configuration — remove that configuration before re-running")
+        raise RuntimeError("wizard step 1 incomplete — name or user directory not accepted")
+    _scc_click(t, "Next")
+    t.wait_for_timeout(9_000)
+
+    _leaf_click(t, "^select$", wait=4_000)               # Select a Provider
+    _leaf_click(t, "^duo$")
+    if not _sa_next_enabled(t):
+        raise RuntimeError("wizard step 2 incomplete — provider Duo not accepted")
+    _log("step 2: provider Duo")
+    _scc_click(t, "Next")
+    t.wait_for_timeout(9_000)
+
+
+def sa_download_sp_metadata(t, sa_org: str, ent: str, dest: str, log=None) -> str:
+    """Wizard steps 1-3, then download the Service Provider XML.
+
+    Abandoning the wizard here creates no configuration, so this can safely
+    run before the Duo side is ready.
+    """
+    _log = log or (lambda s: print(f"     [sa-sso] {s}"))
+    dirname = _sa_wizard_open(t, sa_org, ent, log=_log)
+    _sa_wizard_to_step3(t, dirname, log=_log)
+    with t.expect_download(timeout=45_000) as dl:
+        hit = t.evaluate(_LEAF_HIT, "^download service provider xml file$")
+        if not hit:
+            raise RuntimeError("no 'Download Service Provider XML file' control at step 3")
+        t.mouse.click(hit["x"], hit["y"])
+    xml = open(dl.value.path(), "rb").read().decode("utf-8", "replace")
+    if "EntityDescriptor" not in xml:
+        raise RuntimeError(f"SP download is not SAML metadata ({len(xml)} bytes)")
+    with open(dest, "w") as fh:
+        fh.write(xml)
+    _log(f"SP metadata saved ({len(xml)} bytes)")
+    return dirname
+
+
+def sa_upload_idp_metadata(t, sa_org: str, ent: str, idp_path: str,
+                           log=None) -> tuple[bool, str]:
+    """Re-enter the wizard and finish it with Duo's IdP metadata."""
+    _log = log or (lambda s: print(f"     [sa-sso] {s}"))
+    dirname = _sa_wizard_open(t, sa_org, ent, log=_log)
+    _sa_wizard_to_step3(t, dirname, log=_log)
+    if t.locator('input[type=file]').count() == 0:
+        return False, "no IdP metadata upload control at wizard step 3"
+    t.locator('input[type=file]').first.set_input_files(idp_path)
+    t.wait_for_timeout(8_000)
+
+    hit = t.evaluate(_LEAF_HIT, "^done$")
+    if not hit:
+        return False, "no Done control at wizard step 3"
+    t.mouse.click(hit["x"], hit["y"])
+    t.wait_for_timeout(14_000)
+
+    # Confirm from the configuration page rather than from the click.
+    t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}/connect/users-and-groups"
+           f"?enterpriseId={ent}", wait_until="load", timeout=45_000)
+    _scc_wait(t, "Configuration management")
+    _scc_click(t, "Configuration management")
+    _scc_wait(t, "SSO authentication")
+    t.wait_for_timeout(6_000)
+    tail = (_scc_text(t) or "").split("SSO authentication")[-1]
+    if "DuoSSO" not in tail:
+        return False, "wizard finished but no SSO configuration is listed"
+    _log(f"SSO configuration active, authenticating {dirname}")
+    return True, f"SSO authentication configured (DuoSSO -> {dirname})"
+
+
+def duo_setup_saml_sso(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Lab guide section 4: complete the SAML trust in both directions.
+
+    Runs in three passes because the two consoles need separate browser
+    sessions and each side's metadata depends on the other's:
+
+      1. Secure Access wizard -> download the Service Provider XML.
+         Abandoning the wizard at this point creates no configuration.
+      2. Duo -> upload that XML (which populates entity_id/acs_url), tick
+         "Enable for all users", map userName to Email Address, then download
+         the IdP metadata XML.
+      3. Secure Access wizard again -> upload the IdP XML and click Done.
+
+    Every stage is verified against re-read state, not against the click.
+    """
+    import re as _re
+    import sqlite3 as _sq
+    import tempfile as _tf
+
+    from playwright.sync_api import sync_playwright as _spw
+
+    _log = log or (lambda s: print(f"  [duo-sso] {s}"))
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {})
+
+    idac = (oc.get("idac_url") or "").strip()
+    sa_org = (oc.get("sa_org_id") or "").strip()
+    app_ikey = (oc.get("duo_saml_app_ikey") or "").strip()
+    if not (idac and sa_org):
+        return False, "idac_url / sa_org_id missing from org_credentials"
+    if not app_ikey:
+        return False, ("duo_saml_app_ikey not set — the Cisco Secure Access "
+                       "application must exist first (lab guide section 3)")
+
+    tmp = _tf.mkdtemp(prefix="duosso-")
+    sp_path, idp_path = f"{tmp}/sa_sp.xml", f"{tmp}/duo_idp.xml"
+
+    # ── pass 1: Secure Access -> Service Provider XML ──
+    with _spw() as pw:
+        br = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            ctx = br.new_context(ignore_https_errors=True, accept_downloads=True,
+                                 viewport={"width": 1600, "height": 1200})
+            t, ent = _scc_open_session(ctx, idac, log=_log)
+            if sa_sso_already_configured(t, sa_org, ent):
+                _log("SSO authentication already configured — nothing to do")
+                return True, "SSO authentication already configured in Secure Access"
+            sa_download_sp_metadata(t, sa_org, ent, sp_path, log=_log)
+        except Exception as e:
+            return False, f"could not obtain the Service Provider XML: {type(e).__name__}: {e}"
+        finally:
+            br.close()
+
+    # ── pass 2: Duo ──
+    pw = br = None
+    try:
+        pw, br, ctx, page = duo_passkey_login(pod_id, db_path, log=_log)
+        host = page.url.split("/")[2]
+        app_url = f"https://{host}/applications/{app_ikey}"
+        page.goto(app_url, wait_until="load", timeout=45_000)
+        page.wait_for_timeout(9_000)
+
+        ok, msg = duo_upload_sp_metadata(page, sp_path, log=_log)
+        if not ok:
+            return False, msg
+        ok, msg = duo_enable_for_all_users(page, log=_log)
+        if not ok:
+            return False, msg
+        ok, attr_msg = duo_map_username_to_email(page, log=_log)
+        if not ok:
+            return False, attr_msg
+
+        page.goto(app_url, wait_until="load", timeout=45_000)
+        page.wait_for_timeout(9_000)
+        duo_download_idp_metadata(page, idp_path, log=_log)
+    except Exception as e:
+        return False, f"Duo side failed: {type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception as e:
+            _log(f"browser cleanup: {type(e).__name__}")
+
+    # ── pass 3: Secure Access -> consume the IdP XML ──
+    with _spw() as pw2:
+        br2 = pw2.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            ctx2 = br2.new_context(ignore_https_errors=True, accept_downloads=True,
+                                   viewport={"width": 1600, "height": 1200})
+            t2, ent2 = _scc_open_session(ctx2, idac, log=_log)
+            ok, msg = sa_upload_idp_metadata(t2, sa_org, ent2, idp_path, log=_log)
+        except Exception as e:
+            return False, f"could not upload the IdP XML: {type(e).__name__}: {e}"
+        finally:
+            br2.close()
+
+    if not ok:
+        return False, msg
+    return True, f"{msg} | {attr_msg}"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Duo Card — manual pipeline (replaces duo_setup/duo_ext_dir/duo_saml_setup
 # pipeline steps).  Stored in duo_steps table.  Smart re-use: if the org
@@ -7735,6 +8220,7 @@ DUO_CARD_STEPS = [
     "authproxy_enroll",
 
     "scim_push",
+    "sso_saml",
     "verify",
 ]
 
@@ -9036,6 +9522,14 @@ def duo_run_card(
         except Exception as e:
             return False, f"SA SCIM verify failed: {e}"
 
+    def step_sso_saml():
+        """Lab guide section 4 — the SAML trust between Duo and Secure Access.
+
+        Depends on the Cisco Secure Access application existing (scim_push),
+        because the SP metadata is uploaded onto that application's page.
+        """
+        return duo_setup_saml_sso(pod_id, db_path, log=_log)
+
     def step_verify():
         """WinRM: check DuoAuthProxy is Running AND DRPC is connected."""
         AUTHPROXY_LOG = (
@@ -9081,6 +9575,7 @@ def duo_run_card(
         "saml_scim_config": step_saml_scim_config,
         "authproxy_enroll": step_authproxy_enroll,
         "scim_push":        step_scim_push,
+        "sso_saml":         step_sso_saml,
         "verify":           step_verify,
     }
 
@@ -9097,7 +9592,8 @@ def duo_run_card(
             # ad_sync is here because the later steps (SSO enrollment, verify)
             # are independent of user sync — but it must still show red rather
             # than the old soft-fail ok=True, which hid an empty Duo org.
-            if step in ("scim_push", "verify", "saml_scim_config", "ad_sync"):
+            if step in ("scim_push", "verify", "saml_scim_config",
+                        "ad_sync", "sso_saml"):
                 continue
             # Fatal steps: stop on first hard failure
             _log(f"  Hard failure at {step} — stopping")

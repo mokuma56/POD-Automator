@@ -10051,7 +10051,7 @@ async function clearSda(podId) {
 
 // ── Duo Card JS ───────────────────────────────────────────────────────────────
 
-const DUO_CARD_STEPS = ['bootstrap','org_setup','authproxy_push','ad_sync','saml_scim_config','authproxy_enroll','scim_push','verify'];
+const DUO_CARD_STEPS = ['bootstrap','org_setup','authproxy_push','ad_sync','saml_scim_config','authproxy_enroll','scim_push','sso_saml','verify'];
 const DUO_CARD_LABELS = {
   bootstrap:        'Duo Org Bootstrap',
   org_setup:        'Duo Org Setup',
