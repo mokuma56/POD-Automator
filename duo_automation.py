@@ -10676,41 +10676,66 @@ def duo_run_card(
         return duo_test_sso_login(pod_id, db_path, log=_log)
 
     def step_verify():
-        """WinRM: check DuoAuthProxy is Running AND DRPC is connected."""
-        AUTHPROXY_LOG = (
-            r"C:\Program Files\Duo Security Authentication Proxy\log\authproxy.log"
-        )
+        """Assert the Auth Proxy is healthy, using Duo's own connectivity tool.
+
+        This used to infer health from the last 30 log lines and, when it found
+        neither a success nor a failure marker, returned OK with "DRPC log
+        status unclear". That is the common case, not the rare one: a healthy
+        long-running proxy logs nothing but directory-sync polls, so the step
+        passed on absence of evidence.
+
+        authproxy_connectivity_tool.exe tests each configured section and
+        prints a SUMMARY naming only the sections WITH problems, so a verdict
+        is always available.
+
+        Scope: this card depends on [cloud] (directory sync) and [sso]. Other
+        sections are reported in full rather than hidden, but do not fail the
+        step — [ad_client] serves RADIUS, which this card never exercises.
+        """
+        CONN_TOOL = (r"C:\Program Files\Duo Security Authentication Proxy"
+                     r"\bin\authproxy_connectivity_tool.exe")
+        OWNED = ("cloud", "sso")
         try:
             sess = _winrm_connect_for_pod(pod_id)
 
-            # Service status
-            r_svc = sess.run_ps("(Get-Service DuoAuthProxy).Status")
-            svc_status = r_svc.std_out.decode(errors="replace").strip()
-            if "running" not in svc_status.lower():
-                return False, f"DuoAuthProxy service: {svc_status} (not running)"
+            svc = sess.run_ps("(Get-Service DuoAuthProxy).Status") \
+                      .std_out.decode(errors="replace").strip()
+            if "running" not in svc.lower():
+                return False, f"DuoAuthProxy service: {svc} (not running)"
 
-            # DRPC connection status from log
-            r_log = sess.run_ps(
-                f'Get-Content "{AUTHPROXY_LOG}" -Tail 30 -ErrorAction SilentlyContinue'
-            )
-            lines = r_log.std_out.decode(errors="replace").splitlines()
-            has_401    = any("Invalid signature" in l for l in lines)
-            has_idp    = any("configured IdP"    in l for l in lines)
-            manual_int = any("manual intervention" in l.lower() for l in lines)
+            out = sess.run_ps(f"& '{CONN_TOOL}' 2>&1 | Out-String") \
+                      .std_out.decode(errors="replace")
+            if "SUMMARY" not in out:
+                return False, ("the Duo connectivity tool produced no summary — "
+                               f"{' '.join(out.split())[:160] or 'no output'}")
 
-            if has_idp and not has_401:
-                idp_line = next(l for l in reversed(lines) if "configured IdP" in l)
-                return True, f"DuoAuthProxy Running + DRPC connected ✓ ({idp_line.strip()[-40:]})"
-            if has_401 or manual_int:
-                return False, (
-                    "DuoAuthProxy Running but DRPC NOT connected (401 Invalid signature) — "
-                    "enrollment blob is spent. Generate a new blob: Duo Admin portal → "
-                    "SSO Settings → External Auth Sources → AD → Auth Proxy → Step 2 → "
-                    "Generate Command, paste into org credentials, re-run step 5."
-                )
-            return True, f"DuoAuthProxy service: {svc_status} (DRPC log status unclear)"
+            # Only sections with problems are listed under SUMMARY.
+            summary = out.split("SUMMARY", 1)[1].split(
+                "The results have also been logged")[0]
+            problems, current = {}, None
+            for line in summary.splitlines():
+                m = re.search(r"Section \[([^\]]+)\]", line)
+                if m:
+                    current = m.group(1).strip().lower()
+                    problems.setdefault(current, [])
+                elif current and "[error]" in line:
+                    problems[current].append(" ".join(line.split())[:120])
+            problems = {k: v for k, v in problems.items() if v}
+
+            broken_here = [k for k in problems if k in OWNED]
+            if broken_here:
+                detail = "; ".join(f"[{k}] {problems[k][0]}" for k in broken_here)
+                return False, f"Auth Proxy connectivity FAILED — {detail}"
+
+            other = [k for k in problems if k not in OWNED]
+            msg = f"DuoAuthProxy Running; connectivity OK for {', '.join(OWNED)}"
+            if other:
+                # Surfaced, never swallowed — the card just does not depend on it.
+                msg += ("; NOTE unrelated section(s) report problems: "
+                        + "; ".join(f"[{k}] {problems[k][0]}" for k in other))
+            return True, msg
         except Exception as e:
-            return False, f"WinRM verify error: {e}"
+            return False, f"WinRM verify error: {type(e).__name__}: {e}"
 
     step_fns = {
         "bootstrap":        step_bootstrap,
