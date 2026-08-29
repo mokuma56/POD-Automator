@@ -9580,22 +9580,7 @@ function renderFabricGrid(podId, steps) {
     html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (FABRIC_STEP_TARGETS[s]||'') + '</div>';
     html += pipelineBadge(st);
     if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
-    const est = DUO_STEP_SECS[s];
-    if (st === 'running') {
-      const t0 = duoStarted(info.started_at);
-      const el = t0 ? Math.round((Date.now() - t0) / 1000) : 0;
-      const left = est != null ? est - el : null;
-      // Past the estimate, say so rather than showing a negative countdown —
-      // these steps genuinely overrun and a stuck "0s" reads as hung.
-      html += '<div class="step-dur" style="color:#02c8ff;">' + duoEta(el) + ' elapsed'
-            + (left != null ? (left > 0 ? ' \u2022 ~' + duoEta(left) + ' left'
-                                        : ' \u2022 over est (~' + duoEta(est) + ')') : '')
-            + '</div>';
-    } else if (dur) {
-      html += '<div class="step-dur">' + dur + '</div>';
-    } else if (st === 'pending' && est != null) {
-      html += '<div class="step-dur" style="color:#667788;">~' + duoEta(est) + '</div>';
-    }
+    if (dur)    html += '<div class="step-dur">' + dur + '</div>';
     html += '</div>';
   });
   html += '</div>';
@@ -10314,7 +10299,22 @@ function renderDuoGrid(podId, data) {
     html += '<div class="step-name">' + (DUO_CARD_LABELS[s]||s) + '</div>';
     html += pipelineBadge(st);
     if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
-    if (dur)    html += '<div class="step-dur">' + dur + '</div>';
+    const est = DUO_STEP_SECS[s];
+    if (st === 'running') {
+      const t0 = duoStarted(info.started_at);
+      const el = t0 ? Math.round((Date.now() - t0) / 1000) : 0;
+      const left = est != null ? est - el : null;
+      // Past the estimate, say so rather than count into negatives - these
+      // steps genuinely overrun and a stuck "0s left" reads as hung.
+      html += '<div class="step-dur" style="color:#02c8ff;">' + duoEta(el) + ' elapsed'
+            + (left != null ? (left > 0 ? ' ~' + duoEta(left) + ' left'
+                                        : ' (over est ~' + duoEta(est) + ')') : '')
+            + '</div>';
+    } else if (dur) {
+      html += '<div class="step-dur">' + dur + '</div>';
+    } else if (st === 'pending' && est != null) {
+      html += '<div class="step-dur" style="color:#667788;">~' + duoEta(est) + ' est</div>';
+    }
     html += '</div>';
   });
   html += '</div>';
