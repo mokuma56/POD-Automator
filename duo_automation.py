@@ -3116,6 +3116,81 @@ def duo_setup_secure_access_app(pod_id: str, db_path: str, log=None) -> tuple[bo
             pass
 
 
+
+def duo_delete_directory_sync(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Delete the AD directory sync in Duo.
+
+    The sync OWNS the users and groups it created, so the Admin API refuses to
+    delete them (400) for as long as it exists — this must run before the
+    user/group cleanup or that cleanup silently removes nothing.
+
+    "Delete Directory Sync" sits at the top of the sync's own page; the
+    confirmation is the usual shape (controls outside the dialog).
+    """
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: print(f"  [duo-dirsync] {s}"))
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {})
+
+    host = (oc.get("duo_admin_host") or "").strip()
+    if not host:
+        return False, "duo_admin_host missing from org_credentials"
+
+    FIND = r"""() => {
+        const a = Array.from(document.querySelectorAll('a'))
+            .find(x => /\/users\/directorysync\/DS/i.test(x.getAttribute('href')||''));
+        return a ? a.getAttribute('href') : null;
+    }"""
+
+    pw = br = None
+    try:
+        pw, br, ctx, page = duo_passkey_login(pod_id, db_path, log=_log)
+        page.goto(f"https://{host}/users/directorysync", wait_until="load", timeout=45_000)
+        page.wait_for_timeout(9_000)
+        href = page.evaluate(FIND)
+        if not href:
+            return True, "no directory sync present"
+
+        page.goto(f"https://{host}{href}", wait_until="load", timeout=45_000)
+        page.wait_for_timeout(10_000)
+        dl = page.locator('a:has-text("Delete Directory Sync"), '
+                          'button:has-text("Delete Directory Sync")').last
+        if dl.count() == 0:
+            return False, "no 'Delete Directory Sync' control on the sync page"
+        dl.scroll_into_view_if_needed(timeout=15_000)
+        page.wait_for_timeout(1_000)
+        dl.click(timeout=15_000)
+        page.wait_for_timeout(7_000)
+        _sa_confirm(page)
+
+        page.goto(f"https://{host}/users/directorysync", wait_until="load", timeout=45_000)
+        page.wait_for_timeout(10_000)
+        if page.evaluate(FIND):
+            return False, "the directory sync is still listed after the delete"
+        _log("directory sync deleted")
+        return True, "directory sync deleted"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception as e:
+            _log(f"browser cleanup: {type(e).__name__}")
+
 def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True,
                           log=None) -> tuple[bool, str]:
     """Undo everything the Duo card built, so a run can be tested from scratch.
@@ -3125,8 +3200,9 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
     activation is one-time per org and cannot be repeated. Everything the card
     creates on top of that is removed:
 
-      Duo   - synced users, synced groups, the Auth Proxy integration
-      SA    - nothing here (IdP directories must be removed in the SCC UI)
+      SA    - the SSO configuration and the Duo-NNNNN IdP directory
+      Duo   - the AD directory sync, then its users and groups, and the
+              Auth Proxy integration
       DB    - authproxy_*, sa_scim_token, duo_saml_app_ikey
 
     Set keep_bootstrap=False to also clear the org's identity columns, but note
@@ -3152,6 +3228,26 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
 
     ikey, skey, host = (oc.get("duo_ikey", ""), oc.get("duo_skey", ""), oc.get("duo_host", ""))
     removed = []
+
+    # Order matters. The Secure Access SSO configuration pins its IdP
+    # directory, and the Duo directory sync owns the synced users and groups —
+    # the Admin API returns 400 for every one of them while it exists. Both
+    # used to be manual steps; neither has a delete API, but both can be
+    # driven through their UIs.
+    for label, fn in (("Secure Access teardown", sa_teardown_identity),
+                      ("directory sync delete", duo_delete_directory_sync)):
+        try:
+            ok_t, msg_t = fn(pod_id, db_path, log=_log)
+        except Exception as e:
+            _log(f"WARN: {label} failed: {type(e).__name__}: {e}")
+            continue
+        if not ok_t:
+            _log(f"WARN: {label}: {msg_t}")
+            continue
+        # "no X present" is not something removed — saying so would report a
+        # clean slate as though work had been done.
+        removed += [p.strip() for p in msg_t.split("|")
+                    if not p.strip().lower().startswith("no ")]
 
     stuck = []
     if ikey and skey and host:
@@ -3222,13 +3318,9 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
     if stuck:
         # Be explicit rather than implying a clean slate.
         return False, (f"{detail}. STILL PRESENT: {', '.join(stuck)} — these are "
-                       f"owned by the AD directory sync and cannot be deleted via "
-                       f"the API. Delete the directory sync in Duo (Users -> "
-                       f"External Directories -> Delete Directory Sync) and the "
-                       f"Secure Access IdP directory, then re-run.")
-    return True, (f"{detail}. NOTE: the AD directory sync and the Secure Access IdP "
-                  f"directory must be deleted in their UIs — neither exposes a "
-                  f"delete API.")
+                       f"owned by the AD directory sync, so its delete above must "
+                       f"have failed; check that warning and re-run.")
+    return True, detail
 
 
 def _scc_open_session(ctx, idac_url: str, log=None):
@@ -8957,19 +9049,30 @@ def _sa_confirm(t) -> bool:
     Either way the controls render OUTSIDE [role=dialog], so a scan scoped to
     the dialog finds no buttons at all.
     """
+    # Tick ONLY an acknowledgement, matched on its label. Taking "the first
+    # unchecked checkbox" is wrong: the directory-sync page carries
+    # sync_notes / sync_phones / send_enrollment, and this would silently
+    # toggle a real setting instead.
     ack = t.evaluate("""() => {
         const i = Array.from(document.querySelectorAll('input[type=checkbox]'))
-            .find(x => x.getClientRects().length && !x.checked);
+            .filter(x => x.getClientRects().length && !x.checked)
+            .find(x => {
+                let n = x, t = '';
+                for (let k = 0; k < 4 && n; k++) {
+                    n = n.parentElement;
+                    if (!n) break;
+                    t = (n.innerText||'');
+                    if (t) break;
+                }
+                return /i understand|implications|would like to proceed/i.test(t);
+            });
         if (!i) return null;
-        i.setAttribute('data-ack', '1');
         const r = i.getBoundingClientRect();
         return {x:r.x+r.width/2, y:r.y+r.height/2};
     }""")
     if ack:
         t.mouse.click(ack["x"], ack["y"])
         t.wait_for_timeout(2_000)
-        t.evaluate("""() => document.querySelectorAll('[data-ack]')
-            .forEach(e => e.removeAttribute('data-ack'))""")
 
     # The dialog's own button is the LAST match; the first is the Edit view's.
     hit = t.evaluate("""() => {
