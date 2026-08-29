@@ -114,6 +114,37 @@ be named `ciscosdwan.cfg` in `bootflash:` root.
   `page.mouse.click()` for three-dot menus, Edit, toggles, and Save.
 - Okta ignores Playwright `fill()` — use `press_sequentially()`.
 
+### Duo admin UI
+- The application page is ~5,400px tall and its **Save is a submit at y≈5353**. Neither
+  a coordinate click nor Playwright's locator click reaches it — `scroll_into_view_if_needed`
+  times out on the sticky layout — and **both fail silently with no POST at all**. Submit
+  the form instead: `form.requestSubmit()` on `modify-integration-form` (SAML/app settings)
+  or `outbound-scim-configuration` (SCIM/provisioning).
+- `entity_id` / `acs_url` are **hidden** fields. Writing to them is discarded on save; they
+  are populated only by uploading Secure Access's SP XML through `input[name=xml_file]`.
+  While they read "None", Duo silently refuses to persist "Enable for all users".
+- The IdP metadata URL is **not derivable**. `api-{hash}` does not map to `sso-{hash}.sso` —
+  the SSO host has a different hash and an extra segment (`admin-demodemo…` vs
+  `sso-3d52ddf2.demo.sso…`). Use the "Download XML" control.
+- Attribute mapping: the editable control is the **cds combobox on the table row**,
+  identified via hidden `attributeMapping.0.internalName`. Do not open "Edit mappings" —
+  that is the checklist of *which* attributes to send, and its modal covers the row.
+  Mapped correctly, `internalName` flips `uname` -> `email`.
+- Group multi-select: clicking the picker with **no text** lists exactly the groups not yet
+  selected. Do not type to filter — clearing the input drops the chips already chosen, which
+  is why only the last group ever survived Save. Re-open the dropdown each round.
+
+### Secure Access SSO wizard
+- **SAML is selected by default**; clicking the tile toggles it OFF and leaves Next
+  permanently disabled.
+- `authName` is the input's **id/placeholder**, not its `name` attribute.
+- cds comboboxes render options as **plain visible leaves** — not `li`, not `[role=option]`.
+  Match on text among leaf nodes.
+- A directory can back only **one** SSO configuration. Once used it vanishes from the User
+  Directory dropdown ("No matches found") rather than erroring, so re-running the wizard on
+  a configured org fails at step 1. Check the SSO card first.
+- Abandoning the wizard before Done creates nothing, so a metadata-download pass is safe.
+
 ### Embedding JS in Python strings
 - Nested backtick template literals that interpolate variables are fine.
 - Do **not** use `\'` inside triple-quoted Python to build `onclick="..."` attributes —
