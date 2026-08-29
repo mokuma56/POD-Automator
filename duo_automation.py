@@ -8907,6 +8907,220 @@ def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
         finally:
             br.close()
 
+
+# ── Secure Access teardown ────────────────────────────────────────────────────
+#
+# Neither the SSO configuration nor the IdP directory exposes a delete on its
+# card, or in the expanded row (which offers only Edit and Test Configuration).
+# The delete lives inside **Edit**, and its confirmation button renders OUTSIDE
+# the dialog container — the same shape as the permitted-domain delete.
+
+def _sa_expand_row(t, label: str) -> bool:
+    """Expand one of the collapsed accordion rows by its chevron.
+
+    Clicking the label does nothing, and a fixed pixel offset from it misses,
+    because the label width varies with the configuration name.
+    """
+    hit = t.evaluate("""(lbl) => {
+        const e = Array.from(document.querySelectorAll('*'))
+            .filter(x => x.getClientRects().length && x.children.length === 0 &&
+                         (x.innerText||'').trim() === lbl).pop();
+        if (!e) return null;
+        let n = e;
+        for (let k = 0; k < 6 && n; k++) {
+            n = n.parentElement;
+            if (!n) break;
+            const svg = n.querySelector('svg');
+            if (svg && svg.getClientRects().length) {
+                const s = svg.getBoundingClientRect();
+                return {x: s.x + s.width / 2, y: s.y + s.height / 2};
+            }
+        }
+        return null;
+    }""", label)
+    if not hit:
+        return False
+    t.mouse.click(hit["x"], hit["y"])
+    t.wait_for_timeout(7_000)
+    return True
+
+
+def _sa_confirm(t) -> bool:
+    """Complete a delete confirmation.
+
+    Two shapes appear. The permitted-domain dialog just wants a "Confirm".
+    The identity deletes ("This will remove access for the users...") gate
+    their own Delete behind an acknowledgement checkbox — "I understand all
+    of the implications and would like to proceed" — which must be ticked
+    first, or the button does nothing and the row survives.
+
+    Either way the controls render OUTSIDE [role=dialog], so a scan scoped to
+    the dialog finds no buttons at all.
+    """
+    ack = t.evaluate("""() => {
+        const i = Array.from(document.querySelectorAll('input[type=checkbox]'))
+            .find(x => x.getClientRects().length && !x.checked);
+        if (!i) return null;
+        i.setAttribute('data-ack', '1');
+        const r = i.getBoundingClientRect();
+        return {x:r.x+r.width/2, y:r.y+r.height/2};
+    }""")
+    if ack:
+        t.mouse.click(ack["x"], ack["y"])
+        t.wait_for_timeout(2_000)
+        t.evaluate("""() => document.querySelectorAll('[data-ack]')
+            .forEach(e => e.removeAttribute('data-ack'))""")
+
+    # The dialog's own button is the LAST match; the first is the Edit view's.
+    hit = t.evaluate("""() => {
+        const b = Array.from(document.querySelectorAll('button,[role=button]'))
+            .filter(x => x.getClientRects().length &&
+                         /^(confirm|delete)$/i.test((x.innerText||'').trim())).pop();
+        if (!b) return null;
+        b.scrollIntoView({block:'center'});
+        const r = b.getBoundingClientRect();
+        return {x:r.x+r.width/2, y:r.y+r.height/2};
+    }""")
+    if not hit:
+        return False
+    t.mouse.click(hit["x"], hit["y"])
+    t.wait_for_timeout(14_000)
+    return True
+
+
+def _sa_config_page(t, sa_org: str, ent: str) -> None:
+    t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}"
+           f"/connect/users-and-groups?enterpriseId={ent}",
+           wait_until="load", timeout=45_000)
+    _scc_wait(t, "Configuration management")
+    _scc_click(t, "Configuration management")
+    _scc_wait(t, "SSO authentication")
+    t.wait_for_timeout(6_000)
+
+
+def sa_delete_sso_config(t, sa_org: str, ent: str, name: str = "DuoSSO",
+                         log=None) -> tuple[bool, str]:
+    """Remove the SSO configuration so its directory can be reused.
+
+    Secure Access allows one SSO configuration per directory, so a leftover
+    blocks every re-run of the SAML step.
+    """
+    _log = log or (lambda s: print(f"     [sa-teardown] {s}"))
+    _sa_config_page(t, sa_org, ent)
+    if name not in (_scc_text(t) or ""):
+        return True, f"no {name} SSO configuration present"
+    if not _sa_expand_row(t, name):
+        return False, f"could not expand the {name} row"
+
+    ed = t.locator('button:has-text("Edit"), a:has-text("Edit")').last
+    if ed.count() == 0:
+        return False, "no Edit control on the expanded SSO row"
+    ed.scroll_into_view_if_needed(timeout=15_000)
+    t.wait_for_timeout(1_000)
+    ed.click(timeout=15_000)
+    t.wait_for_timeout(11_000)
+
+    dl = t.locator('button:has-text("Delete")').last
+    if dl.count() == 0:
+        return False, "no Delete control in the SSO Edit view"
+    dl.click(timeout=15_000)
+    t.wait_for_timeout(6_000)
+    _sa_confirm(t)
+
+    _sa_config_page(t, sa_org, ent)
+    if name in (_scc_text(t) or ""):
+        return False, f"{name} is still listed after the delete"
+    _log(f"deleted the {name} SSO configuration")
+    return True, f"deleted the {name} SSO configuration"
+
+
+def sa_delete_idp_directory(t, sa_org: str, ent: str, log=None) -> tuple[bool, str]:
+    """Remove the Duo-NNNNN IdP directory left behind by each run.
+
+    Every rollback/rerun cycle otherwise leaves another one in Secure Access.
+    """
+    import re as _re
+    _log = log or (lambda s: print(f"     [sa-teardown] {s}"))
+    _sa_config_page(t, sa_org, ent)
+    m = _re.search(r"Duo-\d+", _scc_text(t) or "")
+    if not m:
+        return True, "no Duo IdP directory present"
+    dirname = m.group(0)
+    if not _sa_expand_row(t, dirname):
+        return False, f"could not expand the {dirname} row"
+
+    ed = t.locator('button:has-text("Edit"), a:has-text("Edit")').last
+    if ed.count() == 0:
+        return False, f"no Edit control on the expanded {dirname} row"
+    ed.scroll_into_view_if_needed(timeout=15_000)
+    t.wait_for_timeout(1_000)
+    ed.click(timeout=15_000)
+    t.wait_for_timeout(11_000)
+
+    dl = t.locator('button:has-text("Delete")').last
+    if dl.count() == 0:
+        return False, f"no Delete control in the {dirname} Edit view"
+    dl.click(timeout=15_000)
+    t.wait_for_timeout(6_000)
+    _sa_confirm(t)
+
+    _sa_config_page(t, sa_org, ent)
+    if dirname in (_scc_text(t) or ""):
+        return False, f"{dirname} is still listed after the delete"
+    _log(f"deleted the {dirname} IdP directory")
+    return True, f"deleted the {dirname} IdP directory"
+
+
+def sa_teardown_identity(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Remove the SSO configuration and the IdP directory, in that order.
+
+    The directory cannot go while a configuration still authenticates against
+    it.
+    """
+    import re as _re
+    import sqlite3 as _sq
+
+    from playwright.sync_api import sync_playwright as _spw
+
+    _log = log or (lambda s: print(f"  [sa-teardown] {s}"))
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {})
+
+    idac = (oc.get("idac_url") or "").strip()
+    sa_org = (oc.get("sa_org_id") or "").strip()
+    if not (idac and sa_org):
+        return False, "idac_url / sa_org_id missing from org_credentials"
+
+    results, failed = [], []
+    with _spw() as pw:
+        br = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            ctx = br.new_context(ignore_https_errors=True,
+                                 viewport={"width": 1600, "height": 1200})
+            t, ent = _scc_open_session(ctx, idac, log=_log)
+            for fn in (sa_delete_sso_config, sa_delete_idp_directory):
+                try:
+                    ok, msg = fn(t, sa_org, ent, log=_log)
+                except Exception as e:
+                    ok, msg = False, f"{fn.__name__}: {type(e).__name__}: {e}"
+                results.append(msg)
+                if not ok:
+                    failed.append(msg)
+        finally:
+            br.close()
+    if failed:
+        return False, " | ".join(results)
+    return True, " | ".join(results)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Duo Card — manual pipeline (replaces duo_setup/duo_ext_dir/duo_saml_setup
 # pipeline steps).  Stored in duo_steps table.  Smart re-use: if the org
