@@ -3780,7 +3780,10 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
                     rest = (rest + "\n\n" + sso).strip()
                     _log("restored [sso] stanza from org_credentials")
             merged = cloud + ("\n" + rest + "\n" if rest else "")
-            # ad_client binds with the same UPN.
+            # Drop any [ad_client] carried in from an older stored config — the
+            # guide's file is [cloud] + [sso] only (ISE serves RADIUS here).
+            merged = _re.sub(r"^\[ad_client\][^\[]*", "", merged, flags=_re.M)
+            # [cloud] binds with the UPN form.
             merged = _re.sub(r"^service_account_username=(?!.*@)(.+)$",
                              lambda m: f"service_account_username={m.group(1)}@corp.pseudoco.com",
                              merged, flags=_re.M)
@@ -6676,20 +6679,21 @@ def duo_push_authproxy_config(
         except Exception as e:
             _log(f"WARN: could not save authproxy creds to DB: {e}")
 
+        # The guide's authproxy.cfg is [cloud] + [sso] ONLY — it has students
+        # "select all and delete the [sso] and [cloud] configuration" and paste
+        # those two back, expecting Validate to report "There are no
+        # configuration problems" and "No issues detected". [ad_client] is a
+        # RADIUS/LDAP client section this lab never uses (ISE serves RADIUS),
+        # and its simple bind fails against this DC, so shipping it guarantees
+        # the connectivity tool and the Proxy Manager both report problems that
+        # nothing in the lab depends on.
         cfg = (
             "[cloud]\n"
             f"ikey={ap_ikey}\n"
             f"skey={ap_skey}\n"
             f"api_host={duo_host}\n"
-            "\n"
-            "[ad_client]\n"
-            f"host={AD_CLIENT_HOST}\n"
-            f"port={AD_CLIENT_PORT}\n"
-            f"service_account_username={AD_WINRM_USER}\n"
-            f"service_account_password={AD_WINRM_PASS}\n"
-            f"search_dn={AD_CLIENT_BASE_DN}\n"
         )
-        _log(f"built authproxy.cfg ({len(cfg)} bytes): [cloud] + [ad_client]")
+        _log(f"built authproxy.cfg ({len(cfg)} bytes): [cloud]")
 
     # ── 3. Connect to AD1 via WinRM ──────────────────────────────────────────
     _log(f"connecting to AD1 ({AD_CLIENT_HOST}) via WinRM ...")
@@ -8570,8 +8574,39 @@ def duo_configure_sso_auth_source(pod_id: str, db_path: str, log=None) -> tuple[
             return a ? a.getAttribute('href') : null;
         }""")
         if not href:
-            return False, ("no Active Directory external authentication source — "
-                           "run the external directory step first")
+            # Create it rather than giving up. _pw_sso_ext_auth_setup() drives
+            # Add Source -> Add Active Directory, and until now it was reachable
+            # only from duo_ext_dir_and_sso_setup(), which nothing called — so
+            # NOTHING in the card could build this object. A rollback that
+            # removed it left the card permanently unable to recover.
+            _log("no AD external authentication source — creating it")
+            try:
+                ws = _winrm_connect_for_pod(pod_id, log=_log)
+            except Exception as e:
+                return False, f"need WinRM to create the auth source: {e}"
+            try:
+                mk_ok, mk_msg = _pw_sso_ext_auth_setup(
+                    page, ws, SSO_PERMITTED_DOMAIN, _log)
+            finally:
+                if hasattr(ws, "close"):
+                    try:
+                        ws.close()
+                    except Exception as e:
+                        _log(f"winrm close: {type(e).__name__}")
+            if not mk_ok:
+                return False, f"could not create the AD auth source: {mk_msg}"
+            notes.append("AD auth source created")
+            page.goto(f"https://{host}/sso?selected_tab=authentication_sources",
+                      wait_until="load", timeout=45_000)
+            page.wait_for_timeout(9_000)
+            href = page.evaluate("""() => {
+                const a = Array.from(document.querySelectorAll('a'))
+                    .find(x => /^active directory$/i.test((x.innerText||'').trim()));
+                return a ? a.getAttribute('href') : null;
+            }""")
+            if not href:
+                return False, ("created the AD auth source but it is not listed "
+                               "on External Authentication Sources")
         page.goto(f"https://{host}{href}", wait_until="load", timeout=45_000)
         page.wait_for_timeout(11_000)
 
