@@ -10201,7 +10201,7 @@ async function pollDuoLogs(podId) {
       const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
       d.lines.forEach(l => {
         const t = (l.timestamp || '').substring(11, 19);
-        pre.textContent += (t ? t + '  ' : '') + (l.log_line || '').replace(/^\[duo\]\s*/, '') + '\n';
+        pre.textContent += (t ? t + '  ' : '') + (l.log_line || '').replace(/^\\[duo\\]\\s*/, '') + '\\n';
       });
       window._duoLogSince = d.last_id;
       // Only autoscroll when the user has not scrolled up to read something.
