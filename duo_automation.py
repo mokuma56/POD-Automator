@@ -8418,25 +8418,15 @@ def duo_configure_sso_auth_source(pod_id: str, db_path: str, log=None) -> tuple[
                                (m.group(1),)).fetchone() or {})
 
     host = (oc.get("duo_admin_host") or "").strip()
-    api_host = (oc.get("duo_host") or "").strip()
-    ikey, skey = (oc.get("duo_ikey") or "").strip(), (oc.get("duo_skey") or "").strip()
     if not host:
         return False, "duo_admin_host missing from org_credentials"
 
-    # Which domains matter is a property of this pod's users, not a constant.
-    domains = []
-    try:
-        users = _duo_request(ikey, skey, api_host, "GET",
-                             "/admin/v1/users").get("response", [])
-        for u in users:
-            d = (u.get("email") or "").split("@")[-1].strip().lower()
-            if d and d not in domains:
-                domains.append(d)
-    except Exception as e:
-        return False, f"could not list Duo users to derive email domains: {e}"
-    if not domains:
-        return False, "no user email domains found — run the AD sync first"
-    _log(f"email domains in use: {', '.join(domains)}")
+    # The guide permits the base domain only. Deriving this from user emails
+    # also picks up the per-pod subdomain (kit is kit@rtp17.corp.pseudoco.com),
+    # which is not what the lab asks for — Duo matches the subdomain against
+    # the permitted base domain.
+    domains = [SSO_PERMITTED_DOMAIN]
+    _log(f"permitted domain: {SSO_PERMITTED_DOMAIN}")
 
     notes = []
     pw = br = None
@@ -8535,7 +8525,7 @@ def duo_configure_sso_auth_source(pod_id: str, db_path: str, log=None) -> tuple[
             # and re-added every run (Duo dedupes, so nothing broke visibly).
             # Compare the first cell exactly: rtp17.corp.pseudoco.com contains
             # corp.pseudoco.com as a substring.
-            if page.evaluate("""(d) => Array.from(document.querySelectorAll('tr'))
+            if page.evaluate(r"""(d) => Array.from(document.querySelectorAll('tr'))
                 .some(r => {
                     const c = r.querySelector('td');
                     return c && (c.innerText||'').trim().split(/\s+/)[0] === d;
