@@ -2962,7 +2962,7 @@ def duo_setup_secure_access_app(pod_id: str, db_path: str, log=None) -> tuple[bo
                 tagged = page.evaluate("""(known) => {
                     // NB: do not require an empty value — the picker keeps text
                     // after a pick and would stop matching.
-                    const i = Array.from(document.querySelectorAll('input[type=text]'))
+                    const i = Array.from(document.querySelectorAll('input')).filter(x => x.type === 'text')
                         .filter(x => x.getClientRects().length)
                         .find(x => !known.includes(x.name) &&
                                    (x.placeholder||'').toLowerCase() !== 'username' &&
@@ -3890,10 +3890,17 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
             # every lookup found nothing. The picker is the unnamed, empty,
             # visible text input; the selection ultimately lands in the hidden
             # input named "groups".
+            #
+            # Match on the .type PROPERTY, never the CSS selector
+            # input[type=text]: Duo renders these inputs with no type attribute
+            # at all, so the attribute selector matches zero elements while
+            # .type still reads "text". That is what made this report
+            # "group picker input never rendered" and "visible text inputs = []"
+            # on a page that plainly had four of them.
             for _ in range(20):
                 page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(3_000)
-                if page.evaluate("""() => Array.from(document.querySelectorAll('input[type=text]'))
+                if page.evaluate("""() => Array.from(document.querySelectorAll('input')).filter(x => x.type === 'text')
                         .some(i => !i.name && !i.id && !i.value && i.getClientRects().length)"""):
                     break
             else:
@@ -3920,7 +3927,7 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
 
                 found = page.evaluate("""() => {
                     // the picker carries no name, no id and no value
-                    const i = Array.from(document.querySelectorAll('input[type=text]'))
+                    const i = Array.from(document.querySelectorAll('input')).filter(x => x.type === 'text')
                         .filter(x => x.getClientRects().length)
                         .find(x => !x.name && !x.id && !x.value);
                     if (!i) return false;
@@ -3930,7 +3937,7 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
                 if not found:
                     _log(f"  group picker input not present for {want!r}; visible text "
                          f"inputs = " + str(page.evaluate(
-                             """() => Array.from(document.querySelectorAll('input[type=text]'))
+                             """() => Array.from(document.querySelectorAll('input')).filter(x => x.type === 'text')
                                 .map(i => ({n: i.name||'', id: i.id||'', v: (i.value||'').slice(0,18),
                                             vis: !!i.getClientRects().length}))""")))
                     continue
@@ -8673,7 +8680,7 @@ def duo_configure_sso_auth_source(pod_id: str, db_path: str, log=None) -> tuple[
         }""")
         if "Active Directory" not in cur:
             box = page.evaluate("""() => {
-                const i = Array.from(document.querySelectorAll('input[type=text]'))
+                const i = Array.from(document.querySelectorAll('input')).filter(x => x.type === 'text')
                     .filter(x => x.getClientRects().length &&
                                  x.id !== 'global-search-input' &&
                                  x.name !== 'primary_auth_expiration_value')[0];
@@ -10233,7 +10240,45 @@ def duo_run_card(
             except Exception as e:
                 return False, f"bootstrapped but could not re-read credentials: {e}"
         else:
-            parts.append("already bootstrapped")
+            # Presence is not validity. A rollback that deletes the Admin API
+            # application in Duo leaves these columns populated but orphaned,
+            # and every later step then dies on 401 — which is exactly how the
+            # card failed at org_setup after a manual teardown. Probe the
+            # credentials and re-mint the application if they are dead.
+            try:
+                _duo_request(duo_ikey, duo_skey, duo_host, "GET",
+                             "/admin/v1/info/summary")
+                parts.append("already bootstrapped")
+            except Exception as e:
+                if "401" not in str(e) and "403" not in str(e):
+                    raise
+                _log(f"stored Admin API credentials rejected ({str(e)[:60]}) — "
+                     f"re-creating the Admin API application")
+                rpw = rbr = None
+                try:
+                    rpw, rbr, rctx, rpage = duo_passkey_login(pod_id, db_path, log=_log)
+                    creds = _pw_create_admin_api_app(
+                        rpage, rpage.url.split("/")[2], log=_log)
+                finally:
+                    try:
+                        if rbr:
+                            rbr.close()
+                        if rpw:
+                            rpw.stop()
+                    except Exception as ce:
+                        _log(f"browser cleanup: {type(ce).__name__}")
+                duo_ikey = creds["ikey"]
+                duo_skey = creds["skey"]
+                duo_host = creds.get("host") or duo_host
+                with _sq.connect(db_path) as conn:
+                    conn.execute(
+                        "UPDATE org_credentials SET duo_ikey=?, duo_skey=?, duo_host=?, "
+                        "updated_at=datetime('now') WHERE org_number=?",
+                        (duo_ikey, duo_skey, duo_host, org_num))
+                # Prove the new credentials before letting the card continue.
+                _duo_request(duo_ikey, duo_skey, duo_host, "GET",
+                             "/admin/v1/info/summary")
+                parts.append("Admin API application re-created")
 
         # Students work from Jumphost1 and never see this dashboard, so the
         # proctor-facing passcode panel is no use to them. Make sure the org has
