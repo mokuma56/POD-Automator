@@ -8529,11 +8529,17 @@ def duo_configure_sso_auth_source(pod_id: str, db_path: str, log=None) -> tuple[
             page.goto(f"https://{host}/sso?selected_tab=settings",
                       wait_until="load", timeout=45_000)
             page.wait_for_timeout(9_000)
-            if page.evaluate("""(d) => {
-                const e = Array.from(document.querySelectorAll('div,section'))
-                    .filter(x => /permitted domain/i.test(x.innerText||'')).pop();
-                return e ? (e.innerText||'').includes(d) : false;
-            }""", dom):
+            # Match the domain in the list's own rows. Scoping to a
+            # /permitted domain/ container picked the description block, which
+            # never contains the entries, so this always reported "missing"
+            # and re-added every run (Duo dedupes, so nothing broke visibly).
+            # Compare the first cell exactly: rtp17.corp.pseudoco.com contains
+            # corp.pseudoco.com as a substring.
+            if page.evaluate("""(d) => Array.from(document.querySelectorAll('tr'))
+                .some(r => {
+                    const c = r.querySelector('td');
+                    return c && (c.innerText||'').trim().split(/\s+/)[0] === d;
+                })""", dom):
                 _log(f"permitted domain {dom}: already present")
                 continue
             # This button sits near the bottom of a long, lazily-rendered page;
@@ -8686,6 +8692,14 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
         page.goto(f"https://{host}{href}", wait_until="load", timeout=45_000)
         page.wait_for_timeout(11_000)
 
+        # Every enrolment adds another proxy record, so stop early when one is
+        # already connected — otherwise a re-run of the card litters the source.
+        if page.evaluate("""() => Array.from(document.querySelectorAll('tr'))
+                .some(r => /connected to duo/i.test(r.innerText||'') &&
+                           !/not connected/i.test(r.innerText||''))"""):
+            _log("an Authentication Proxy is already connected to Duo SSO")
+            return True, "Authentication Proxy already connected to Duo Single Sign-On"
+
         add = page.locator('button:has-text("Add Authentication Proxy")').last
         if add.count() == 0:
             return False, "no 'Add Authentication Proxy' control on the AD source page"
@@ -8784,7 +8798,10 @@ def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
     from playwright.sync_api import sync_playwright as _spw
 
     _log = log or (lambda s: print(f"  [duo-sso-test] {s}"))
-    password = password or _os.environ.get("LAB_USER_PASSWORD", "")
+    # Prefer the environment; fall back to the existing module constant rather
+    # than copying the literal forward (see CLAUDE.md on credentials). The lab
+    # users share the standard lab password.
+    password = password or _os.environ.get("LAB_USER_PASSWORD", "") or AD_WINRM_PASS
     if not password:
         return False, ("no test password — set LAB_USER_PASSWORD "
                        "(the lab user password) in the environment")
