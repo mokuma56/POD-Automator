@@ -164,6 +164,17 @@ misleading messages:
 - Secure Access's SSO rows are **collapsed accordions**; the label is inert, the chevron
   opens them, and only then do "Edit" and "Test Configuration" exist.
 
+### Duo DOM: never use `input[type=text]`
+Duo renders inputs with **no `type` attribute**, so the CSS attribute selector
+`input[type=text]` matches **zero** elements while the DOM property `.type` still
+reads `"text"`. On the directory-sync page all four text inputs are `attr=null`.
+Filter on the property instead:
+`Array.from(document.querySelectorAll('input')).filter(x => x.type === 'text')`.
+This silently broke the AD group picker — it logged "group picker input never
+rendered" and "visible text inputs = []" on a page that plainly had four, which
+left the sync with no groups, Complete Setup disabled, no users, and every
+downstream card step failing.
+
 ### Secure Access SSO wizard
 - **SAML is selected by default**; clicking the tile toggles it OFF and leaves Next
   permanently disabled.
