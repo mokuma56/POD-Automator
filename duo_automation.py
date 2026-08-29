@@ -3092,10 +3092,18 @@ def duo_setup_secure_access_app(pod_id: str, db_path: str, log=None) -> tuple[bo
             _log(f"user-access step: {type(e).__name__}: {str(e)[:70]}")
 
         if ok and not access_ok:
-            return False, (f"Cisco Secure Access app {app_ikey} is provisioning "
-                           f"{total} users, but 'Enable for all users' did not "
-                           f"persist on the Single Sign-On tab — users cannot "
-                           f"authenticate through the app")
+            # Not a failure of THIS step. "Enable for all users" cannot persist
+            # until entity_id/acs_url exist, and those are populated only by
+            # uploading Secure Access's Service Provider XML — which the
+            # sso_saml step does, afterwards, because it needs the very
+            # app_ikey created here. The dependency is circular, so this step
+            # owns provisioning and sso_saml owns user access; it re-asserts
+            # and verifies the flag once the metadata is in place.
+            return True, (f"Cisco Secure Access app {app_ikey} provisioning "
+                          f"{total} users to SA (groups: "
+                          f"{', '.join(picked) or 'preexisting'}); 'Enable for all "
+                          f"users' still pending — it needs the Service Provider "
+                          f"XML, which the sso_saml step uploads and verifies")
         if ok:
             return True, (f"Cisco Secure Access app {app_ikey} provisioning "
                           f"{total} users to SA (groups: {', '.join(picked) or 'preexisting'}), "
