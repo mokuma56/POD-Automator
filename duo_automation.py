@@ -8867,9 +8867,24 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
         # module has no section to start, so the proxy never connects. This
         # only shows up from a truly clean state — a leftover [sso] block used
         # to mask it.
-        sso_cfg = (_pw_get_copy_content(page, "1.2", log=_log)
-                   or _pw_get_copy_content(page, "SSO section", log=_log)
-                   or _pw_get_copy_content(page, "service account", log=_log))
+        # Identify the block by its CONTENT, not by a nearby heading.
+        # _pw_get_copy_content(page, "1.2") uses *:has-text('1.2'), and
+        # :has-text matches ancestors, so it selected a large container and
+        # returned the FIRST <pre> inside it — step 1.1's file path. That got
+        # appended to authproxy.cfg as a bare string, leaving [sso] still
+        # absent while the log claimed the stanza was written.
+        sso_cfg = page.evaluate("""() => {
+            const cand = Array.from(document.querySelectorAll('pre,code,textarea,div,span'))
+                .filter(e => e.getClientRects().length)
+                .map(e => ((e.innerText || e.value || '')).trim())
+                .filter(t => /^\[sso\]/m.test(t) && t.length < 4000);
+            if (!cand.length) return '';
+            // the tightest element containing the stanza
+            return cand.sort((a, b) => a.length - b.length)[0];
+        }""")
+        if sso_cfg and not re.search(r"^\[sso\]", sso_cfg, re.M):
+            _log(f"ignoring captured text — not an [sso] stanza: {sso_cfg[:60]!r}")
+            sso_cfg = ""
         if sso_cfg:
             _log(f"[sso] stanza captured ({len(sso_cfg)} chars)")
 
