@@ -4507,24 +4507,42 @@ def duo_passkey_login(pod_id: str, db_path: str, log=None):
     if not creds:
         raise RuntimeError(f"org {org_num} has no stored passkey — run duo_passkey_bootstrap first")
 
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-    ctx = browser.new_context(ignore_https_errors=True,
-                              viewport={"width": 1500, "height": 1100},
-                              permissions=["clipboard-read", "clipboard-write"])
-    page = ctx.new_page()
-    cdp, auth_id, base = _pw_load_passkey(ctx, page, creds, oc.get("duo_passkey_hwm") or 0)
-    ok = _pw_duo_admin_login_passkey(page, oc["duo_admin_host"], oc["duo_admin_email"],
-                                     oc["duo_admin_password"], log=_log)
-    hwm = _pw_read_signcount(cdp, auth_id, base)
-    with _sq.connect(db_path) as conn:
-        conn.execute("UPDATE org_credentials SET duo_passkey_hwm=? WHERE org_number=?",
-                     (hwm, org_num))
-    if not ok:
+    # The stored high-water mark can fall BEHIND Duo's own counter: a login
+    # that is interrupted after the assertion but before the save (a killed
+    # run, a crash, a timeout) advances Duo and not us. The next attempt then
+    # presents a counter Duo has already seen and is rejected as a clone —
+    # "Passkey authentication failed" — and no amount of retrying at the same
+    # offset will ever recover. Escalate the offset instead.
+    stored_hwm = int(oc.get("duo_passkey_hwm") or 0)
+    attempts = [50, 5_000, 250_000]
+    pw = browser = None
+    for i, bump in enumerate(attempts):
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = browser.new_context(ignore_https_errors=True,
+                                  viewport={"width": 1500, "height": 1100},
+                                  permissions=["clipboard-read", "clipboard-write"])
+        page = ctx.new_page()
+        cdp, auth_id, base = _pw_load_passkey(ctx, page, creds, stored_hwm + bump - 50)
+        ok = _pw_duo_admin_login_passkey(page, oc["duo_admin_host"], oc["duo_admin_email"],
+                                         oc["duo_admin_password"], log=_log)
+        hwm = _pw_read_signcount(cdp, auth_id, base)
+        if ok:
+            # Persist only on success. Saving after a failure would bank a
+            # counter the relying party never accepted.
+            with _sq.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE org_credentials SET duo_passkey_hwm=? WHERE org_number=?",
+                    (hwm, org_num))
+            return pw, browser, ctx, page
         browser.close()
         pw.stop()
-        raise RuntimeError("passkey login failed")
-    return pw, browser, ctx, page
+        if i + 1 < len(attempts):
+            _log(f"passkey rejected at signCount {base} — retrying "
+                 f"{attempts[i + 1]} above the stored mark")
+    raise RuntimeError(
+        f"passkey login failed at signCount offsets {attempts} above {stored_hwm} — "
+        f"Duo's counter may be further ahead, or the credential was removed")
 
 
 def _pw_duo_admin_login_totp(admin_host: str, email: str, password: str,
