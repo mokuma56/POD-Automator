@@ -2930,52 +2930,90 @@ def duo_setup_secure_access_app(pod_id: str, db_path: str, log=None) -> tuple[bo
             page.wait_for_timeout(3_000)
 
             # groupSource has two options: manualGroups ("Select groups") and
-            # SSOPermittedGroups. Pick by value, not position.
-            page.evaluate("""() => {
+            # SSOPermittedGroups. Pick by value, not position, with a real mouse
+            # event — Duo's newer components ignore JS clicks.
+            radio_ok = page.evaluate("""() => {
                 const r = Array.from(document.querySelectorAll('input[name="groupSource"]'))
                     .find(x => (x.value||'').toLowerCase().startsWith('manual'));
-                if (r && !r.checked) r.click();
+                if (!r) return false;
+                r.setAttribute('data-gs', '1');
+                return true;
             }""")
-            page.wait_for_timeout(2_500)
+            if radio_ok:
+                _duo_mclick(page, selector='input[data-gs="1"]')
+                page.evaluate("""() => document.querySelectorAll('[data-gs]')
+                    .forEach(e => e.removeAttribute('data-gs'))""")
+            page.wait_for_timeout(3_000)
 
             # The picker's name is a fresh UUID on every render, so identify it
-            # structurally: the text input that is none of the known fields.
+            # structurally: the visible, empty text input that is none of the
+            # known fields.
             KNOWN = ("credentials.baseUrl", "credentials.credentialDetail.token",
                      "iname", "entity_id", "acs_url")
-            for g in AD_GROUPS:
-                sel = page.evaluate("""(known) => {
-                    const i = Array.from(document.querySelectorAll('input[type=text]'))
-                        .filter(x => x.getClientRects().length)
-                        .find(x => !known.includes(x.name) &&
-                                   (x.placeholder||'').toLowerCase() !== 'username' &&
-                                   x.id !== 'global-search-input');
-                    if (!i) return null;
-                    i.setAttribute('data-pick', '1');
-                    return true;
-                }""", list(KNOWN))
-                if not sel:
-                    _log("group picker input not found")
-                    break
+            # Tag the picker ONCE. Re-finding it per group failed after the
+            # first pass, because the filter required an empty value and the
+            # input still held the text just typed into it.
+            tagged = page.evaluate("""(known) => {
+                const i = Array.from(document.querySelectorAll('input[type=text]'))
+                    .filter(x => x.getClientRects().length && !x.value)
+                    .find(x => !known.includes(x.name) &&
+                               (x.placeholder||'').toLowerCase() !== 'username' &&
+                               x.id !== 'global-search-input');
+                if (!i) return false;
+                i.setAttribute('data-pick', '1');
+                return true;
+            }""", list(KNOWN))
+            if not tagged:
+                _log("group picker input not found on the provisioning tab")
+            for g in AD_GROUPS if tagged else []:
                 box = page.locator('input[data-pick="1"]').first
                 box.click()
-                box.fill(g)
-                page.wait_for_timeout(3_500)
+                # Do NOT fill("") here — clearing the input wipes the chips
+                # already chosen, so only the last group ever survived Save.
+                # Select-all + type replaces just the search text.
+                box.press("Control+a")
+                box.type(g, delay=120)
+                page.wait_for_timeout(4_000)
+                # Mouse-click the option; a JS click is swallowed here too.
+                # Duo renders these options as div[class*=option] / div[class*=menu],
+                # NOT as li or [role=option] — every earlier selector missed them
+                # and reported an empty option list.
                 hit = page.evaluate(f"""() => {{
                     const t = {g!r}.toLowerCase();
-                    const e = Array.from(document.querySelectorAll('li,[role=option],.cds-menu-item'))
-                        .filter(x => x.getClientRects().length)
-                        .find(x => (x.innerText||'').trim().toLowerCase().startsWith(t));
-                    if (e) {{ e.click(); return (e.innerText||'').trim().slice(0,32); }}
-                    return null;
+                    const e = Array.from(document.querySelectorAll(
+                            'li,[role=option],[role=menuitem],.cds-menu-item,'
+                            + 'div[class*=option],div[class*=menu]'))
+                        .filter(x => x.getClientRects().length && x.children.length === 0 &&
+                                     !x.closest('nav') && !x.closest('.cds-nav'))
+                        .filter(x => (x.innerText||'').trim().toLowerCase().startsWith(t))
+                        .sort((a,b) => (a.innerText||'').length - (b.innerText||'').length)[0];
+                    if (!e) return null;
+                    e.scrollIntoView({{block:'center'}});
+                    const r = e.getBoundingClientRect();
+                    return {{x: r.x + r.width/2, y: r.y + r.height/2,
+                             txt: (e.innerText||'').trim().slice(0,32)}};
                 }}""")
                 if hit:
-                    picked.append(hit)
-                page.evaluate("""() => document.querySelectorAll('[data-pick]')
-                    .forEach(e => e.removeAttribute('data-pick'))""")
-                page.wait_for_timeout(2_000)
+                    page.mouse.click(hit["x"], hit["y"])
+                    picked.append(hit["txt"])
+                    _log(f"  selected group {hit['txt']!r}")
+                else:
+                    _log(f"  {g!r} not offered; options were " + str(page.evaluate(
+                        """() => Array.from(document.querySelectorAll('li,[role=option],.cds-menu-item'))
+                           .filter(e => e.getClientRects().length && !e.closest('.cds-nav'))
+                           .map(e => (e.innerText||'').trim()).filter(Boolean).slice(0,10)""")))
+                page.wait_for_timeout(2_500)
         except Exception as e:
             _log(f"group selection: {type(e).__name__}: {str(e)[:70]}")
-        _log(f"groups mapped: {picked or 'NONE'}")
+        # Selecting only stages the choice — without Save the chips vanish on
+        # reload and provisioning keeps its old (empty) scope. Same trap as the
+        # AD directory sync picker.
+        if picked:
+            saved = _duo_mclick(page, text="Save")
+            _log(f"groups {picked} selected; Save clicked={saved}")
+            page.wait_for_timeout(8_000)
+        else:
+            _log("groups mapped: NONE")
 
         # ── Save + enable ─────────────────────────────────────────────────────
         page.evaluate("""() => {
