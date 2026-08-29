@@ -10768,6 +10768,19 @@ def duo_run_card(
             if "running" not in svc.lower():
                 return False, f"DuoAuthProxy service: {svc} (not running)"
 
+            # A section that is ABSENT reports no problems, so "no problems"
+            # alone is not health: this passed with "connectivity OK for
+            # cloud, sso" while authproxy.cfg held [cloud] only and SSO was
+            # completely dead. Require the sections to exist first.
+            cfg = sess.run_ps(f"Get-Content '{AUTHPROXY_CFG_PATH}' -Raw") \
+                      .std_out.decode(errors="replace")
+            present = re.findall(r"^\[([^\]]+)\]", cfg, re.M)
+            missing = [x for x in OWNED if x not in present]
+            if missing:
+                return False, (f"authproxy.cfg is missing section(s) "
+                               f"{', '.join('[' + x + ']' for x in missing)} — "
+                               f"has {', '.join('[' + x + ']' for x in present) or 'nothing'}")
+
             out = sess.run_ps(f"& '{CONN_TOOL}' 2>&1 | Out-String") \
                       .std_out.decode(errors="replace")
             if "SUMMARY" not in out:
