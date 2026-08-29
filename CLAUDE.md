@@ -134,6 +134,36 @@ be named `ciscosdwan.cfg` in `bootflash:` root.
   selected. Do not type to filter — clearing the input drops the chips already chosen, which
   is why only the last group ever survived Save. Re-open the dropdown each round.
 
+### Duo SSO (getting a user actually logged in)
+Four things beyond the SAML metadata exchange, all of which fail silently or with
+misleading messages:
+- The **AD external authentication source must be Enabled** *and* carry its server
+  configuration (host/port/base DN). Blank config → "The authentication source is not
+  configured"; disabled → the login is refused before any auth event is logged.
+- **Every user email domain must be a Permitted Domain.** These are pod-specific — POD-17
+  carries both `corp.pseudoco.com` and `rtp17.corp.pseudoco.com` — so derive them from the
+  users in Duo, never hardcode.
+- The **Routing Rules default rule** must point at Active Directory. It defaults to Duo,
+  which cannot authenticate AD-synced users.
+- The **Auth Proxy must be enrolled with Duo SSO**, or the login reaches the password
+  prompt and returns "Invalid credentials". The tell is `40112` / "Rotate call failed" in
+  `authproxy.log`. Enrol with **`authproxy_update_sso_enrollment_code.exe`** — *not*
+  `authproxyctl.exe` — and get the code from the UI ("Add Authentication Proxy" →
+  "Generate command"); it only renders on a freshly created proxy page, is single-use, and
+  the base64 blob wraps across lines and contains characters PowerShell treats specially,
+  so rejoin it and pass it as a quoted argument.
+- `/admin/v1/integrations` returns 403 for the lab's Admin API key; the guide never uses
+  the API for any of this.
+- MFA is on by default and blocks the lab. The guide sets **Global Policy** → New user
+  policy = "Allow access without MFA" (`sections.new_user.new_user_behavior=no-mfa`) and
+  Authentication policy = "Skip MFA"
+  (`sections.authentication_policy.user_auth_behavior=bypass`). Do **not** edit the
+  separate Default Self-Service Portal Policy. The editor's first-run overlay blocks its
+  section nav until dismissed, those sections live in a `<nav>`, and saving navigates back
+  to the table — so capture the editor URL before saving or verification reads the wrong page.
+- Secure Access's SSO rows are **collapsed accordions**; the label is inert, the chevron
+  opens them, and only then do "Edit" and "Test Configuration" exist.
+
 ### Secure Access SSO wizard
 - **SAML is selected by default**; clicking the tile toggles it OFF and leaves Next
   permanently disabled.
