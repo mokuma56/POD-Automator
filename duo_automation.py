@@ -3737,24 +3737,130 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
                 return True, (f"AD directory sync Connected (ikey={ikey}, dc={AD_DC_IP}, "
                               f"dirkey={dirkey}) — groups already configured: {existing}")
 
-            picked = page.evaluate("""(wanted) => {
-                // Open the AD group picker, then tick the lab's three groups.
-                const opener = Array.from(document.querySelectorAll('button,a,div'))
-                    .find(x => /select ad groups/i.test((x.innerText || '').trim()) &&
-                               (x.innerText || '').trim().length < 40);
-                if (opener) opener.click();
-                const out = [];
-                document.querySelectorAll('input[type=checkbox]').forEach(cb => {
-                    const lab = (cb.closest('label')?.innerText ||
-                        document.querySelector('label[for="'+cb.id+'"]')?.innerText ||
-                        (cb.parentElement && cb.parentElement.innerText) || '').trim();
-                    if (wanted.some(w => lab.toLowerCase() === w.toLowerCase()) && !cb.checked) {
-                        cb.click(); out.push(lab.slice(0, 24));
-                    }
-                });
-                return {opened: !!opener, picked: out};
-            }""", list(AD_GROUPS))
-            _log(f"group picker opened={picked.get('opened')} selected={picked.get('picked')}")
+            # The picker is a dropdown, not a checkbox list, and Duo's newer
+            # components ignore JS element.click() — the previous version opened
+            # nothing, looked for checkboxes that do not exist, and did it all in
+            # a single evaluate with no time for options to render. Use real
+            # mouse events with waits between each step.
+            picked_names = []
+            # Re-navigate rather than reusing the render we arrived on. Coming
+            # here from the connection edit leaves a partially-mounted form
+            # whose only text input is directory_key; a direct load renders the
+            # picker and attribute fields reliably.
+            page.goto(f"https://{host}/users/directorysync/{dirkey}",
+                      wait_until="load", timeout=40_000)
+            page.wait_for_timeout(9_000)
+            # The sync page mounts progressively: for a while the only text
+            # input is directory_key, and the group picker plus the attribute
+            # fields do not exist yet. Wait for a late-rendering field before
+            # touching the picker, or every lookup silently finds nothing.
+            # Wait for the PICKER ITSELF, not a nearby field. Waiting on
+            # username_attribute passed while the picker was still absent, so
+            # every lookup found nothing. The picker is the unnamed, empty,
+            # visible text input; the selection ultimately lands in the hidden
+            # input named "groups".
+            for _ in range(20):
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(3_000)
+                if page.evaluate("""() => Array.from(document.querySelectorAll('input[type=text]'))
+                        .some(i => !i.name && !i.id && !i.value && i.getClientRects().length)"""):
+                    break
+            else:
+                _log("WARN: group picker input never rendered")
+            # The picker is an UNNAMED text input beside the selected-group
+            # chips. Its label ("Select AD groups") disappears once any chip
+            # exists, so identify it by exclusion instead. Type the group name,
+            # then mouse-click the matching option.
+            KNOWN_INPUTS = ("global-search-input", "directory_key",
+                            "username_attribute", "realname_attribute",
+                            "email_attribute")
+            opened = False
+            for want in AD_GROUPS:
+                already = page.evaluate(f"""() => {{
+                    const t = {want!r}.toLowerCase();
+                    return Array.from(document.querySelectorAll('*'))
+                        .some(e => e.children.length === 0 &&
+                              (e.textContent||'').trim().toLowerCase() === '×' + t);
+                }}""")
+                if already:
+                    picked_names.append(want)
+                    _log(f"  group {want!r} already selected")
+                    continue
+
+                found = page.evaluate("""() => {
+                    // the picker carries no name, no id and no value
+                    const i = Array.from(document.querySelectorAll('input[type=text]'))
+                        .filter(x => x.getClientRects().length)
+                        .find(x => !x.name && !x.id && !x.value);
+                    if (!i) return false;
+                    i.setAttribute('data-gp', '1');
+                    return true;
+                }""")
+                if not found:
+                    _log(f"  group picker input not present for {want!r}; visible text "
+                         f"inputs = " + str(page.evaluate(
+                             """() => Array.from(document.querySelectorAll('input[type=text]'))
+                                .map(i => ({n: i.name||'', id: i.id||'', v: (i.value||'').slice(0,18),
+                                            vis: !!i.getClientRects().length}))""")))
+                    continue
+                opened = True
+                box = page.locator('input[data-gp="1"]').first
+                box.click()
+                box.fill("")
+                box.type(want, delay=120)
+                page.wait_for_timeout(4_000)
+
+                hit = page.evaluate(f"""() => {{
+                    const t = {want!r}.toLowerCase();
+                    // exclude the sidebar nav, which also contains short labels
+                    const e = Array.from(document.querySelectorAll(
+                            'li,[role=option],[role=menuitem],.cds-menu-item'))
+                        .filter(x => x.getClientRects().length && !x.closest('nav') &&
+                                     !x.closest('.cds-nav'))
+                        .filter(x => (x.innerText||'').trim().toLowerCase().startsWith(t))
+                        .sort((a,b) => (a.innerText||'').length - (b.innerText||'').length)[0];
+                    if (!e) return null;
+                    e.scrollIntoView({{block:'center'}});
+                    const r = e.getBoundingClientRect();
+                    return {{x: r.x + r.width/2, y: r.y + r.height/2,
+                             txt: (e.innerText||'').trim().slice(0,30)}};
+                }}""")
+                page.evaluate("""() => document.querySelectorAll('[data-gp]')
+                    .forEach(e => e.removeAttribute('data-gp'))""")
+                if hit:
+                    page.mouse.click(hit["x"], hit["y"])
+                    picked_names.append(hit["txt"])
+                    _log(f"  selected group {hit['txt']!r}")
+                    page.wait_for_timeout(3_000)
+                else:
+                    _log(f"  group {want!r} not offered by the picker")
+
+            # Selecting a group only stages it — without an explicit Save the
+            # chips vanish on reload and the sync keeps its old scope. This is
+            # why a run that visibly selected IoT still imported nothing until
+            # Save was pressed by hand.
+            if picked_names:
+                saved = _duo_mclick(page, text="Save")
+                page.wait_for_timeout(6_000)
+                # Confirm against the API rather than trusting the click.
+                try:
+                    gs = _duo_request(oc_ikey, oc_skey, oc_host, "GET",
+                                      "/admin/v1/groups").get("response", [])
+                    live = [g.get("name", "") for g in gs
+                            if any(g.get("name", "").lower().startswith(w.lower())
+                                   for w in AD_GROUPS)]
+                    _log(f"Save clicked={saved}; groups now in Duo: {live}")
+                    picked_names = live or picked_names
+                except Exception as e:
+                    _log(f"could not verify groups after Save: {type(e).__name__}")
+            picked = {"opened": opened, "picked": picked_names}
+            if not picked_names:
+                # Leave a trace of what WAS on screen, so a failure here is
+                # diagnosable instead of just "NONE".
+                _log("picker offered: " + str(page.evaluate(
+                    """() => Array.from(document.querySelectorAll('li,[role=option],.cds-menu-item'))
+                       .filter(e => e.getClientRects().length)
+                       .map(e => (e.innerText||'').trim()).filter(Boolean).slice(0,12)""")))
             page.wait_for_timeout(3_000)
 
             # Guide: First Name -> givenname, Last Name -> sn.
