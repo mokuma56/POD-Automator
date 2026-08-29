@@ -8819,8 +8819,9 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
         m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
         if not m:
             return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        org_num = m.group(1)
         oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
-                               (m.group(1),)).fetchone() or {})
+                               (org_num,)).fetchone() or {})
 
     host = (oc.get("duo_admin_host") or "").strip()
     if not host:
@@ -8859,6 +8860,18 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
         page.wait_for_timeout(1_500)
         add.click(timeout=15_000)
         page.wait_for_timeout(10_000)
+
+        # Step 1.2 on this page yields the [sso] stanza that must exist in
+        # authproxy.cfg BEFORE the enrollment code is applied. Without it the
+        # code is stored ("All secrets stored successfully") but the CloudSSO
+        # module has no section to start, so the proxy never connects. This
+        # only shows up from a truly clean state — a leftover [sso] block used
+        # to mask it.
+        sso_cfg = (_pw_get_copy_content(page, "1.2", log=_log)
+                   or _pw_get_copy_content(page, "SSO section", log=_log)
+                   or _pw_get_copy_content(page, "service account", log=_log))
+        if sso_cfg:
+            _log(f"[sso] stanza captured ({len(sso_cfg)} chars)")
 
         if not _leaf_click(page, "^generate command$", wait=10_000):
             return False, "no 'Generate command' control on the proxy page"
@@ -8905,6 +8918,23 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
             r = s.run_ps(script)
             return ((r.std_out or b"").decode("utf-8", "replace").strip(),
                     (r.std_err or b"").decode("utf-8", "replace").strip())
+
+        if sso_cfg:
+            current = _winrm_read_file(s, AUTHPROXY_CFG_PATH)
+            cleaned = re.sub(r"\[sso\].*?(?=\[|\Z)", "", current,
+                             flags=re.DOTALL).rstrip()
+            merged = cleaned + "\n\n" + sso_cfg.strip() + "\n"
+            ok_w, msg_w = _winrm_write_restart_cfg(s, merged, _log)
+            if not ok_w:
+                return False, f"could not add the [sso] stanza to authproxy.cfg: {msg_w}"
+            _log("[sso] stanza written to authproxy.cfg")
+            with _sq.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE org_credentials SET authproxy_sso_cfg=?, "
+                    "updated_at=datetime('now') WHERE org_number=?",
+                    (sso_cfg.strip(), org_num))
+        else:
+            _log("WARN: no [sso] stanza captured — enrollment may not start the module")
 
         out, err = ps(f'& "{exe}" "{code}"')
         if err:
