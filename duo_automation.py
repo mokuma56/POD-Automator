@@ -3909,62 +3909,64 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
             # chips. Its label ("Select AD groups") disappears once any chip
             # exists, so identify it by exclusion instead. Type the group name,
             # then mouse-click the matching option.
+            # Drive this the way the Secure Access app picker is driven:
+            # clicking the picker with NO text lists the groups not yet
+            # selected, and each option is a plain visible leaf. Typing was
+            # fragile here — Playwright's locator click on the picker times
+            # out because the input is not actionable by its own bounds — so
+            # use mouse coordinates throughout and never type.
             KNOWN_INPUTS = ("global-search-input", "directory_key",
                             "username_attribute", "realname_attribute",
                             "email_attribute")
             opened = False
             for want in AD_GROUPS:
-                already = page.evaluate(f"""() => {{
-                    const t = {want!r}.toLowerCase();
+                already = page.evaluate("""(w) => {
+                    const t = w.toLowerCase();
                     return Array.from(document.querySelectorAll('*'))
                         .some(e => e.children.length === 0 &&
                               (e.textContent||'').trim().toLowerCase() === '×' + t);
-                }}""")
+                }""", want)
                 if already:
                     picked_names.append(want)
                     _log(f"  group {want!r} already selected")
                     continue
 
-                found = page.evaluate("""() => {
-                    // the picker carries no name, no id and no value
-                    const i = Array.from(document.querySelectorAll('input')).filter(x => x.type === 'text')
-                        .filter(x => x.getClientRects().length)
-                        .find(x => !x.name && !x.id && !x.value);
-                    if (!i) return false;
-                    i.setAttribute('data-gp', '1');
-                    return true;
-                }""")
-                if not found:
-                    _log(f"  group picker input not present for {want!r}; visible text "
-                         f"inputs = " + str(page.evaluate(
-                             """() => Array.from(document.querySelectorAll('input')).filter(x => x.type === 'text')
-                                .map(i => ({n: i.name||'', id: i.id||'', v: (i.value||'').slice(0,18),
-                                            vis: !!i.getClientRects().length}))""")))
+                box = page.evaluate("""(known) => {
+                    // The picker carries no name and no id. Match on the .type
+                    // PROPERTY — Duo omits the type attribute, so
+                    // input[type=text] matches nothing at all here.
+                    const i = Array.from(document.querySelectorAll('input'))
+                        .filter(x => x.type === 'text' && x.getClientRects().length)
+                        .find(x => !known.includes(x.name) && !known.includes(x.id) &&
+                                   !x.name && !x.id);
+                    if (!i) return null;
+                    i.scrollIntoView({block:'center'});
+                    const r = i.getBoundingClientRect();
+                    return {x: r.x + r.width/2, y: r.y + r.height/2};
+                }""", list(KNOWN_INPUTS))
+                if not box:
+                    _log(f"  group picker input not present for {want!r}")
                     continue
                 opened = True
-                box = page.locator('input[data-gp="1"]').first
-                box.click()
-                box.fill("")
-                box.type(want, delay=120)
+                page.mouse.click(box["x"], box["y"])
                 page.wait_for_timeout(4_000)
 
-                hit = page.evaluate(f"""() => {{
-                    const t = {want!r}.toLowerCase();
-                    // exclude the sidebar nav, which also contains short labels
-                    const e = Array.from(document.querySelectorAll(
-                            'li,[role=option],[role=menuitem],.cds-menu-item'))
-                        .filter(x => x.getClientRects().length && !x.closest('nav') &&
+                hit = page.evaluate("""(w) => {
+                    const t = w.toLowerCase();
+                    const e = Array.from(document.querySelectorAll('*'))
+                        .filter(x => x.getClientRects().length && x.children.length === 0 &&
+                                     !x.closest('nav') && !x.closest('header') &&
                                      !x.closest('.cds-nav'))
-                        .filter(x => (x.innerText||'').trim().toLowerCase().startsWith(t))
+                        .filter(x => (x.innerText||'').trim().toLowerCase() === t ||
+                                     (x.innerText||'').trim().toLowerCase()
+                                         .startsWith(t + ' '))
                         .sort((a,b) => (a.innerText||'').length - (b.innerText||'').length)[0];
                     if (!e) return null;
-                    e.scrollIntoView({{block:'center'}});
+                    e.scrollIntoView({block:'center'});
                     const r = e.getBoundingClientRect();
-                    return {{x: r.x + r.width/2, y: r.y + r.height/2,
-                             txt: (e.innerText||'').trim().slice(0,30)}};
-                }}""")
-                page.evaluate("""() => document.querySelectorAll('[data-gp]')
-                    .forEach(e => e.removeAttribute('data-gp'))""")
+                    return {x: r.x + r.width/2, y: r.y + r.height/2,
+                            txt: (e.innerText||'').trim().slice(0,30)};
+                }""", want)
                 if hit:
                     page.mouse.click(hit["x"], hit["y"])
                     picked_names.append(hit["txt"])
@@ -10370,6 +10372,32 @@ def duo_run_card(
                 return False, f"generated token but could not re-read it: {e}"
         if not scim_tok:
             return False, "sa_scim_token still not set after generation"
+
+        # The token only lets Secure Access be written to; nothing pushes users
+        # until Duo's "Cisco Secure Access" application exists with that Base
+        # URL + Token on its Provisioning tab and the AD groups in scope. This
+        # call was missing entirely, so the step generated a perfectly good
+        # token and then failed its own check on 0 users, every run.
+        app_ok, app_msg = duo_setup_secure_access_app(pod_id, db_path, log=_log)
+        if not app_ok:
+            return False, f"Cisco Secure Access application: {app_msg}"
+        _log(f"Cisco Secure Access application: {app_msg}")
+        # Provisioning is asynchronous — give Duo's connector a moment before
+        # judging the result, rather than reporting a false empty.
+        page_wait = 0
+        try:
+            import requests as _rq
+            for page_wait in range(1, 13):
+                time.sleep(10)
+                _r2 = _rq.get("https://api.sse.cisco.com/identity/v2/scim/Users",
+                              headers={"Authorization": f"Bearer {scim_tok}"},
+                              timeout=15)
+                if _r2.status_code == 200 and _r2.json().get("totalResults", 0):
+                    _log(f"provisioning landed after ~{page_wait * 10}s")
+                    break
+        except Exception as e:
+            _log(f"while waiting for provisioning: {type(e).__name__}")
+
         try:
             import requests as _req
             resp = _req.get(
