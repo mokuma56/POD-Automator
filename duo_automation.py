@@ -8204,6 +8204,432 @@ def duo_setup_saml_sso(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
         return False, msg
     return True, f"{msg} | {attr_msg}"
 
+
+def duo_disable_lab_mfa(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Lab guide: turn off Duo's MFA requirement so the lab can be tested.
+
+    "By default, MFA is required for all users authenticating through Duo."
+    Under the GLOBAL policy the guide sets New user policy to "Allow access
+    without MFA" and Authentication policy to "Skip MFA". Without this the
+    SSO test is rejected with "Account disabled" before any authentication
+    event is even logged, because the AD-synced users have no enrolled
+    devices.
+
+    The guide warns not to edit the default policy *under* the Global Policy
+    (the Default Self-Service Portal Policy is a separate row), so this
+    reaches the editor through the Global Policy row's own Actions -> Edit
+    and refuses to touch anything unless the editor says "Editing Global
+    Policy".
+    """
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: print(f"  [duo-mfa] {s}"))
+
+    # value -> the label the guide names, for logging
+    WANT = {
+        "sections.new_user.new_user_behavior": ("no-mfa", "Allow access without MFA"),
+        "sections.authentication_policy.user_auth_behavior": ("bypass", "Skip MFA"),
+    }
+    SECTION_OF = {
+        "sections.new_user.new_user_behavior": "New user policy",
+        "sections.authentication_policy.user_auth_behavior": "Authentication policy",
+    }
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {})
+
+    host = (oc.get("duo_admin_host") or "").strip()
+    if not host:
+        return False, "duo_admin_host missing from org_credentials"
+
+    def read_state(page):
+        return page.evaluate("""() => {
+            const out = {};
+            document.querySelectorAll('input[type=radio]').forEach(i => {
+                if (i.name && i.name.startsWith('sections.') && i.checked) out[i.name] = i.value;
+            });
+            return out;
+        }""")
+
+    pw = br = None
+    try:
+        pw, br, ctx, page = duo_passkey_login(pod_id, db_path, log=_log)
+
+        # Reach the editor the way the guide does: the Global Policy ROW's
+        # Actions menu, never the neighbouring self-service policy.
+        page.goto(f"https://{host}/policies", wait_until="load", timeout=45_000)
+        page.wait_for_timeout(9_000)
+        hit = page.evaluate("""() => {
+            const cell = Array.from(document.querySelectorAll('td'))
+                .find(td => /^global policy$/i.test((td.innerText||'').trim()));
+            if (!cell) return null;
+            const row = cell.closest('tr');
+            const btns = Array.from(row.querySelectorAll('button,[role=button],a'))
+                .filter(e => e.getClientRects().length);
+            const b = btns[btns.length - 1];
+            if (!b) return null;
+            const r = b.getBoundingClientRect();
+            return {x:r.x+r.width/2, y:r.y+r.height/2};
+        }""")
+        if not hit:
+            return False, "no Actions control on the Global Policy row"
+        page.mouse.click(hit["x"], hit["y"])
+        page.wait_for_timeout(4_000)
+        if not _leaf_click(page, "^edit$", wait=12_000):
+            return False, "no Edit item in the Global Policy Actions menu"
+        page.wait_for_timeout(6_000)
+
+        editing = page.evaluate(
+            """() => (/Editing ([^|\\n]+)/.exec(document.body.innerText||'') || [])[1] || ''""")
+        if "global policy" not in (editing or "").strip().lower():
+            return False, (f"refusing to edit — editor says {editing.strip()!r}, "
+                           "expected the Global Policy")
+        _log(f"editing {editing.strip()!r}")
+        # Saving navigates back to the policy table, so remember the editor's
+        # own URL — verifying against page.url afterwards reads the table and
+        # finds no radios at all.
+        editor_url = page.url.split("#")[0]
+
+        # The first-run overlay blocks the section nav underneath it.
+        _leaf_click(page, "^dismiss$", wait=4_000)
+
+        changed = []
+        for field, (value, label) in WANT.items():
+            # The section list is inside a <nav>, which _leaf_click excludes.
+            nav = page.evaluate("""(name) => {
+                const e = Array.from(document.querySelectorAll('*'))
+                    .filter(x => x.getClientRects().length && x.children.length === 0 &&
+                                 (x.innerText||'').trim().toLowerCase() === name.toLowerCase())
+                    .pop();
+                if (!e) return null;
+                e.scrollIntoView({block:'center'});
+                const r = e.getBoundingClientRect();
+                return {x:r.x+r.width/2, y:r.y+r.height/2};
+            }""", SECTION_OF[field])
+            if not nav:
+                return False, f"policy section {SECTION_OF[field]!r} not found"
+            page.mouse.click(nav["x"], nav["y"])
+            page.wait_for_timeout(7_000)
+
+            state = page.evaluate("""(cfg) => {
+                const i = Array.from(document.querySelectorAll('input[type=radio]'))
+                    .find(x => x.name === cfg.field && x.value === cfg.value);
+                if (!i) return 'missing';
+                if (i.checked) return 'already';
+                i.setAttribute('data-mfa', '1');
+                return 'todo';
+            }""", {"field": field, "value": value})
+            if state == "missing":
+                return False, f"option {label!r} not offered in {SECTION_OF[field]}"
+            if state == "already":
+                _log(f"{label}: already set")
+                continue
+            _duo_mclick(page, selector='input[data-mfa="1"]')
+            page.wait_for_timeout(2_000)
+            page.evaluate("""() => document.querySelectorAll('[data-mfa]')
+                .forEach(e => e.removeAttribute('data-mfa'))""")
+            changed.append(label)
+            _log(f"{label}: selected")
+
+        if changed:
+            if not _leaf_click(page, "^save$", wait=12_000):
+                return False, "no Save control in the policy editor"
+
+        # Verify from a reloaded editor, not from the clicks.
+        page.goto(editor_url, wait_until="load", timeout=45_000)
+        page.wait_for_timeout(12_000)
+        _leaf_click(page, "^dismiss$", wait=3_000)
+        final = {}
+        for field in WANT:
+            nav = page.evaluate("""(name) => {
+                const e = Array.from(document.querySelectorAll('*'))
+                    .filter(x => x.getClientRects().length && x.children.length === 0 &&
+                                 (x.innerText||'').trim().toLowerCase() === name.toLowerCase())
+                    .pop();
+                if (!e) return null;
+                const r = e.getBoundingClientRect();
+                return {x:r.x+r.width/2, y:r.y+r.height/2};
+            }""", SECTION_OF[field])
+            if nav:
+                page.mouse.click(nav["x"], nav["y"])
+                page.wait_for_timeout(6_000)
+            final.update(read_state(page))
+
+        bad = [f"{SECTION_OF[f]}={final.get(f)!r} (wanted {v!r})"
+               for f, (v, _lbl) in WANT.items() if final.get(f) != v]
+        if bad:
+            return False, "MFA policy did not persist — " + "; ".join(bad)
+        return True, ("Global Policy: Allow access without MFA + Skip MFA"
+                      + (f" (changed: {', '.join(changed)})" if changed else " (already set)"))
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception as e:
+            _log(f"browser cleanup: {type(e).__name__}")
+
+
+def duo_configure_sso_auth_source(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Lab guide section 2, the three steps that make Duo SSO able to log users in.
+
+    Configuring the Active Directory external authentication source is not
+    enough on its own. Without these the SSO flow is rejected outright with
+    "Account disabled" — before any authentication event is logged, and
+    before the user is ever asked for a password:
+
+      1. The AD source must be ENABLED ("Verify that Active Directory is
+         Enabled at the top of the page. If not, select Enable Source").
+      2. Each user email domain must be a Permitted Domain — "Users must log
+         in with an email address from a Permitted Domain."
+      3. The Routing Rules default rule must point at Active Directory; it
+         defaults to Duo, which cannot authenticate AD-synced users.
+
+    Domains are taken from the users actually in Duo, because they are
+    pod-specific (POD-17 carries both corp.pseudoco.com and
+    rtp17.corp.pseudoco.com).
+    """
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: print(f"  [duo-authsrc] {s}"))
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {})
+
+    host = (oc.get("duo_admin_host") or "").strip()
+    api_host = (oc.get("duo_host") or "").strip()
+    ikey, skey = (oc.get("duo_ikey") or "").strip(), (oc.get("duo_skey") or "").strip()
+    if not host:
+        return False, "duo_admin_host missing from org_credentials"
+
+    # Which domains matter is a property of this pod's users, not a constant.
+    domains = []
+    try:
+        users = _duo_request(ikey, skey, api_host, "GET",
+                             "/admin/v1/users").get("response", [])
+        for u in users:
+            d = (u.get("email") or "").split("@")[-1].strip().lower()
+            if d and d not in domains:
+                domains.append(d)
+    except Exception as e:
+        return False, f"could not list Duo users to derive email domains: {e}"
+    if not domains:
+        return False, "no user email domains found — run the AD sync first"
+    _log(f"email domains in use: {', '.join(domains)}")
+
+    notes = []
+    pw = br = None
+    try:
+        pw, br, ctx, page = duo_passkey_login(pod_id, db_path, log=_log)
+
+        # ── 1. enable the Active Directory source ──
+        page.goto(f"https://{host}/sso?selected_tab=authentication_sources",
+                  wait_until="load", timeout=45_000)
+        page.wait_for_timeout(8_000)
+        href = page.evaluate("""() => {
+            const a = Array.from(document.querySelectorAll('a'))
+                .find(x => /^active directory$/i.test((x.innerText||'').trim()));
+            return a ? a.getAttribute('href') : null;
+        }""")
+        if not href:
+            return False, ("no Active Directory external authentication source — "
+                           "run the external directory step first")
+        page.goto(f"https://{host}{href}", wait_until="load", timeout=45_000)
+        page.wait_for_timeout(11_000)
+
+        # ── 1a. the Active Directory server configuration ──
+        # Enabling the source is not enough: with these blank the SSO flow
+        # fails with "The authentication source is not configured".
+        SET = """(cfg) => {
+            const i = Array.from(document.querySelectorAll('input'))
+                .find(x => (x.name||'') === cfg.name);
+            if (!i) return null;
+            Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set.call(i, cfg.val);
+            i.dispatchEvent(new Event('input', {bubbles: true}));
+            i.dispatchEvent(new Event('change', {bubbles: true}));
+            return i.value;
+        }"""
+        server_cfg = {
+            "servers[0].hostname": AD_DC_IP,
+            "servers[0].port": "389",
+            "base_dns[0]": AD_BASE_DN,
+        }
+        missing = [k for k, v in server_cfg.items()
+                   if page.evaluate("""(n) => {
+                       const i = Array.from(document.querySelectorAll('input'))
+                           .find(x => (x.name||'') === n);
+                       return i ? i.value.trim() : null;
+                   }""", k) != v]
+        if missing:
+            for name, val in server_cfg.items():
+                if page.evaluate(SET, {"name": name, "val": val}) != val:
+                    return False, f"could not set the AD source field {name!r}"
+            page.wait_for_timeout(2_000)
+            # "Save and enable" appears while the source is disabled and does
+            # both jobs; "Save changes" is the enabled-state equivalent.
+            if not (_leaf_click(page, "^save and enable$", wait=12_000)
+                    or _leaf_click(page, "^save changes$", wait=12_000)):
+                return False, "no Save control on the AD source page"
+            notes.append(f"AD server config {AD_DC_IP}:389 {AD_BASE_DN}")
+            _log(f"AD server config set ({AD_DC_IP}:389, {AD_BASE_DN})")
+            page.goto(f"https://{host}{href}", wait_until="load", timeout=45_000)
+            page.wait_for_timeout(11_000)
+        else:
+            _log("AD server config: already set")
+
+        hit = page.evaluate("""() => {
+            const b = Array.from(document.querySelectorAll('button,a,[role=button]'))
+                .find(x => x.getClientRects().length &&
+                           /^enable source$/i.test((x.innerText||'').trim()));
+            if (!b) return null;
+            b.scrollIntoView({block:'center'});
+            const r = b.getBoundingClientRect();
+            return {x:r.x+r.width/2, y:r.y+r.height/2};
+        }""")
+        if hit:
+            page.mouse.click(hit["x"], hit["y"])
+            page.wait_for_timeout(6_000)
+            _leaf_click(page, "^enable source$", wait=9_000)   # confirmation dialog
+            notes.append("AD source enabled")
+        page.goto(f"https://{host}{href}", wait_until="load", timeout=45_000)
+        page.wait_for_timeout(9_000)
+        # An enabled source offers "Disable source"; a disabled one offers "Enable source".
+        enabled = page.evaluate("""() => Array.from(
+            document.querySelectorAll('button,a,[role=button]'))
+            .some(x => x.getClientRects().length &&
+                       /^disable source$/i.test((x.innerText||'').trim()))""")
+        if not enabled:
+            return False, "Active Directory source is still not enabled"
+        _log("AD source enabled")
+
+        # ── 2. permitted email domains ──
+        for dom in domains:
+            page.goto(f"https://{host}/sso?selected_tab=settings",
+                      wait_until="load", timeout=45_000)
+            page.wait_for_timeout(9_000)
+            if page.evaluate("""(d) => {
+                const e = Array.from(document.querySelectorAll('div,section'))
+                    .filter(x => /permitted domain/i.test(x.innerText||'')).pop();
+                return e ? (e.innerText||'').includes(d) : false;
+            }""", dom):
+                _log(f"permitted domain {dom}: already present")
+                continue
+            # This button sits near the bottom of a long, lazily-rendered page;
+            # a coordinate click computed before the layout settles misses it.
+            # Playwright's locator click re-checks actionability as it goes.
+            btn = page.locator(
+                'button:has-text("Add email domain"), a:has-text("Add email domain")').last
+            if btn.count() == 0:
+                return False, "no 'Add email domain' control on the SSO settings tab"
+            btn.scroll_into_view_if_needed(timeout=15_000)
+            page.wait_for_timeout(1_500)
+            btn.click(timeout=15_000)
+            # "domainName" is the field's id/placeholder, not its name — an
+            # input[name=...] selector matches nothing even with the dialog
+            # plainly open. Match any of the three, and write through the
+            # native setter so React registers the value.
+            FILL = """(cfg) => {
+                const i = Array.from(document.querySelectorAll('input'))
+                    .find(x => x.getClientRects().length &&
+                               [x.name, x.id, x.placeholder]
+                                   .some(v => (v||'').toLowerCase() === 'domainname'));
+                if (!i) return null;
+                Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set.call(i, cfg.val);
+                i.dispatchEvent(new Event('input', {bubbles: true}));
+                i.dispatchEvent(new Event('change', {bubbles: true}));
+                return i.value;
+            }"""
+            for _ in range(8):
+                page.wait_for_timeout(3_000)
+                if page.evaluate(FILL, {"val": dom}) == dom:
+                    break
+            else:
+                return False, "the Add email domain dialog did not open"
+            page.wait_for_timeout(1_500)
+            if not _leaf_click(page, "^add$", wait=9_000):
+                return False, f"no Add control in the email-domain dialog for {dom}"
+            notes.append(f"domain {dom} added")
+            _log(f"permitted domain {dom}: added")
+
+        # ── 3. routing rules default -> Active Directory ──
+        page.goto(f"https://{host}/sso?selected_tab=routing_rules",
+                  wait_until="load", timeout=45_000)
+        page.wait_for_timeout(10_000)
+        cur = page.evaluate("""() => {
+            const t = (document.body.innerText||'');
+            const m = /Use this authentication source[\\s\\S]{0,80}/.exec(t);
+            return m ? m[0].replace(/\\s+/g,' ') : '';
+        }""")
+        if "Active Directory" not in cur:
+            box = page.evaluate("""() => {
+                const i = Array.from(document.querySelectorAll('input[type=text]'))
+                    .filter(x => x.getClientRects().length &&
+                                 x.id !== 'global-search-input' &&
+                                 x.name !== 'primary_auth_expiration_value')[0];
+                if (!i) return null;
+                i.scrollIntoView({block:'center'});
+                const r = i.getBoundingClientRect();
+                return {x:r.x+r.width/2, y:r.y+r.height/2};
+            }""")
+            if not box:
+                return False, "no authentication-source picker on the Routing Rules tab"
+            page.mouse.click(box["x"], box["y"])
+            page.wait_for_timeout(4_000)
+            if not _leaf_click(page, "^active directory$", wait=3_000):
+                return False, "'Active Directory' not offered as a routing source"
+            if not _leaf_click(page, "^save$", wait=10_000):
+                return False, "no Save control on the Routing Rules tab"
+            notes.append("default routing rule -> Active Directory")
+
+        page.goto(f"https://{host}/sso?selected_tab=routing_rules",
+                  wait_until="load", timeout=45_000)
+        page.wait_for_timeout(10_000)
+        row = page.evaluate("""() => {
+            const r = Array.from(document.querySelectorAll('tr'))
+                .find(x => /default rule/i.test(x.innerText||''));
+            return r ? (r.innerText||'').replace(/\\s+/g,' ').trim() : '';
+        }""")
+        if "Active Directory" not in row:
+            return False, f"default routing rule did not persist — row reads {row!r}"
+        _log("default routing rule -> Active Directory")
+
+        return True, ("Duo SSO auth source ready: AD enabled, domains "
+                      f"{', '.join(domains)}, default routing -> Active Directory"
+                      + (f" (changed: {'; '.join(notes)})" if notes else " (already set)"))
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception as e:
+            _log(f"browser cleanup: {type(e).__name__}")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Duo Card — manual pipeline (replaces duo_setup/duo_ext_dir/duo_saml_setup
 # pipeline steps).  Stored in duo_steps table.  Smart re-use: if the org
