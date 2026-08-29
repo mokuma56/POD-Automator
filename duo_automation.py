@@ -8630,6 +8630,276 @@ def duo_configure_sso_auth_source(pod_id: str, db_path: str, log=None) -> tuple[
         except Exception as e:
             _log(f"browser cleanup: {type(e).__name__}")
 
+
+def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Connect the Authentication Proxy on AD1 to Duo Single Sign-On.
+
+    Without this the SSO login reaches Duo's password prompt and fails with
+    "Invalid credentials", because Duo has no route to Active Directory. The
+    proxy log names the cause exactly:
+
+        DuoAPIFailClosedError: 40112: Unable to connect to Duo Single Sign-On.
+        Please generate a new enrollment command from the Authentication Proxy
+
+    The enrollment code is single-use, so it is minted and applied in one
+    pass. Note this is NOT authproxyctl.exe (what the older helper reached
+    for) — Duo SSO uses authproxy_update_sso_enrollment_code.exe, and the
+    code is only rendered on a freshly created proxy page, so the flow has to
+    go through "Add Authentication Proxy" as the guide does.
+    """
+    import re as _re
+    import sqlite3 as _sq
+    import time as _t
+
+    _log = log or (lambda s: print(f"  [duo-sso-proxy] {s}"))
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {})
+
+    host = (oc.get("duo_admin_host") or "").strip()
+    if not host:
+        return False, "duo_admin_host missing from org_credentials"
+
+    # ── mint the enrollment command ──
+    cmd = ""
+    pw = br = None
+    try:
+        pw, br, ctx, page = duo_passkey_login(pod_id, db_path, log=_log)
+        page.goto(f"https://{host}/sso?selected_tab=authentication_sources",
+                  wait_until="load", timeout=45_000)
+        page.wait_for_timeout(8_000)
+        href = page.evaluate("""() => {
+            const a = Array.from(document.querySelectorAll('a'))
+                .find(x => /^active directory$/i.test((x.innerText||'').trim()));
+            return a ? a.getAttribute('href') : null;
+        }""")
+        if not href:
+            return False, "no Active Directory authentication source to enrol against"
+        page.goto(f"https://{host}{href}", wait_until="load", timeout=45_000)
+        page.wait_for_timeout(11_000)
+
+        add = page.locator('button:has-text("Add Authentication Proxy")').last
+        if add.count() == 0:
+            return False, "no 'Add Authentication Proxy' control on the AD source page"
+        add.scroll_into_view_if_needed(timeout=15_000)
+        page.wait_for_timeout(1_500)
+        add.click(timeout=15_000)
+        page.wait_for_timeout(10_000)
+
+        if not _leaf_click(page, "^generate command$", wait=10_000):
+            return False, "no 'Generate command' control on the proxy page"
+        for _ in range(6):
+            page.wait_for_timeout(4_000)
+            cmd = page.evaluate("""() => {
+                const e = Array.from(document.querySelectorAll('*'))
+                    .filter(x => x.children.length === 0 &&
+                                 /authproxy_update_sso_enrollment_code/i
+                                     .test(x.textContent||''))
+                    .pop();
+                return e ? (e.textContent||'').trim() : '';
+            }""")
+            if cmd:
+                break
+        if not cmd:
+            return False, "Duo did not render an enrollment command"
+    except Exception as e:
+        return False, f"could not mint the enrollment command: {type(e).__name__}: {e}"
+    finally:
+        try:
+            if br:
+                br.close()
+            if pw:
+                pw.stop()
+        except Exception as e:
+            _log(f"browser cleanup: {type(e).__name__}")
+
+    m = _re.search(r'"([^"]+\.exe)"\s*(.+)$', cmd, _re.S)
+    if not m:
+        return False, f"could not parse the enrollment command: {cmd[:90]!r}"
+    exe = m.group(1)
+    # The blob wraps across lines in the DOM, and contains characters
+    # PowerShell treats specially — rejoin it and pass it as a quoted arg
+    # rather than pasting the rendered line verbatim.
+    code = _re.sub(r"\s+", "", m.group(2))
+    _log(f"enrollment code minted ({len(code)} chars)")
+
+    # ── apply it on AD1 ──
+    try:
+        s = _winrm_connect()
+
+        def ps(script):
+            r = s.run_ps(script)
+            return ((r.std_out or b"").decode("utf-8", "replace").strip(),
+                    (r.std_err or b"").decode("utf-8", "replace").strip())
+
+        out, err = ps(f'& "{exe}" "{code}"')
+        if err:
+            return False, f"enrollment command failed on AD1: {err[:200]}"
+        _log(f"enrollment applied: {out[:120] or 'no output'}")
+
+        ps("Restart-Service DuoAuthProxy -Force")
+        _t.sleep(50)
+
+        log_path = (r"C:\Program Files\Duo Security Authentication Proxy"
+                    r"\log\authproxy.log")
+        tail, _ = ps(f"Get-Content '{log_path}' -Tail 80")
+        if "40112" in tail or "Rotate call failed" in tail:
+            bad = [ln for ln in tail.splitlines() if "40112" in ln]
+            return False, ("proxy still cannot reach Duo SSO: "
+                           + (bad[0].strip()[:160] if bad else "rotate failed"))
+        if "CloudSSO Connector Module" not in tail:
+            return False, ("the [sso] section did not start — no CloudSSO "
+                           "Connector Module in the proxy log after restart")
+        return True, "Authentication Proxy connected to Duo Single Sign-On"
+    except Exception as e:
+        return False, f"AD1 step failed: {type(e).__name__}: {e}"
+
+
+def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
+                       password: str = "", log=None) -> tuple[bool, str]:
+    """Run Secure Access's own "Test Configuration" and assert it succeeds.
+
+    The SSO rows on the Configuration management page are collapsed
+    accordions — the control only exists once the row is expanded, and
+    clicking the label does nothing (the chevron is the target). Test
+    Configuration opens the real Duo SSO flow, so a success here exercises
+    the whole chain: SAML request, Duo, the auth proxy, Active Directory,
+    and the assertion back to Secure Access.
+
+    The password is read from LAB_USER_PASSWORD unless one is passed in;
+    it is never logged.
+    """
+    import os as _os
+    import re as _re
+    import sqlite3 as _sq
+
+    from playwright.sync_api import sync_playwright as _spw
+
+    _log = log or (lambda s: print(f"  [duo-sso-test] {s}"))
+    password = password or _os.environ.get("LAB_USER_PASSWORD", "")
+    if not password:
+        return False, ("no test password — set LAB_USER_PASSWORD "
+                       "(the lab user password) in the environment")
+
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        if not pod:
+            return False, f"POD {pod_id} not found"
+        m = _re.search(r"pseudoco-(\d+)", pod["scc_org"] or "")
+        if not m:
+            return False, f"cannot derive org number from scc_org={pod['scc_org']!r}"
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {})
+
+    idac = (oc.get("idac_url") or "").strip()
+    sa_org = (oc.get("sa_org_id") or "").strip()
+    scim_tok = (oc.get("sa_scim_token") or "").strip()
+    if not (idac and sa_org):
+        return False, "idac_url / sa_org_id missing from org_credentials"
+
+    # Default to kit, the user the lab guide tests with. The UPN is
+    # pod-specific (kit@rtp17.corp.pseudoco.com), so read it rather than
+    # assuming a domain.
+    if not username:
+        try:
+            r = requests.get("https://api.sse.cisco.com/identity/v2/scim/Users",
+                             headers={"Authorization": f"Bearer {scim_tok}"}, timeout=20)
+            users = [u.get("userName", "") for u in r.json().get("Resources", [])]
+            username = next((u for u in users if u.lower().startswith("kit@")),
+                            users[0] if users else "")
+        except Exception as e:
+            return False, f"could not read a test user from Secure Access: {e}"
+    if not username:
+        return False, "no provisioned users in Secure Access to test with"
+    _log(f"testing as {username}")
+
+    with _spw() as pw:
+        br = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            ctx = br.new_context(ignore_https_errors=True,
+                                 viewport={"width": 1600, "height": 1200})
+            t, ent = _scc_open_session(ctx, idac, log=_log)
+            t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}"
+                   f"/connect/users-and-groups?enterpriseId={ent}",
+                   wait_until="load", timeout=45_000)
+            _scc_wait(t, "Configuration management")
+            _scc_click(t, "Configuration management")
+            _scc_wait(t, "SSO authentication")
+            t.wait_for_timeout(6_000)
+
+            # Expand the SSO row via its chevron; the label itself is inert.
+            row = t.evaluate("""() => {
+                const e = Array.from(document.querySelectorAll('*'))
+                    .filter(x => x.getClientRects().length && x.children.length === 0 &&
+                                 /^DuoSSO$/.test((x.innerText||'').trim())).pop();
+                if (!e) return null;
+                // Aim at the chevron: walk out to the accordion header and take
+                // its own svg. A fixed pixel offset from the label misses,
+                // because the label's width varies with the configuration name.
+                let n = e;
+                for (let k = 0; k < 6 && n; k++) {
+                    n = n.parentElement;
+                    if (!n) break;
+                    const svg = n.querySelector('svg');
+                    if (svg && svg.getClientRects().length) {
+                        const s = svg.getBoundingClientRect();
+                        return {x: s.x + s.width / 2, y: s.y + s.height / 2};
+                    }
+                }
+                const r = e.getBoundingClientRect();
+                return {x: r.x - 25, y: r.y + r.height / 2};
+            }""")
+            if not row:
+                return False, "no SSO configuration listed — run the sso_saml step first"
+            t.mouse.click(row["x"], row["y"])
+            t.wait_for_timeout(6_000)
+
+            hit = t.evaluate(_LEAF_HIT, "^test configuration$")
+            if not hit:
+                return False, "'Test Configuration' not offered after expanding the SSO row"
+            with ctx.expect_page(timeout=30_000) as info:
+                t.mouse.click(hit["x"], hit["y"])
+            sso = info.value
+            sso.wait_for_load_state("load", timeout=30_000)
+            sso.wait_for_timeout(6_000)
+
+            if sso.locator("input[type=email]").count() == 0:
+                return False, f"unexpected first page in the SSO flow: {sso.url[:90]}"
+            sso.locator("input[type=email]").first.fill(username)
+            sso.wait_for_timeout(1_000)
+            sso.evaluate("""() => {const b=Array.from(document.querySelectorAll('button'))
+                .find(x=>/^next$/i.test((x.innerText||'').trim())); if(b)b.click();}""")
+            sso.wait_for_timeout(12_000)
+
+            if sso.locator("input[type=password]").count() == 0:
+                txt = (sso.evaluate("() => document.body.innerText") or "")
+                return False, ("never reached the password prompt — "
+                               + " ".join(txt.split())[:200])
+            sso.locator("input[type=password]").first.fill(password)
+            sso.wait_for_timeout(1_000)
+            sso.evaluate("""() => {const b=Array.from(document.querySelectorAll('button'))
+                .find(x=>/log ?in|sign ?in|submit|continue/i.test((x.innerText||'').trim()));
+                if(b)b.click();}""")
+            sso.wait_for_timeout(20_000)
+
+            txt = " ".join((sso.evaluate("() => document.body.innerText") or "").split())
+            if "completed successfully" in txt.lower():
+                return True, f"SSO test succeeded as {username}"
+            return False, f"SSO test did not succeed: {txt[:220]}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+        finally:
+            br.close()
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Duo Card — manual pipeline (replaces duo_setup/duo_ext_dir/duo_saml_setup
 # pipeline steps).  Stored in duo_steps table.  Smart re-use: if the org
@@ -8647,6 +8917,9 @@ DUO_CARD_STEPS = [
 
     "scim_push",
     "sso_saml",
+    "sso_authsource",
+    "mfa_policy",
+    "sso_test",
     "verify",
 ]
 
@@ -9956,6 +10229,29 @@ def duo_run_card(
         """
         return duo_setup_saml_sso(pod_id, db_path, log=_log)
 
+    def step_sso_authsource():
+        """Guide section 2: make Duo SSO able to authenticate the lab users.
+
+        Enables the AD source and fills its server configuration, permits the
+        users' email domains, points the default routing rule at Active
+        Directory, and connects the Authentication Proxy to Duo SSO. Without
+        the proxy connection the login reaches Duo's password prompt and is
+        refused with "Invalid credentials".
+        """
+        ok, msg = duo_configure_sso_auth_source(pod_id, db_path, log=_log)
+        if not ok:
+            return False, msg
+        ok2, msg2 = duo_enroll_sso_authproxy(pod_id, db_path, log=_log)
+        return (ok2, f"{msg} | {msg2}") if ok2 else (False, f"{msg} | {msg2}")
+
+    def step_mfa_policy():
+        """Guide: turn off the MFA requirement so the lab can be tested."""
+        return duo_disable_lab_mfa(pod_id, db_path, log=_log)
+
+    def step_sso_test():
+        """Guide: Secure Access -> expand DuoSSO -> Test Configuration."""
+        return duo_test_sso_login(pod_id, db_path, log=_log)
+
     def step_verify():
         """WinRM: check DuoAuthProxy is Running AND DRPC is connected."""
         AUTHPROXY_LOG = (
@@ -10002,6 +10298,9 @@ def duo_run_card(
         "authproxy_enroll": step_authproxy_enroll,
         "scim_push":        step_scim_push,
         "sso_saml":         step_sso_saml,
+        "sso_authsource":   step_sso_authsource,
+        "mfa_policy":       step_mfa_policy,
+        "sso_test":         step_sso_test,
         "verify":           step_verify,
     }
 
@@ -10019,7 +10318,8 @@ def duo_run_card(
             # are independent of user sync — but it must still show red rather
             # than the old soft-fail ok=True, which hid an empty Duo org.
             if step in ("scim_push", "verify", "saml_scim_config",
-                        "ad_sync", "sso_saml"):
+                        "ad_sync", "sso_saml", "sso_authsource",
+                        "mfa_policy", "sso_test"):
                 continue
             # Fatal steps: stop on first hard failure
             _log(f"  Hard failure at {step} — stopping")
