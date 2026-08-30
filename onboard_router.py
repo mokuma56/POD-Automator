@@ -3249,6 +3249,19 @@ def phase_scc_reset_check():
             return
         try:
             c = _sq.connect(db_path)
+            # Never downgrade a completed item to skipped. zta_profiles is owned
+            # by BOTH this phase and the browser phase, and on 2026-08-30 the
+            # browser recorded "completed / browser confirmed clean" only for
+            # this phase to overwrite it with "skipped / SCC keys not found" —
+            # the card then showed a worse result than the work that had actually
+            # been done. A real completed or failed still overwrites.
+            if status == "skipped":
+                prev = c.execute(
+                    "SELECT status FROM scc_checklist WHERE pod_id=? AND item_key=?",
+                    (pod_id, item_key)).fetchone()
+                if prev and prev[0] == "completed":
+                    c.close()
+                    return
             c.execute(
                 "INSERT OR REPLACE INTO scc_checklist "
                 "(pod_id, item_key, status, detail) VALUES (?, ?, ?, ?)",
@@ -3265,13 +3278,19 @@ def phase_scc_reset_check():
             _persist(k, "skipped", msg)
         return False, msg
 
+    # The CDO key pair is only a FALLBACK here — every endpoint this phase calls
+    # is api.sse.cisco.com, which authenticates with the Secure Access (sa_*)
+    # keys loaded just below. Aborting on a missing CDO key therefore skipped all
+    # six items over a credential they never use: on org 502 that meant
+    # access_policy_rules, dns_servers, epp_posture_profiles,
+    # network_tunnel_groups, private_resources and zta_profiles had never once
+    # run, while sa_api_key was populated the whole time.
     try:
         keys = _scc_load_keys(org_num, pod_id=pod_id)
     except FileNotFoundError as e:
-        msg = str(e)
-        for k in ALL_KEYS:
-            _persist(k, "skipped", msg)
-        return False, f"SCC keys missing for org {org_num} — generate keys first | {msg}"
+        keys = {}
+        print(f"  [scc-reset] no CDO key pair for org {org_num} "
+              f"({e}) — continuing on the Secure Access keys")
 
     # SSE (Umbrella) API uses the Secure Access (sa_*) key pair, not the CDO
     # machine-account JWT stored in scc_api_secret.  Load SA keys explicitly.
@@ -3283,6 +3302,17 @@ def phase_scc_reset_check():
         # Fallback: try scc keys (old behaviour, may return 500)
         key_id     = keys.get("scc_api_key") or keys.get("key_id", "")
         key_secret = keys.get("scc_api_secret") or keys.get("key_secret", "")
+
+    if not key_id or not key_secret:
+        # Now that a missing CDO pair is no longer fatal on its own, this is the
+        # real precondition: with neither pair we cannot call the SSE API at all.
+        # Say so explicitly rather than letting _scc_token fail on empty strings.
+        msg = (f"no usable API credentials for org {org_num}: set sa_api_key / "
+               f"sa_api_secret (preferred) or scc_api_key / scc_api_secret in "
+               f"Org Credentials")
+        for k in ALL_KEYS:
+            _persist(k, "skipped", msg)
+        return False, msg
 
     try:
         token = _scc_token(key_id, key_secret)
