@@ -1459,5 +1459,206 @@ def pod_rerun_step(pod_id: str, from_step: int, card: str = "duo") -> str:
             "hint": f"is the dashboard running at {DASHBOARD_URL}?",
         })
 
+
+# ---------------------------------------------------------------------------
+# Triage — is this our bug, or is the lab broken?
+#
+# The actions are opposite, so guessing is worse than admitting uncertainty:
+# a code bug wants a fix and a PR; a dead switch wants a human and NO code
+# change. "Fixing" hardware in software contorts working code around broken
+# kit, and retrying a blank switch forever hides the thing that actually needs
+# hands on it.
+# ---------------------------------------------------------------------------
+
+# What each pipeline step actually touches. A PRIOR, not a verdict — it is
+# combined with cross-POD incidence and live evidence below.
+STEP_TARGET = {
+    # physical kit: console, cabling, flash, power
+    "reset_device": "device", "verify_router": "device",
+    "copy_bootstrap": "device", "controller_mode_enable": "device",
+    "verify_border_spine": "device", "verify_leaf1": "device",
+    "verify_leaf2": "device", "connectivity_test": "device",
+    "route_verification": "device",
+    # SaaS control planes
+    "quick_connect": "cloud", "config_group_associate": "cloud",
+    "assign_license": "cloud", "set_variables": "cloud",
+    "deploy_config_group": "cloud", "generate_bootstrap": "cloud",
+    "redeploy_config_group": "cloud", "verify_online": "cloud",
+    "cdfmc_check": "cloud", "scc_reset_check": "cloud",
+    # directory / windows hosts
+    "ad_verify": "directory",
+    # local
+    "detect_pod_number": "local",
+}
+
+# Phrases that identify the cause regardless of which step reported them.
+EVIDENCE_PATTERNS = [
+    # -- lab / hardware: no code change can fix these --
+    (r"no route to host|network is unreachable|host unreachable", "infrastructure",
+     "the POD network is unreachable — check the VPN tunnel"),
+    (r"rommon|boot manual|bootvar|config-register", "hardware",
+     "device is not booting into IOS normally — needs console attention"),
+    (r"connection refused.*23|telnet.*refused|console.*(busy|in use)", "hardware",
+     "console port refused or in use — another session may be attached"),
+    (r"timed out|timeout", "unknown",
+     "a timeout alone does not say whether the target is slow, dead or absent"),
+    (r"authentication fail|invalid credential|access denied|80090308|data 52e",
+     "credentials", "credentials rejected by the target"),
+    # -- local infrastructure: remediable without touching code --
+    (r"container .* is not running|no such container", "infrastructure",
+     "a helper container died — restart it and retry"),
+    (r"is the dashboard running|connection refused.*5050", "infrastructure",
+     "the dashboard is not answering"),
+    # -- upstream SaaS --
+    (r"\b50[0234]\b|service unavailable|bad gateway|rate limit|429", "upstream",
+     "the vendor service returned a server-side error"),
+    (r"401|403|unauthorized|forbidden", "credentials",
+     "the API rejected our credentials or scope"),
+    # -- our code --
+    (r"not found|could not find|no such element|selector|locator|has no attribute|"
+     r"traceback|keyerror|typeerror|attributeerror|is not defined", "code",
+     "the automation looked for something and did not find it"),
+]
+
+
+def _evidence_class(text: str):
+    import re as _re
+    t = (text or "").lower()
+    hits = []
+    for pat, cls, why in EVIDENCE_PATTERNS:
+        if _re.search(pat, t):
+            hits.append({"class": cls, "reason": why})
+    return hits
+
+
+@mcp.tool()
+def pod_triage(pod_id: str = "", step_name: str = "", card: str = "") -> str:
+    """Classify failures: our bug, or the lab itself?
+
+    Combines three independent signals rather than trusting any one:
+
+      1. CROSS-POD INCIDENCE — the strongest discriminator, and the reason to
+         watch every POD at once. A step failing on 1 of 8 PODs points at that
+         POD's kit; failing on 8 of 8 points at our code or a vendor change.
+      2. WHAT THE STEP TOUCHES — physical device, SaaS control plane,
+         directory, or local infra.
+      3. LIVE EVIDENCE — the error text, and whether the POD's VPN container
+         is actually up right now.
+
+    Returns a verdict per failure with the evidence behind it. When the
+    signals disagree or are thin it says so — "insufficient_evidence" is a
+    real answer here, because acting on a wrong guess is worse than asking.
+
+    Call with no arguments to triage every current failure.
+    """
+    conn = _db()
+    duo_all = _step_rows(conn, "duo_steps")
+    pipe_all = _step_rows(conn, "pipeline_steps")
+    pod_ids = [r["pod_id"] for r in conn.execute("SELECT pod_id FROM pods")]
+    conn.close()
+
+    universe = [("duo", r) for r in duo_all] + [("pipeline", r) for r in pipe_all]
+    failures = [(c, r) for c, r in universe if r["status"] == "failed"]
+    if pod_id:
+        failures = [(c, r) for c, r in failures if r["pod_id"] == pod_id]
+    if step_name:
+        failures = [(c, r) for c, r in failures if r["step_name"] == step_name]
+    if card:
+        failures = [(c, r) for c, r in failures if c == card]
+
+    # How many PODs even attempted each step? Incidence is meaningless without
+    # the denominator — "failed on 1" means nothing if only 1 POD ran it.
+    attempted = {}
+    for c, r in universe:
+        attempted.setdefault((c, r["step_name"]), set()).add(r["pod_id"])
+    failed_by = {}
+    for c, r in universe:
+        if r["status"] == "failed":
+            failed_by.setdefault((c, r["step_name"]), set()).add(r["pod_id"])
+
+    verdicts = []
+    for c, r in failures:
+        key = (c, r["step_name"])
+        n_att, n_fail = len(attempted.get(key, ())), len(failed_by.get(key, ()))
+        target = STEP_TARGET.get(r["step_name"], "cloud" if c == "duo" else "unknown")
+        hits = _evidence_class(r.get("result") or "")
+
+        # live infrastructure check — cheap, and it separates "the POD is gone"
+        # from "our code is wrong" immediately
+        vpn_up = None
+        try:
+            import subprocess as _sp
+            pr = _sp.run(["docker", "inspect", f"vpn-{r['pod_id']}",
+                          "--format", "{{.State.Running}}"],
+                         capture_output=True, text=True, timeout=8)
+            vpn_up = pr.stdout.strip() == "true"
+        except Exception:
+            pass
+
+        reasons, verdict = [], "insufficient_evidence"
+        if vpn_up is False:
+            verdict = "infrastructure"
+            reasons.append(f"vpn-{r['pod_id']} container is not running")
+        elif hits:
+            strong = [h for h in hits if h["class"] != "unknown"]
+            ambiguous = [h for h in hits if h["class"] == "unknown"]
+            if ambiguous and strong:
+                # An ambiguity marker DOMINATES a co-occurring keyword. e.g.
+                # "Locator.click: Timeout exceeded" matches both "locator"
+                # (code) and "timeout" (ambiguous). It was a code bug twice
+                # this week — and it is equally what a changed vendor UI or an
+                # unrendered page looks like. Naming it "code" on the keyword
+                # alone is the overconfidence this tool exists to avoid, so
+                # defer to cross-POD incidence instead.
+                reasons += [h["reason"] for h in ambiguous]
+                reasons.append("also matches " + "/".join(sorted({h["class"] for h in strong}))
+                               + ", but the ambiguous signal wins — let incidence decide")
+            elif strong:
+                verdict = strong[0]["class"]
+                reasons += [h["reason"] for h in strong]
+            else:
+                reasons += [h["reason"] for h in hits]
+
+        if verdict in ("insufficient_evidence", "unknown"):
+            if n_att >= 3 and n_fail == n_att:
+                verdict = "code"
+                reasons.append(f"fails on ALL {n_att} PODs that ran it — "
+                               f"a per-POD fault would not be universal")
+            elif n_att >= 3 and n_fail == 1:
+                verdict = "lab" if target in ("device", "directory") else "insufficient_evidence"
+                reasons.append(f"fails on 1 of {n_att} PODs — isolated to this POD")
+            elif n_att < 3:
+                reasons.append(f"only {n_att} POD(s) have run this step — "
+                               f"too few to compare across PODs")
+
+        verdicts.append({
+            "pod_id": r["pod_id"], "card": c, "step": r["step_name"],
+            "target": target,
+            "verdict": verdict,
+            "actionable_by": {
+                "code": "claude — investigate, fix, verify by re-running the step",
+                "lab": "human — inspect the device; do NOT change code for this",
+                "hardware": "human — console/cabling/boot state; no code fix applies",
+                "infrastructure": "remediable — restart the container / VPN, then retry",
+                "credentials": "human — the target rejected our credentials",
+                "upstream": "retry with backoff; if persistent it may become a code fix",
+                "insufficient_evidence": "gather more — re-run once, or inspect the device",
+            }.get(verdict, "unknown"),
+            "cross_pod": {"failed_on": n_fail, "attempted_on": n_att},
+            "vpn_container_running": vpn_up,
+            "reasons": reasons,
+            "fingerprint": _fingerprint(r.get("result") or ""),
+            "result": (r.get("result") or "")[:300],
+        })
+
+    return json.dumps({
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pods_known": len(pod_ids),
+        "failures_triaged": len(verdicts),
+        "verdicts": verdicts,
+        "note": "cross-POD incidence needs 3+ PODs to be meaningful; with fewer "
+                "this leans on error text and live checks only",
+    }, indent=2, default=str)
+
 if __name__ == "__main__":
     mcp.run()
