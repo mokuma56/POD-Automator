@@ -338,6 +338,39 @@ def api_pods():
             p["duo_done"], p["duo_total"] = 0, 0
             p["duo_configured"], p["duo_failed"] = "", False
 
+        # ISE card completion, for the "ISE Integrated" tile and the ISE column.
+        # Same rule as Duo — every step must be accounted for — with one
+        # addition: a step marked 'skipped' counts ONLY when it skipped itself
+        # deliberately. ise_run_card records a stepped-over failure as 'skipped'
+        # with a "[soft-fail]" result prefix, and counting those would put a
+        # green dot on a POD whose ISE integration silently did not happen.
+        try:
+            import ise_integrations as _ise_steps
+            irows = conn.execute(
+                "SELECT step_name, status, COALESCE(result,'') AS result "
+                "FROM ise_steps WHERE pod_id=?",
+                (p["pod_id"],)
+            ).fetchall()
+            imap = {r["step_name"]: (r["status"], r["result"]) for r in irows}
+            iwant = list(_ise_steps.ISE_STEPS)
+            idone, idegraded = [], []
+            for k in iwant:
+                st, res = imap.get(k, ("", ""))
+                if st == "completed":
+                    idone.append(k)
+                elif st == "skipped":
+                    (idegraded if res.startswith("[soft-fail]") else idone).append(k)
+            p["ise_done"] = len(idone)
+            p["ise_total"] = len(iwant)
+            p["ise_configured"] = "yes" if len(idone) == len(iwant) else ""
+            p["ise_failed"] = (any(v[0] == "failed" for v in imap.values())
+                               or bool(idegraded))
+            p["ise_degraded"] = len(idegraded)
+        except Exception:
+            p["ise_done"], p["ise_total"] = 0, 0
+            p["ise_configured"], p["ise_failed"] = "", False
+            p["ise_degraded"] = 0
+
         # Add per-POD VPN status
         vpn = check_pod_vpn(p["pod_id"])
         p["vpn_status"] = vpn["status"]
@@ -7456,6 +7489,8 @@ DASHBOARD_HTML = """
         <th>VPN</th>
         <th>Serial</th>
         <th>SD-WAN</th>
+         <th title="Duo card: green when every step completed">DUO</th>
+         <th title="ISE card: green when every step completed">ISE</th>
          <th>SCC Org</th>
          <th>Pipeline</th>
          <th>Actions</th>
@@ -7772,6 +7807,7 @@ function renderStats(pods) {
   const fullyReady  = pods.filter(p => isFullyReady(p)).length;
   const sdwanOk     = pods.filter(p => p.sdwan_online === 'yes').length;
   const duoOk       = pods.filter(p => p.duo_configured === 'yes').length;
+  const iseOk       = pods.filter(p => p.ise_configured === 'yes').length;
   // Derive running/partial/pending from step data (p.status stays 'pending' during run)
   const running = pods.filter(p => PIPELINE_ORDER.some(k => p[k] === 'running')).length;
   const partial = pods.filter(p => !isFullyReady(p) && p.sdwan_online === 'yes').length;
@@ -7781,10 +7817,30 @@ function renderStats(pods) {
     '<div class="stat-card green"><div class="num">' + fullyReady + '</div><div class="label">Fully Ready</div></div>' +
     '<div class="stat-card" style="border-left:3px solid #00e68a"><div class="num">' + sdwanOk + '</div><div class="label">SD-WAN Online</div></div>' +
     '<div class="stat-card" style="border-left:3px solid #b39ddb"><div class="num">' + duoOk + '</div><div class="label">Duo Configured</div></div>' +
+    '<div class="stat-card" style="border-left:3px solid #ffb74d"><div class="num">' + iseOk + '</div><div class="label">ISE Integrated</div></div>' +
     '<div class="stat-card yellow"><div class="num">' + running + '</div><div class="label">Running</div></div>' +
     '<div class="stat-card" style="border-left:3px solid #02c8ff"><div class="num">' + partial + '</div><div class="label">Partial</div></div>' +
     '<div class="stat-card red"><div class="num">' + pending + '</div><div class="label">Pending</div></div>' +
     '<div class="stat-card"><div class="num">' + total + '</div><div class="label">Total</div></div>';
+}
+
+// Dot colour for the DUO / ISE columns. Three states, not two: a card that has
+// never been run is grey, because showing it red is indistinguishable from a
+// card that ran and failed — and these two cards sit outside the core pipeline,
+// so "not run yet" is the normal state for most PODs.
+function cardDot(configured, failed, done) {
+  if (configured === 'yes') return '#00e68a';   // every step completed
+  if (failed)               return '#ff4757';   // ran and failed, or degraded
+  if (done > 0)             return '#ffa502';   // part-way through
+  return '#445566';                             // never run
+}
+
+function cardTip(name, configured, failed, done, total, degraded) {
+  if (configured === 'yes') return name + ' configured (' + done + '/' + total + ' steps)';
+  if (degraded)             return name + ' degraded: ' + degraded + ' step(s) stepped over after failing';
+  if (failed)               return name + ' failed (' + done + '/' + total + ' steps completed)';
+  if (done > 0)             return name + ' partial: ' + done + '/' + total + ' steps';
+  return name + ' not run';
 }
 
 function badge(val, yesLabel) {
@@ -7917,6 +7973,8 @@ function renderTable(pods) {
       <td style="text-align:center"><span style="color:${vpnColor};font-size:18px;line-height:1" title="${p.vpn_detail || ''}">&#x25cf;</span></td>
       <td style="font-size:11px;color:#667788">${serial}</td>
       <td class="device-col" style="font-size:18px;line-height:1;color:${p.sdwan_online === 'yes' ? '#00e68a' : '#ff4757'}">&#x25cf;</td>
+      <td class="device-col" style="font-size:18px;line-height:1;color:${cardDot(p.duo_configured, p.duo_failed, p.duo_done)}" title="${cardTip('Duo', p.duo_configured, p.duo_failed, p.duo_done, p.duo_total, 0)}">&#x25cf;</td>
+      <td class="device-col" style="font-size:18px;line-height:1;color:${cardDot(p.ise_configured, p.ise_failed, p.ise_done)}" title="${cardTip('ISE', p.ise_configured, p.ise_failed, p.ise_done, p.ise_total, p.ise_degraded)}">&#x25cf;</td>
       <td style="font-size:11px;color:#667788;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.scc_org||''}">${p.scc_org ? '<span style="color:#02c8ff">&#x25cf;</span> ' + (p.scc_org.match(/pseudoco-(\d+)--/) ? p.scc_org.match(/pseudoco-(\d+)--/)[1] : p.scc_org) : '<span style="color:#667788">—</span>'}</td>
       <td>${pipeLabel}</td>
       <td style="display:flex;gap:4px;flex-wrap:wrap;">
