@@ -2959,18 +2959,26 @@ def duo_setup_secure_access_app(pod_id: str, db_path: str, log=None) -> tuple[bo
             KNOWN = ("credentials.baseUrl", "credentials.credentialDetail.token",
                      "iname", "entity_id", "acs_url")
             for _round in range(len(AD_GROUPS)):
-                tagged = page.evaluate("""(known) => {
-                    // NB: do not require an empty value — the picker keeps text
-                    // after a pick and would stop matching.
-                    const i = Array.from(document.querySelectorAll('input')).filter(x => x.type === 'text')
-                        .filter(x => x.getClientRects().length)
-                        .find(x => !known.includes(x.name) &&
-                                   (x.placeholder||'').toLowerCase() !== 'username' &&
-                                   x.id !== 'global-search-input');
-                    if (!i) return false;
-                    i.setAttribute('data-pick', '1');
-                    return true;
-                }""", list(KNOWN))
+                # Anchor on the Groups section's own hidden field rather than
+                # "the first text input that is not a known name". Once the
+                # attribute mapping is set, its combobox renders as another
+                # unnamed text input ("Email Address") that sorts BEFORE the
+                # group picker — so the exclusion list picked the attribute
+                # dropdown, which offers no AD groups, and the step reported
+                # "no further groups offered" with the picker never touched.
+                tagged = page.evaluate("""() => {
+                    const anchor = document.querySelector('input[name="outboundGroups.groups"]');
+                    if (!anchor) return false;
+                    let scope = anchor;
+                    for (let k = 0; k < 8 && scope; k++) {
+                        scope = scope.parentElement;
+                        if (!scope) break;
+                        const i = Array.from(scope.querySelectorAll('input'))
+                            .find(x => x.type === 'text' && x.getClientRects().length);
+                        if (i) { i.setAttribute('data-pick', '1'); return true; }
+                    }
+                    return false;
+                }""")
                 if not tagged:
                     _log("group picker input not present")
                     break
@@ -6289,11 +6297,15 @@ def _pw_sso_ext_auth_setup(
     log("navigating to Applications → SSO Settings ...")
     try:
         base_url = "/".join(duo_page.url.split("/")[:3])
+        # /admin/sso is a legacy path that does not carry the sources table —
+        # the "Add source" button simply is not on it, which is why creating
+        # the source failed with "Could not find '+ Add Source' button" even
+        # though the button exists on the real page.
         duo_page.goto(
-            f"{base_url}/admin/sso",
-            timeout=T, wait_until="networkidle",
+            f"{base_url}/sso?selected_tab=authentication_sources",
+            timeout=T, wait_until="load",
         )
-        duo_page.wait_for_timeout(1000)
+        duo_page.wait_for_timeout(9_000)
     except Exception:
         pass
 
@@ -6337,6 +6349,7 @@ def _pw_sso_ext_auth_setup(
         # ── Add Source → Add Active Directory ────────────────────────────────
         log("adding Active Directory as external auth source ...")
         if not _pw_click_first(duo_page, [
+            "button:has-text('Add source')", "a:has-text('Add source')",
             "button:has-text('Add Source')", "a:has-text('Add Source')",
             "button:has-text('+ Add Source')",
         ], timeout=T, log=log):
