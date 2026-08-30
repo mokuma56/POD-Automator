@@ -2742,12 +2742,22 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                 if _show_btn.is_visible(timeout=1500):
                     _show_btn.click()
                     page.wait_for_timeout(400)
-                    _otp_vis = page.evaluate("""() => {
-                        const inp = document.querySelector('input[type="text"]:not([placeholder*="search" i]):not([placeholder*="Ctrl" i])') ||
-                                    document.querySelector('input[placeholder=""]');
-                        return inp ? inp.value : '';
-                    }""")
-                    log_fn(f"[scc-nav] OTP field value (post-wait Show): len={len(_otp_vis)} first20={_otp_vis[:20]!r}")
+                    # Target the OTP field specifically. This used to take the
+                    # first text input on the page, which is the integration NAME
+                    # field -- so it reported len=19 'ISE-POD-POD-17-5892' for a
+                    # field actually holding a 64-character token, and sent the
+                    # reader chasing a token/name mix-up that did not exist.
+                    _fields = page.evaluate("""() => Array.from(
+                        document.querySelectorAll('input'))
+                        .filter(i => i.type === 'text' || i.type === 'password')
+                        .filter(i => !/search|ctrl/i.test(i.getAttribute('placeholder') || ''))
+                        .map(i => ({testid: i.getAttribute('data-testid') || '',
+                                    id: i.id || '', len: (i.value || '').length}))""")
+                    log_fn(f"[scc-nav] form field lengths after fill: {_fields}")
+                    _otp_len = max((f["len"] for f in _fields), default=0)
+                    if _otp_len < 32:
+                        log_fn(f"[scc-nav] WARNING: no field holds a token-length value "
+                               f"(longest={_otp_len}); the OTP may not have been entered")
             except Exception as _show_e:
                 log_fn(f"[scc-nav] post-wait Show debug: {_show_e}")
 
@@ -2907,27 +2917,50 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             else:
                 page.wait_for_timeout(2000)
 
-            content = page.content().lower()
             # Take an "after-save" screenshot for verification
             try:
                 page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"))
                 log_fn("[scc-nav] After-save screenshot saved")
             except Exception:
                 pass
-            # Only return success if Save was actually clicked AND page shows a real result.
-            # Do NOT match broad words like "connected" that appear on the form page itself.
-            _success_signals = ["waiting for activation", "pending activation",
-                                 "activation pending", "successfully added",
-                                 "integration added", "integration created",
-                                 "my integrations"]
-            _found_signal = next((s for s in _success_signals if s in content), None)
-            if _found_signal:
-                return True, f"ISE \u2192 SCC integration submitted ({_found_signal}; token: {otp_token[:20]}...)"
-            if _saved:
-                return True, (f"ISE \u2192 SCC integration form submitted (token: {otp_token[:20]}...) "
-                              f"— check scc_after_save_{pod_id}.png to confirm activation state")
-            return True, (f"ISE \u2192 SCC integration attempted (no Save button found) "
-                          f"— check scc_after_save_{pod_id}.png")
+            # Assert the module actually exists rather than inferring from the
+            # page text. The previous version had three routes to True: a phrase
+            # match that included "my integrations" (merely the page's own name),
+            # a "Save was clicked, go look at the screenshot" branch, and -- worst
+            # -- a final `return True` reached when no Save button was found at
+            # all. All three reported success without ever confirming a module.
+            if not _saved:
+                return False, ("ISE \u2192 SCC integration: no Save button was found, "
+                               f"nothing submitted — see scc_after_save_{pod_id}.png")
+
+            _listed = False
+            for _try in range(6):
+                try:
+                    page.goto(
+                        "https://security.cisco.com/integrations/main/my-integrations"
+                        f"?enterpriseId={_eid}",
+                        wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(6000)
+                    _listed = page.evaluate("""(name) => Array.from(
+                        document.querySelectorAll('tr,li,div'))
+                        .some(r => (r.innerText || '').includes(name))""", _name)
+                except Exception as _ve:
+                    log_fn(f"[scc-nav] verification attempt {_try + 1} failed: {_ve}")
+                if _listed:
+                    break
+                log_fn(f"[scc-nav] {_name} not listed yet ({_try + 1}/6)")
+                page.wait_for_timeout(5000)
+
+            try:
+                page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"))
+            except Exception:
+                pass
+
+            if _listed:
+                return True, (f"ISE \u2192 SCC integration '{_name}' created and listed "
+                              f"in Active Integrations")
+            return False, (f"ISE \u2192 SCC integration '{_name}' was submitted but does not "
+                           f"appear in Active Integrations — see scc_after_save_{pod_id}.png")
 
         except Exception as e:
             return False, f"ISE \u2192 Secure Access integration error: {e}"
