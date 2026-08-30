@@ -5349,6 +5349,51 @@ class DockerWinRMSession:
             self._log(f"WinRM proxy container removed: {self._container}")
             self._container = None
 
+    # 9 of the 11 _winrm_connect_for_pod call sites do not wrap close() in a
+    # finally, so a raise anywhere in a step leaves the proxy container running.
+    # `docker run --rm ... sleep 900` bounds that at 15 minutes, but across 30
+    # PODs that is 30 stray containers at a time, and the log then shows a
+    # "started" with no matching "removed" which reads like a hang.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def __del__(self):
+        # Best effort only: interpreter shutdown may already have torn down the
+        # modules close() needs, and a __del__ that raises is worse than a leak.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def winrm_sweep_stale(pod_id: str, log=None) -> int:
+    """Remove leftover WinRM proxy containers for a POD. Returns how many.
+
+    Call this where no session for the POD can legitimately be open — at the
+    start of a card run — never mid-run: a live session's container is
+    indistinguishable by name from an abandoned one, and killing it breaks the
+    step that is using it.
+    """
+    import subprocess as _sp
+    _log = log or (lambda m: None)
+    try:
+        r = _sp.run(["docker", "ps", "-q", "--filter",
+                     f"name=winrm-proxy-{pod_id.lower()}-"],
+                    capture_output=True, text=True, timeout=15)
+        ids = [x for x in r.stdout.split() if x]
+        for cid in ids:
+            _sp.run(["docker", "rm", "-f", cid], capture_output=True, timeout=20)
+        if ids:
+            _log(f"swept {len(ids)} stale WinRM proxy container(s) for {pod_id}")
+        return len(ids)
+    except Exception as e:
+        _log(f"WinRM proxy sweep failed (continuing): {e}")
+        return 0
+
 
 def _winrm_connect_for_pod(pod_id: str,
                             ad_ip: str = AD_DC_IP,
@@ -10340,6 +10385,14 @@ def duo_run_card(
     """
     import sqlite3 as _sq, datetime as _dt, os as _os, re as _re_dc
     _log = log or (lambda s: print(f"  [duo-card] {s}"))
+
+    # Clear any WinRM proxy container left behind by an earlier run. Safe here
+    # and only here: no session for this POD can legitimately be open before the
+    # card starts. Most call sites do not close their session in a finally, so
+    # a failed step strands a container for up to the 15 minutes its `sleep 900`
+    # runs -- across 30 PODs that is a lot of stray containers, and a "started"
+    # with no matching "removed" in the log reads like a hang.
+    winrm_sweep_stale(pod_id, _log)
     duo_ensure_table(db_path)
 
     # ── Load org credentials ──────────────────────────────────────────────────
