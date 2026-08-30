@@ -190,6 +190,17 @@ def _migrate():
     # duo_admin_totp_secret (the column the TOTP flow actually reads and writes)
     # and had exactly one reference in the repo — this line, which created it.
     # Never populated in any org.
+    # Which optional cards were requested for a POD when it was launched:
+    # '' | 'duo' | 'ise' | 'duo,ise'. Recorded per POD so the combined view and
+    # the readiness check judge a POD against what was ASKED FOR. A boolean
+    # cannot tell "Duo was not wanted" apart from "Duo did not finish", and that
+    # distinction is what keeps the Ready column meaningful — most PODs run the
+    # core pipeline only.
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN run_addons TEXT DEFAULT ''")
+    except Exception:
+        pass
+
     for _col in ("scc_org_uuid", "idac_url", "duo_admin_email",
                  "duo_admin_password"):
         try:
@@ -371,6 +382,17 @@ def api_pods():
             p["ise_configured"], p["ise_failed"] = "", False
             p["ise_degraded"] = 0
 
+        # What was requested for this POD, so the UI can judge it against that
+        # rather than against every card that exists.
+        _addons = [a for a in (p.get("run_addons") or "").split(",") if a]
+        p["run_addons"] = ",".join(_addons)
+        p["wants_duo"] = "duo" in _addons
+        p["wants_ise"] = "ise" in _addons
+        p["addons_ok"] = (
+            (not p["wants_duo"] or p.get("duo_configured") == "yes")
+            and (not p["wants_ise"] or p.get("ise_configured") == "yes")
+        )
+
         # Add per-POD VPN status
         vpn = check_pod_vpn(p["pod_id"])
         p["vpn_status"] = vpn["status"]
@@ -438,6 +460,66 @@ def api_pipeline(pod_id):
         result = []
     conn.close()
     return jsonify(result)
+
+@app.route("/api/pipeline-full/<pod_id>")
+def api_pipeline_full(pod_id):
+    """Pipeline steps plus whichever optional cards this POD was launched with.
+
+    One request instead of three, and the server decides which phases apply from
+    pods.run_addons, so the UI cannot drift from what was actually requested.
+    Phases are returned in execution order: pipeline -> duo -> ise.
+    """
+    conn = _db()
+    try:
+        row = conn.execute("SELECT run_addons FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        addons = [a for a in ((row["run_addons"] if row else "") or "").split(",") if a]
+
+        def _rows(table):
+            try:
+                return [dict(r) for r in conn.execute(
+                    f"SELECT * FROM {table} WHERE pod_id=? ORDER BY rowid", (pod_id,))]
+            except sqlite3.Error:
+                return []
+
+        phases = [{"key": "pipeline", "title": "Pipeline",
+                   "steps": _rows("pipeline_steps"), "labels": {}}]
+        if "duo" in addons:
+            try:
+                import duo_automation as _da
+                order = list(_da.DUO_CARD_STEPS)
+                labels = getattr(_da, "DUO_STEP_LABELS", {}) or {}
+            except Exception:
+                order, labels = [], {}
+            phases.append({"key": "duo", "title": "Duo / Secure Access",
+                           "steps": _rows("duo_steps"), "order": order, "labels": labels})
+        if "ise" in addons:
+            try:
+                import ise_integrations as _ii
+                order = list(_ii.ISE_STEPS)
+                labels = getattr(_ii, "ISE_STEP_LABELS", {}) or {}
+            except Exception:
+                order, labels = [], {}
+            phases.append({"key": "ise", "title": "ISE Integrations",
+                           "steps": _rows("ise_steps"), "order": order, "labels": labels})
+        return jsonify({"pod_id": pod_id, "run_addons": ",".join(addons), "phases": phases})
+    finally:
+        conn.close()
+
+
+@app.route("/api/pods/<pod_id>/run-addons", methods=["POST"])
+def api_set_run_addons(pod_id):
+    """Record which optional cards a POD should run alongside the pipeline."""
+    data = request.get_json(silent=True) or {}
+    wanted = [a for a in ("duo", "ise") if a in (data.get("addons") or [])]
+    conn = _db()
+    try:
+        conn.execute("UPDATE pods SET run_addons=? WHERE pod_id=?",
+                     (",".join(wanted), pod_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"status": "ok", "pod_id": pod_id, "run_addons": ",".join(wanted)})
+
 
 @app.route("/api/logs/<pod_id>")
 def api_logs(pod_id):
@@ -7043,6 +7125,236 @@ def run_pod(pod_id):
     finally:
         os.unlink(tmp.name)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FULL AUTOMATION ORCHESTRATOR — pipeline (+ Duo) (+ ISE)
+#
+# The three run in three different execution contexts and cannot be merged into
+# one step list: the pipeline is a compose service, the ISE card is a one-shot
+# container, and the Duo card is a HOST thread (it needs host WinRM routing and
+# host Playwright). So this chains them instead, each keeping its own runner,
+# its own table and its own card. Nothing about running them individually
+# changes.
+#
+# Concurrency is two independent limits, not one budget. Docker Desktop
+# pre-reserves its memory as a fixed VM allocation, so container work and
+# host-side Playwright do not compete for the same RAM:
+#
+#   pipeline  -> containers, ~280MB each measured, bounded by Docker's cap
+#   Duo       -> host Chromium, ~432MB measured for one browser+page, so budget
+#                ~700MB per POD once the SCC tab and virtual authenticator are
+#                open. Bounded by DUO_MAX_CONCURRENT below.
+#
+# 30 PODs serialised on Duo would take ~12.5 hours, which is why this is a
+# semaphore and not a lock.
+DUO_MAX_CONCURRENT = 5
+_duo_slots = threading.Semaphore(DUO_MAX_CONCURRENT)
+
+# A pipeline step that fails without being in this set stops the chain. Mirrors
+# onboard.py's SOFT_FAIL_STEPS; several core steps fail routinely on lab
+# hardware and must not block the optional cards.
+PIPELINE_SOFT_FAIL = {
+    "detect_pod_number", "controller_mode_enable", "verify_online",
+    "redeploy_config_group", "verify_border_spine", "verify_leaf1",
+    "verify_leaf2", "connectivity_test", "route_verification",
+    "cdfmc_check", "ad_verify", "scc_reset_check",
+}
+
+
+def _peak_rss_mb() -> float:
+    """Total RSS of this host's Chromium processes, in MB.
+
+    Logged around the Duo phase so the first multi-POD event replaces the
+    measured-once estimate above with a real number.
+    """
+    try:
+        out = subprocess.run(["pgrep", "-f", "chromium|Chromium|headless_shell"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        if not out:
+            return 0.0
+        ps = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(out)],
+                            capture_output=True, text=True, timeout=10).stdout.split()
+        return sum(int(x) for x in ps) / 1024
+    except Exception:
+        return 0.0
+
+
+def _wait_for_pipeline(pod_id: str, log_fn, timeout_s: int = 5400) -> tuple:
+    """Block until every pipeline step reaches a terminal state.
+
+    /api/run-pod is fire-and-forget — it starts the compose service and returns
+    — so the chain has to detect completion itself. Watching step rows rather
+    than the container's exit means a pipeline that dies mid-step is still
+    caught, by the deadline rather than by a missing exit code.
+
+    Returns (ok, detail). ok is False only on a HARD failure (a failed step not
+    in PIPELINE_SOFT_FAIL) or on timeout.
+    """
+    from onboard import steps as _pipeline_steps          # names, in order
+    want = [n for n, _ in _pipeline_steps]
+    deadline = time.time() + timeout_s
+    last_note = 0.0
+
+    while time.time() < deadline:
+        conn = _db()
+        try:
+            rows = {r["step_name"]: r["status"] for r in conn.execute(
+                "SELECT step_name, status FROM pipeline_steps WHERE pod_id=?", (pod_id,))}
+        except sqlite3.Error:
+            rows = {}
+        finally:
+            conn.close()
+
+        hard = [n for n, st in rows.items()
+                if st == "failed" and n not in PIPELINE_SOFT_FAIL]
+        if hard:
+            return False, f"pipeline hard-failed at {', '.join(hard)}"
+
+        terminal = [n for n in want
+                    if rows.get(n) in ("completed", "skipped", "failed")]
+        if len(terminal) >= len(want):
+            soft = [n for n, st in rows.items() if st == "failed"]
+            return True, (f"pipeline finished ({len(terminal)}/{len(want)}"
+                          + (f", {len(soft)} soft-failed" if soft else "") + ")")
+
+        if time.time() - last_note > 120:
+            log_fn(f"pipeline {len(terminal)}/{len(want)} steps done — waiting")
+            last_note = time.time()
+        time.sleep(10)
+
+    return False, f"pipeline did not finish within {timeout_s // 60} min"
+
+
+def _start_pipeline_container(pod_id: str) -> tuple:
+    """Launch the pipeline compose service for one POD. Returns (ok, message)."""
+    import tempfile
+    from docker.generate import generate_compose, read_db
+    pods = read_db(status_filter=("pending", "available", "ready", "running",
+                                  "in_progress", ""))
+    p = next((x for x in pods if x["pod_id"] == pod_id), None)
+    if not p:
+        return False, f"POD {pod_id} not found in DB"
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False)
+    tmp.write(generate_compose(p))
+    tmp.close()
+    try:
+        r = subprocess.run(
+            ["docker", "compose", "-p", pod_id.lower(), "-f", tmp.name,
+             "up", "-d", "pipeline"],
+            capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return False, (r.stderr[:300] or r.stdout[:300])
+        return True, "pipeline started"
+    finally:
+        os.unlink(tmp.name)
+
+
+def _run_full_automation(pod_id: str, addons: list):
+    """pipeline -> Duo -> ISE, honouring the agreed failure policy.
+
+    Soft-failed pipeline steps do not stop the chain; a hard failure does.
+    A Duo failure does NOT stop ISE — the two are independent.
+    """
+    def _log(m):
+        log(pod_id, f"[full] {m}")
+
+    _log(f"starting: pipeline{''.join(' + ' + a for a in addons)}")
+    _warn_if_image_stale(pod_id)
+
+    ok, msg = _start_pipeline_container(pod_id)
+    _log(msg)
+    if not ok:
+        _log("ABORTED — pipeline would not start")
+        return
+
+    ok, msg = _wait_for_pipeline(pod_id, _log)
+    _log(msg)
+    if not ok:
+        _log("ABORTED — optional cards skipped because the pipeline did not succeed")
+        return
+
+    if "duo" in addons:
+        # Host-side Playwright: hold a slot for the whole card.
+        waiting = not _duo_slots.acquire(blocking=False)
+        if waiting:
+            _log(f"queued for a Duo slot ({DUO_MAX_CONCURRENT} run at once)")
+            _duo_slots.acquire()
+        try:
+            _log(f"Duo card starting (host Chromium RSS now {_peak_rss_mb():.0f} MB)")
+            import duo_automation as _da
+            d_ok, d_msg = _da.duo_run_card(
+                pod_id, str(DB_PATH), from_step=0,
+                log=lambda m: log(pod_id, f"[duo] {m}"))
+            _log(f"Duo {'OK' if d_ok else 'FAILED'}: {d_msg}")
+            _log(f"host Chromium RSS after Duo: {_peak_rss_mb():.0f} MB")
+        except Exception as e:
+            _log(f"Duo exception: {e}")
+        finally:
+            _duo_slots.release()
+
+    if "ise" in addons:
+        # Container-side: bounded by Docker, not by the Duo semaphore.
+        _log("ISE card starting")
+        proc = subprocess.Popen([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-u", "-c",
+            f"import sys; sys.path.insert(0,'/pipeline'); "
+            f"from ise_integrations import ise_run_card, ise_ensure_table; "
+            f"ise_ensure_table('/pipeline/host-data/pod_state.db'); "
+            f"ok, r = ise_run_card('{pod_id}', '/pipeline/host-data/pod_state.db', "
+            f"    log=print, from_step=0); "
+            f"print(('OK' if ok else 'FAIL') + ': ' + str(r))"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, f"[ise] {line}")
+        proc.wait()
+        _log(f"ISE card finished (rc={proc.returncode})")
+
+    _log("full automation complete")
+
+
+@app.route("/api/run-pod-full/<pod_id>", methods=["POST"])
+def api_run_pod_full(pod_id):
+    """Run the pipeline plus whichever optional cards were requested.
+
+    POST {"addons": ["duo","ise"]} — omitted means read pods.run_addons.
+    The selection is recorded so the combined view and the readiness check
+    judge this POD against what was actually asked for.
+    """
+    data = request.get_json(silent=True) or {}
+    if "addons" in data:
+        addons = [a for a in ("duo", "ise") if a in (data.get("addons") or [])]
+        conn = _db()
+        try:
+            conn.execute("UPDATE pods SET run_addons=? WHERE pod_id=?",
+                         (",".join(addons), pod_id))
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        conn = _db()
+        try:
+            row = conn.execute("SELECT run_addons FROM pods WHERE pod_id=?",
+                               (pod_id,)).fetchone()
+            addons = [a for a in ((row["run_addons"] if row else "") or "").split(",") if a]
+        finally:
+            conn.close()
+
+    threading.Thread(target=_run_full_automation, args=(pod_id, addons),
+                     daemon=True).start()
+    return jsonify({"status": "ok", "pod_id": pod_id, "addons": addons,
+                    "message": f"Started pipeline"
+                               + "".join(f" + {a.upper()}" for a in addons)
+                               + f" for {pod_id}"})
+
+
 @app.route("/api/run-all", methods=["POST"])
 def run_all():
     """Run pipeline containers for all PODs with connected VPNs."""
@@ -7469,6 +7781,12 @@ DASHBOARD_HTML = """
    <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
      <button class="btn-start-all" id="btn-check-update" onclick="checkForUpdates()" style="background:#1a3a1a;border:1px solid #22c55e;color:#22c55e;">&#8593; Check for Updates</button>
       <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
+     <select id="run-all-mode" title="What to run for every POD" style="background:#0a1628;border:1px solid #7c3aed;color:#b39ddb;border-radius:5px;padding:5px 7px;font-size:12px;">
+       <option value="">Pipeline only</option>
+       <option value="duo">+ Duo</option>
+       <option value="ise">+ ISE</option>
+       <option value="duo,ise">+ Duo + ISE</option>
+     </select>
      <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
       <button class="btn-start-all" id="btn-full-reset" onclick="fullReset()" style="background:#7f1d1d;border-color:#ef4444;color:#fca5a5;">&#9888; Full Reset</button>
      <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
@@ -7979,6 +8297,12 @@ function renderTable(pods) {
       <td>${pipeLabel}</td>
       <td style="display:flex;gap:4px;flex-wrap:wrap;">
         <button class="btn-start" onclick="connectVpn('${p.pod_id}')">Connect VPN</button>
+         <select class="run-mode" data-pod="${p.pod_id}" onchange="saveRunAddons(this)" title="What to run when you press Run Automation" style="background:#0a1628;border:1px solid #7c3aed;color:#b39ddb;border-radius:4px;padding:3px 5px;font-size:11px;">
+           <option value=""${(p.run_addons||'')===''?' selected':''}>Pipeline only</option>
+           <option value="duo"${(p.run_addons||'')==='duo'?' selected':''}>+ Duo</option>
+           <option value="ise"${(p.run_addons||'')==='ise'?' selected':''}>+ ISE</option>
+           <option value="duo,ise"${(p.run_addons||'')==='duo,ise'?' selected':''}>+ Duo + ISE</option>
+         </select>
          <button class="btn-reconnect" onclick="runPod('${p.pod_id}')" style="background:#7c3aed;border-color:#7c3aed;color:#fff;">&#9654; Run Automation</button>
          <button class="btn-reconnect" onclick="resetPipeline('${p.pod_id}')" style="background:#b45309;border-color:#b45309;color:#fff;" title="Clear all pipeline steps and logs so the pipeline can be re-run">&#8635; Reset Pipeline</button>
          <button class="btn-reconnect" onclick="reconnectVpn('${p.pod_id}')">Reconnect VPN</button>
@@ -8015,10 +8339,42 @@ function renderTable(pods) {
   });
 }
 
+// Persist the per-POD choice immediately. The table re-renders on a 5s poll and
+// rebuilds each row from p.run_addons, so a selection left only in the DOM would
+// silently revert under the user.
+async function saveRunAddons(sel) {
+  const podId = sel.dataset.pod;
+  const addons = sel.value ? sel.value.split(',') : [];
+  try {
+    await fetch('/api/pods/' + podId + '/run-addons', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({addons})
+    });
+    const p = (window._lastPods || []).find(x => x.pod_id === podId);
+    if (p) p.run_addons = sel.value;   // keep the cache in step until the next poll
+  } catch (e) {
+    console.warn('could not save run mode', e);
+  }
+}
+
+function selectedAddons(podId) {
+  const sel = document.querySelector('select.run-mode[data-pod="' + podId + '"]');
+  const v = sel ? sel.value : '';
+  return v ? v.split(',') : [];
+}
+
 async function runPod(podId) {
   const status = document.getElementById('docker-status');
-  status.textContent = 'Running automation for ' + podId + '...';
-  const r = await fetch('/api/run-pod/' + podId, { method: 'POST' });
+  const addons = selectedAddons(podId);
+  // Pipeline-only keeps the original endpoint untouched — the default path is
+  // the one that runs most often and should not change behaviour.
+  const label = addons.length ? ' + ' + addons.map(a => a.toUpperCase()).join(' + ') : '';
+  status.textContent = 'Running automation' + label + ' for ' + podId + '...';
+  const r = addons.length
+    ? await fetch('/api/run-pod-full/' + podId, {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({addons}) })
+    : await fetch('/api/run-pod/' + podId, { method: 'POST' });
   const data = await r.json();
   status.textContent = data.message || 'Done';
   setTimeout(() => status.textContent = '', 8000);
@@ -8075,11 +8431,37 @@ async function saveAssigned(podId, value) {
 
 async function runAllPods() {
   const status = document.getElementById('docker-status');
-  status.textContent = 'Starting all POD automation...';
-  const r = await fetch('/api/run-all', { method: 'POST' });
-  const data = await r.json();
-  status.textContent = data.message || 'Done';
-  setTimeout(() => status.textContent = '', 10000);
+  const sel = document.getElementById('run-all-mode');
+  const v = sel ? sel.value : '';
+  const addons = v ? v.split(',') : [];
+
+  // Pipeline-only keeps the original bulk endpoint untouched.
+  if (!addons.length) {
+    status.textContent = 'Starting all POD automation...';
+    const r = await fetch('/api/run-all', { method: 'POST' });
+    const data = await r.json();
+    status.textContent = data.message || 'Done';
+    setTimeout(() => status.textContent = '', 10000);
+    load();
+    return;
+  }
+
+  const label = addons.map(a => a.toUpperCase()).join(' + ');
+  const pods = (window._lastPods || []).map(p => p.pod_id);
+  if (!pods.length) { status.textContent = 'No PODs loaded'; return; }
+  if (!confirm('Run the pipeline + ' + label + ' on ' + pods.length + ' POD(s)?\\n\\n'
+      + 'Pipelines run in parallel. Duo runs on this Mac and is limited to 5 at a '
+      + 'time, so the Duo phase queues — expect roughly ' + Math.ceil(pods.length / 5)
+      + ' x 25 min for that part.')) return;
+
+  status.textContent = 'Starting pipeline + ' + label + ' on ' + pods.length + ' POD(s)...';
+  // Fire them all; the server queues the Duo phase itself.
+  await Promise.all(pods.map(id => fetch('/api/run-pod-full/' + id, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({addons})
+  }).catch(() => null)));
+  status.textContent = 'Started on ' + pods.length + ' POD(s) — Duo queues 5 at a time';
+  setTimeout(() => status.textContent = '', 12000);
   load();
 }
 
