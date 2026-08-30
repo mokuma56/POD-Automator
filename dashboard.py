@@ -1671,6 +1671,10 @@ def api_sda_deploy(pod_id):
     )
 
     import threading
+    # ISE steps run inside the image, so a stale image silently ignores every
+    # source change. Surface it in this POD's log before the run starts.
+    _warn_if_image_stale(pod_id)
+
     def _run():
         proc = subprocess.Popen([
             "docker", "run", "--rm",
@@ -1712,6 +1716,10 @@ def api_sda_rollback(pod_id):
     )
 
     import threading
+    # ISE steps run inside the image, so a stale image silently ignores every
+    # source change. Surface it in this POD's log before the run starts.
+    _warn_if_image_stale(pod_id)
+
     def _run():
         proc = subprocess.Popen([
             "docker", "run", "--rm",
@@ -1998,6 +2006,10 @@ def api_ise_run(pod_id):
     except Exception as _pre_err:
         log(pod_id, f"[ise] pre-run step init warning: {_pre_err}")
 
+    # ISE steps run inside the image, so a stale image silently ignores every
+    # source change. Surface it in this POD's log before the run starts.
+    _warn_if_image_stale(pod_id)
+
     def _run():
         proc = subprocess.Popen([
             "docker", "run", "--rm",
@@ -2063,6 +2075,8 @@ def api_ise_teardown(pod_id):
         return jsonify({"status": "error",
                         "message": f"VPN container vpn-{pod_id} is not running"}), 400
 
+    _warn_if_image_stale(pod_id)
+
     def _run():
         proc = subprocess.Popen([
             "docker", "run", "--rm",
@@ -2113,6 +2127,10 @@ def api_ise_reactivate(pod_id):
     )
     if r.returncode != 0 or r.stdout.strip() != "running":
         return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    # ISE steps run inside the image, so a stale image silently ignores every
+    # source change. Surface it in this POD's log before the run starts.
+    _warn_if_image_stale(pod_id)
 
     def _run():
         proc = subprocess.Popen([
@@ -12582,5 +12600,119 @@ def api_update():
     return app.response_class(generate(), mimetype="text/event-stream",
                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+
+# ── Container image staleness ────────────────────────────────────────────────
+# ise_integrations.py and duo_automation.py are COPYd into pod-automator:latest
+# (docker/Dockerfile) and the ISE steps run INSIDE that container. If the image
+# is older than the source, edits have no effect whatsoever: the code changes,
+# the run repeats the identical failure, and nothing indicates why.
+#
+# That is not hypothetical. On 2026-08-30 the image was 27 days old, so every
+# ISE fix made in that window silently did nothing -- ise_integrations.py was
+# 143 lines behind and duo_automation.py 4,663. Debugging against a stale image
+# is indistinguishable from debugging code that does not work.
+IMAGE_NAME = "pod-automator:latest"
+
+
+def _image_staleness(image: str = IMAGE_NAME) -> dict:
+    """Compare the image's build time against the sources the Dockerfile COPYs.
+
+    Returns {stale, reason, image_built, newer} — newer lists the files that
+    changed after the build, most recent first. Never raises: a broken check
+    must not stop the dashboard starting.
+    """
+    import datetime as _dt
+    import re as _re
+
+    out = {"stale": False, "reason": "", "image_built": None, "newer": []}
+    try:
+        r = subprocess.run(["docker", "image", "inspect", image, "--format", "{{.Created}}"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            out["reason"] = f"image {image} not found — build it"
+            out["stale"] = True
+            return out
+        built_raw = r.stdout.strip()
+        # Docker prints RFC3339 with nanoseconds, which %f cannot parse.
+        built = _dt.datetime.fromisoformat(
+            _re.sub(r"\.(\d{6})\d+", r".\1", built_raw).replace("Z", "+00:00"))
+        out["image_built"] = built.astimezone().strftime("%Y-%m-%d %H:%M")
+
+        # Read the COPY lines so this stays right if the Dockerfile changes.
+        # `data/` is COPYd too, but it holds the SQLite DB and every debug
+        # screenshot -- it changes on every run, and the container gets it as a
+        # bind mount anyway, so counting it would report "stale" permanently and
+        # the warning would be ignored. Only code decides staleness.
+        CODE_SUFFIXES = {".py", ".sh", ".csv", ".txt", ".cfg", ".conf"}
+        SKIP_DIRS = {"data"}
+        df = DATA_DIR / "docker" / "Dockerfile"
+        targets: list = []
+        if df.exists():
+            for line in df.read_text(encoding="utf-8").splitlines():
+                if not line.startswith("COPY "):
+                    continue
+                # last token is the destination
+                for tok in line.split()[1:-1]:
+                    tok = tok.rstrip("/")
+                    if tok in SKIP_DIRS:
+                        continue
+                    targets.append(tok)
+        if not targets:
+            targets = ["ise_integrations.py", "duo_automation.py", "onboard.py"]
+
+        cutoff = built.timestamp()
+        newer = []
+        for t in targets:
+            path = DATA_DIR / t
+            if not path.exists():
+                continue
+            files = ([path] if path.is_file()
+                     else [f for f in path.rglob("*") if f.is_file()])
+            for f in files:
+                if f.suffix.lower() not in CODE_SUFFIXES:
+                    continue
+                try:
+                    m = f.stat().st_mtime
+                except OSError:
+                    continue
+                if m > cutoff:
+                    newer.append((f.name, m))
+        newer.sort(key=lambda x: -x[1])
+        out["newer"] = [n for n, _ in newer[:12]]
+        if newer:
+            out["stale"] = True
+            out["reason"] = (f"{len(newer)} source file(s) newer than the image "
+                             f"(built {out['image_built']}) — "
+                             f"run: docker compose -f docker-compose.yml build")
+    except Exception as e:            # never block startup on this check
+        out["reason"] = f"staleness check failed: {e}"
+    return out
+
+
+def _warn_if_image_stale(pod_id: str = None) -> dict:
+    """Log the staleness verdict. Pass pod_id to put it in that POD's log too."""
+    st = _image_staleness()
+    if st["stale"]:
+        msg = f"[image] STALE IMAGE: {st['reason']}"
+        if st["newer"]:
+            msg += f" | newer: {', '.join(st['newer'])}"
+        print(msg, flush=True)
+        if pod_id:
+            try:
+                log(pod_id, msg)
+            except Exception:
+                pass
+    return st
+
+
+@app.route("/api/image-status")
+def api_image_status():
+    """Is pod-automator:latest behind the source it was built from?"""
+    return jsonify(_image_staleness())
+
+
 if __name__ == "__main__":
+    _st = _warn_if_image_stale()
+    if not _st["stale"]:
+        print(f"[image] {IMAGE_NAME} is current (built {_st['image_built']})", flush=True)
     app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False)
