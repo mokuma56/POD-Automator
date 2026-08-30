@@ -8971,9 +8971,28 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
             bad = [ln for ln in tail.splitlines() if "40112" in ln]
             return False, ("proxy still cannot reach Duo SSO: "
                            + (bad[0].strip()[:160] if bad else "rotate failed"))
-        if "CloudSSO Connector Module" not in tail:
-            return False, ("the [sso] section did not start — no CloudSSO "
-                           "Connector Module in the proxy log after restart")
+        # Do NOT decide this from a log tail. "CloudSSO Connector Module" is
+        # printed once at startup, and the proxy logs a directory-sync poll
+        # every ~40s, so it scrolls out of an 80-line window and the step fails
+        # on a working proxy — observed with sso_test and verify both green.
+        # Ask the connectivity tool, exactly as step_verify does.
+        cfg_now, _ = ps(f"Get-Content '{AUTHPROXY_CFG_PATH}' -Raw")
+        if not re.search(r"^\[sso\]", cfg_now, re.M):
+            return False, "authproxy.cfg still has no [sso] section after the write"
+        tool = (r"C:\Program Files\Duo Security Authentication Proxy"
+                r"\bin\authproxy_connectivity_tool.exe")
+        conn_out, _ = ps(f"& '{tool}' 2>&1 | Out-String")
+        if "SUMMARY" in conn_out:
+            summary = conn_out.split("SUMMARY", 1)[1]
+            cur, sso_bad = None, False
+            for line in summary.splitlines():
+                mm = re.search(r"Section \[([^\]]+)\]", line)
+                if mm:
+                    cur = mm.group(1).strip().lower()
+                elif cur == "sso" and "[error]" in line:
+                    sso_bad = True
+            if sso_bad:
+                return False, "the [sso] section reports connectivity errors"
         return True, "Authentication Proxy connected to Duo Single Sign-On"
     except Exception as e:
         return False, f"AD1 step failed: {type(e).__name__}: {e}"
