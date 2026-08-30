@@ -7847,6 +7847,16 @@ function updateTimer(startTime) {
   el.innerHTML = `<span class="timer-label">elapsed</span>${elapsedStr(diff)}`;
 }
 
+// Step results are arbitrary text from Python — tracebacks and reprs contain
+// things like <HTTPConnection(host='...') at 0x124218ad0>. Injected raw, the
+// browser reads that as an unknown tag, and a mid-tag truncation swallows
+// every card rendered after it. Escape before interpolating.
+function escHtml(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function formatDur(start, end) {
   if (!start) return '';
   const s = new Date(start).getTime();
@@ -7968,7 +7978,7 @@ async function loadSteps(podId) {
         '<div class="step-num">Phase ' + idx + '/' + total + '</div>' +
         '<div class="step-name">' + label + '</div>' +
         pipelineBadge(st, step?.result || '', name) +
-        '<div class="step-result">' + result + '</div>' +
+        '<div class="step-result">' + escHtml(result) + '</div>' +
         durHtml + rebootHtml +
         '<span class="started-at" data-time="' + (step?.started_at || '') + '" style="display:none"></span>' +
         '</div>';
@@ -8002,7 +8012,7 @@ async function loadSteps(podId) {
         '<div class="step-num">Phase ' + idx + '/' + total + '</div>' +
         '<div class="step-name">' + label + '</div>' +
         pipelineBadge(st, step?.result || '', name) +
-        '<div class="step-result">' + result + '</div>' +
+        '<div class="step-result">' + escHtml(result) + '</div>' +
         durHtml + rebootHtml +
         '<span class="started-at" data-time="' + (step?.started_at || '') + '" style="display:none"></span>' +
         '</div>';
@@ -9579,7 +9589,7 @@ function renderFabricGrid(podId, steps) {
     html += '<div class="step-name">' + (FABRIC_STEP_LABELS[s]||s) + '</div>';
     html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (FABRIC_STEP_TARGETS[s]||'') + '</div>';
     html += pipelineBadge(st);
-    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (result) html += '<div class="step-result">' + escHtml(result.split('\\n')[0]) + '</div>';
     if (dur)    html += '<div class="step-dur">' + dur + '</div>';
     html += '</div>';
   });
@@ -9804,7 +9814,7 @@ function renderSdaGrid(podId, data) {
     html += '<div class="step-name">' + (SDA_DEPLOY_STEP_LABELS[s] || s) + '</div>';
     html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (SDA_DEPLOY_STEP_TARGETS[s] || '') + '</div>';
     html += '<span class="sda-badge">' + pipelineBadge(st) + '</span>';
-    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (result) html += '<div class="step-result">' + escHtml(result.split('\\n')[0]) + '</div>';
     if (dur)    html += '<div class="step-dur">' + dur + '</div>';
     html += '</div>';
   });
@@ -9843,7 +9853,7 @@ function renderSdaGrid(podId, data) {
     html += '<div class="step-name">' + (SDA_ROLLBACK_STEP_LABELS[s] || s) + '</div>';
     html += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + (SDA_ROLLBACK_STEP_TARGETS[s] || '') + '</div>';
     html += '<span class="sda-badge">' + pipelineBadge(st) + '</span>';
-    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (result) html += '<div class="step-result">' + escHtml(result.split('\\n')[0]) + '</div>';
     if (dur)    html += '<div class="step-dur">' + dur + '</div>';
     html += '</div>';
   });
@@ -10061,7 +10071,7 @@ function _sdaUpdateCards(data) {
     if (res) res.textContent = resText;
     else if (resText) {
       const dur = card.querySelector('.step-dur');
-      if (dur) dur.insertAdjacentHTML('beforebegin', '<div class="step-result">' + resText + '</div>');
+      if (dur) dur.insertAdjacentHTML('beforebegin', '<div class="step-result">' + escHtml(resText) + '</div>');
     }
   });
 
@@ -10298,7 +10308,7 @@ function renderDuoGrid(podId, data) {
     html += '<div class="step-num">Step ' + (i+1) + '/' + total + '</div>';
     html += '<div class="step-name">' + (DUO_CARD_LABELS[s]||s) + '</div>';
     html += pipelineBadge(st);
-    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (result) html += '<div class="step-result">' + escHtml(result.split('\\n')[0]) + '</div>';
     const est = DUO_STEP_SECS[s];
     if (st === 'running') {
       const t0 = duoStarted(info.started_at);
@@ -11885,7 +11895,7 @@ function renderIseGrid(podId, data) {
     html += '<div class="step-num">Step ' + (i+1) + '/' + total + '</div>';
     html += '<div class="step-name">' + (ISE_STEP_LABELS[s]||s) + '</div>';
     html += pipelineBadge(st);
-    if (result) html += '<div class="step-result">' + result.split('\\n')[0] + '</div>';
+    if (result) html += '<div class="step-result">' + escHtml(result.split('\\n')[0]) + '</div>';
     if (dur)    html += '<div class="step-dur">' + dur + '</div>';
     html += '</div>';
   });
