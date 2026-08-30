@@ -8873,7 +8873,7 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
         # returned the FIRST <pre> inside it — step 1.1's file path. That got
         # appended to authproxy.cfg as a bare string, leaving [sso] still
         # absent while the log claimed the stanza was written.
-        sso_cfg = page.evaluate("""() => {
+        sso_cfg = page.evaluate(r"""() => {
             const cand = Array.from(document.querySelectorAll('pre,code,textarea,div,span'))
                 .filter(e => e.getClientRects().length)
                 .map(e => ((e.innerText || e.value || '')).trim())
@@ -9206,14 +9206,28 @@ def _sa_confirm(t) -> bool:
     return True
 
 
-def _sa_config_page(t, sa_org: str, ent: str) -> None:
+def _sa_config_page(t, sa_org: str, ent: str) -> bool:
+    """Open Configuration management and wait for its CARDS, not just a heading.
+
+    Returns True only once the page has actually rendered its content. The
+    SPA paints its shell ~30s before the cards, so a caller that asks "is
+    DuoSSO listed?" too early gets "no" and concludes there is nothing to
+    delete — reporting a clean teardown while both objects survive. Callers
+    must treat False as "unknown", never as "absent".
+    """
     t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}"
            f"/connect/users-and-groups?enterpriseId={ent}",
            wait_until="load", timeout=45_000)
     _scc_wait(t, "Configuration management")
     _scc_click(t, "Configuration management")
     _scc_wait(t, "SSO authentication")
-    t.wait_for_timeout(6_000)
+    # "Integrate directories" is the Directories card's own action, so it only
+    # exists once the card list is really on the page.
+    for _ in range(12):
+        t.wait_for_timeout(5_000)
+        if "Integrate directories" in (_scc_text(t) or ""):
+            return True
+    return False
 
 
 def sa_delete_sso_config(t, sa_org: str, ent: str, name: str = "DuoSSO",
@@ -9224,7 +9238,9 @@ def sa_delete_sso_config(t, sa_org: str, ent: str, name: str = "DuoSSO",
     blocks every re-run of the SAML step.
     """
     _log = log or (lambda s: print(f"     [sa-teardown] {s}"))
-    _sa_config_page(t, sa_org, ent)
+    if not _sa_config_page(t, sa_org, ent):
+        return False, ("Secure Access configuration page never rendered its "
+                       "cards — cannot tell whether an SSO configuration exists")
     if name not in (_scc_text(t) or ""):
         return True, f"no {name} SSO configuration present"
     if not _sa_expand_row(t, name):
@@ -9245,7 +9261,10 @@ def sa_delete_sso_config(t, sa_org: str, ent: str, name: str = "DuoSSO",
     t.wait_for_timeout(6_000)
     _sa_confirm(t)
 
-    _sa_config_page(t, sa_org, ent)
+    # Confirm the removal against a page that actually rendered — otherwise
+    # "not listed" just means "not loaded yet" and the delete looks successful.
+    if not _sa_config_page(t, sa_org, ent):
+        return False, f"deleted {name} but could not confirm — page did not render"
     if name in (_scc_text(t) or ""):
         return False, f"{name} is still listed after the delete"
     _log(f"deleted the {name} SSO configuration")
@@ -9259,7 +9278,9 @@ def sa_delete_idp_directory(t, sa_org: str, ent: str, log=None) -> tuple[bool, s
     """
     import re as _re
     _log = log or (lambda s: print(f"     [sa-teardown] {s}"))
-    _sa_config_page(t, sa_org, ent)
+    if not _sa_config_page(t, sa_org, ent):
+        return False, ("Secure Access configuration page never rendered its "
+                       "cards — cannot tell whether an IdP directory exists")
     m = _re.search(r"Duo-\d+", _scc_text(t) or "")
     if not m:
         return True, "no Duo IdP directory present"
@@ -9282,7 +9303,8 @@ def sa_delete_idp_directory(t, sa_org: str, ent: str, log=None) -> tuple[bool, s
     t.wait_for_timeout(6_000)
     _sa_confirm(t)
 
-    _sa_config_page(t, sa_org, ent)
+    if not _sa_config_page(t, sa_org, ent):
+        return False, f"deleted {dirname} but could not confirm — page did not render"
     if dirname in (_scc_text(t) or ""):
         return False, f"{dirname} is still listed after the delete"
     _log(f"deleted the {dirname} IdP directory")
