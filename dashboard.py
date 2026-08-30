@@ -7923,10 +7923,36 @@ function elapsedStr(ms) {
   return `${sec}s`;
 }
 
+// Parse a timestamp written by the backend. TWO formats exist and BOTH are UTC:
+//   duo_steps      "2026-08-30T12:38:57Z"   ISO, parses correctly everywhere
+//   pipeline_steps "2026-08-28 12:59:38"    sqlite datetime('now') — UTC, but
+//                                           with NO timezone marker
+// new Date() on the second reads it as LOCAL time (Chrome) or returns Invalid
+// Date (Safari). Locally that is a 5-hour error, so any "elapsed since start"
+// was wrong by the UTC offset. Durations happened to survive because both ends
+// skewed equally and cancelled.
+// Returns null rather than NaN so callers can decide what to show.
+function parseStamp(v) {
+  if (!v) return null;
+  const s = String(v).trim();
+  let iso = null;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(s)) {
+    iso = s;                                   // already ISO/UTC
+  } else if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(s)) {
+    iso = s.replace(' ', 'T') + 'Z';           // naive -> explicit UTC
+  } else {
+    return null;
+  }
+  const t = new Date(iso).getTime();
+  return isNaN(t) ? null : t;
+}
+
 function updateTimer(startTime) {
   const el = document.getElementById('elapsed-timer');
   if (!startTime) { el.innerHTML = ''; return; }
-  const diff = Date.now() - new Date(startTime).getTime();
+  const t0 = parseStamp(startTime);
+  if (t0 === null) { el.innerHTML = ''; return; }
+  const diff = Date.now() - t0;
   el.innerHTML = `<span class="timer-label">elapsed</span>${elapsedStr(diff)}`;
 }
 
@@ -7942,8 +7968,10 @@ function escHtml(v) {
 
 function formatDur(start, end) {
   if (!start) return '';
-  const s = new Date(start).getTime();
-  const e = end ? new Date(end).getTime() : Date.now();
+  const s = parseStamp(start);
+  if (s === null) return '';
+  const e = end ? parseStamp(end) : Date.now();
+  if (e === null) return '';
   return elapsedStr(e - s);
 }
 
@@ -8064,7 +8092,7 @@ async function loadSteps(podId) {
       const cardBorder = st === 'skipped' || (SOFT_FAIL_STEPS.has(name) && st === 'completed' && result && result.includes('FAIL')) ? 'border-left:3px solid #ffa502;' : st === 'failed' ? 'border-left:3px solid #ff4757;' : '';
       let rebootHtml = '';
       if (name === 'controller_mode_enable' && st === 'running' && step?.started_at) {
-        const elapsedSec = Math.floor((Date.now() - new Date(step.started_at + 'Z').getTime()) / 1000);
+        const elapsedSec = Math.floor((Date.now() - (parseStamp(step.started_at) ?? Date.now())) / 1000);
         const pct = Math.min(99, Math.round(elapsedSec / CTRL_MODE_EST_SECS * 100));
         const remaining = Math.max(0, CTRL_MODE_EST_SECS - elapsedSec);
         const remStr = remaining > 0 ? '~' + Math.ceil(remaining / 60) + 'm remaining' : 'any moment now...';
@@ -8098,7 +8126,7 @@ async function loadSteps(podId) {
       const cardBorder = st === 'skipped' || (SOFT_FAIL_STEPS.has(name) && st === 'completed' && result && result.includes('FAIL')) ? 'border-left:3px solid #ffa502;' : st === 'failed' ? 'border-left:3px solid #ff4757;' : '';
       let rebootHtml = '';
       if (name === 'controller_mode_enable' && st === 'running' && step?.started_at) {
-        const elapsedSec = Math.floor((Date.now() - new Date(step.started_at + 'Z').getTime()) / 1000);
+        const elapsedSec = Math.floor((Date.now() - (parseStamp(step.started_at) ?? Date.now())) / 1000);
         const pct = Math.min(99, Math.round(elapsedSec / CTRL_MODE_EST_SECS * 100));
         const remaining = Math.max(0, CTRL_MODE_EST_SECS - elapsedSec);
         const remStr = remaining > 0 ? '~' + Math.ceil(remaining / 60) + 'm remaining' : 'any moment now...';
