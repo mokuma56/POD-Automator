@@ -314,6 +314,27 @@ def api_pods():
                 p[f"{s['step_name']}_result"] = (s["result"] or "")[:80]
         except Exception:
             pass
+        # Duo card completion, for the "DUO Configured" tile. A POD counts only
+        # when EVERY step of the card is completed — a partially-green card is
+        # not a configured POD, and the whole point of this dashboard is not to
+        # report success that is not there.
+        try:
+            import duo_automation as _da_steps
+            drows = conn.execute(
+                "SELECT step_name, status FROM duo_steps WHERE pod_id=?",
+                (p["pod_id"],)
+            ).fetchall()
+            dmap = {r["step_name"]: r["status"] for r in drows}
+            want = list(_da_steps.DUO_CARD_STEPS)
+            done = [k for k in want if dmap.get(k) in ("completed", "skipped")]
+            p["duo_done"] = len(done)
+            p["duo_total"] = len(want)
+            p["duo_configured"] = "yes" if len(done) == len(want) else ""
+            p["duo_failed"] = any(v == "failed" for v in dmap.values())
+        except Exception:
+            p["duo_done"], p["duo_total"] = 0, 0
+            p["duo_configured"], p["duo_failed"] = "", False
+
         # Add per-POD VPN status
         vpn = check_pod_vpn(p["pod_id"])
         p["vpn_status"] = vpn["status"]
@@ -1819,6 +1840,55 @@ def api_duo_run(pod_id):
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "pod_id": pod_id, "from_step": from_step})
+
+
+@app.route("/api/step-timings")
+def api_step_timings():
+    """Median duration per step, measured from this deployment's own history.
+
+    Feeds the "time remaining" estimates. Medians (not means) so one pathological
+    run — a step that sat waiting on a human, or a stuck browser — does not skew
+    the estimate for everyone.
+
+    NOTE two timestamp formats live in this database: pipeline_steps writes
+    "YYYY-MM-DD HH:MM:SS" and duo_steps writes "YYYY-MM-DDTHH:MM:SSZ". Parse
+    both rather than silently returning nothing.
+    """
+    import datetime as _dt
+
+    def _parse(t):
+        if not t:
+            return None
+        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return _dt.datetime.strptime(t, fmt)
+            except ValueError:
+                continue
+        return None
+
+    out = {}
+    conn = _db()
+    for table, key in (("pipeline_steps", "pipeline"), ("duo_steps", "duo")):
+        durs = {}
+        try:
+            rows = conn.execute(
+                f"SELECT step_name, started_at, completed_at FROM {table} "
+                f"WHERE started_at IS NOT NULL AND completed_at IS NOT NULL"
+            ).fetchall()
+        except Exception:
+            rows = []
+        for r in rows:
+            a, b = _parse(r["started_at"]), _parse(r["completed_at"])
+            if not a or not b:
+                continue
+            secs = (b - a).total_seconds()
+            # Discard nonsense: clock skew, or a row left open across a restart.
+            if secs < 0 or secs > 3600:
+                continue
+            durs.setdefault(r["step_name"], []).append(secs)
+        out[key] = {k: round(sorted(v)[len(v) // 2]) for k, v in durs.items() if v}
+    conn.close()
+    return jsonify(out)
 
 
 @app.route("/api/duo/logs/<pod_id>")
@@ -7409,6 +7479,17 @@ DASHBOARD_HTML = """
 </div>
 
 <script>
+// Median step durations measured from this deployment's own history
+// (/api/step-timings). Refreshed on load so estimates track reality as more
+// runs accumulate, instead of drifting away from a hardcoded table.
+window.STEP_SECS = {pipeline: {}, duo: {}};
+(async () => {
+  try {
+    const r = await fetch('/api/step-timings');
+    if (r.ok) window.STEP_SECS = await r.json();
+  } catch (e) { /* estimates simply stay hidden */ }
+})();
+
 const PIPELINE_ORDER = [
   "detect_pod_number",
   "verify_router",
@@ -7543,6 +7624,7 @@ function renderStats(pods) {
   const total = pods.length;
   const fullyReady  = pods.filter(p => isFullyReady(p)).length;
   const sdwanOk     = pods.filter(p => p.sdwan_online === 'yes').length;
+  const duoOk       = pods.filter(p => p.duo_configured === 'yes').length;
   // Derive running/partial/pending from step data (p.status stays 'pending' during run)
   const running = pods.filter(p => PIPELINE_ORDER.some(k => p[k] === 'running')).length;
   const partial = pods.filter(p => !isFullyReady(p) && p.sdwan_online === 'yes').length;
@@ -7551,6 +7633,7 @@ function renderStats(pods) {
   document.getElementById('summary').innerHTML =
     '<div class="stat-card green"><div class="num">' + fullyReady + '</div><div class="label">Fully Ready</div></div>' +
     '<div class="stat-card" style="border-left:3px solid #00e68a"><div class="num">' + sdwanOk + '</div><div class="label">SD-WAN Online</div></div>' +
+    '<div class="stat-card" style="border-left:3px solid #b39ddb"><div class="num">' + duoOk + '</div><div class="label">Duo Configured</div></div>' +
     '<div class="stat-card yellow"><div class="num">' + running + '</div><div class="label">Running</div></div>' +
     '<div class="stat-card" style="border-left:3px solid #02c8ff"><div class="num">' + partial + '</div><div class="label">Partial</div></div>' +
     '<div class="stat-card red"><div class="num">' + pending + '</div><div class="label">Pending</div></div>' +
@@ -7938,11 +8021,27 @@ async function loadSteps(podId) {
   const barColor = hardFailed ? '#ff4757' : (softFailed && allAccountedFor && !running) ? '#ffa502' : running ? '#02c8ff' : done === total ? '#00e68a' : '#667788';
   if (fill) { fill.style.width = pct + '%'; fill.style.background = barColor; }
   if (txt)  txt.textContent = pct + '% (' + done + '/' + total + (skipped ? ', ' + skipped + ' warn' : '') + ')';
-  if (lbl)  lbl.textContent = hardFailed ? 'Failed at ' + done + '/' + total
+  // Overall time remaining, summed from measured medians for the steps that
+  // have not finished. Only shown while running — a static estimate on an
+  // idle card is noise.
+  let remainSecs = 0;
+  const tmap = (window.STEP_SECS || {}).pipeline || {};
+  const stMap = {};
+  steps.forEach(x => { stMap[x.step_name] = x.status; });
+  PIPELINE_ORDER.forEach(k => {
+    const st = stMap[k];
+    if (st === 'running' || st === undefined || st === '' || st === 'pending') {
+      remainSecs += (tmap[k] || 0);
+    }
+  });
+  const remainTxt = (running && remainSecs > 0)
+    ? ' \u2022 ~' + duoEta(remainSecs) + ' left' : '';
+  if (lbl)  lbl.textContent = (hardFailed ? 'Failed at ' + done + '/' + total
                              : (softFailed && allAccountedFor && !running) ? 'Complete — check warnings'
                              : skipped > 0 && done === total ? 'Done with ' + skipped + ' warning(s)'
                              : running ? 'Running — ' + done + '/' + total
-                             : done === total ? 'Complete!' : 'Pending — ' + done + '/' + total;
+                             : done === total ? 'Complete!' : 'Pending — ' + done + '/' + total)
+                             + remainTxt;
 
   // Estimated duration for controller_mode_enable (router reboot into SD-WAN mode)
   // Based on observed run 2026-05-20: 534s. Round up to 540s for comfort.
@@ -10251,7 +10350,8 @@ function renderDuoGrid(podId, data) {
   html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
   let remain = 0;
   DUO_CARD_STEPS.forEach(s2 => {
-    const i2 = steps[s2] || {}, st2 = i2.status || 'pending', e2 = DUO_STEP_SECS[s2] || 0;
+    const i2 = steps[s2] || {}, st2 = i2.status || 'pending';
+    const e2 = ((window.STEP_SECS || {}).duo || {})[s2] ?? (DUO_STEP_SECS[s2] || 0);
     if (st2 === 'pending') remain += e2;
     else if (st2 === 'running') {
       const t0 = duoStarted(i2.started_at);
@@ -10309,7 +10409,7 @@ function renderDuoGrid(podId, data) {
     html += '<div class="step-name">' + (DUO_CARD_LABELS[s]||s) + '</div>';
     html += pipelineBadge(st);
     if (result) html += '<div class="step-result">' + escHtml(result.split('\\n')[0]) + '</div>';
-    const est = DUO_STEP_SECS[s];
+    const est = ((window.STEP_SECS || {}).duo || {})[s] ?? DUO_STEP_SECS[s];
     if (st === 'running') {
       const t0 = duoStarted(info.started_at);
       const el = t0 ? Math.round((Date.now() - t0) / 1000) : 0;
