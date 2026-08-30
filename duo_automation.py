@@ -8074,12 +8074,14 @@ def sa_sso_already_configured(t, sa_org: str, ent: str) -> bool:
     card switches its action from "Add SSO authentication" to "Configure",
     which opens an edit view rather than the three-step wizard.
     """
-    t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}/connect/users-and-groups"
-           f"?enterpriseId={ent}", wait_until="load", timeout=45_000)
-    _scc_wait(t, "Configuration management")
-    _scc_click(t, "Configuration management")
-    _scc_wait(t, "SSO authentication")
-    t.wait_for_timeout(6_000)
+    # Must go through the render-verified navigation. Doing its own goto and
+    # reading the text too early makes an unrendered page look like "no SSO
+    # configuration", after which the caller walks into the wizard and dies on
+    # "no Configure / Add SSO authentication control". Raise rather than
+    # guess — an unsettled page is UNKNOWN, not absent.
+    if not _sa_config_page(t, sa_org, ent):
+        raise RuntimeError("Secure Access configuration page never rendered its "
+                           "cards — cannot tell whether SSO is already configured")
     return "DuoSSO" in (_scc_text(t) or "").split("SSO authentication")[-1]
 
 
@@ -8091,11 +8093,10 @@ def _sa_wizard_open(t, sa_org: str, ent: str, log=None) -> str:
     """
     import re as _re
     _log = log or (lambda s: print(f"     [sa-sso] {s}"))
-    t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}/connect/users-and-groups"
-           f"?enterpriseId={ent}", wait_until="load", timeout=45_000)
-    _scc_wait(t, "Configuration management")
-    _scc_click(t, "Configuration management")
-    _scc_wait(t, "SSO authentication")
+    # Same reason as above: wait for the cards, not just the heading, or the
+    # control lookup below finds nothing on a page that simply had not painted.
+    if not _sa_config_page(t, sa_org, ent):
+        raise RuntimeError("Secure Access configuration page never rendered its cards")
     m = _re.search(r"Duo-\d+", _scc_text(t) or "")
     dirname = m.group(0) if m else "Duo"
     hit = t.evaluate("""() => {
