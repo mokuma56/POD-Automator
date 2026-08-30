@@ -2320,6 +2320,12 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
         ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
         try:
             import duo_automation as _da
+            # _scc_open_session LOADS a stored URL, which is read-only. It must
+            # never be handed a path that MINTS one: idac_sdk reprovisions the
+            # pod's entire identity — a new Duo org AND a new SCC org AND a new
+            # Meraki org (see duo_automation.py, fetch_idac_url_from_dcloud).
+            # Minting here would rotate the org out from under the very reset
+            # that is cleaning it, and the damage would be silent.
             page, eid = _da._scc_open_session(ctx, idac,
                                               log=lambda m: log_fn(f"[scc-nav] {m}"))
             page.set_default_timeout(30000)
@@ -3111,11 +3117,12 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
     import sqlite3 as _sq
 
     db_path = str(DATA_DIR / "data" / "pod_state.db")
+    # Session comes from _host_scc_open(): a fresh iDAC login by preference, with
+    # the stored file only as a fallback. This used to refuse outright unless
+    # scc_session_<POD>.json existed, which made the reset depend on someone
+    # having remembered to run "Refresh SCC Sessions" (a HEADED Chrome on the
+    # Mac, ~12h expiry) beforehand.
     scc_session = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
-    if not scc_session.exists():
-        scc_session = DATA_DIR / "data" / "scc_session.json"
-    if not scc_session.exists():
-        return False, f"No SCC session found for {pod_id} — run Refresh SCC Sessions first"
 
     def _persist(item_key, status, detail=""):
         try:
@@ -3128,15 +3135,12 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
         except Exception as _e:
             log_fn(f"[scc-reset] DB write error: {_e}")
 
-    _sd = json.loads(scc_session.read_text())
+    # enterpriseId used to be dug out of the stored session file's localStorage,
+    # which meant this could not run without one. _host_scc_open() returns it
+    # from whichever session it established, so _base is rebuilt below once the
+    # browser is open.
     _eid = ""
-    for _o in _sd.get("origins", []):
-        for _it in _o.get("localStorage", []):
-            if _it.get("name") == "enterpriseId":
-                _eid = _it["value"]
-                break
-    _base = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
-             if _eid else "https://security.cisco.com/dashboard")
+    _base = "https://security.cisco.com/dashboard"
 
     # Look up sa_org_id and derive org name from DB so _sa_url() / _enter_secure_access()
     # can build direct SA URLs and interact with the org-picker modal.
@@ -3166,11 +3170,10 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
-            ctx = browser.new_context(
-                storage_state=_sd, viewport={"width": 1920, "height": 1080}
-            )
-            page = ctx.new_page()
+            ctx, page, _eid = _host_scc_open(browser, pod_id, log_fn, str(scc_session))
             page.set_default_timeout(20000)
+            if _eid:
+                _base = f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
 
             # ── Load SCC and verify session ───────────────────────────────────
             page.goto(_base, wait_until="domcontentloaded", timeout=60000)
