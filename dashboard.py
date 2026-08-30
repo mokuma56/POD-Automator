@@ -91,7 +91,6 @@ def _migrate():
             vpn_user TEXT DEFAULT '',
             vpn_pass TEXT DEFAULT '',
             router_ip TEXT DEFAULT '',
-            jump_host TEXT DEFAULT '',
             session_id TEXT DEFAULT '',
             notes TEXT DEFAULT '',
             scc_org TEXT DEFAULT '',
@@ -187,8 +186,12 @@ def _migrate():
     # unused. duo_automation.py:2346 writes duo_admin_email/duo_admin_password
     # inside a try/except that only logs a WARN, so the failure was silent.
     # Do not re-add a DROP here.
+    # duo_totp_secret was removed 2026-08-30: it was a superseded twin of
+    # duo_admin_totp_secret (the column the TOTP flow actually reads and writes)
+    # and had exactly one reference in the repo — this line, which created it.
+    # Never populated in any org.
     for _col in ("scc_org_uuid", "idac_url", "duo_admin_email",
-                 "duo_admin_password", "duo_totp_secret"):
+                 "duo_admin_password"):
         try:
             conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
         except Exception:
@@ -1969,7 +1972,13 @@ def api_ise_run(pod_id):
         from ise_integrations import ISE_STEPS
         _c = _db()
         _now = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        _start_idx = max(0, from_step - 1)  # from_step is 1-indexed; 0 means start from index 0
+        # from_step is a 0-indexed offset into ISE_STEPS, matching ise_run_card's
+        # own `if i < from_step: continue`. This used to subtract 1, so the
+        # dashboard marked step N-1 'running' while the container started at
+        # step N — leaving an orphaned 'running' row that _clear_stuck_running
+        # later relabelled "container exited unexpectedly" for a step that had
+        # never run at all.
+        _start_idx = max(0, from_step)
         for _i, _s in enumerate(ISE_STEPS):
             if _i < _start_idx:
                 continue
@@ -2021,12 +2030,61 @@ def api_ise_run(pod_id):
 
 @app.route("/api/ise/reset/<pod_id>", methods=["POST"])
 def api_ise_reset(pod_id):
-    """Clear all ISE card step rows for a POD."""
+    """Clear all ISE card step rows for a POD.
+
+    Dashboard state only — this does NOT remove anything from ISE, SCC or
+    cdFMC. Use /api/ise/teardown for that.
+    """
     _ensure_ise_table()
     c = _db()
     c.execute("DELETE FROM ise_steps WHERE pod_id=?", (pod_id,))
     c.commit(); c.close()
-    return jsonify({"status": "ok", "message": f"ISE state cleared for {pod_id}"})
+    return jsonify({"status": "ok",
+                    "message": f"ISE dashboard state cleared for {pod_id} "
+                               f"(integrations in ISE/SCC are untouched)"})
+
+
+@app.route("/api/ise/teardown/<pod_id>", methods=["POST"])
+def api_ise_teardown(pod_id):
+    """Actually remove the ISE integrations, for a clean-org re-test.
+
+    Runs inside the VPN network namespace: ISE is only reachable from there,
+    and the container can reach SCC too via a fresh iDAC login, so the whole
+    teardown is one process rather than a host round-trip.
+    """
+    import threading
+    _ensure_ise_table()
+
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error",
+                        "message": f"VPN container vpn-{pod_id} is not running"}), 400
+
+    def _run():
+        proc = subprocess.Popen([
+            "docker", "run", "--rm",
+            "--network", f"container:vpn-{pod_id}",
+            "-e", f"POD_ID={pod_id}",
+            "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+            "--entrypoint", "python3",
+            "pod-automator:latest", "-u", "-c",
+            f"import sys; sys.path.insert(0,'/pipeline'); "
+            f"from ise_integrations import ise_teardown; "
+            f"ok, r = ise_teardown('{pod_id}', '/pipeline/host-data/pod_state.db', log=print); "
+            f"print(('OK' if ok else 'FAIL') + ': ' + str(r))"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, f"[ise-teardown] {line}")
+        proc.wait()
+        log(pod_id, f"[ise-teardown] container exited (rc={proc.returncode})")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "pod_id": pod_id})
 
 
 @app.route("/api/ise/reactivate/<pod_id>", methods=["POST"])
@@ -2086,10 +2144,98 @@ def api_ise_reactivate(pod_id):
     return jsonify({"status": "started", "pod_id": pod_id, "step": "ise_scc_deactivate_reactivate"})
 
 
+def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tuple:
+    """Open an authenticated SCC session on the host. Returns (context, page, enterprise_id).
+
+    Prefers a live iDAC SAML auto-login over the stored session file.
+
+    The stored sessions (data/scc_session_<POD>.json) expire in about 12 hours
+    and had to be refreshed by hand with refresh_scc_sessions.py. In practice
+    they went stale and every SCC-dependent ISE step failed with
+    "No SCC session file for <pod>" — three of the five steps on the card, all
+    from one missing file. The iDAC URL is per-org, long-lived and already
+    stored in org_credentials, and replaying it is read-only (only idac_sdk
+    reprovisions), so a fresh session can be minted on demand instead.
+
+    A fresh login also sidesteps the original reason this work was pushed to the
+    host at all: Okta *silent renew* is what the VPN breaks, and a first-time
+    SAML login never performs one.
+
+    Raises RuntimeError if no session can be established — an unusable session
+    must not be returned as if it were fine.
+    """
+    import re as _re
+
+    idac = ""
+    try:
+        _c = _db()
+        _c.row_factory = sqlite3.Row
+        _pod = _c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        _m = _re.search(r"pseudoco-(\d+)", ((_pod["scc_org"] if _pod else "") or ""))
+        if _m:
+            _row = _c.execute("SELECT idac_url FROM org_credentials WHERE org_number=?",
+                              (_m.group(1),)).fetchone()
+            idac = ((_row["idac_url"] if _row else "") or "").strip()
+        _c.close()
+    except sqlite3.Error as _e:
+        # Only DB trouble is tolerated here — a programming error must surface
+        # rather than be reported as "no idac_url" and silently degrade to the
+        # stale-file path.
+        log_fn(f"[scc-nav] could not read idac_url for {pod_id}: {_e}")
+
+    if idac:
+        ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
+        try:
+            import duo_automation as _da
+            page, eid = _da._scc_open_session(ctx, idac,
+                                              log=lambda m: log_fn(f"[scc-nav] {m}"))
+            page.set_default_timeout(30000)
+            return ctx, page, eid
+        except Exception as _e:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            log_fn(f"[scc-nav] iDAC login failed ({_e}) — falling back to stored session")
+    else:
+        log_fn(f"[scc-nav] no idac_url stored for {pod_id} — using stored session file")
+
+    # Fallback: the pre-existing stored-session path.
+    if not session_path or not Path(session_path).exists():
+        raise RuntimeError(
+            f"no SCC session for {pod_id}: iDAC login unavailable and "
+            f"{Path(session_path).name if session_path else 'no session file'} not present")
+
+    _sd = json.loads(Path(session_path).read_text())
+    if isinstance(_sd, dict) and "cookies" in _sd:
+        log_fn(f"[scc-nav] storage_state: {len(_sd.get('cookies', []))} cookies, "
+               f"{len(_sd.get('origins', []))} origins")
+        ctx = browser.new_context(storage_state=_sd,
+                                  viewport={"width": 1920, "height": 1080})
+    else:
+        log_fn("[scc-nav] legacy cookie session")
+        ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
+        ctx.add_cookies(_sd)
+
+    eid = ""
+    for _o in (_sd.get("origins", []) if isinstance(_sd, dict) else []):
+        for _it in _o.get("localStorage", []):
+            if _it.get("name") == "enterpriseId":
+                eid = _it["value"]
+                break
+    page = ctx.new_page()
+    page.set_default_timeout(30000)
+    page.goto(f"https://security.cisco.com/dashboard?enterpriseId={eid}"
+              if eid else "https://security.cisco.com/dashboard",
+              wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2000)
+    return ctx, page, eid
+
+
 def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) -> tuple:
     """Run SCC Platform Integrations on the HOST (not Docker).
     Docker routes all traffic through OpenConnect VPN which breaks Okta silent-renew.
-    On the host, storage_state → security.cisco.com works correctly.
+    The session comes from _host_scc_open() — a fresh iDAC login by preference.
     Called by /api/ise/scc-complete which the Docker ISE container POSTs to.
     """
     import time as _time
@@ -2098,23 +2244,11 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
-            _sd = json.loads(Path(session_path).read_text())
-            if isinstance(_sd, dict) and "cookies" in _sd:
-                log_fn(f"[scc-nav] storage_state: {len(_sd.get('cookies',[]))} cookies, "
-                       f"{len(_sd.get('origins', []))} origins")
-                scc_ctx = browser.new_context(
-                    storage_state=_sd,
-                    viewport={"width": 1920, "height": 1080},
-                )
-            else:
-                log_fn("[scc-nav] legacy cookie session")
-                scc_ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
-                scc_ctx.add_cookies(_sd)
-            page = scc_ctx.new_page()
-            page.set_default_timeout(30000)
+            scc_ctx, page, _eid = _host_scc_open(browser, pod_id, log_fn, session_path)
 
             # Intercept SCC API responses so we can detect OTP rejection (400)
-            # without relying on page-content heuristics.
+            # without relying on page-content heuristics. Attached after the
+            # session is open; the /v1/ise POST happens later in this function.
             _scc_api_resp: dict = {}
             def _on_scc_response(resp) -> None:
                 if "/v1/ise" in resp.url and resp.request.method == "POST":
@@ -2124,18 +2258,7 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                     except Exception:
                         pass
             page.on("response", _on_scc_response)
-
-            _eid = ""
-            for _o in _sd.get("origins", []):
-                for _it in _o.get("localStorage", []):
-                    if _it.get("name") == "enterpriseId":
-                        _eid = _it["value"]
-                        break
-            _url = (f"https://security.cisco.com/dashboard?enterpriseId={_eid}"
-                    if _eid else "https://security.cisco.com/dashboard")
-            log_fn(f"[scc-nav] Navigating to SCC dashboard...")
-            page.goto(_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2000)
+            log_fn("[scc-nav] SCC session ready")
 
             # /login/callback is the OAuth2 callback URL — the SPA is processing a
             # silent token renewal, not a login failure. Wait up to 20s for it to
@@ -4621,9 +4744,9 @@ def api_ise_scc_complete():
     if not pod_id or not otp_token:
         return jsonify({"ok": False, "message": "pod_id and otp_token required"}), 400
 
+    # A missing session file is no longer fatal — _host_scc_open mints one from
+    # the org's iDAC URL and treats this file only as a fallback.
     session_path = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
-    if not session_path.exists():
-        return jsonify({"ok": False, "message": f"No SCC session file for {pod_id}"}), 404
 
     log(pod_id, f"[scc-nav] Host SCC nav starting for {pod_id} (OTP: {otp_token[:12]}...)")
 
@@ -4664,13 +4787,15 @@ def _scc_otp_watcher():
                     # Remove signal file immediately so we don't process twice
                     Path(_otp_file).unlink(missing_ok=True)
                     log(_pod_id, f"[scc-nav] Watcher picked up OTP for {_pod_id} — running host SCC nav")
+                    # No longer gated on the session file existing: _host_scc_open
+                    # mints a fresh session from the org's iDAC URL and only falls
+                    # back to this file. Refusing here was what turned a missing
+                    # 12-hour session into "No SCC session file for POD-xx" on
+                    # three of the five ISE steps.
                     _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
-                    if not _session_path.exists():
-                        _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
-                    else:
-                        _ok, _msg = _host_scc_integrate(_pod_id, _otp, str(_session_path),
-                                                        lambda m: log(_pod_id, m))
-                        _res = {"ok": _ok, "message": _msg}
+                    _ok, _msg = _host_scc_integrate(_pod_id, _otp, str(_session_path),
+                                                    lambda m: log(_pod_id, m))
+                    _res = {"ok": _ok, "message": _msg}
                     log(_pod_id, f"[scc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
                     # Write result for container to pick up
                     _result_path = DATA_DIR / "data" / f"ise_scc_result_{_pod_id}.json"
@@ -4911,23 +5036,10 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
         browser = p.chromium.launch(headless=True,
             args=["--disable-popup-blocking", "--no-sandbox", "--disable-dev-shm-usage"])
         try:
-            _sd = json.loads(Path(session_path).read_text())
-            ctx = browser.new_context(
-                storage_state=_sd, viewport={"width": 1920, "height": 1080},
-                ignore_https_errors=True,
-            )
-            log_fn(f"[cdfmc-nav] storage_state: {len(_sd.get('cookies',[]))} cookies")
-
-            page = ctx.new_page()
-            page.set_default_timeout(30000)
-
-            # ── 1. Get EID from session localStorage ─────────────────────────
-            _eid = ""
-            for _o in (_sd.get("origins", []) if isinstance(_sd, dict) else []):
-                for _it in _o.get("localStorage", []):
-                    if _it.get("name") == "enterpriseId":
-                        _eid = _it["value"]
-                        break
+            # ── 1. Authenticated SCC session + enterprise id ─────────────────
+            # A fresh iDAC login by preference; the stored session file is only
+            # a fallback. See _host_scc_open.
+            ctx, page, _eid = _host_scc_open(browser, pod_id, log_fn, session_path)
 
             # ── 2. Navigate to SCC FMC app page (draws HBR-BUTTON drawer) ────
             _fmc_url = (f"https://security.cisco.com/firewalls/applications/FMC/?enterpriseId={_eid}"
@@ -5295,15 +5407,14 @@ def _cdfmc_otp_watcher():
                         continue
                     Path(_otp_file).unlink(missing_ok=True)
                     log(_pod_id, f"[cdfmc-nav] Watcher picked up OTP for {_pod_id}")
+                    # Not gated on the file: _host_scc_open mints a fresh
+                    # iDAC session and only falls back to it.
                     _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
-                    if not _session_path.exists():
-                        _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
-                    else:
-                        _ok, _msg = _host_cdfmc_integrate(
-                            _pod_id, _otp, _iname, str(_session_path),
-                            lambda m: log(_pod_id, m),
-                        )
-                        _res = {"ok": _ok, "message": _msg}
+                    _ok, _msg = _host_cdfmc_integrate(
+                        _pod_id, _otp, _iname, str(_session_path),
+                        lambda m: log(_pod_id, m),
+                    )
+                    _res = {"ok": _ok, "message": _msg}
                     log(_pod_id, f"[cdfmc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
                     _result_path = DATA_DIR / "data" / f"ise_cdfmc_result_{_pod_id}.json"
                     _result_path.write_text(json.dumps(_res))
@@ -5335,27 +5446,11 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
     MAX_WAIT    = 20 * 60   # 20 min total
     INTERVAL    = 5  * 60   # check every 5 min
 
-    # Load session file — normalize to Playwright storage_state dict
-    try:
-        _sd = json.loads(Path(session_path).read_text())
-    except Exception as _se:
-        return False, f"Cannot read SCC session file: {_se}"
-    _storage = {"cookies": _sd, "origins": []} if isinstance(_sd, list) else _sd
-
-    # Extract enterpriseId from localStorage
-    _eid = ""
-    for _o in (_sd.get("origins", []) if isinstance(_sd, dict) else []):
-        for _it in _o.get("localStorage", []):
-            if _it.get("name") == "enterpriseId":
-                _eid = _it["value"]
-                break
-
-    sgt_url = (
-        f"https://security.cisco.com/secure-access/org/{sa_org_id}"
-        f"/resources/securitygrouptags"
-        + (f"?enterpriseId={_eid}" if _eid else "")
-    )
-    log_fn(f"[sgt-verify] SGT URL: {sgt_url}")
+    # The SGT URL needs the enterprise id. That used to be dug out of a stored
+    # session file's localStorage, which meant this step could not run at all
+    # without a fresh scc_session_<POD>.json. It now comes from the session we
+    # open below, so the URL is built once that session exists.
+    sgt_url = ""
 
     def _navigate_and_count(page) -> tuple:
         """Go to SGT page, return (ok, count).  ok=None means session expired."""
@@ -5382,11 +5477,13 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            ctx  = browser.new_context(
-                storage_state=_storage, viewport={"width": 1920, "height": 1080}
+            ctx, page, _eid = _host_scc_open(browser, pod_id, log_fn, session_path)
+            sgt_url = (
+                f"https://security.cisco.com/secure-access/org/{sa_org_id}"
+                f"/resources/securitygrouptags"
+                + (f"?enterpriseId={_eid}" if _eid else "")
             )
-            page = ctx.new_page()
-            page.set_default_timeout(30000)
+            log_fn(f"[sgt-verify] SGT URL: {sgt_url}")
 
             if skip_wait:
                 # ── Immediate recheck — no propagation wait ───────────────────
@@ -5484,15 +5581,14 @@ def _sgt_verify_watcher():
                          datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
                     )
                     _dbc.commit(); _dbc.close()
+                    # Not gated on the file: _host_scc_open mints a fresh
+                    # iDAC session and only falls back to it.
                     _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
-                    if not _session_path.exists():
-                        _res = {"ok": False, "message": f"No SCC session file for {_pod_id}"}
-                    else:
-                        _ok, _msg = _host_sgt_verify(
-                            _pod_id, _sa_org, str(_session_path),
-                            lambda m: log(_pod_id, m),
-                        )
-                        _res = {"ok": _ok, "message": _msg}
+                    _ok, _msg = _host_sgt_verify(
+                        _pod_id, _sa_org, str(_session_path),
+                        lambda m: log(_pod_id, m),
+                    )
+                    _res = {"ok": _ok, "message": _msg}
                     log(_pod_id, f"[sgt-verify] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
                     # Update final status in ise_steps
                     _dbc2 = _db()
@@ -5523,9 +5619,9 @@ def api_ise_sgt_recheck(pod_id):
     """Immediately recheck SGTs in Secure Access — no propagation wait."""
     import threading as _th
     _ensure_ise_table()
+    # _host_scc_open mints a session from the org's iDAC URL, so a missing
+    # session file no longer blocks a manual recheck.
     _session_path = DATA_DIR / "data" / f"scc_session_{pod_id}.json"
-    if not _session_path.exists():
-        return jsonify({"status": "error", "message": "No SCC session file — Refresh SCC Sessions first"}), 400
     _sa_org = None
     try:
         import re as _re
@@ -8937,7 +9033,7 @@ async function loadOrgCreds(orgNum) {
     _setVal('oc-duo_ikey',               d.duo_ikey);
     _setVal('oc-duo_skey',               d.duo_skey);
     _setVal('oc-duo_host',               d.duo_host);
-    _setVal('oc-duo_saml_app_ikey',      d.duo_saml_app_ikey);
+    // no oc-duo_saml_app_ikey input exists — see the note in saveOrgCreds
     _setVal('oc-sa_scim_token',          d.sa_scim_token);
     _setVal('oc-authproxy_enroll_blob',  d.authproxy_enroll_blob);
     _setVal('oc-scc_api_key',            d.scc_api_key);
@@ -8964,7 +9060,10 @@ async function saveOrgCreds(orgNum) {
     duo_ikey:               _g('oc-duo_ikey').trim(),
     duo_skey:               _g('oc-duo_skey').trim(),
     duo_host:               _g('oc-duo_host').trim(),
-    duo_saml_app_ikey:      _g('oc-duo_saml_app_ikey').trim(),
+    // duo_saml_app_ikey is deliberately absent: the form has no input for it,
+    // so _g() always returned '' and the field only survived because the save
+    // endpoint drops empty values. duo_automation.py owns this column — it is
+    // written when the SAML application is created, never typed by hand.
     sa_scim_token:          _g('oc-sa_scim_token').trim(),
     authproxy_enroll_blob:  _g('oc-authproxy_enroll_blob').trim(),
     scc_api_key:            _g('oc-scc_api_key').trim(),

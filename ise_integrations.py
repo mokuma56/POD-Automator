@@ -36,6 +36,9 @@ ISE_HOST = "198.18.5.101"
 ISE_USER = "admin"
 ISE_PASS = "C1sco12345"
 ISE_URL  = f"https://{ISE_HOST}"
+# pxGrid Cloud region the lab guide specifies. The Dijit Select defaults to
+# ap-southeast-1, so this must be actively set and verified.
+PXGRID_REGION = "us-west-2"
 
 ISE_STEPS = [
     "ise_pxgrid_register",
@@ -596,19 +599,143 @@ async def _read_otp_from_page(page, log) -> str | None:
     return None
 
 
-async def _navigate_to_integration_catalog(page, log) -> bool:
-    """Navigate to ISE Administration → Integration Catalog. Returns True on success."""
+async def _catalog_is_populated(page) -> int:
+    """How many integration cards the catalog is currently showing.
+
+    0 means the list never loaded. Used to assert that navigation actually
+    worked instead of assuming it did.
+    """
     try:
-        # Correct hash URL (found from live ISE DOM inspection)
-        await page.goto(f"{ISE_URL}/admin/#administration/administration_integration_catalog/integration_catalog",
-                        wait_until="domcontentloaded", timeout=60000)
-        try:
-            await page.wait_for_selector('button[data-label="More details"]', timeout=30000)
-        except Exception:
-            await page.wait_for_timeout(4000)
-        # Re-dismiss modal in case it reappeared after navigation
+        return await page.evaluate(
+            """() => document.querySelectorAll('button[data-label="More details"]').length""")
+    except Exception:
+        return 0
+
+
+async def _open_integration(page, name: str, log) -> bool:
+    """Open a named integration's detail page from the Integration Catalog.
+
+    The catalog has two sections and an integration appears in exactly one of
+    them: "Activated integrations" is a TABLE whose Integration column is a
+    link, while "Available integrations" is a grid of CARDS each carrying its
+    own "More details" button.
+
+    Step 2 used to do:
+
+        # Click "More details" on Cisco Security Cloud card (first card)
+        page.locator('button[data-label="More details"]').first.click()
+
+    which assumed the wanted integration was the first Available card. Once
+    Cisco Security Cloud is activated it leaves the Available grid entirely, so
+    `.first` is whatever happens to lead the grid -- on POD-17 that is Firewall
+    Management Center. The step then drove the wrong integration while logging
+    that it had opened the right one.
+
+    Tries the activated link first, then the matching card, then asserts the
+    detail page really is the requested integration.
+    """
+    # 1. Activated integrations table -- the name is a link.
+    try:
+        link = page.locator(f':text("{name}")').first
+        if await link.is_visible(timeout=5_000):
+            await link.click(timeout=8_000)
+            await page.wait_for_timeout(3_000)
+            body = (await page.evaluate("() => document.body.innerText") or "")
+            if name.lower() in body.lower():
+                log(f"Opened {name!r} from Activated integrations")
+                return True
+    except Exception:
+        pass
+
+    # 2. Available grid -- find the CARD holding this title and click ITS button,
+    #    never a positional .first.
+    try:
+        clicked = await page.evaluate("""(name) => {
+            const btns = Array.from(document.querySelectorAll('button[data-label="More details"]'));
+            for (const b of btns) {
+                let el = b;
+                for (let i = 0; i < 8 && el; i++) {
+                    const t = (el.innerText || '');
+                    if (t.toLowerCase().includes(name.toLowerCase())) { b.click(); return true; }
+                    el = el.parentElement;
+                }
+            }
+            return false;
+        }""", name)
+        if clicked:
+            await page.wait_for_timeout(3_000)
+            body = (await page.evaluate("() => document.body.innerText") or "")
+            if name.lower() in body.lower():
+                log(f"Opened {name!r} from Available integrations")
+                return True
+    except Exception as e:
+        log(f"Could not open {name!r} from the Available grid: {e}")
+
+    log(f"Integration {name!r} not found in the catalog")
+    return False
+
+
+async def _navigate_to_integration_catalog(page, log) -> bool:
+    """Navigate to ISE Administration -> Integration Catalog. Returns True on success.
+
+    This MUST go through the menu. Loading the hash URL directly
+    (#administration/administration_integration_catalog/integration_catalog)
+    renders the page shell but the integration list never loads -- the route
+    settles on the empty state "All current integrations are active", with zero
+    "More details" buttons and no Activated section at all. Measured on POD-17:
+
+        hash URL -> body 437 chars,  0 "More details" buttons
+        menu     -> body 2416 chars, 4 "More details" buttons, Activated section
+
+    That empty page is what made three separate steps report three unrelated
+    causes -- ise_scc_integrate timing out on "More details",
+    ise_cdfmc_integrate reporting "FMC not found in catalog (ISE error/no
+    internet)", and ise_scc_deactivate_reactivate reporting "Could not find
+    Cisco Security Cloud link in Activated integrations". All three were
+    reading a catalog that had simply never been populated.
+
+    The old version also returned True when the catalog never rendered, so the
+    caller could not tell that navigation had failed. It now asserts.
+    """
+    try:
+        # Land on the admin UI first; the menu only exists once it has loaded.
+        if "/admin/" not in page.url:
+            await page.goto(f"{ISE_URL}/admin/", wait_until="domcontentloaded",
+                            timeout=60000)
+            await page.wait_for_timeout(8000)
+        await _ise_dismiss_session_info(page)
         await _ise_dismiss_modal(page)
-        return True
+        await page.wait_for_timeout(2000)
+
+        CLICK = """(lbl) => {
+            const el = Array.from(document.querySelectorAll('a,button,span,div,li'))
+                .filter(e => e.getClientRects().length &&
+                             (e.innerText || '').trim() === lbl)
+                .pop();
+            if (!el) return false;
+            el.click();
+            return true;
+        }"""
+        for label in ("Administration", "Integration Catalog"):
+            if not await page.evaluate(CLICK, label):
+                log(f"Integration Catalog nav: menu item {label!r} not found")
+                return False
+            await page.wait_for_timeout(9000)
+
+        await _ise_dismiss_session_info(page)
+        await _ise_dismiss_modal(page)
+
+        # Assert the list actually rendered -- an unpopulated catalog is a
+        # navigation failure, not an empty catalog.
+        for _ in range(6):
+            n = await _catalog_is_populated(page)
+            if n:
+                log(f"Integration Catalog loaded ({n} integration card(s))")
+                return True
+            await page.wait_for_timeout(5000)
+
+        log("Integration Catalog did not populate -- the list never loaded")
+        return False
     except Exception as e:
         log(f"Could not navigate to Integration Catalog: {e}")
         return False
@@ -890,6 +1017,57 @@ async def _do_cisco_sso_auth(page, url: str, email: str, password: str, log) -> 
 
 # ── Step 1: pxGrid Cloud Registration ─────────────────────────────────────────
 
+# ── pxGrid Cloud registration panel ───────────────────────────────────────────
+# ISE renders the registered state as label/value pairs plus a Deregister button:
+#
+#     Cisco DNA Portal account   PseudoCo-502     Status             Connected
+#     ISE deployment name        PseudoCo-502     Registered region  us-west-2
+#     Description                --               Mode               Active
+#
+# It never prints "registration successful" / "registration complete" /
+# "successfully registered", which is what both the idempotency guard and the
+# connect poll used to look for. So a fully registered, Connected ISE looked
+# unregistered to the guard (it re-ran the whole flow) and unconnected to the
+# poll (it failed after 3 minutes). One reader now serves both.
+_PXGRID_PANEL_JS = """() => {
+    const body = document.body.innerText || '';
+    const grab = (label) => {
+        const re = new RegExp(label + '\\s*\\n\\s*([^\\n]+)', 'i');
+        const m = re.exec(body);
+        return m ? m[1].trim() : '';
+    };
+    const deregister = Array.from(document.querySelectorAll('button,a,[role=button]'))
+        .some(e => e.getClientRects().length &&
+                   /^deregister$/i.test((e.innerText || '').trim()));
+    return {
+        status:  grab('Status'),
+        account: grab('Cisco DNA Portal account'),
+        name:    grab('ISE deployment name'),
+        region:  grab('Registered region'),
+        mode:    grab('Mode'),
+        deregister,
+    };
+}"""
+
+
+async def _pxgrid_panel(page) -> dict:
+    """Read the pxGrid Cloud registration panel. {} if it cannot be read."""
+    try:
+        return await page.evaluate(_PXGRID_PANEL_JS)
+    except Exception:
+        return {}
+
+
+def _pxgrid_is_registered(panel: dict) -> bool:
+    """A live registration offers Deregister AND reports Connected.
+
+    Requiring both avoids two traps: "Cisco DNA Portal account" is a static
+    label present even when unregistered, and a Deregister control alone was
+    judged unreliable by earlier work here.
+    """
+    return bool(panel.get("deregister")) and "connected" in (panel.get("status") or "").lower()
+
+
 async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tuple[bool, str]:
     from playwright.async_api import async_playwright
 
@@ -1096,14 +1274,12 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # Check if already registered (skip) — only skip on very specific phrases
             # that only appear in a truly connected/registered state.
             # Do NOT include "deregister" — it can appear on unregistered pages too.
-            page_text = (await page.inner_text("body")).lower()
-            _already_phrases = [
-                "registration successful", "registration complete",
-                "successfully registered",
-            ]
-            if any(ph in page_text for ph in _already_phrases):
-                log(f"pxGrid Cloud already registered — matched phrase in page text")
-                return True, f"{_SKIP_PREFIX} pxGrid Cloud already registered (Deployment page)"
+            _panel = await _pxgrid_panel(page)
+            if _pxgrid_is_registered(_panel):
+                log(f"pxGrid Cloud already registered: {_panel}")
+                return True, (f"{_SKIP_PREFIX} pxGrid Cloud already registered and connected "
+                              f"(account {_panel.get('account')}, name {_panel.get('name')}, "
+                              f"region {_panel.get('region')})")
 
              # ── Diagnostic: dump all Dijit CheckBox/ToggleButton IDs and their labels ──
             # This helps identify the correct "Enable pxGrid Cloud" widget ID.
@@ -1452,7 +1628,13 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 await page.wait_for_timeout(500)
                 _disp = (await page.inner_text('td#pxCloud_region')).strip()
                 log(f"Region field now shows: {_disp!r}")
-                if 'us-west-2' in _disp or _opt_clicked:
+                # NOTE: the displayed value is NOT authoritative. The Dijit Select
+                # cell often keeps showing the default (ap-southeast-1) while the
+                # request that actually reaches Cisco is corrected in flight by the
+                # region intercept below -- registrations confirmed landing in
+                # us-west-2 despite this field reading ap-southeast-1. Do not make
+                # this display check fatal; it fails runs that would have succeeded.
+                if PXGRID_REGION in _disp or _opt_clicked:
                     _set_region = True
             else:
                 log("WARNING: Could not locate pxCloud_region element")
@@ -1724,6 +1906,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             log("Region intercept route active (all requests)")
 
             # Set up popup listener then click Register
+            _popup_err = ""
             _popup_handled = False
             try:
                 async with ctx.expect_page(timeout=15000) as _popup_info:
@@ -1757,13 +1940,49 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     log("OAuth popup did not close within 15s — continuing")
 
             except Exception as _pe:
+                _popup_err = str(_pe).split("\n")[0][:160]
                 log(f"Popup listener error: {_pe} — Register button may not have opened a popup")
 
             if not _registered:
                 return False, "Could not find/click Register button on ISE node edit page"
 
             if not _popup_handled:
-                return False, "OAuth popup handler failed — check ise_oauth_error.png"
+                # Capture the MAIN page here. The only screenshot this step took
+                # was inside the popup handler, so when no popup ever opened
+                # nothing was written and the message sent the reader to a file
+                # that could be months old.
+                _shot = "/pipeline/host-data/ise_pxgrid_no_popup.png"
+                try:
+                    await page.screenshot(path=_shot, full_page=True)
+                except Exception as _se:
+                    log(f"could not capture failure screenshot: {_se}")
+                    _shot = "(screenshot failed)"
+                # Report what the form actually looked like — a Register click
+                # that opens no popup usually means the form was not accepted,
+                # not that the popup was missed.
+                try:
+                    _state = await page.evaluate("""() => {
+                        const g = (id) => {
+                            const e = document.getElementById(id);
+                            if (!e) return 'absent';
+                            const r = e.getBoundingClientRect();
+                            const vis = (r.width > 0 && r.height > 0) ? 'visible' : 'hidden';
+                            return vis + (e.type === 'checkbox' ? (e.checked ? '/checked' : '/unchecked')
+                                                                : '/' + JSON.stringify(e.value || ''));
+                        };
+                        return {
+                            enable: g('enablePxCloudServices'),
+                            name:   g('pxCloud_deviceName'),
+                            region: g('pxCloud_region'),
+                            eula1:  g('pxCloudRegistrationStmt1'),
+                            eula2:  g('pxCloudRegistrationStmt2'),
+                        };
+                    }""")
+                except Exception:
+                    _state = {}
+                log(f"pxGrid form state at failure: {_state}")
+                return False, (f"Register opened no OAuth popup ({_popup_err or 'no error'}) "
+                               f"— form state {_state}; screenshot {_shot}")
 
             # ── After popup auth: ISE shows "Select an Account" dialog in main page ──
             # After device activation, ISE detects the auth completion and shows the
@@ -1867,46 +2086,71 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             await page.wait_for_timeout(2000)
 
             # ── Poll for pxGrid Cloud connected status (up to ~3 min) ────────────
-            # NOTE: "cisco dna portal account" is a STATIC form label — present even
-            # when NOT connected — do NOT use it as a success indicator.
-            _CONNECTED_INDICATORS = [
-                "pxgrid cloud is connected",
-                "connected to cisco dna",
-                "registration successful",
-                "registration complete",
-                "successfully registered",
-            ]
-            _FAIL_INDICATORS = ["could not connect", "connection failed", "unable to connect"]
-            _refresh_js = """() => {
-                const candidates = Array.from(document.querySelectorAll(
-                    'button, [role="button"], .icon-refresh, [title*="refresh" i], [aria-label*="refresh" i]'
-                ));
-                for (const el of candidates) {
-                    const r = el.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0) {
-                        el.click();
-                        return 'clicked:' + (el.title || el.ariaLabel || el.className || el.tagName).slice(0,60);
-                    }
-                }
-                return null;
-            }"""
+            # Read the registration panel's own fields. Two earlier bugs lived here:
+            #
+            #  1. the "refresh" clicked the FIRST visible button matching a very
+            #     broad selector, which on this page is the form's Reset button --
+            #     so every poll reset the form instead of refreshing status
+            #     ("refresh=clicked:dijitReset dijitButtonContents" in the logs);
+            #  2. success was matched against phrases like "pxgrid cloud is
+            #     connected" / "registration successful" that ISE never renders.
+            #     The panel simply shows "Status" / "Connected".
+            #
+            # Together they made a registration that HAD succeeded -- account
+            # PseudoCo-502, region us-west-2, Mode Active, Deregister offered --
+            # report "not connected after 3 min".
+            _panel = {}
             for _attempt in range(18):  # 18 × 10s ≈ 3 min
                 await page.wait_for_timeout(10000)
-                _refreshed = await page.evaluate(_refresh_js)
-                await page.wait_for_timeout(3000)
-                _pt = (await page.inner_text("body")).lower()
-                if any(ind in _pt for ind in _CONNECTED_INDICATORS):
-                    log(f"pxGrid Cloud connected confirmed on attempt {_attempt + 1}")
-                    await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_connected.png"), full_page=False)
-                    return True, f"pxGrid Cloud registered and connected (PseudoCo-{org_number})"
-                _still_fail = any(err in _pt for err in _FAIL_INDICATORS)
-                log(f"Refresh {_attempt + 1}/18: {'not connected' if _still_fail else 'status unclear'} (refresh={_refreshed})")
-                if _attempt % 3 == 2:
-                    await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_poll_{_attempt + 1}.png"), full_page=False)
+                _panel = await _pxgrid_panel(page)
+                if _pxgrid_is_registered(_panel):
+                    log(f"pxGrid Cloud connected on attempt {_attempt + 1}: {_panel}")
+                    await page.screenshot(
+                        path="/pipeline/host-data/ise_pxgrid_connected.png", full_page=False)
 
-            # Timed out after 3 min
-            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_register_final.png"), full_page=True)
-            return False, "pxGrid Cloud registration saved but ISE not connected after 3 min — check ise_pxgrid_register_final.png"
+                    # Now that the panel exposes them, assert the registration is
+                    # the one we asked for rather than merely present.
+                    _bad = []
+                    if deployment_name and _panel.get("name") != deployment_name:
+                        _bad.append(f"deployment name {_panel.get('name')!r} != {deployment_name!r}")
+                    if PXGRID_REGION not in (_panel.get("region") or ""):
+                        _bad.append(f"region {_panel.get('region')!r} != {PXGRID_REGION!r}")
+                    if _bad:
+                        return False, ("pxGrid Cloud connected but registered wrongly: "
+                                       + "; ".join(_bad))
+                    return True, (f"pxGrid Cloud registered and connected "
+                                  f"(account {_panel.get('account')}, "
+                                  f"name {_panel.get('name')}, region {_panel.get('region')})")
+
+                log(f"Poll {_attempt + 1}/18: status={_panel.get('status')!r} "
+                    f"deregister={_panel.get('deregister')}")
+
+                # Re-navigate periodically: the panel is populated when the node
+                # edit page loads, so a stale page can sit on pre-registration
+                # content indefinitely.
+                if _attempt % 6 == 5:
+                    try:
+                        await page.goto(
+                            f"{ISE_URL}/admin/#administration/administration_system"
+                            f"/administration_system_deployment",
+                            wait_until="domcontentloaded", timeout=60000)
+                        await page.wait_for_timeout(10000)
+                        await _ise_dismiss_session_info(page)
+                        await page.locator('a:text-is("ise")').first.click(timeout=10000)
+                        await page.wait_for_timeout(9000)
+                        log("Re-opened node edit page to refresh the pxGrid panel")
+                    except Exception as _re:
+                        log(f"Re-navigation failed (continuing): {_re}")
+
+            # Timed out. Report what the panel actually said -- the old message
+            # pointed at a screenshot that could be months old.
+            _shot = "/pipeline/host-data/ise_pxgrid_register_final.png"
+            try:
+                await page.screenshot(path=_shot, full_page=True)
+            except Exception:
+                _shot = "(screenshot failed)"
+            return False, (f"pxGrid Cloud registration saved but not Connected after 3 min "
+                           f"— panel: {_panel}; screenshot {_shot}")
 
         except Exception as e:
             try:
@@ -2912,36 +3156,19 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
     from playwright.async_api import async_playwright
     import time as _time, base64 as _b64
 
-    # ── Early session validity check ──────────────────────────────────────────
-    # Validate the SCC session file BEFORE spending 4+ minutes on ISE steps.
-    try:
-        _sp = Path(session_path)
-        if not _sp.exists():
-            return False, "SCC session file not found — click 'Refresh SCC Sessions' first"
-        _age_h = (_time.time() - _sp.stat().st_mtime) / 3600
-        if _age_h > 8.0:
-            return False, f"SCC session is {_age_h:.1f}h old (>8h) — click 'Refresh SCC Sessions' first"
-        _sd = json.loads(_sp.read_text())
-        _okta_raw = ""
-        for _o in _sd.get("origins", []):
-            for _it in _o.get("localStorage", []):
-                if _it.get("name") == "okta-token-storage":
-                    _okta_raw = _it.get("value", "")
-        if _okta_raw:
-            _tok = json.loads(_okta_raw)
-            _id_tok = _tok.get("idToken", {}).get("idToken", "")
-            if _id_tok:
-                _parts = _id_tok.split(".")
-                if len(_parts) == 3:
-                    _payload = _parts[1] + "=" * (-len(_parts[1]) % 4)
-                    _claims = json.loads(_b64.b64decode(_payload))
-                    _exp = _claims.get("exp", 0)
-                    _remaining = _exp - _time.time()
-                    if _remaining < 120:  # less than 2 min remaining
-                        return False, f"SCC token expires in {_remaining/60:.1f} min — click 'Refresh SCC Sessions' then immediately retry"
-                    log(f"SCC session valid — token expires in {_remaining/60:.1f} min")
-    except Exception as _e:
-        log(f"SCC session pre-check warning: {_e} — continuing anyway")
+    # ── Early pre-flight ──────────────────────────────────────────────────────
+    # The SCC half of this step runs on the host, which now mints its own
+    # session from the org's iDAC URL (see dashboard._host_scc_open). The old
+    # checks here — file present, under 8h old, Okta token not near expiry —
+    # described a stored session that is no longer the primary credential, and
+    # they refused runs that would have succeeded: the file is routinely absent
+    # or months stale while the iDAC login works fine.
+    #
+    # What still matters is that the host will have *something* to log in with,
+    # so fail fast (before 4+ minutes of ISE navigation) only when it will not.
+    if not (creds.get("idac_url") or "").strip() and not Path(session_path).exists():
+        return False, ("no iDAC URL for this org and no stored SCC session — "
+                       "set the iDAC URL in Org Credentials, or click 'Refresh SCC Sessions'")
     # ─────────────────────────────────────────────────────────────────────────
 
     async with async_playwright() as pw:
@@ -2962,18 +3189,16 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
             if not await _navigate_to_integration_catalog(page, log):
                 return False, "Could not open Integration Catalog"
 
-            # Click "More details" on Cisco Security Cloud card (first card in catalog)
+            # Open Cisco Security Cloud BY NAME. It may sit in either catalog
+            # section, so never click a positional "More details" -- see
+            # _open_integration.
             log("Opening Cisco Security Cloud details")
             await _ise_dismiss_modal(page)
             await _ise_dismiss_session_info(page)
             await page.wait_for_timeout(1500)
             await _ise_dismiss_modal(page)
-            # Wait for catalog cards to render before clicking More details
-            try:
-                await page.wait_for_selector('button[data-label="More details"]', timeout=20000)
-            except Exception:
-                pass
-            await page.locator('button[data-label="More details"]').first.click(timeout=20000, force=True)
+            if not await _open_integration(page, "Cisco Security Cloud", log):
+                return False, "Cisco Security Cloud not found in the ISE Integration Catalog"
             await page.wait_for_timeout(2000)
 
             # Click "Configuration" tab (default lands on "About this integration")
@@ -3353,10 +3578,57 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
 
 # ── Main card runner ──────────────────────────────────────────────────────────
 
+# These three depend on lab internet access, which is outside our control, so a
+# failure must not abort the rest of the card. They are stepped over — but a
+# failure that is stepped over is still a failure and is reported as 'degraded',
+# never as a success. See _summarise_outcomes.
+SOFT_FAIL_STEPS = (
+    "ise_cdfmc_integrate",
+    "ise_scc_deactivate_reactivate",
+    "ise_sgt_verify",
+)
+
+
+def _summarise_outcomes(outcomes: list) -> tuple[bool, str]:
+    """Turn per-step outcomes into an honest (ok, message) pair.
+
+    Only 'completed' and a deliberate self-skip ("SKIP: ...", which means the
+    step decided it had nothing to do) count as success. A step that failed and
+    was stepped over counts as 'degraded'.
+
+    This exists because the card used to `return True, "All ISE integration
+    steps completed"` unconditionally: a run where one step failed and three
+    were stepped over still reported success, so the card showed green over a
+    POD on which no ISE integration had actually happened.
+    """
+    done     = [s for s, st, _ in outcomes if st == "completed"]
+    skipped  = [s for s, st, _ in outcomes if st == "skipped"]
+    degraded = [(s, m) for s, st, m in outcomes if st == "degraded"]
+    failed   = [(s, m) for s, st, m in outcomes if st == "failed"]
+
+    def names(items):
+        return ", ".join(ISE_STEP_LABELS.get(s, s) for s, _ in items)
+
+    parts = [f"{len(done)}/{len(outcomes)} completed"]
+    if skipped:
+        parts.append(f"{len(skipped)} skipped (nothing to do)")
+    if degraded:
+        parts.append(f"{len(degraded)} DEGRADED: {names(degraded)}")
+    if failed:
+        parts.append("FAILED: " + "; ".join(
+            f"{ISE_STEP_LABELS.get(s, s)} — {m}" for s, m in failed))
+    return (not failed and not degraded), " | ".join(parts)
+
+
 def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tuple[bool, str]:
     """
     Run the ISE integration card for a POD.
-    Steps that return (True, "SKIP: ...") are marked as 'skipped' in the DB.
+
+    from_step is a 0-indexed offset into ISE_STEPS: from_step=2 starts at the
+    third step. Steps that return (True, "SKIP: ...") are marked 'skipped'.
+
+    Returns (ok, summary). ok is True only when every step that ran either
+    completed or skipped itself deliberately.
     """
     _log = log or (lambda s: print(f"  [ise] {s}"))
     ise_ensure_table(db_path)
@@ -3373,6 +3645,8 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
         session_path = str(per_pod)
         _log(f"Using per-POD SCC session: {per_pod.name}")
 
+    outcomes: list = []
+
     for i, step in enumerate(ISE_STEPS):
         if i < from_step:
             continue
@@ -3383,10 +3657,18 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
         try:
             with closing(_db_connect(db_path)) as _skip_db:
                 _row = _skip_db.execute(
-                    "SELECT status FROM ise_steps WHERE pod_id=? AND step_name=?", (pod_id, step)
+                    "SELECT status, result FROM ise_steps WHERE pod_id=? AND step_name=?",
+                    (pod_id, step)
                 ).fetchone()
             if _row and _row[0] in ("completed", "skipped"):
-                _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — already {_row[0]}, skipping")
+                # A row marked 'skipped' by an earlier soft-fail is a carried-over
+                # failure, not a success — carry the degradation forward so a
+                # re-run of the remaining steps cannot launder it into a green card.
+                prior = ("degraded" if (_row[1] or "").startswith("[soft-fail]")
+                         else _row[0])
+                _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — "
+                     f"already {_row[0]}, skipping")
+                outcomes.append((step, prior, _row[1] or f"already {_row[0]}"))
                 continue
         except Exception as _skip_e:
             _log(f"[warn] skip-check DB error for {step}: {_skip_e} — proceeding to run step")
@@ -3412,21 +3694,275 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
 
         msg = _sanitize(msg)
 
-        # Detect skip
-        if ok and msg.startswith(_SKIP_PREFIX):
-            status = "skipped"
-        else:
-            status = "completed" if ok else "failed"
+        if ok:
+            # "SKIP: ..." means the step decided it had nothing to do, which is
+            # a success. Anything else that returned ok is a completion.
+            status = "skipped" if msg.startswith(_SKIP_PREFIX) else "completed"
+            _ise_step_set(pod_id, step, status, msg, db_path)
+            _log(f"  \u2192 {status}: {msg}")
+            outcomes.append((step, status, msg))
+            continue
 
-        _ise_step_set(pod_id, step, status, msg, db_path)
-        _log(f"  \u2192 {status}: {msg}")
+        if step in SOFT_FAIL_STEPS:
+            # Step over it, but record it as degraded so the card cannot report
+            # success. The DB row stays 'skipped' so the UI still renders it
+            # amber rather than red; the [soft-fail] prefix is what marks it as
+            # a carried-over failure on any later re-run.
+            _ise_step_set(pod_id, step, "skipped", f"[soft-fail] {msg}", db_path)
+            _log(f"  \u2192 DEGRADED (soft-fail, continuing): {msg}")
+            outcomes.append((step, "degraded", msg))
+            continue
 
-        if not ok:
-            # Soft-fail steps: internet issues are a lab constraint — always proceed
-            if step in ("ise_cdfmc_integrate", "ise_scc_deactivate_reactivate", "ise_sgt_verify"):
-                _ise_step_set(pod_id, step, "skipped", f"[soft-fail] {msg}", db_path)
-                _log(f"  [soft-fail] {ISE_STEP_LABELS[step]} — marked skipped, continuing to next step")
+        _ise_step_set(pod_id, step, "failed", msg, db_path)
+        _log(f"  \u2192 failed: {msg}")
+        outcomes.append((step, "failed", msg))
+        return _summarise_outcomes(outcomes)
+
+    return _summarise_outcomes(outcomes)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ISE TEARDOWN
+#
+# Removes everything the ISE card creates, so a clean-org re-test is possible
+# without hand-deleting through three consoles.
+#
+# Runs entirely inside the pipeline container. The card's forward path bounces
+# SCC work to the host over file IPC because Okta *silent renew* fails under the
+# VPN, but that only affects restoring a saved session — a fresh iDAC SAML login
+# performs no silent renew and works from in here (verified on POD-17, async, on
+# the pod's VPN namespace). Keeping teardown in one process means one log stream
+# and one error path instead of a request/result file round-trip.
+#
+# Every stage asserts the object is GONE by re-reading state, rather than
+# treating "the click did not raise" as success.
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _scc_open_session_async(ctx, idac_url: str, log):
+    """Async twin of duo_automation._scc_open_session.
+
+    Opens an authenticated SCC tab through the iDAC card's SAML auto-login and
+    returns (page, enterprise_id). No password, no stored session; loading a
+    stored iDAC URL is read-only (only idac_sdk reprovisions).
+    """
+    pg = await ctx.new_page()
+    await pg.goto(idac_url, wait_until="load", timeout=45_000)
+    await pg.wait_for_timeout(5_000)
+    async with ctx.expect_page(timeout=25_000) as info:
+        await pg.evaluate("""() => {const b=Array.from(document.querySelectorAll('button,a'))
+            .find(x=>/^view$/i.test((x.innerText||'').trim())); if(b)b.click();}""")
+    tab = await info.value
+    await tab.wait_for_load_state("load", timeout=30_000)
+    for _ in range(18):
+        await tab.wait_for_timeout(5_000)
+        if "enterpriseId=" in tab.url:
+            break
+    if "enterpriseId=" not in tab.url:
+        raise RuntimeError(f"SCC session never settled (url={tab.url[:120]})")
+    ent = tab.url.split("enterpriseId=")[1].split("&")[0]
+    log(f"SCC session established (enterprise {ent[:8]}...)")
+    return tab, ent
+
+
+async def _scc_count_ise_integrations(page, eid: str) -> int:
+    """How many ISE integrations SCC currently lists. Reloads before counting."""
+    # The Active Integrations table lives at /integrations/main/my-integrations.
+    # Plain /integrations renders a different view whose table is empty, so
+    # counting there reports 0 rows while integrations plainly exist -- which
+    # would make the teardown below report "already clean" and delete nothing.
+    await page.goto(
+        f"https://security.cisco.com/integrations/main/my-integrations?enterpriseId={eid}",
+        wait_until="domcontentloaded", timeout=60_000)
+    for _ in range(12):
+        await page.wait_for_timeout(5_000)
+        body = (await page.evaluate("() => document.body.innerText") or "")
+        if len(body.strip()) > 200:
+            break
+    return await page.evaluate("""() => Array.from(document.querySelectorAll('tr'))
+        .filter(r => /\\bISE\\b|pxgrid/i.test(r.innerText || '')).length""")
+
+
+async def _scc_delete_ise_integrations(page, eid: str, log) -> tuple[bool, str]:
+    """Delete every ISE/pxGrid integration in SCC. Verifies by re-counting."""
+    before = await _scc_count_ise_integrations(page, eid)
+    log(f"SCC integrations hub: {before} ISE row(s) present")
+    if not before:
+        return True, "SCC: no ISE integration present (already clean)"
+
+    # The row's action menu is its LAST button — it is an icon-only kebab with
+    # no text and no stable test id.
+    for attempt in range(before + 2):
+        n = await _scc_count_ise_integrations(page, eid)
+        if not n:
+            break
+        try:
+            row = page.locator("tr").filter(has_text="ISE").first
+            await row.locator("button").last.click(force=True, timeout=5_000)
+            await page.wait_for_timeout(900)
+        except Exception as e:
+            log(f"SCC: could not open row menu on attempt {attempt + 1}: {e}")
+            break
+
+        clicked = False
+        for sel in ('[role="menuitem"]:has-text("Delete")', 'button:has-text("Delete")',
+                    '[role="menuitem"]:has-text("Remove")', 'a:has-text("Delete")'):
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=1_500):
+                    await el.click()
+                    await page.wait_for_timeout(900)
+                    clicked = True
+                    break
+            except Exception:
                 continue
-            return False, f"{ISE_STEP_LABELS[step]} failed: {msg}"
+        if not clicked:
+            log("SCC: no Delete item in the row menu")
+            break
 
-    return True, "All ISE integration steps completed"
+        for sel in ('button:has-text("Delete")', 'button:has-text("Yes")',
+                    'button:has-text("Confirm")'):
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2_000):
+                    await el.click()
+                    await page.wait_for_timeout(2_000)
+                    break
+            except Exception:
+                continue
+        await page.wait_for_timeout(3_000)
+
+    after = await _scc_count_ise_integrations(page, eid)
+    if after:
+        return False, f"SCC: {after} ISE integration(s) still present after delete"
+    return True, f"SCC: deleted {before} ISE integration(s)"
+
+
+async def _ise_deactivate_scc(page, log) -> tuple[bool, str]:
+    """Deactivate the Cisco Security Cloud integration on ISE. Verifies the state flipped."""
+    if not await _navigate_to_integration_catalog(page, log):
+        return False, "ISE: Integration Catalog did not load"
+
+    body = (await page.evaluate("() => document.body.innerText") or "")
+    if "cisco security cloud" not in body.lower():
+        return True, "ISE: Cisco Security Cloud not in catalog (already clean)"
+
+    try:
+        await page.locator(':text("Cisco Security Cloud")').first.click(timeout=8_000)
+        await page.wait_for_timeout(2_500)
+    except Exception as e:
+        return False, f"ISE: could not open Cisco Security Cloud: {e}"
+
+    for sel in ('text=Configuration', 'button:has-text("Configuration")'):
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=3_000):
+                await el.click()
+                await page.wait_for_timeout(2_500)
+                break
+        except Exception:
+            continue
+
+    body = (await page.evaluate("() => document.body.innerText") or "")
+    if "deactivate" not in body.lower():
+        return True, "ISE: no Active instance to deactivate (already clean)"
+
+    try:
+        await page.locator('button:has-text("Deactivate")').first.click(timeout=8_000)
+        await page.wait_for_timeout(1_500)
+    except Exception as e:
+        return False, f"ISE: Deactivate click failed: {e}"
+
+    # The confirm dialog repeats the word, so try the specific label first.
+    for sel in ('button:has-text("Deactivate App")', 'button:has-text("Deactivate")',
+                'button:has-text("Confirm")', 'button:has-text("Yes")'):
+        try:
+            el = page.locator(sel).last
+            if await el.is_visible(timeout=2_500):
+                await el.click()
+                await page.wait_for_timeout(2_000)
+                break
+        except Exception:
+            continue
+
+    # Assert: Active is gone. "Existing instances" or a visible Activate button
+    # both mean the instance is no longer live.
+    for _ in range(12):
+        await page.wait_for_timeout(5_000)
+        body = (await page.evaluate("() => document.body.innerText") or "").lower()
+        if "existing instances" in body or ("activate" in body and "deactivate" not in body):
+            return True, "ISE: Cisco Security Cloud deactivated"
+    return False, "ISE: still shows Deactivate — instance did not go inactive"
+
+
+async def _ise_teardown_async(pod_id: str, creds: dict, log) -> tuple[bool, str]:
+    from playwright.async_api import async_playwright
+
+    idac = (creds.get("idac_url") or "").strip()
+    results: list = []
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        ctx = await browser.new_context(ignore_https_errors=True,
+                                        viewport={"width": 1920, "height": 1080})
+        try:
+            # ── 1. ISE: deactivate the integration first ──────────────────────
+            # Before SCC, so ISE stops pushing; deleting on the SCC side first
+            # leaves ISE holding a stale Active instance that confuses the next run.
+            page = await ctx.new_page()
+            page.set_default_timeout(30_000)
+            if not await _ise_login(page, log):
+                return False, "ISE login failed"
+            ok, msg = await _ise_deactivate_scc(page, log)
+            log(f"  {msg}")
+            results.append(("ise", ok, msg))
+
+            # ── 2. SCC: delete the integration rows ───────────────────────────
+            if not idac:
+                results.append(("scc", False, "SCC: no idac_url for this org — cannot log in"))
+                log("  SCC: no idac_url for this org — cannot log in")
+            else:
+                scc_page, eid = await _scc_open_session_async(ctx, idac, log)
+                ok, msg = await _scc_delete_ise_integrations(scc_page, eid, log)
+                log(f"  {msg}")
+                results.append(("scc", ok, msg))
+        finally:
+            await ctx.close()
+            await browser.close()
+
+    failed = [m for _, ok, m in results if not ok]
+    summary = " | ".join(m for _, _, m in results)
+    return (not failed), summary
+
+
+def ise_teardown(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
+    """Remove everything the ISE card creates, for a clean-org re-test.
+
+    Deactivates Cisco Security Cloud on ISE, then deletes the ISE integration
+    rows in SCC. Each stage re-reads state to confirm the object is gone.
+
+    Does NOT touch the cdFMC pxGrid instance — that lives in a separate console
+    and its delete flow has not been established yet; it is reported as manual.
+    """
+    _log = log or (lambda s: print(f"  [ise-teardown] {s}"))
+    creds = _load_creds(pod_id, db_path)
+    if creds is None:
+        return False, f"POD {pod_id} not found or scc_org not set"
+
+    _log(f"Tearing down ISE integrations for {pod_id}")
+    try:
+        ok, msg = asyncio.run(_ise_teardown_async(pod_id, creds, _log))
+    except Exception as e:
+        return False, f"teardown error: {e}"
+
+    # Clear the card's step rows so the next run starts genuinely fresh.
+    if ok:
+        try:
+            with closing(_db_connect(db_path)) as c:
+                c.execute("DELETE FROM ise_steps WHERE pod_id=?", (pod_id,))
+                c.commit()
+            _log("Cleared ise_steps rows")
+        except sqlite3.Error as e:
+            _log(f"[warn] could not clear ise_steps: {e}")
+
+    return ok, msg + " | cdFMC pxGrid instance must still be removed by hand"
