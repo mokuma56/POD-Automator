@@ -2410,9 +2410,9 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
 
             # Only fail if still stuck on Okta sign-on (truly expired session)
             if "sign-on" in page.url.lower() and "security.cisco.com" not in page.url.lower():
-                return False, f"SCC session expired (URL: {page.url}) — re-run Refresh SCC Sessions"
+                return False, f"SCC session could not be established — check that this POD's org has an idac_url set in Org Credentials (URL: {page.url})"
             if "login" in page.url.lower() and "/login/callback" not in page.url.lower():
-                return False, f"SCC session expired (URL: {page.url}) — re-run Refresh SCC Sessions"
+                return False, f"SCC session could not be established — check that this POD's org has an idac_url set in Org Credentials (URL: {page.url})"
             log_fn(f"[scc-nav] On dashboard: {page.url[:70]}")
 
             # Wait for SPA to fully render (sidebar needs time after OAuth callback)
@@ -3183,7 +3183,7 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 page.wait_for_timeout(2000); _w += 2
             if ("sign-on" in page.url.lower() and "security.cisco.com" not in page.url.lower()) or \
                ("login" in page.url.lower() and "/login/callback" not in page.url.lower()):
-                return False, "SCC session expired — re-run Refresh SCC Sessions"
+                return False, "SCC session could not be established — check that this POD's org has an idac_url set in Org Credentials"
             try:
                 page.wait_for_load_state("networkidle", timeout=12000)
             except Exception:
@@ -5265,7 +5265,7 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                 log_fn(f"[cdfmc-nav] Attempt {_nav_try}: URL={page.url[:60]}")
 
             if "sign-on" in page.url.lower():
-                return False, "SCC session expired — re-run Refresh SCC Sessions"
+                return False, "SCC session could not be established — check that this POD's org has an idac_url set in Org Credentials"
             log_fn(f"[cdfmc-nav] On SCC FMC app page: {page.url[:70]}")
             page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_fmc_app_{pod_id}.png"))
 
@@ -5692,7 +5692,7 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
                 ok, count = _navigate_and_count(page)
                 page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_recheck_{pod_id}.png"))
                 if ok is None:
-                    return False, "SCC session expired — click Refresh SCC Sessions"
+                    return False, "SCC session could not be established — check that this POD's org has an idac_url set in Org Credentials"
                 if ok:
                     log_fn(f"[sgt-verify] ✓ Found {count} SGTs")
                     return True, f"SGT verify passed: {count} Security Group Tags found in Secure Access"
@@ -5721,7 +5721,7 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
                 page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_check{check_num}_{pod_id}.png"))
 
                 if ok is None:
-                    return False, "SCC session expired — click Refresh SCC Sessions"
+                    return False, "SCC session could not be established — check that this POD's org has an idac_url set in Org Credentials"
                 if ok:
                     log_fn(f"[sgt-verify] ✓ Found {count} SGTs at check {check_num} ({e_mins:02d}:{e_secs:02d} elapsed)")
                     return True, f"SGT verify passed: {count} Security Group Tags found after {e_mins}m{e_secs:02d}s"
@@ -5864,65 +5864,8 @@ def api_ise_sgt_recheck(pod_id):
     _th.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "pod_id": pod_id})
 
-@app.route("/api/scc/refresh-sessions", methods=["POST"])
-def api_scc_refresh_sessions():
-    """Launch refresh_scc_sessions.py locally (headed Chrome) to refresh per-POD SCC
-    session files for all active PODs.  Streams progress to pipeline_logs under
-    pod_id='SCC_REFRESH'.  Runs on the Mac — NOT in Docker."""
-    import threading, os
-
-    req_data = request.get_json(silent=True) or {}
-    trigger_pod = req_data.get("pod_id", "SCC_REFRESH")  # for log attribution
-
-    script = DATA_DIR / "refresh_scc_sessions.py"
-    if not script.exists():
-        return jsonify({"status": "error", "message": "refresh_scc_sessions.py not found"}), 404
-
-    def _run():
-        log(trigger_pod, "[scc-refresh] Starting SCC session refresh for all active PODs...")
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, "-u", str(script), str(DB_PATH)],
-                cwd=str(DATA_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    log(trigger_pod, line if line.startswith("[scc-refresh]") else f"[scc-refresh] {line}")
-            proc.wait()
-            status = "completed" if proc.returncode == 0 else "failed"
-            log(trigger_pod, f"[scc-refresh] {status} (rc={proc.returncode})")
-        except Exception as e:
-            log(trigger_pod, f"[scc-refresh] ERROR: {e}")
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    _scc_refresh_thread[0] = t
-    return jsonify({"status": "started", "pod_id": trigger_pod})
 
 
-@app.route("/api/scc/refresh-cancel", methods=["POST"])
-def api_scc_refresh_cancel():
-    """Kill the running refresh_scc_sessions.py process."""
-    import signal
-    killed = 0
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "refresh_scc_sessions.py"],
-            capture_output=True, text=True
-        )
-        for pid in result.stdout.strip().split():
-            try:
-                os.kill(int(pid), signal.SIGTERM)
-                killed += 1
-            except Exception:
-                pass
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-    return jsonify({"status": "ok", "killed": killed})
 
 
 @app.route("/api/scc/session-status", methods=["GET"])
@@ -7893,7 +7836,6 @@ DASHBOARD_HTML = """
      <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
       <button class="btn-start-all" id="btn-full-reset" onclick="fullReset()" style="background:#7f1d1d;border-color:#ef4444;color:#fca5a5;">&#9888; Full Reset</button>
      <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
-      <button class="btn-start-all" id="btn-scc-refresh-global" onclick="refreshSccSessionsGlobal()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#8635; Refresh SCC Sessions</button>
       <button class="btn-start-all" id="btn-scc-reset-all" onclick="resetAllSccOrgs()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#9881; Reset All SCC Orgs</button>
       <span id="scc-reset-all-status" style="font-size:12px;color:#667788;"></span>
       <span id="scc-refresh-global-status" style="font-size:12px;color:#667788;"></span>
@@ -8184,7 +8126,7 @@ async function loadSccGlobalStatus() {
     const entries = Object.entries(sd);
     if (entries.length === 0) {
       statusEl.style.color = '#667788';
-      statusEl.textContent = 'No sessions \u2014 refresh required';
+      statusEl.textContent = 'No stored sessions (iDAC login used on demand)';
       return;
     }
     const SESSION_TTL_H = 12;
@@ -10077,7 +10019,7 @@ async function loadSccChecklist(podId) {
   }
 
   // ── Session freshness indicator ──────────────────────────────────────────
-  let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No SCC session \u2014 refresh required';
+  let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No stored session (iDAC login used on demand)';
   if (sess.exists) {
     const h = sess.age_hours ?? 0;
     if (h < 4)       { sessColor = '#00e68a'; sessIcon = '\u2713'; sessLabel = 'SCC session fresh (' + h.toFixed(1) + 'h ago)'; }
@@ -10085,13 +10027,12 @@ async function loadSccChecklist(podId) {
     else             { sessColor = '#ff4757'; sessIcon = '\u26a0'; sessLabel = 'SCC session stale (' + h.toFixed(1) + 'h) \u2014 refresh'; }
   }
 
-  // ── Pre-flight: Refresh SCC Sessions ─────────────────────────────────────
+  // ── Pre-flight: SCC session state ────────────────────────────────────────
   let preflight = '<div style="background:#0d1117;border:1px solid #1e2d3d;border-radius:6px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">';
   preflight += '<div>';
   preflight += '<span style="font-size:12px;font-weight:600;color:#8899aa;text-transform:uppercase;letter-spacing:.5px;">Pre-flight</span>&nbsp;';
   preflight += '<span id="scc-sess-badge" style="font-size:12px;color:' + sessColor + ';">' + sessIcon + ' ' + sessLabel + '</span>';
   preflight += '</div>';
-  preflight += '<button id="scc-refresh-btn" style="background:#445566;color:#cdd6e0;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">\u21bb Refresh SCC Sessions</button>';
   preflight += '</div>';
 
   grid.innerHTML = preflight +
@@ -10174,9 +10115,7 @@ async function loadSccChecklist(podId) {
     if (keyInput) keyInput.addEventListener('input', () => { window._sccKeysDirty = true; });
     if (secretInput) secretInput.addEventListener('input', () => { window._sccKeysDirty = true; });
 
-    // Wire Refresh SCC Sessions button
-    const sccRefreshBtn = document.getElementById('scc-refresh-btn');
-    if (sccRefreshBtn) sccRefreshBtn.onclick = () => iseRefreshSessions(podId);
+    // (Refresh SCC Sessions button removed — iDAC login happens on demand)
   }, 0);
 }
 
@@ -11878,89 +11817,6 @@ async function resetAllSccOrgs() {
   }
 }
 
-async function refreshSccSessionsGlobal() {
-  const btn    = document.getElementById('btn-scc-refresh-global');
-  const status = document.getElementById('scc-refresh-global-status');
-  btn.disabled = true;
-  btn.textContent = '\u23f3 Opening browser...';
-  status.style.color = '#02c8ff';
-  status.textContent = 'Log in to security.cisco.com and complete MFA in the browser window that just opened';
-
-  // Cancel button
-  let cancelBtn = document.getElementById('scc-refresh-cancel-btn');
-  if (!cancelBtn) {
-    cancelBtn = document.createElement('button');
-    cancelBtn.id = 'scc-refresh-cancel-btn';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.style.cssText = 'margin-left:10px;background:#c0392b;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px;';
-    btn.parentNode.insertBefore(cancelBtn, btn.nextSibling);
-  }
-  cancelBtn.style.display = 'inline-block';
-
-  // Clear any previous poller before starting a new one
-  if (_sccRefreshPoller) { clearInterval(_sccRefreshPoller); _sccRefreshPoller = null; }
-
-  const _reset = () => {
-    if (_sccRefreshPoller) { clearInterval(_sccRefreshPoller); _sccRefreshPoller = null; }
-    cancelBtn.style.display = 'none';
-    btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions';
-  };
-  cancelBtn.onclick = async () => {
-    _reset();
-    status.style.color = '#667788'; status.textContent = '';
-    await fetch('/api/scc/refresh-cancel', {method:'POST'});
-  };
-
-  try {
-    const startMs = Date.now();
-    const r = await fetch('/api/scc/refresh-sessions', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({pod_id: 'SCC_REFRESH'}),
-    });
-    const d = await r.json();
-    if (d.status !== 'started') {
-      _reset();
-      status.style.color = '#ff4757';
-      status.textContent = 'Error: ' + (d.message || 'unknown');
-      return;
-    }
-
-    // Poll every 5s — detect sessions saved AFTER the refresh started.
-    // age_hours < elapsed_since_start + 2min buffer means the file was written
-    // after we began (avoids false positives from pre-existing fresh sessions).
-    let polls = 0;
-    _sccRefreshPoller = setInterval(async () => {
-      polls++;
-      try {
-        const sr = await fetch('/api/scc/session-status');
-        const sd = await sr.json();
-        const entries = Object.entries(sd);
-        const elapsedH = (Date.now() - startMs + 120000) / 3600000; // elapsed + 2min buffer
-        const newlySaved = entries.filter(([,s]) => s.exists && (s.age_hours ?? 99) < elapsedH);
-        if (newlySaved.length > 0) {
-          _reset();
-          const SESSION_TTL_H = 12;
-          const maxAge = Math.max(...newlySaved.map(([,s]) => s.age_hours ?? 0));
-          const hoursLeft = Math.max(0, SESSION_TTL_H - maxAge).toFixed(0);
-          status.style.color = '#00e68a';
-          status.textContent = '\u2713 ' + newlySaved.length + ' session(s) refreshed \u2014 valid ~' + hoursLeft + 'h';
-        } else if (polls > 90) {
-          _reset();
-          status.style.color = '#f0a500';
-          status.textContent = 'Timeout \u2014 check Live Logs for [scc-refresh] output';
-        } else {
-          status.textContent = 'Running\u2026 (' + (polls * 5) + 's) \u2014 complete login in browser window';
-        }
-      } catch(e) {}
-    }, 5000);
-  } catch(e) {
-    _reset();
-    status.style.color = '#ff4757';
-    status.textContent = 'Request failed';
-  }
-}
-
 load();
 setInterval(load, 5000);
 loadUpgradeConfig();
@@ -12735,7 +12591,7 @@ function renderIseGrid(podId, data) {
   const isRunning = running;
 
   // ── Session freshness indicator ──────────────────────────────────────────
-  let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No SCC session \u2014 refresh required';
+  let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No stored session (iDAC login used on demand)';
   if (sess.exists) {
     const h = sess.age_hours ?? 0;
     if (h < 4)       { sessColor = '#00e68a'; sessIcon = '\u2713'; sessLabel = 'SCC session fresh (' + h.toFixed(1) + 'h ago)'; }
@@ -12745,13 +12601,12 @@ function renderIseGrid(podId, data) {
 
   let html = '';
 
-  // ── Pre-flight: Refresh SCC Sessions ─────────────────────────────────────
+  // ── Pre-flight: SCC session state ────────────────────────────────────────
   html += '<div style="background:#0d1117;border:1px solid #1e2d3d;border-radius:6px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">';
   html += '<div>';
   html += '<span style="font-size:12px;font-weight:600;color:#8899aa;text-transform:uppercase;letter-spacing:.5px;">Pre-flight</span>&nbsp;';
   html += '<span id="scc-sess-badge" style="font-size:12px;color:' + sessColor + ';">' + sessIcon + ' ' + sessLabel + '</span>';
   html += '</div>';
-  html += '<button id="scc-refresh-btn" style="background:#445566;color:#cdd6e0;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u21bb Refresh SCC Sessions</button>';
   html += '</div>';
 
   // ── Header + Run / Reset buttons ─────────────────────────────────────────
@@ -12799,12 +12654,10 @@ function renderIseGrid(podId, data) {
     const reactivateBtn = document.getElementById('ise-reactivate-btn');
     const sgtRecheckBtn = document.getElementById('ise-sgt-recheck-btn');
     const resetBtn      = document.getElementById('ise-reset-btn');
-    const refreshBtn    = document.getElementById('scc-refresh-btn');
     if (runBtn)         runBtn.onclick        = () => iseRun(podId);
     if (reactivateBtn)  reactivateBtn.onclick = () => iseReactivate(podId);
     if (sgtRecheckBtn)  sgtRecheckBtn.onclick = () => iseSgtRecheck(podId);
     if (resetBtn)       resetBtn.onclick      = () => iseReset(podId);
-    if (refreshBtn)     refreshBtn.onclick    = () => iseRefreshSessions(podId);
   }, 0);
 }
 
@@ -12852,72 +12705,6 @@ async function iseSgtRecheck(podId) {
     setTimeout(() => {
       if (btn) { btn.disabled = false; btn.textContent = '\U0001F50D Re-verify SGTs'; }
     }, 3000);
-  }
-}
-
-async function iseRefreshSessions(podId) {
-  const btn   = document.getElementById('scc-refresh-btn');
-  const badge = document.getElementById('scc-sess-badge');
-  if (btn) { btn.disabled = true; btn.textContent = '\u23f3 Refreshing...'; }
-  if (badge) { badge.style.color = '#02c8ff'; badge.textContent = '\u23f3 Browser opening — log in and complete MFA...'; }
-
-  // Add cancel button next to refresh button
-  let cancelBtn = document.getElementById('scc-refresh-cancel-pod-btn');
-  if (!cancelBtn && btn) {
-    cancelBtn = document.createElement('button');
-    cancelBtn.id = 'scc-refresh-cancel-pod-btn';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.style.cssText = 'margin-left:8px;background:#c0392b;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;';
-    btn.parentNode.insertBefore(cancelBtn, btn.nextSibling);
-  }
-  if (cancelBtn) cancelBtn.style.display = 'inline-block';
-
-  let poller = null;
-  if (cancelBtn) cancelBtn.onclick = async () => {
-    if (poller) clearInterval(poller);
-    if (cancelBtn) cancelBtn.style.display = 'none';
-    if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
-    if (badge) { badge.style.color = '#667788'; badge.textContent = 'Cancelled'; }
-    await fetch('/api/scc/refresh-cancel', {method:'POST'});
-  };
-
-  try {
-    const r = await fetch('/api/scc/refresh-sessions', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({pod_id: podId}),
-    });
-    const d = await r.json();
-    if (d.status === 'started') {
-      if (badge) badge.textContent = '\u23f3 Running — complete login in the browser window';
-      let polls = 0;
-      poller = setInterval(async () => {
-        polls++;
-        const sr = await fetch('/api/scc/session-status?pod_id=' + podId);
-        const sd = await sr.json();
-        const s = sd[podId] || {};
-        if (s.exists && (s.age_hours ?? 99) < 1) {
-          clearInterval(poller);
-          if (cancelBtn) cancelBtn.style.display = 'none';
-          if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
-          if (badge) { badge.style.color = '#00e68a'; badge.textContent = '\u2713 SCC session refreshed just now'; }
-          loadIseStatus(podId);
-        } else if (polls > 72) { // 6 min timeout
-          clearInterval(poller);
-          if (cancelBtn) cancelBtn.style.display = 'none';
-          if (btn) { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
-          loadIseStatus(podId);
-        }
-      }, 5000);
-    } else {
-      if (cancelBtn) cancelBtn.style.display = 'none';
-      if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
-       if (badge) { badge.style.color = '#ff4757'; badge.textContent = '\u26a0 Error: ' + (d.message || 'unknown'); }
-    }
-  } catch (e) {
-    if (cancelBtn) cancelBtn.style.display = 'none';
-    if (btn)   { btn.disabled = false; btn.textContent = '\u21bb Refresh SCC Sessions'; }
-    if (badge) { badge.style.color = '#ff4757'; badge.textContent = '\u26a0 Request failed'; }
   }
 }
 
