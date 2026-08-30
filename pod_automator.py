@@ -1167,5 +1167,297 @@ Corpus: github.com/kebaldwi/TECOPS-2599 Projects/BGP_EVPN/ and Projects/TRADITIO
 # Run
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Pipeline supervision — watch every POD at once, and re-run a step to verify
+#
+# Read-only apart from pod_rerun_step, which delegates to the dashboard so the
+# work happens in the process that owns the per-POD VPN proxying.
+# ---------------------------------------------------------------------------
+
+DASHBOARD_URL = os.environ.get("POD_DASHBOARD_URL", "http://localhost:5050")
+
+# Steps whose failure does not stop the card. Kept in sync with
+# duo_automation.duo_run_card; imported lazily so this server still starts if
+# that module is unavailable.
+def _duo_card_steps() -> list:
+    try:
+        import duo_automation as _da
+        return list(_da.DUO_CARD_STEPS)
+    except Exception:
+        return []
+
+
+def _parse_stamp(v):
+    """Both formats in this database are UTC, and only one says so.
+
+    pipeline_steps writes sqlite datetime('now') -> "2026-08-28 12:59:38"
+    duo_steps writes python utcnow()             -> "2026-08-30T12:38:57Z"
+
+    Treating the naive one as local time is a silent multi-hour error, so be
+    explicit rather than handing either to a permissive parser.
+    """
+    if not v:
+        return None
+    s = str(v).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _age_secs(stamp) -> Optional[int]:
+    t = _parse_stamp(stamp)
+    if not t:
+        return None
+    return int((datetime.utcnow() - t).total_seconds())
+
+
+def _fingerprint(text: str) -> str:
+    """Stable signature for a failure message.
+
+    Strips the parts that differ between two occurrences of the SAME bug —
+    ids, hex addresses, hostnames, counts, timings — so the same defect on
+    thirty PODs collapses to one key. That key is what a catalogue and a
+    de-duplicating fixer would both hang off.
+    """
+    import re as _re
+    if not text:
+        return ""
+    t = text.strip().split("\n")[0][:400]
+    subs = [
+        (r"0x[0-9a-fA-F]+", "<addr>"),
+        (r"\b[0-9a-f]{12,}\b", "<hex>"),
+        (r"\b[A-Z0-9]{20}\b", "<key>"),           # Duo ikey/skey/rikey shapes
+        (r"\bDuo-\d+\b", "<dir>"),
+        (r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>"),
+        (r"\b\d+(?:\.\d+)?s\b", "<dur>"),
+        (r"\b\d+\b", "<n>"),
+        (r"\s+", " "),
+    ]
+    for pat, rep in subs:
+        t = _re.sub(pat, rep, t)
+    return t.strip()[:200]
+
+
+def _step_rows(conn, table: str, pod_id: Optional[str] = None) -> list:
+    try:
+        if pod_id:
+            rows = conn.execute(
+                f"SELECT pod_id, step_name, status, result, started_at, completed_at "
+                f"FROM {table} WHERE pod_id=?", (pod_id,)).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT pod_id, step_name, status, result, started_at, completed_at "
+                f"FROM {table}").fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []          # table may not exist until the card has run once
+
+
+def _median_secs(rows: list) -> dict:
+    out = {}
+    for r in rows:
+        a, b = _parse_stamp(r.get("started_at")), _parse_stamp(r.get("completed_at"))
+        if not a or not b:
+            continue
+        secs = (b - a).total_seconds()
+        if secs < 0 or secs > 3600:      # clock skew, or a row left open
+            continue
+        out.setdefault(r["step_name"], []).append(secs)
+    return {k: sorted(v)[len(v) // 2] for k, v in out.items() if v}
+
+
+@mcp.tool()
+def pod_watch(only_problems: bool = True, stuck_factor: float = 3.0) -> str:
+    """Step-level state for EVERY POD at once — the supervisor's main view.
+
+    Reports, per POD, the Duo card and core pipeline progress, and builds an
+    "attention" list of anything failed or stuck.
+
+    A step counts as stuck when it has been 'running' for longer than
+    stuck_factor x its median duration (floor 240s). That catches both a
+    genuinely hung step and a row orphaned by a process that died mid-run —
+    restarting the dashboard kills in-flight runs and leaves exactly this.
+
+    only_problems=False also returns the healthy PODs.
+    """
+    conn = _db()
+    pods = [dict(r) for r in conn.execute("SELECT pod_id FROM pods ORDER BY pod_id")]
+    duo_all = _step_rows(conn, "duo_steps")
+    pipe_all = _step_rows(conn, "pipeline_steps")
+    conn.close()
+
+    duo_med, pipe_med = _median_secs(duo_all), _median_secs(pipe_all)
+    duo_order = _duo_card_steps()
+
+    def summarise(rows, medians, expected_total):
+        done = [r for r in rows if r["status"] in ("completed", "skipped")]
+        failed = [r for r in rows if r["status"] == "failed"]
+        running = [r for r in rows if r["status"] == "running"]
+        stuck = []
+        for r in running:
+            age = _age_secs(r.get("started_at"))
+            budget = max(240, int(medians.get(r["step_name"], 120) * stuck_factor))
+            if age is not None and age > budget:
+                stuck.append({**r, "age_secs": age, "budget_secs": budget})
+        return {
+            "done": len(done),
+            "total": expected_total or len(rows),
+            "failed": [r["step_name"] for r in failed],
+            "running": [r["step_name"] for r in running],
+            "stuck": [s["step_name"] for s in stuck],
+        }, failed, stuck
+
+    out, attention = [], []
+    for p in pods:
+        pid = p["pod_id"]
+        d_rows = [r for r in duo_all if r["pod_id"] == pid]
+        p_rows = [r for r in pipe_all if r["pod_id"] == pid]
+        d_sum, d_failed, d_stuck = summarise(d_rows, duo_med, len(duo_order))
+        p_sum, p_failed, p_stuck = summarise(p_rows, pipe_med, 0)
+
+        for card, failed, stuck in (("duo", d_failed, d_stuck),
+                                    ("pipeline", p_failed, p_stuck)):
+            for r in failed:
+                attention.append({
+                    "pod_id": pid, "card": card, "step": r["step_name"],
+                    "status": "failed",
+                    "fingerprint": _fingerprint(r.get("result") or ""),
+                    "result": (r.get("result") or "")[:400],
+                })
+            for r in stuck:
+                attention.append({
+                    "pod_id": pid, "card": card, "step": r["step_name"],
+                    "status": "stuck",
+                    "age_secs": r["age_secs"], "budget_secs": r["budget_secs"],
+                    "fingerprint": f"stuck in {r['step_name']}",
+                    "result": "",
+                })
+
+        entry = {"pod_id": pid, "duo": d_sum, "pipeline": p_sum}
+        healthy = not d_sum["failed"] and not d_sum["stuck"] \
+            and not p_sum["failed"] and not p_sum["stuck"]
+        if not only_problems or not healthy:
+            out.append(entry)
+
+    # Group the attention list by fingerprint: the same defect across many PODs
+    # is ONE problem to investigate, not N.
+    groups = {}
+    for a in attention:
+        groups.setdefault(a["fingerprint"], []).append(a["pod_id"])
+
+    return json.dumps({
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pods_total": len(pods),
+        "pods_needing_attention": len({a["pod_id"] for a in attention}),
+        "distinct_problems": len(groups),
+        "problem_groups": [{"fingerprint": k, "pods": v} for k, v in
+                           sorted(groups.items(), key=lambda kv: -len(kv[1]))],
+        "attention": attention,
+        "pods": out,
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+def pod_step_detail(pod_id: str, step_name: str, card: str = "duo") -> str:
+    """Full, untruncated result for one step, with its timing and log window.
+
+    The dashboard truncates results to fit a card; this is the whole thing,
+    which is usually where the actual cause is.
+    """
+    table = "duo_steps" if card == "duo" else "pipeline_steps"
+    conn = _db()
+    rows = _step_rows(conn, table, pod_id)
+    row = next((r for r in rows if r["step_name"] == step_name), None)
+    logs = []
+    if row:
+        try:
+            start = _parse_stamp(row.get("started_at"))
+            lrows = conn.execute(
+                "SELECT log_line, timestamp FROM pipeline_logs WHERE pod_id=? "
+                "ORDER BY id DESC LIMIT 400", (pod_id,)).fetchall()
+            for l in reversed([dict(x) for x in lrows]):
+                t = _parse_stamp(l.get("timestamp"))
+                if start and t and t >= start:
+                    logs.append(f"{l['timestamp']} {l['log_line']}")
+        except Exception:
+            pass
+    conn.close()
+    if not row:
+        return json.dumps({"error": f"no {card} step {step_name!r} for {pod_id}"})
+    return json.dumps({
+        "pod_id": pod_id, "card": card, "step": step_name,
+        "status": row["status"],
+        "started_at": row.get("started_at"),
+        "completed_at": row.get("completed_at"),
+        "duration_secs": (lambda a, b: int((b - a).total_seconds())
+                          if a and b else None)(_parse_stamp(row.get("started_at")),
+                                                _parse_stamp(row.get("completed_at"))),
+        "fingerprint": _fingerprint(row.get("result") or ""),
+        "result": row.get("result") or "",
+        "log_window": logs[-120:],
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+def pod_logs(pod_id: str, contains: str = "", limit: int = 120) -> str:
+    """Recent pipeline log lines for a POD, optionally filtered by substring."""
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT log_line, timestamp FROM pipeline_logs WHERE pod_id=? "
+            "ORDER BY id DESC LIMIT 2000", (pod_id,)).fetchall()
+    except Exception:
+        rows = []
+    conn.close()
+    lines = [f"{r['timestamp']} {r['log_line']}" for r in reversed([dict(x) for x in rows])]
+    if contains:
+        lines = [l for l in lines if contains.lower() in l.lower()]
+    return "\n".join(lines[-limit:]) or f"(no matching log lines for {pod_id})"
+
+
+@mcp.tool()
+def pod_rerun_step(pod_id: str, from_step: int, card: str = "duo") -> str:
+    """Re-run a card from a step index — the verification primitive.
+
+    A proposed fix is not finished until the step it was meant to fix passes
+    again, so this exists to close that loop rather than to drive normal runs.
+
+    Delegates to the dashboard rather than executing here: the dashboard owns
+    the per-POD VPN proxying, and running it in this process would reach the
+    lab's 198.18.x.x addresses from a Mac that has no route to them.
+    """
+    import urllib.request as _u
+    if card != "duo":
+        return json.dumps({"error": "only the duo card supports indexed re-run today"})
+    steps = _duo_card_steps()
+    if not steps:
+        return json.dumps({"error": "could not import duo_automation.DUO_CARD_STEPS"})
+    if not 0 <= from_step < len(steps):
+        return json.dumps({"error": f"from_step must be 0..{len(steps)-1}",
+                           "steps": steps})
+    try:
+        req = _u.Request(
+            f"{DASHBOARD_URL}/api/duo/run/{pod_id}",
+            data=json.dumps({"from_step": from_step}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with _u.urlopen(req, timeout=20) as r:
+            body = r.read().decode()
+        return json.dumps({
+            "started": True, "pod_id": pod_id,
+            "from_step": from_step, "step_name": steps[from_step],
+            "note": "poll pod_watch or pod_step_detail for the outcome",
+            "dashboard_response": json.loads(body),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "started": False,
+            "error": f"{type(e).__name__}: {e}",
+            "hint": f"is the dashboard running at {DASHBOARD_URL}?",
+        })
+
 if __name__ == "__main__":
     mcp.run()
