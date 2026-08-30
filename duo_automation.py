@@ -10554,189 +10554,26 @@ def duo_run_card(
             return False, f"SA SCIM check failed: {e}"
 
     def step_authproxy_enroll():
+        """Connect the Authentication Proxy on AD1 to Duo Single Sign-On.
+
+        Delegates to duo_enroll_sso_authproxy(), which captures the [sso]
+        stanza from the proxy page, mints a fresh single-use enrollment code,
+        applies both, and confirms against the proxy log. The old inline
+        version applied a code but never wrote the stanza, so the enrollment
+        EXE reported "All secrets stored successfully" into a section that did
+        not exist and the CloudSSO module could not start.
+
+        The AD external authentication source is created by sso_authsource,
+        which runs later and enrols as part of its own work. When the source
+        does not exist yet there is genuinely nothing to enrol against here,
+        so this defers rather than failing — and says so, rather than
+        reporting success.
         """
-        Re-enroll the Authentication Proxy on fresh AD1 each session.
-
-        Runs authproxy_update_sso_enrollment_code.exe with the stored blob,
-        stops/starts DuoAuthProxy, reads the new rikey from authproxy.cfg
-        on AD1, then updates authproxy_cfg in the DB so the next session's
-        authproxy_push carries the current rikey.
-
-        The blob comes from Duo Admin portal:
-          Applications → SSO Settings → External Authentication Sources
-          → Active Directory → Auth Proxy → Step 2 → Generate Command
-        Copy the base64 argument (not the full EXE path) and store it in
-        the dashboard org credentials card under 'authproxy_enroll_blob'.
-        """
-        import re as _re_ape
-        import time as _te
-
-        AUTHPROXY_LOG = (
-            r"C:\Program Files\Duo Security Authentication Proxy\log\authproxy.log"
-        )
-        SSO_ENROLL_EXE = (
-            r"C:\Program Files\Duo Security Authentication Proxy\bin"
-            r"\authproxy_update_sso_enrollment_code.exe"
-        )
-
-        def _drpc_status(winrm_s, label=""):
-            """Read last 25 lines of authproxy.log; return ('connected'|'failed'|'unknown')."""
-            try:
-                r = winrm_s.run_ps(
-                    f'Get-Content "{AUTHPROXY_LOG}" -Tail 25 -ErrorAction SilentlyContinue'
-                )
-                lines = r.std_out.decode(errors="replace").splitlines()
-                has_401 = any("Invalid signature" in l for l in lines)
-                has_idp = any("configured IdP" in l for l in lines)
-                manual  = any("manual intervention" in l.lower() for l in lines)
-                if has_idp and not has_401:
-                    return "connected"
-                if has_401 or manual:
-                    return "failed"
-                return "unknown"
-            except Exception:
-                return "unknown"
-
-        nonlocal enroll_blob
-
-        # The enrollment command is a ONE-TIME code that Duo expires eight hours
-        # after it is generated, so a stored blob is worthless on the next run —
-        # the EXE still reports "All secrets stored successfully" but DRPC then
-        # fails with 401 Invalid signature. Always mint a fresh one.
-        _log("harvesting a fresh enrollment command (the stored one is single-use)")
-        h_ok, h_msg = duo_harvest_sso_enrollment(pod_id, db_path, log=_log)
-        if h_ok:
-            try:
-                with _sq.connect(db_path) as _c:
-                    _c.row_factory = _sq.Row
-                    _r = _c.execute("SELECT authproxy_enroll_blob FROM org_credentials "
-                                    "WHERE org_number=?", (org_num,)).fetchone()
-                if _r and (_r["authproxy_enroll_blob"] or "").strip():
-                    enroll_blob = _r["authproxy_enroll_blob"].strip()
-                    _log(f"fresh blob ({len(enroll_blob)} chars)")
-            except Exception as e:
-                _log(f"could not re-read blob: {e}")
-        else:
-            _log(f"harvest failed ({h_msg[:100]}) — falling back to the stored blob")
-
-        if not enroll_blob:
-            return False, (
-                f"no enrollment blob available and harvesting one failed: {h_msg[:160]}"
-            )
-
-        # Warn if blob is stale — enrollment blobs are one-time codes.
-        # A blob used in a previous session will cause 401 on the SSO DRPC
-        # connection even though the EXE reports "All secrets stored successfully".
-        blob_age_warn = ""
-        if blob_saved_at:
-            import datetime as _dtb
-            try:
-                saved = _dtb.datetime.strptime(blob_saved_at[:19], "%Y-%m-%d %H:%M:%S")
-                age_h = ((_dtb.datetime.utcnow() - saved).total_seconds()) / 3600
-                if age_h > 24:
-                    blob_age_warn = (
-                        f" ⚠ BLOB IS {age_h:.0f}h OLD — one-time codes expire after first use. "
-                        "If the proxy fails to connect to Duo SSO (401 Invalid signature), "
-                        "generate a new command from Duo Admin portal → SSO Settings → "
-                        "External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command, "
-                        "paste into org credentials, then re-run this step."
-                    )
-                    _log(blob_age_warn)
-            except Exception:
-                pass
-
-        _log("WinRM-connecting to AD1 for SSO enrollment ...")
-        try:
-            winrm_sess = _winrm_connect_for_pod(pod_id, log=_log)
-        except Exception as e:
-            return False, f"WinRM connect failed: {e}"
-
-        try:
-            # ── Pre-check: skip EXE if proxy is already connected ────────────
-            pre = _drpc_status(winrm_sess, "pre")
-            if pre == "connected":
-                _log("DRPC already connected — skipping re-enrollment")
-                return True, "enrollment skipped — proxy already connected to Duo SSO ✓"
-            _log(f"DRPC pre-status: {pre} — proceeding with enrollment")
-
-            # ── Run the enrollment EXE with the blob ─────────────────────────
-            # Note: use run_ps directly (not _winrm_run_cmd) to avoid
-            # double-& issue — _winrm_run_cmd prepends "& " to the cmd
-            _log(f"running authproxy_update_sso_enrollment_code.exe ...")
-            _r = winrm_sess.run_ps(
-                f"& '{SSO_ENROLL_EXE}' '{enroll_blob}'; Write-Output 'ENROLL_DONE'"
-            )
-            _out = _r.std_out.decode(errors="replace").strip()
-            _err = _r.std_err.decode(errors="replace").strip()
-            if _out: _log(f"enroll stdout: {_out[:300]}")
-            if _err: _log(f"enroll stderr: {_err[:200]}")
-
-            exe_ok = "ENROLL_DONE" in _out or "secrets stored" in _out.lower()
-            if not exe_ok:
-                _log("WARN: EXE did not report success — may be an expired blob")
-
-            # ── Restart DuoAuthProxy ─────────────────────────────────────────
-            _log("restarting DuoAuthProxy ...")
-            winrm_sess.run_ps(
-                "Stop-Service -Name DuoAuthProxy -Force -ErrorAction SilentlyContinue"
-            )
-            _te.sleep(3)
-            winrm_sess.run_ps("Start-Service -Name DuoAuthProxy")
-            _te.sleep(5)  # give DRPC time to connect or fail
-
-            # ── Post-check: verify DRPC connection from log ──────────────────
-            post = _drpc_status(winrm_sess, "post")
-            _log(f"DRPC post-status: {post}")
-
-            if post == "connected":
-                return True, "enrollment OK — DRPC connected, IdPs registered ✓" + blob_age_warn
-            if post == "failed":
-                return False, (
-                    "enrollment EXE ran but DRPC is still rejected (401 Invalid signature) — "
-                    "the blob is a one-time code that was already consumed. "
-                    "Generate a NEW command: Duo Admin portal → SSO Settings → "
-                    "External Auth Sources → AD → Auth Proxy → Step 2 → Generate Command, "
-                    "paste into org credentials card, then re-run this step."
-                )
-            # "Unknown" is not success. The log tail is normally just
-            # directory-sync polls, so this branch was the COMMON outcome and
-            # it passed on absence of evidence — the same soft green removed
-            # from verify. Ask the connectivity tool, which always has an
-            # answer, and require the [sso] section to exist at all: the
-            # enrollment EXE happily reports "All secrets stored successfully"
-            # with no section to put them in.
-            try:
-                cfg_txt = winrm_sess.run_ps(
-                    f"Get-Content '{AUTHPROXY_CFG_PATH}' -Raw"
-                ).std_out.decode(errors="replace")
-                if not _re_ape.search(r"^\[sso\]", cfg_txt, _re_ape.M):
-                    return False, ("enrollment ran but authproxy.cfg has no [sso] "
-                                   "section — the CloudSSO module cannot start"
-                                   + blob_age_warn)
-                tool = (r"C:\Program Files\Duo Security Authentication Proxy"
-                        r"\bin\authproxy_connectivity_tool.exe")
-                out = winrm_sess.run_ps(
-                    f"& '{tool}' 2>&1 | Out-String").std_out.decode(errors="replace")
-                summary = out.split("SUMMARY", 1)[1] if "SUMMARY" in out else ""
-                sso_bad = False
-                cur = None
-                for line in summary.splitlines():
-                    mm = _re_ape.search(r"Section \[([^\]]+)\]", line)
-                    if mm:
-                        cur = mm.group(1).strip().lower()
-                    elif cur == "sso" and "[error]" in line:
-                        sso_bad = True
-                if sso_bad:
-                    return False, ("enrollment ran but the [sso] section reports "
-                                   "connectivity errors" + blob_age_warn)
-                return True, ("enrollment OK — [sso] present, connectivity clean"
-                              + blob_age_warn)
-            except Exception as e:
-                return False, (f"enrollment ran but its state could not be "
-                               f"confirmed: {type(e).__name__}: {e}" + blob_age_warn)
-
-        except Exception as e:
-            return False, f"authproxy enrollment failed: {e}"
+        ok, msg = duo_enroll_sso_authproxy(pod_id, db_path, log=_log)
+        if not ok and "no Active Directory authentication source" in msg:
+            return True, ("deferred — no AD authentication source yet; "
+                          "sso_authsource creates it and enrols the proxy")
+        return ok, msg
 
     def step_scim_push():
         """
@@ -10914,7 +10751,7 @@ def duo_run_card(
             # than the old soft-fail ok=True, which hid an empty Duo org.
             if step in ("scim_push", "verify", "saml_scim_config",
                         "ad_sync", "sso_saml", "sso_authsource",
-                        "mfa_policy", "sso_test"):
+                        "mfa_policy", "sso_test", "authproxy_enroll"):
                 continue
             # Fatal steps: stop on first hard failure
             _log(f"  Hard failure at {step} — stopping")
