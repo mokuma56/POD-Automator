@@ -221,8 +221,10 @@ NTLM needs MD4, which is disabled in Python 3.14-slim.
   and must not look like a failure. A step marked `skipped` counts as done only
   when it skipped itself deliberately; `ise_run_card` records a stepped-over
   failure as `skipped` with a `[soft-fail]` prefix, and those count as degraded.
-- There are no tests. When you fix a bug in a pure function (version parsing, timestamp
-  handling, config generation), add a `pytest` test next to it — start the suite rather
-  than deferring it again.
+- Tests live in `tests/`; run them with
+  `uv run --with pytest python3 -m pytest tests/ -q`. The suite is small and new —
+  when you fix a bug in a pure function (version parsing, timestamp handling,
+  config generation, result classification), add a test next to it rather than
+  deferring it again.
 - Broad `except Exception` is heavily used (~780 occurrences). Don't add more; when you
   touch one, narrow it and log the exception rather than swallowing it.
