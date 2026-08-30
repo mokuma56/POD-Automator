@@ -5283,10 +5283,18 @@ class DockerWinRMSession:
     def _start(self):
         import subprocess as _sp, time as _t
         name = f"winrm-proxy-{self._pod_id.lower()}-{int(_t.time())}"
+        # --entrypoint sleep is REQUIRED. The image's entrypoint is
+        # "python3 onboard.py", so without it this runs
+        #     python3 onboard.py sleep 900
+        # — the onboarding pipeline with "sleep" as the serial number. The
+        # container then lives only until that bails, so the proxy vanishes
+        # mid-session ("container ... is not running") at an unpredictable
+        # moment, and an unrelated pipeline gets kicked off as a side effect.
         r = _sp.run(
             ["docker", "run", "-d", "--rm", "--name", name,
              "--network", f"container:vpn-{self._pod_id}",
-             "pod-automator:latest", "sleep", "900"],
+             "--entrypoint", "sleep",
+             "pod-automator:latest", "900"],
             capture_output=True, text=True,
         )
         if r.returncode != 0:
