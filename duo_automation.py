@@ -8927,7 +8927,12 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
 
     # ── apply it on AD1 ──
     try:
-        s = _winrm_connect()
+        # MUST be the pod-aware helper. _winrm_connect() dials AD1 directly,
+        # which only routes from inside the pod's container; the dashboard runs
+        # on the Mac with no VPN and gets ConnectTimeout. Every test of this
+        # function had been run inside a container, so the difference never
+        # showed until the card was driven from the dashboard.
+        s = _winrm_connect_for_pod(pod_id, log=_log)
 
         def ps(script):
             r = s.run_ps(script)
