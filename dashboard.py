@@ -8297,7 +8297,7 @@ function renderTable(pods) {
       <td>${pipeLabel}</td>
       <td style="display:flex;gap:4px;flex-wrap:wrap;">
         <button class="btn-start" onclick="connectVpn('${p.pod_id}')">Connect VPN</button>
-         <select class="run-mode" data-pod="${p.pod_id}" onchange="saveRunAddons(this)" title="What to run when you press Run Automation" style="background:#0a1628;border:1px solid #7c3aed;color:#b39ddb;border-radius:4px;padding:3px 5px;font-size:11px;">
+         <select class="run-mode" data-pod="${p.pod_id}" data-saved="${p.run_addons||''}" onchange="saveRunAddons(this)" title="What to run when you press Run Automation" style="background:#0a1628;border:1px solid #7c3aed;color:#b39ddb;border-radius:4px;padding:3px 5px;font-size:11px;">
            <option value=""${(p.run_addons||'')===''?' selected':''}>Pipeline only</option>
            <option value="duo"${(p.run_addons||'')==='duo'?' selected':''}>+ Duo</option>
            <option value="ise"${(p.run_addons||'')==='ise'?' selected':''}>+ ISE</option>
@@ -8342,14 +8342,23 @@ function renderTable(pods) {
 // Persist the per-POD choice immediately. The table re-renders on a 5s poll and
 // rebuilds each row from p.run_addons, so a selection left only in the DOM would
 // silently revert under the user.
+//
+// Only writes when the value differs from what the server last sent (stamped on
+// data-saved at render time). Chrome restores form-control values across
+// location.reload(), which was observed re-saving a stale selection: the user
+// changes the mode away, reloads, and the restored control writes the old value
+// back. Comparing against the server's value makes any spurious event a no-op,
+// whatever caused it.
 async function saveRunAddons(sel) {
   const podId = sel.dataset.pod;
+  if (sel.value === (sel.dataset.saved || '')) return;
   const addons = sel.value ? sel.value.split(',') : [];
   try {
     await fetch('/api/pods/' + podId + '/run-addons', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({addons})
     });
+    sel.dataset.saved = sel.value;
     const p = (window._lastPods || []).find(x => x.pod_id === podId);
     if (p) p.run_addons = sel.value;   // keep the cache in step until the next poll
   } catch (e) {
