@@ -214,7 +214,13 @@ NTLM needs MD4, which is disabled in Python 3.14-slim.
 
 - Package manager: `uv`. Run scripts as `uv run python3 <script>`.
 - Dashboard table column order: POD → Assigned → Session → Status → VPN → Serial →
-  SD-WAN → SCC Org → Pipeline → Actions → Notes.
+  SD-WAN → DUO → ISE → SCC Org → Pipeline → Actions → Notes.
+  The DUO and ISE dots are tri-state: green = every step completed, red = failed
+  or degraded, amber = part-way, grey = never run. Grey matters — both cards sit
+  outside the core pipeline, so "not run yet" is the normal state for most PODs
+  and must not look like a failure. A step marked `skipped` counts as done only
+  when it skipped itself deliberately; `ise_run_card` records a stepped-over
+  failure as `skipped` with a `[soft-fail]` prefix, and those count as degraded.
 - There are no tests. When you fix a bug in a pure function (version parsing, timestamp
   handling, config generation), add a `pytest` test next to it — start the suite rather
   than deferring it again.
