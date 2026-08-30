@@ -6364,11 +6364,31 @@ def _pw_sso_ext_auth_setup(
             return False, "Could not find '+ Add Active Directory' option"
         duo_page.wait_for_timeout(1500)
 
-        # Accept Privacy Statement
-        _pw_click_first(duo_page, [
-            "button:has-text('Accept')", "input[value='Accept']",
-            "button:has-text('I Accept')", "button:has-text('Agree')",
-        ], timeout=TS, log=log)
+        # Accept the Privacy Statement. It is a CHECKBOX (id/name
+        # "tos-checkbox"), not an Accept/Agree button — and "Configure Active
+        # Directory" stays disabled until it is ticked, which is why clicking
+        # that button timed out with "Could not click 'Configure Active
+        # Directory'". Verified against the live page.
+        ticked = duo_page.evaluate("""() => {
+            const i = Array.from(document.querySelectorAll('input[type=checkbox]'))
+                .find(x => x.getClientRects().length &&
+                           /tos|privacy|agree|accept/i.test((x.name||'') + (x.id||'')));
+            if (!i) return 'absent';
+            if (i.checked) return 'already';
+            i.setAttribute('data-tos', '1');
+            return 'todo';
+        }""")
+        if ticked == "todo":
+            _duo_mclick(duo_page, selector='input[data-tos="1"]')
+            duo_page.wait_for_timeout(1500)
+            duo_page.evaluate("""() => document.querySelectorAll('[data-tos]')
+                .forEach(e => e.removeAttribute('data-tos'))""")
+        log(f"privacy statement checkbox: {ticked}")
+        if ticked != "absent" and not duo_page.evaluate("""() => Array.from(
+                document.querySelectorAll('input[type=checkbox]'))
+                .some(x => x.getClientRects().length && x.checked &&
+                           /tos|privacy|agree|accept/i.test((x.name||'') + (x.id||'')))"""):
+            return False, "could not accept the Privacy Statement checkbox"
         duo_page.wait_for_timeout(800)
 
         # Configure Active Directory
