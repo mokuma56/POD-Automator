@@ -7153,6 +7153,17 @@ _duo_slots = threading.Semaphore(DUO_MAX_CONCURRENT)
 # A pipeline step that fails without being in this set stops the chain. Mirrors
 # onboard.py's SOFT_FAIL_STEPS; several core steps fail routinely on lab
 # hardware and must not block the optional cards.
+# Mirrors onboard.py's `steps` list and the JS PIPELINE_ORDER. Kept as data
+# because onboard.py cannot be imported from the host (see _wait_for_pipeline).
+PIPELINE_STEP_NAMES = [
+    "detect_pod_number", "verify_router", "reset_device", "quick_connect",
+    "config_group_associate", "assign_license", "set_variables",
+    "deploy_config_group", "generate_bootstrap", "copy_bootstrap",
+    "controller_mode_enable", "verify_online", "redeploy_config_group",
+    "verify_border_spine", "verify_leaf1", "verify_leaf2", "connectivity_test",
+    "route_verification", "cdfmc_check", "ad_verify", "scc_reset_check",
+]
+
 PIPELINE_SOFT_FAIL = {
     "detect_pod_number", "controller_mode_enable", "verify_online",
     "redeploy_config_group", "verify_border_spine", "verify_leaf1",
@@ -7180,49 +7191,90 @@ def _peak_rss_mb() -> float:
 
 
 def _wait_for_pipeline(pod_id: str, log_fn, timeout_s: int = 5400) -> tuple:
-    """Block until every pipeline step reaches a terminal state.
+    """Block until the pipeline container for this POD has exited, then judge it.
 
-    /api/run-pod is fire-and-forget — it starts the compose service and returns
-    — so the chain has to detect completion itself. Watching step rows rather
-    than the container's exit means a pipeline that dies mid-step is still
-    caught, by the deadline rather than by a missing exit code.
+    Timing comes from the CONTAINER, not the step rows. Step rows persist between
+    runs, so on any re-run they are already terminal the moment the container
+    starts — the first version of this returned "pipeline finished (21/21)" one
+    second after launching it, and Duo began while the pipeline was still
+    executing. Both phases touch AD and SCC, so overlapping them is not merely
+    an inaccurate log line.
+
+    The container is authoritative for "is it still going": it exits when
+    onboard.py returns, and it also exits if the pipeline dies, so the deadline
+    is a backstop rather than the primary signal. Outcome is then read from the
+    step rows.
 
     Returns (ok, detail). ok is False only on a HARD failure (a failed step not
     in PIPELINE_SOFT_FAIL) or on timeout.
     """
-    from onboard import steps as _pipeline_steps          # names, in order
-    want = [n for n, _ in _pipeline_steps]
+    name = f"pipeline-{pod_id}"
     deadline = time.time() + timeout_s
     last_note = 0.0
+    seen_running = False
+    appear_by = time.time() + 90        # grace for the container to show up
 
     while time.time() < deadline:
-        conn = _db()
         try:
-            rows = {r["step_name"]: r["status"] for r in conn.execute(
-                "SELECT step_name, status FROM pipeline_steps WHERE pod_id=?", (pod_id,))}
-        except sqlite3.Error:
-            rows = {}
-        finally:
-            conn.close()
+            r = subprocess.run(["docker", "inspect", name, "--format",
+                                "{{.State.Status}}"],
+                               capture_output=True, text=True, timeout=15)
+            state = r.stdout.strip() if r.returncode == 0 else "gone"
+        except Exception as e:
+            log_fn(f"could not inspect {name} ({e}) — retrying")
+            state = "unknown"
 
-        hard = [n for n, st in rows.items()
-                if st == "failed" and n not in PIPELINE_SOFT_FAIL]
-        if hard:
-            return False, f"pipeline hard-failed at {', '.join(hard)}"
-
-        terminal = [n for n in want
-                    if rows.get(n) in ("completed", "skipped", "failed")]
-        if len(terminal) >= len(want):
-            soft = [n for n, st in rows.items() if st == "failed"]
-            return True, (f"pipeline finished ({len(terminal)}/{len(want)}"
-                          + (f", {len(soft)} soft-failed" if soft else "") + ")")
+        if state in ("running", "created", "restarting"):
+            seen_running = True
+        elif state in ("exited", "dead", "gone"):
+            # `docker compose up -d` returns before the container is
+            # inspectable, so "gone" at the very start means "not yet", not
+            # "already finished" — treating it as finished would reintroduce the
+            # instant-completion bug in a new form.
+            if seen_running:
+                break
+            if time.time() > appear_by:
+                return False, f"{name} never appeared within 90s of launch"
 
         if time.time() - last_note > 120:
-            log_fn(f"pipeline {len(terminal)}/{len(want)} steps done — waiting")
+            conn = _db()
+            try:
+                done = conn.execute(
+                    "SELECT COUNT(*) FROM pipeline_steps WHERE pod_id=? "
+                    "AND status IN ('completed','skipped')", (pod_id,)).fetchone()[0]
+            except sqlite3.Error:
+                done = "?"
+            finally:
+                conn.close()
+            log_fn(f"pipeline running — {done}/{len(PIPELINE_STEP_NAMES)} steps done")
             last_note = time.time()
         time.sleep(10)
+    else:
+        return False, f"pipeline did not finish within {timeout_s // 60} min"
 
-    return False, f"pipeline did not finish within {timeout_s // 60} min"
+    # Container is done — now judge the outcome from the rows.
+    conn = _db()
+    try:
+        rows = {r["step_name"]: r["status"] for r in conn.execute(
+            "SELECT step_name, status FROM pipeline_steps WHERE pod_id=?", (pod_id,))}
+    except sqlite3.Error:
+        rows = {}
+    finally:
+        conn.close()
+
+    hard = [n for n, st in rows.items()
+            if st == "failed" and n not in PIPELINE_SOFT_FAIL]
+    if hard:
+        return False, f"pipeline hard-failed at {', '.join(hard)}"
+
+    terminal = [n for n in PIPELINE_STEP_NAMES
+                if rows.get(n) in ("completed", "skipped", "failed")]
+    soft = [n for n, st in rows.items() if st == "failed"]
+    if len(terminal) < len(PIPELINE_STEP_NAMES):
+        return False, (f"pipeline container exited with only "
+                       f"{len(terminal)}/{len(PIPELINE_STEP_NAMES)} steps accounted for")
+    return True, (f"pipeline finished ({len(terminal)}/{len(PIPELINE_STEP_NAMES)}"
+                  + (f", {len(soft)} soft-failed" if soft else "") + ")")
 
 
 def _start_pipeline_container(pod_id: str) -> tuple:
@@ -7279,17 +7331,33 @@ def _run_full_automation(pod_id: str, addons: list):
         if waiting:
             _log(f"queued for a Duo slot ({DUO_MAX_CONCURRENT} run at once)")
             _duo_slots.acquire()
+        # Sample the peak DURING the card, not before it. Reading RSS on the way
+        # in reports 0 MB, because Playwright has not launched yet — useless for
+        # sizing DUO_MAX_CONCURRENT, which is the whole reason for measuring.
+        _peak = {"mb": 0.0}
+        _stop_sampling = threading.Event()
+
+        def _sample():
+            while not _stop_sampling.wait(15):
+                _peak["mb"] = max(_peak["mb"], _peak_rss_mb())
+
+        _sampler = threading.Thread(target=_sample, daemon=True)
+        _sampler.start()
         try:
-            _log(f"Duo card starting (host Chromium RSS now {_peak_rss_mb():.0f} MB)")
+            _log("Duo card starting")
             import duo_automation as _da
             d_ok, d_msg = _da.duo_run_card(
                 pod_id, str(DB_PATH), from_step=0,
                 log=lambda m: log(pod_id, f"[duo] {m}"))
             _log(f"Duo {'OK' if d_ok else 'FAILED'}: {d_msg}")
-            _log(f"host Chromium RSS after Duo: {_peak_rss_mb():.0f} MB")
         except Exception as e:
             _log(f"Duo exception: {e}")
         finally:
+            _stop_sampling.set()
+            _peak["mb"] = max(_peak["mb"], _peak_rss_mb())
+            _log(f"peak host Chromium RSS during Duo: {_peak['mb']:.0f} MB "
+                 f"(all Chromium on this host, so with N concurrent this is the "
+                 f"combined figure)")
             _duo_slots.release()
 
     if "ise" in addons:
@@ -7847,6 +7915,7 @@ DASHBOARD_HTML = """
      </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
+      <div id="addon-phases"></div>
     </div>
     <div class="tab-content" id="tab-logs">
       <div class="log-box" id="log-box">Waiting for logs...</div>
@@ -8611,6 +8680,62 @@ async function showPipeline(podId) {
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
+// Render the optional Duo / ISE phases beneath the pipeline grid.
+//
+// Deliberately a separate section rather than extra entries in PIPELINE_ORDER.
+// The pipeline grid diff-updates cards by index to stop them flashing on every
+// 5s poll, and threading two variable-length phases through that is a good way
+// to reintroduce the flashing it exists to prevent. This also keeps the
+// pipeline progress bar meaning "the core pipeline", which is what the Ready
+// column is judged on for PODs that never asked for the extra cards.
+async function renderAddonPhases(podId) {
+  const host = document.getElementById('addon-phases');
+  if (!host) return;
+  let data;
+  try {
+    data = await (await fetch('/api/pipeline-full/' + podId)).json();
+  } catch (e) { host.innerHTML = ''; return; }
+
+  const extra = (data.phases || []).filter(ph => ph.key !== 'pipeline');
+  if (!extra.length) { host.innerHTML = ''; return; }   // pipeline-only POD
+
+  host.innerHTML = extra.map(ph => {
+    const byName = {};
+    (ph.steps || []).forEach(s => { byName[s.step_name] = s; });
+    const order = (ph.order && ph.order.length) ? ph.order : (ph.steps || []).map(s => s.step_name);
+    const done = order.filter(n => {
+      const st = byName[n] && byName[n].status;
+      return st === 'completed' || st === 'skipped';
+    }).length;
+
+    const cards = order.map((name, i) => {
+      const st = byName[name] ? byName[name].status : 'pending';
+      const res = (byName[name] && byName[name].result) ? byName[name].result : '';
+      const label = (ph.labels && ph.labels[name]) ? ph.labels[name] : name.replace(/_/g, ' ');
+      // A "skipped" row carrying [soft-fail] is a stepped-over failure, not a
+      // deliberate skip — colour it as the degradation it is.
+      const degraded = st === 'skipped' && res.indexOf('[soft-fail]') === 0;
+      const border = degraded ? 'border-left:3px solid #ff4757;'
+                   : st === 'skipped' ? 'border-left:3px solid #ffa502;'
+                   : st === 'failed'  ? 'border-left:3px solid #ff4757;' : '';
+      const dur = formatDur(byName[name] && byName[name].started_at,
+                            byName[name] && byName[name].completed_at);
+      return '<div class="step-card" style="' + border + '">'
+        + '<div class="step-num">' + ph.title + ' ' + (i + 1) + '/' + order.length + '</div>'
+        + '<div class="step-name">' + escHtml(label) + '</div>'
+        + pipelineBadge(degraded ? 'failed' : st, res, name)
+        + '<div class="step-result">' + escHtml(res.slice(0, 60)) + '</div>'
+        + (dur ? '<div class="step-dur">' + dur + '</div>' : '')
+        + '</div>';
+    }).join('');
+
+    return '<div style="margin-top:14px;">'
+      + '<div style="font-size:12px;color:#02c8ff;font-weight:600;padding:4px 0;">'
+      + escHtml(ph.title) + ' &mdash; ' + done + '/' + order.length + '</div>'
+      + '<div class="pipeline-grid">' + cards + '</div></div>';
+  }).join('');
+}
+
 async function loadSteps(podId) {
   const r = await fetch('/api/pipeline/' + podId);
   const steps = await r.json();
@@ -8670,6 +8795,8 @@ async function loadSteps(podId) {
   // Estimated duration for controller_mode_enable (router reboot into SD-WAN mode)
   // Based on observed run 2026-05-20: 534s. Round up to 540s for comfort.
   const CTRL_MODE_EST_SECS = 540;
+
+  renderAddonPhases(podId);   // no await — must not delay the pipeline grid
 
   const grid = document.getElementById('pipeline-grid');
   const switchingPod = grid._podId !== podId;
