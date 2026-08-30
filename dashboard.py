@@ -4820,15 +4820,32 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
             # ── 5. ise_pxgrid ─────────────────────────────────────────────────
             log_fn("[scc-reset] 5/6 ise_pxgrid")
             try:
-                _go(["Platform Management", "Integrations"])
-                page.wait_for_timeout(1000)
-                for _tab in ['button:has-text("My Integrations")', 'a:has-text("My Integrations")', '[role="tab"]:has-text("My Integrations")']:
-                    try:
-                        t = page.locator(_tab).first
-                        if t.is_visible(timeout=3000):
-                            t.click(); page.wait_for_timeout(2000); break
-                    except Exception: continue
+                # Go straight to the Active Integrations table. Clicking
+                # "Platform Management" -> "Integrations" then hunting for a
+                # "My Integrations" tab lands on a view whose table is empty, so
+                # this reported "No ISE integration found (already clean)" while
+                # SCC still held ISE-POD-POD-17-5892 — verified right after a reset
+                # on 2026-08-30. A reset that reports clean while leaving the object
+                # behind hands the next lab a dirty org: worse than failing outright.
+                page.goto(
+                    "https://security.cisco.com/integrations/main/my-integrations"
+                    + (f"?enterpriseId={_eid}" if _eid else ""),
+                    wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(6000)
                 _shot("6_ise")
+                
+                # Absence only means anything once the table has rendered.
+                _rendered = False
+                for _try in range(8):
+                    _body = page.inner_text("body").lower()
+                    if "integration" in _body and len(_body.strip()) > 200:
+                        _rendered = True
+                        break
+                    page.wait_for_timeout(4000)
+                if not _rendered:
+                    raise RuntimeError("Integrations table never rendered — cannot tell "
+                                       "whether an ISE integration exists")
+                
                 _body = page.inner_text("body").lower()
                 _deleted = False
                 if "ise" in _body:
@@ -4852,8 +4869,23 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                             except Exception: continue
                     except Exception as _ie:
                         log_fn(f"[scc-reset] ise row error: {_ie}")
-                _detail = "Deleted ISE/pxGrid integration ✓" if _deleted else "No ISE integration found (already clean)"
-                _persist("ise_pxgrid", "completed", _detail)
+                # Re-read before claiming clean: "clean" must mean the table shows no
+                # ISE row, not merely that we found none to click.
+                page.goto(
+                    "https://security.cisco.com/integrations/main/my-integrations"
+                    + (f"?enterpriseId={_eid}" if _eid else ""),
+                    wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(6000)
+                _remaining = page.evaluate(
+                    """() => Array.from(document.querySelectorAll('tr'))
+                           .filter(r => /\\bISE\\b|pxgrid/i.test(r.innerText || '')).length""")
+                if _remaining:
+                    _detail = f"FAIL: {_remaining} ISE integration(s) still present after reset"
+                else:
+                    _detail = "Deleted ISE/pxGrid integration ✓" if _deleted else "No ISE integration found (already clean)"
+                # Status must follow the finding: persisting "completed" alongside a
+                # FAIL detail is how a dirty org reads as a clean one on the card.
+                _persist("ise_pxgrid", "failed" if _remaining else "completed", _detail)
                 log_fn(f"[scc-reset] ise_pxgrid: {_detail}")
             except Exception as _e:
                 _persist("ise_pxgrid", "failed", f"Error: {str(_e)[:120]}")
