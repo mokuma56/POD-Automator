@@ -461,6 +461,81 @@ def api_pipeline(pod_id):
     conn.close()
     return jsonify(result)
 
+@app.route("/api/pipeline-summary")
+def api_pipeline_summary():
+    """Every POD's step statuses in ONE call, for the compact multi-POD view.
+
+    The detail view fetches /api/pipeline/<pod> per POD; at 20+ PODs on a 5s
+    poll that is 240 requests a minute for data the table already needs in
+    aggregate. One query serves the lot.
+
+    Returns per POD: the status of each pipeline step in PIPELINE_STEP_NAMES
+    order, the step currently running, how many are done, and when the run
+    started so the UI can show elapsed time. ETA is left to the client, which
+    already holds the measured per-step medians in window.STEP_SECS.
+    """
+    conn = _db()
+    conn.row_factory = sqlite3.Row
+    try:
+        pods = [dict(r) for r in conn.execute(
+            "SELECT pod_id, pod_number, run_addons FROM pods ORDER BY pod_id")]
+        rows = conn.execute(
+            "SELECT pod_id, step_name, status, started_at, completed_at "
+            "FROM pipeline_steps").fetchall()
+    finally:
+        conn.close()
+
+    by_pod: dict = {}
+    for r in rows:
+        by_pod.setdefault(r["pod_id"], {})[r["step_name"]] = dict(r)
+
+    def _parse(ts):
+        # Rows carry both "%Y-%m-%dT%H:%M:%SZ" and "%Y-%m-%d %H:%M:%S".
+        import datetime as _dt
+        for f in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return _dt.datetime.strptime((ts or "").strip(), f)
+            except Exception:
+                continue
+        return None
+
+    out = []
+    for p in pods:
+        steps = by_pod.get(p["pod_id"], {})
+        seq, running, done = [], "", 0
+        for name in PIPELINE_STEP_NAMES:
+            st = (steps.get(name) or {}).get("status", "")
+            seq.append({"name": name, "status": st})
+            if st in ("completed", "skipped"):
+                done += 1
+            elif st == "running":
+                running = name
+
+        starts = [_parse(v.get("started_at")) for v in steps.values()]
+        starts = [x for x in starts if x]
+        started = min(starts).strftime("%Y-%m-%dT%H:%M:%SZ") if starts else ""
+
+        # A run is finished when nothing is running; use the last completion so
+        # elapsed stops climbing on an idle POD.
+        ends = [_parse(v.get("completed_at")) for v in steps.values()]
+        ends = [x for x in ends if x]
+        ended = "" if running else (max(ends).strftime("%Y-%m-%dT%H:%M:%SZ") if ends else "")
+
+        out.append({
+            "pod_id": p["pod_id"],
+            "pod_number": p.get("pod_number") or "",
+            "run_addons": p.get("run_addons") or "",
+            "steps": seq,
+            "running": running,
+            "done": done,
+            "total": len(PIPELINE_STEP_NAMES),
+            "failed": any(x["status"] == "failed" for x in seq),
+            "started_at": started,
+            "ended_at": ended,
+        })
+    return jsonify(out)
+
+
 @app.route("/api/pipeline-full/<pod_id>")
 def api_pipeline_full(pod_id):
     """Pipeline steps plus whichever optional cards this POD was launched with.
@@ -2332,8 +2407,8 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
     # pipeline step 21, before any optional card, and its browser half cannot
     # authenticate without a URL (POD-18 failed that way three times).
     if True:
-        log_fn(f"[scc-nav] no stored iDAC URL for {pod_id} — reading the "
-               f"session's own URL from the jump host")
+        log_fn(f"[scc-nav] reading {pod_id}'s iDAC URL from the jump host session log"
+               + ("" if idac else " (none stored yet)"))
         try:
             _r = subprocess.run([
                 "docker", "run", "--rm",
@@ -7832,6 +7907,19 @@ DASHBOARD_HTML = """
   .tab-content { display: none; background: #112240; border-radius: 0 8px 8px 8px; padding: 16px; min-height: 300px; }
   .tab-content.active { display: block; }
 
+  /* Compact multi-POD view: one row per POD, one dot per pipeline step. At 20+
+     PODs the full table does not fit on screen, and the detail panel only shows
+     one POD at a time. */
+  .sum-row { display:flex; align-items:center; gap:10px; padding:6px 10px; border-radius:6px;
+             background:#112240; margin-bottom:4px; cursor:pointer; }
+  .sum-row:hover { background:#16305c; }
+  .sum-pod { width:88px; font-size:12px; font-weight:700; color:#00bceb; flex-shrink:0; }
+  .sum-dots { display:flex; gap:3px; flex:1; min-width:0; flex-wrap:nowrap; overflow:hidden; }
+  .sum-dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+  .sum-meta { font-size:11px; color:#8899aa; white-space:nowrap; flex-shrink:0; }
+  .sum-step { font-size:11px; color:#02c8ff; white-space:nowrap; overflow:hidden;
+              text-overflow:ellipsis; max-width:190px; flex-shrink:0; }
+
   .pipeline-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
   .step-card { background: #0a1628; border-radius: 6px; padding: 10px; text-align: center; }
   .step-card .step-num { font-size: 11px; color: #667788; }
@@ -8030,7 +8118,17 @@ DASHBOARD_HTML = """
      <span id="docker-status" style="font-size:12px;color:#667788;"></span>
    </div>
 
-  <table>
+  <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
+    <button id="btn-view-full" class="btn-start-all" onclick="setPodView('full')"
+            style="background:#1a2d4a;border-color:#02c8ff;color:#02c8ff;">&#9776; Full table</button>
+    <button id="btn-view-summary" class="btn-start-all" onclick="setPodView('summary')"
+            style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#9636; Summary</button>
+    <span style="font-size:11px;color:#667788;">Summary shows every POD's pipeline as dots &mdash; click a row for detail</span>
+  </div>
+
+  <div id="pod-summary" style="display:none;"></div>
+
+  <table id="pod-table">
     <thead>
       <tr id="sort-header">
         <th>POD</th>
@@ -8352,6 +8450,94 @@ function isFullyReady(p) {
 
 function hasSkippedSteps(p) {
   return PIPELINE_ORDER.some(k => p[k] === 'skipped');
+}
+
+// ── Compact multi-POD summary ────────────────────────────────────────────────
+// At 20+ PODs the full table runs off screen and the detail panel only shows one
+// POD at a time. This gives one row per POD: a dot per pipeline step, elapsed
+// time, and a remaining estimate from the measured per-step medians already in
+// window.STEP_SECS. Clicking a row opens the existing detail view.
+let _podView = 'full';
+let _sumPollId = null;
+
+function setPodView(mode) {
+  _podView = mode;
+  const table = document.getElementById('pod-table');
+  const sum   = document.getElementById('pod-summary');
+  const bf    = document.getElementById('btn-view-full');
+  const bs    = document.getElementById('btn-view-summary');
+  const on  = 'background:#1a2d4a;border-color:#02c8ff;color:#02c8ff;';
+  const off = 'background:#2d3f50;border-color:#445566;color:#cdd6e0;';
+  if (mode === 'summary') {
+    table.style.display = 'none';  sum.style.display = 'block';
+    bs.style.cssText = on; bf.style.cssText = off;
+    renderPodSummary();
+    if (!_sumPollId) _sumPollId = setInterval(renderPodSummary, 5000);
+  } else {
+    table.style.display = '';      sum.style.display = 'none';
+    bf.style.cssText = on; bs.style.cssText = off;
+    if (_sumPollId) { clearInterval(_sumPollId); _sumPollId = null; }
+  }
+}
+
+function _sumDotColor(st) {
+  if (st === 'completed') return '#00e68a';
+  if (st === 'skipped')   return '#ffa502';   // soft-fail / warn — expected on lab hardware
+  if (st === 'failed')    return '#ff4757';
+  if (st === 'running')   return '#02c8ff';
+  return '#2d3f50';                            // not reached yet
+}
+
+function _fmtDur(secs) {
+  if (secs == null || secs < 0) return '';
+  const m = Math.floor(secs / 60), sec = Math.floor(secs % 60);
+  return m >= 60 ? Math.floor(m / 60) + 'h' + (m % 60) + 'm' : (m > 0 ? m + 'm' + sec + 's' : sec + 's');
+}
+
+async function renderPodSummary() {
+  const host = document.getElementById('pod-summary');
+  if (!host || _podView !== 'summary') return;
+  let pods;
+  try { pods = await (await fetch('/api/pipeline-summary')).json(); }
+  catch (e) { return; }
+
+  const tmap = (window.STEP_SECS || {}).pipeline || {};
+  const html = pods.map(p => {
+    const dots = p.steps.map(x =>
+      '<span class="sum-dot" style="background:' + _sumDotColor(x.status) + '" title="'
+      + escHtml(x.name.replace(/_/g, ' ')) + (x.status ? ' — ' + x.status : '') + '"></span>').join('');
+
+    // Elapsed freezes once nothing is running, so an idle POD stops counting up.
+    const start = parseStamp(p.started_at);
+    const end   = p.ended_at ? parseStamp(p.ended_at) : null;
+    const elapsed = start ? Math.floor(((end || Date.now()) - start) / 1000) : null;
+
+    // Remaining = sum of medians for steps not yet done. Only meaningful mid-run.
+    let remain = 0;
+    p.steps.forEach(x => {
+      if (x.status !== 'completed' && x.status !== 'skipped' && x.status !== 'failed') {
+        remain += (tmap[x.name] || 0);
+      }
+    });
+
+    const meta = [
+      p.done + '/' + p.total,
+      elapsed != null ? _fmtDur(elapsed) : '',
+      (p.running && remain > 0) ? '~' + _fmtDur(remain) + ' left' : '',
+    ].filter(Boolean).join(' · ');
+
+    const addons = p.run_addons ? ' <span style="color:#b39ddb">+' +
+      escHtml(p.run_addons.toUpperCase().replace(',', ' +')) + '</span>' : '';
+
+    return '<div class="sum-row" onclick="showPipeline(\'' + p.pod_id + '\')">'
+      + '<div class="sum-pod">' + escHtml(p.pod_id) + addons + '</div>'
+      + '<div class="sum-dots">' + dots + '</div>'
+      + '<div class="sum-step">' + escHtml(p.running ? p.running.replace(/_/g, ' ')
+                                          : (p.failed ? 'failed' : (p.done === p.total ? 'complete' : 'idle'))) + '</div>'
+      + '<div class="sum-meta">' + meta + '</div></div>';
+  }).join('');
+
+  if (host._sig !== html) { host.innerHTML = html; host._sig = html; }
 }
 
 function renderStats(pods) {
@@ -10236,23 +10422,9 @@ async function loadSccChecklist(podId) {
   }
 
   // ── Session freshness indicator ──────────────────────────────────────────
-  let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No stored session (iDAC login used on demand)';
-  if (sess.exists) {
-    const h = sess.age_hours ?? 0;
-    if (h < 4)       { sessColor = '#00e68a'; sessIcon = '\u2713'; sessLabel = 'SCC session fresh (' + h.toFixed(1) + 'h ago)'; }
-    else if (h < 8)  { sessColor = '#f0a500'; sessIcon = '\u26a0'; sessLabel = 'SCC session ageing (' + h.toFixed(1) + 'h ago)'; }
-    else             { sessColor = '#ff4757'; sessIcon = '\u26a0'; sessLabel = 'SCC session stale (' + h.toFixed(1) + 'h) \u2014 refresh'; }
-  }
 
-  // ── Pre-flight: SCC session state ────────────────────────────────────────
-  let preflight = '<div style="background:#0d1117;border:1px solid #1e2d3d;border-radius:6px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">';
-  preflight += '<div>';
-  preflight += '<span style="font-size:12px;font-weight:600;color:#8899aa;text-transform:uppercase;letter-spacing:.5px;">Pre-flight</span>&nbsp;';
-  preflight += '<span id="scc-sess-badge" style="font-size:12px;color:' + sessColor + ';">' + sessIcon + ' ' + sessLabel + '</span>';
-  preflight += '</div>';
-  preflight += '</div>';
 
-  grid.innerHTML = preflight +
+  grid.innerHTML =
     // SCC API Credentials card
     '<div class="switch-card" style="margin-bottom:12px;">'
     + '<div class="switch-card-title"><span class="role-tag cc">KEYS</span><span style="color:#e0e6ed;font-size:13px;font-weight:600;">SCC API Credentials</span></div>'
@@ -12808,23 +12980,9 @@ function renderIseGrid(podId, data) {
   const isRunning = running;
 
   // ── Session freshness indicator ──────────────────────────────────────────
-  let sessColor = '#ff4757', sessIcon = '\u26a0', sessLabel = 'No stored session (iDAC login used on demand)';
-  if (sess.exists) {
-    const h = sess.age_hours ?? 0;
-    if (h < 4)       { sessColor = '#00e68a'; sessIcon = '\u2713'; sessLabel = 'SCC session fresh (' + h.toFixed(1) + 'h ago)'; }
-    else if (h < 8)  { sessColor = '#f0a500'; sessIcon = '\u26a0'; sessLabel = 'SCC session ageing (' + h.toFixed(1) + 'h ago)'; }
-    else             { sessColor = '#ff4757'; sessIcon = '\u26a0'; sessLabel = 'SCC session stale (' + h.toFixed(1) + 'h) \u2014 refresh'; }
-  }
 
   let html = '';
 
-  // ── Pre-flight: SCC session state ────────────────────────────────────────
-  html += '<div style="background:#0d1117;border:1px solid #1e2d3d;border-radius:6px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">';
-  html += '<div>';
-  html += '<span style="font-size:12px;font-weight:600;color:#8899aa;text-transform:uppercase;letter-spacing:.5px;">Pre-flight</span>&nbsp;';
-  html += '<span id="scc-sess-badge" style="font-size:12px;color:' + sessColor + ';">' + sessIcon + ' ' + sessLabel + '</span>';
-  html += '</div>';
-  html += '</div>';
 
   // ── Header + Run / Reset buttons ─────────────────────────────────────────
   html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
