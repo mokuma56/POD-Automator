@@ -5868,6 +5868,95 @@ def api_ise_sgt_recheck(pod_id):
 
 
 
+@app.route("/api/idac/populate", methods=["POST"])
+def api_idac_populate():
+    """Fill org_credentials.idac_url from each pod's dCloud session log.
+
+    Read-only: it copies the URL dCloud already created at session spin-up out
+    of C:\\dcloud\\session_automation.log on the jump host. It never runs
+    idac_sdk, which does not fetch a URL but REPROVISIONS — minting a new Duo
+    AND SCC AND Meraki org and orphaning whatever was registered against the
+    originals.
+
+    This exists because the SCC reset is pipeline step 21 while the Duo
+    bootstrap (the only thing that used to record a URL) runs afterwards, so on
+    a genuinely new org the browser half of the reset could never authenticate.
+    Populating up front breaks that ordering dependency.
+
+    POST {"pod_id": "POD-18"} for one pod, or omit for every pod with a VPN up.
+    Never overwrites a stored URL: a different one would point at different orgs.
+    """
+    import re as _re
+    data = request.get_json(silent=True) or {}
+    only = (data.get("pod_id") or "").strip()
+
+    conn = _db()
+    conn.row_factory = sqlite3.Row
+    try:
+        pods = [dict(r) for r in conn.execute(
+            "SELECT pod_id, scc_org FROM pods ORDER BY pod_id")]
+    finally:
+        conn.close()
+    if only:
+        pods = [p for p in pods if p["pod_id"] == only]
+
+    results = []
+    for p in pods:
+        pid = p["pod_id"]
+        m = _re.search(r"pseudoco-(\d+)", (p.get("scc_org") or ""))
+        if not m:
+            results.append({"pod_id": pid, "status": "skipped",
+                            "detail": "no scc_org yet — run the pipeline first"})
+            continue
+        org = m.group(1)
+
+        conn = _db()
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT idac_url FROM org_credentials WHERE org_number=?", (org,)).fetchone()
+        finally:
+            conn.close()
+        existing = (row["idac_url"] if row else "") or ""
+        # Deliberately NOT "skip if set". The iDAC URL is scoped to the dCloud
+        # SESSION, but we store it against the ORG — so resetting a session
+        # leaves a dead URL behind, and reusing it fails obscurely. The session
+        # log is authoritative for the session running right now, so refresh
+        # whenever it differs. Reading the log is read-only; nothing is minted.
+
+        try:
+            import duo_automation as _da
+            url = _da.read_idac_url_from_session(pid, log=lambda m: log(pid, f"[idac] {m}"))
+        except Exception as e:
+            results.append({"pod_id": pid, "org": org, "status": "error",
+                            "detail": str(e)[:160]})
+            continue
+
+        if not url:
+            results.append({"pod_id": pid, "org": org, "status": "not_found",
+                            "detail": "no iDAC URL in the session log"})
+            continue
+        if url == existing.strip():
+            results.append({"pod_id": pid, "org": org, "status": "unchanged"})
+            continue
+
+        conn = _db()
+        try:
+            conn.execute(
+                "INSERT INTO org_credentials (org_number, idac_url) VALUES (?,?) "
+                "ON CONFLICT(org_number) DO UPDATE SET idac_url=excluded.idac_url",
+                (org, url))
+            conn.commit()
+        finally:
+            conn.close()
+        log(pid, f"[idac] stored session iDAC URL for org {org}")
+        results.append({"pod_id": pid, "org": org,
+                        "status": "refreshed" if existing.strip() else "stored",
+                        "chars": len(url)})
+
+    return jsonify({"status": "ok", "results": results})
+
+
 @app.route("/api/scc/session-status", methods=["GET"])
 def api_scc_session_status():
     """Return freshness of per-POD SCC session files."""
