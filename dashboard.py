@@ -2316,6 +2316,49 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
         # stale-file path.
         log_fn(f"[scc-nav] could not read idac_url for {pod_id}: {_e}")
 
+    # Self-heal: fetch the URL dCloud already wrote for this session rather than
+    # making someone populate it by hand. It lives in the session log on the jump
+    # host, which is only reachable from the pod's VPN namespace — hence the
+    # short-lived container. Read-only; nothing is minted.
+    #
+    # This has to happen HERE rather than in the orchestrator because the SCC
+    # reset runs as pipeline step 21, before any of the optional cards, and its
+    # browser half cannot authenticate without a URL. POD-18 failed exactly that
+    # way three times.
+    if not idac:
+        log_fn(f"[scc-nav] no stored iDAC URL for {pod_id} — reading the "
+               f"session's own URL from the jump host")
+        try:
+            _r = subprocess.run([
+                "docker", "run", "--rm",
+                "--network", f"container:vpn-{pod_id}",
+                "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+                "--entrypoint", "python3",
+                "pod-automator:latest", "-u", "-c",
+                "import sys; sys.path.insert(0,'/pipeline'); "
+                "import duo_automation as d; "
+                f"print(d.read_idac_url_from_session('{pod_id}') or '')",
+            ], capture_output=True, text=True, timeout=180)
+            _found = ""
+            for _line in (_r.stdout or "").splitlines():
+                if _line.strip().startswith("https://idac.cat-dcloud.com"):
+                    _found = _line.strip()
+                    break
+            if _found:
+                # Deliberately NOT stored yet. The org number here comes from
+                # pods.scc_org, which holds the cdFMC host — and that is not
+                # always the SCC org: POD-17's cdFMC is org 517 while its iDAC
+                # resolves to enterprise 73840d7e, which is org 502. Storing on
+                # the way in filed the URL under the wrong org. The enterprise
+                # id returned by the login is authoritative, so the write happens
+                # after the session opens, below.
+                idac = _found
+                log_fn("[scc-nav] read the session iDAC URL from the jump host")
+            else:
+                log_fn("[scc-nav] no iDAC URL in the jump host session log")
+        except Exception as _e:
+            log_fn(f"[scc-nav] could not read the session log: {_e}")
+
     if idac:
         ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
         try:
@@ -2329,6 +2372,25 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
             page, eid = _da._scc_open_session(ctx, idac,
                                               log=lambda m: log_fn(f"[scc-nav] {m}"))
             page.set_default_timeout(30000)
+
+            # Now we know which org this URL really belongs to. Key it by the
+            # enterprise id, not by the org parsed out of the cdFMC host.
+            try:
+                _c3 = _db()
+                _c3.row_factory = sqlite3.Row
+                _own = _c3.execute(
+                    "SELECT org_number, idac_url FROM org_credentials WHERE scc_org_uuid=?",
+                    (eid,)).fetchone()
+                if _own and (_own["idac_url"] or "").strip() != idac:
+                    _c3.execute("UPDATE org_credentials SET idac_url=? WHERE org_number=?",
+                                (idac, _own["org_number"]))
+                    _c3.commit()
+                    log_fn(f"[scc-nav] stored the session iDAC URL for org "
+                           f"{_own['org_number']} (enterprise {eid[:8]}...)")
+                _c3.close()
+            except sqlite3.Error as _se:
+                log_fn(f"[scc-nav] could not record the iDAC URL: {_se}")
+
             return ctx, page, eid
         except Exception as _e:
             try:
