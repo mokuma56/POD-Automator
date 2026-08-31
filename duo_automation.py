@@ -443,9 +443,14 @@ def duo_push_authproxy_cfg(
     else:
         err2 = r2.std_err.decode(errors="replace")
         # CLIXML noise in stderr is PowerShell formatting, not a real error
-        clixml_only = err2.strip().startswith("#< CLIXML")
-        if clixml_only or status == "Unknown":
-            _log(f"DuoAuthProxy service: {status} (status check inconclusive — cfg written and restart issued, treating as OK)")
+        # CLIXML noise in stderr is PowerShell formatting, not a real error — but
+        # it is present on almost every call, so `clixml_only or ...` meant a
+        # DEFINITE "Stopped" was laundered into success. POD-5 reported
+        # "service: Stopped ... treating as OK" twice while the proxy was down,
+        # and the failure only surfaced four steps later as sso_test "Invalid
+        # credentials". Only a genuinely unknown status is inconclusive.
+        if status == "Unknown":
+            _log(f"DuoAuthProxy service: {status} (status genuinely unknown — cfg written and restart issued)")
             return True, f"authproxy.cfg pushed ({ap_host}) | service restart issued (status={status})"
         return False, (
             f"authproxy.cfg written but service status={status} | {err2[:100]}"
@@ -5337,10 +5342,13 @@ def _winrm_write_restart_cfg(session, cfg_content: str, log) -> tuple[bool, str]
     log(f"DuoAuthProxy service: {status}")
     if status.lower() == "running":
         return True, "cfg written | service Running"
-    # CLIXML noise in stderr is PowerShell formatting, not a real error — treat Unknown as OK
-    restart_clixml = restart_err.strip().startswith("#< CLIXML")
-    if restart_clixml or status == "Unknown":
-        log(f"DuoAuthProxy service: {status} (status check inconclusive — cfg written and restart issued, treating as OK)")
+    # CLIXML in stderr is PowerShell formatting, present on nearly every call —
+    # so `restart_clixml or ...` accepted a DEFINITE "Stopped" as success. That
+    # is how POD-5 carried on with the proxy down until sso_test failed four
+    # steps later with a misleading "Invalid credentials". Only a genuinely
+    # unknown status is inconclusive.
+    if status == "Unknown":
+        log(f"DuoAuthProxy service: {status} (status genuinely unknown — cfg written and restart issued)")
         return True, f"cfg written | service restart issued (status={status})"
     return False, f"cfg written but service={status} (restart_err={restart_err[:100]})"
 
@@ -6065,6 +6073,35 @@ def _duo_admin_direct_login(page, email: str, password: str, log=None) -> None:
     _l(f"Duo admin login successful: {page.url[:80]}")
 
 
+import re as _re
+
+def _looks_like_sso_stanza(text: str) -> bool:
+    """Is this actually an [sso] config stanza, and not something else entirely?
+
+    _pw_get_copy_content matches on a label like "1.2", and :has-text() matches
+    ANCESTORS as well as the element, so it can return the wrong node's content.
+    On POD-5 it returned the config FILE PATH — 69 characters of
+    "C:\\Program Files\\Duo Security Authentication Proxy\\conf\\authproxy.cfg" —
+    which was then appended into authproxy.cfg. That invalidated the [cloud]
+    section, Duo logged "No valid cloud sections could be found", the service
+    died mid-run, and the failure surfaced four steps later as sso_test
+    "Invalid credentials".
+
+    A real stanza names the section or carries its key; a filesystem path is
+    never either.
+    """
+    import re as _re_chk
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) < 30:                      # the real stanza is ~350 chars
+        return False
+    if _re_chk.match(r'^[A-Za-z]:\\', t):   # a bare Windows path
+        return False
+    low = t.lower()
+    return ("[sso]" in low) or ("rikey" in low)
+
+
 def _pw_get_copy_content(page, hint: str, log=None) -> str:
     """
     Extract the text content that a 'Copy' button in a step is copying.
@@ -6580,6 +6617,11 @@ def _pw_sso_ext_auth_setup(
         or _pw_get_copy_content(duo_page, "SSO section", log=log)
         or _pw_get_copy_content(duo_page, "service account", log=log)
     )
+    if sso_cfg and not _looks_like_sso_stanza(sso_cfg):
+        log(f"[sso] capture returned something that is not a stanza "
+            f"({len(sso_cfg)} chars, starts {sso_cfg.strip()[:40]!r}) — discarding "
+            f"rather than corrupting authproxy.cfg")
+        sso_cfg = ""
     if sso_cfg:
         log(f"[sso] config captured ({len(sso_cfg)} chars)")
         # Append [sso] section to authproxy.cfg on AD1
