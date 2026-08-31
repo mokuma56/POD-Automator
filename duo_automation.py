@@ -1830,6 +1830,56 @@ asyncio.run(get_url())
 """
 
 
+
+# ── Reading a pod's EXISTING iDAC URL (never minting one) ────────────────────
+SESSION_AUTOMATION_LOG = r"C:\dcloud\session_automation.log"
+
+
+def read_idac_url_from_session(pod_id: str, log=None) -> str:
+    """Read the iDAC URL dCloud already created for this session. Read-only.
+
+    dCloud writes the session's iDAC URL into C:\dcloud\session_automation.log
+    on the jump host when the pod spins up. That URL corresponds to the orgs the
+    pod was PROVISIONED with, which is exactly what we want — verified
+    byte-identical (sha 0c4c8d62..., 121 chars) to the URL stored for POD-17's
+    org 502.
+
+    This is the alternative to idac_sdk, which does not fetch anything: it
+    REPROVISIONS, minting a new Duo AND SCC AND Meraki org and orphaning
+    whatever was registered against the originals. Prefer this always.
+
+    Returns "" when no URL can be read; callers must not fall back to minting.
+    """
+    import re as _re
+    _log = log or (lambda m: None)
+    try:
+        sess = _winrm_connect_jump(pod_id, log=log)
+    except Exception as e:
+        _log(f"could not reach the jump host to read the session log: {e}")
+        return ""
+    try:
+        r = sess.run_ps(
+            "$m = Select-String -Path '" + SESSION_AUTOMATION_LOG + "' "
+            "-Pattern 'https://idac\\.cat-dcloud\\.com[^\\s\"'']*' ; "
+            "$m | ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } | "
+            "Select-Object -Unique -First 1"
+        )
+        url = r.std_out.decode("utf-8", errors="replace").strip().split("\n")[0].strip()
+        if url.startswith("https://idac.cat-dcloud.com"):
+            _log(f"read existing iDAC URL from the session log ({len(url)} chars)")
+            return url
+        _log("no iDAC URL found in the session log")
+        return ""
+    except Exception as e:
+        _log(f"could not read the session log: {e}")
+        return ""
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
 def fetch_idac_url_from_dcloud(log=None, pod_id: str = "",
                                allow_rotation: bool = False) -> str:
     """
@@ -2471,13 +2521,18 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
         # fetch_idac_url_from_dcloud defaults to allow_rotation=False for this
         # reason; passing True defeated the safeguard. If the URL is missing,
         # stop and let a human supply it.
-        raise RuntimeError(
-            f"org {org_num}: no iDAC URL stored for this pod. Refusing to mint "
-            f"one — idac_sdk reprovisions the pod's Duo, SCC AND Meraki orgs, "
-            f"orphaning anything already registered (the firewall, ISE, SCC "
-            f"integrations). Paste the session's existing iDAC URL into "
-            f"org_credentials.idac_url for org {org_num} and re-run."
-        )
+        _log(f"org {org_num}: no stored iDAC URL — reading the one dCloud "
+             f"created for this session (read-only; never minting)")
+        idac = read_idac_url_from_session(pod_id, log=_log)
+        if not idac:
+            raise RuntimeError(
+                f"org {org_num}: no iDAC URL stored, and none found in "
+                f"{SESSION_AUTOMATION_LOG} on the jump host. Refusing to mint "
+                f"one — idac_sdk reprovisions the pod's Duo, SCC AND Meraki "
+                f"orgs, orphaning anything already registered (the firewall, "
+                f"ISE, SCC integrations). Paste the session's iDAC URL into "
+                f"org_credentials.idac_url for org {org_num} and re-run."
+            )
 
     # _pw_activate_duo_admin() runs its own sync_playwright(); nesting a second
     # one raises "Sync API inside the asyncio loop". Activate first, then open
