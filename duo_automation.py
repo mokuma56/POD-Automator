@@ -3457,9 +3457,38 @@ def _scc_open_session(ctx, idac_url: str, log=None):
     pg = ctx.new_page()
     pg.goto(idac_url, wait_until="load", timeout=45_000)
     pg.wait_for_timeout(5_000)
-    with ctx.expect_page(timeout=25_000) as info:
-        pg.evaluate("""() => {const b=Array.from(document.querySelectorAll('button,a'))
-            .find(x=>/^view$/i.test((x.innerText||'').trim())); if(b)b.click();}""")
+
+    # Wait for the "View" button to actually exist before clicking it.
+    # The click used to be a bare evaluate with `if(b)b.click()`: when the
+    # adaptive card had not finished rendering, b was undefined, NOTHING was
+    # clicked, and the code then sat in expect_page() for 25s waiting for a
+    # popup that was never going to open -- reported as
+    # 'iDAC login failed (Timeout 25000ms exceeded while waiting for event
+    # "page")', which reads like a slow popup rather than a missing button.
+    FIND_VIEW = """() => Array.from(document.querySelectorAll('button,a'))
+        .some(x => /^view$/i.test((x.innerText || '').trim()))"""
+    _have_view = False
+    for _i in range(12):
+        try:
+            if pg.evaluate(FIND_VIEW):
+                _have_view = True
+                if _i:
+                    _log(f"iDAC 'View' button appeared after ~{_i * 2.5:.0f}s")
+                break
+        except Exception:
+            pass
+        pg.wait_for_timeout(2_500)
+    if not _have_view:
+        raise RuntimeError(
+            "iDAC card has no 'View' button after 30s — the adaptive card did not "
+            "render (URL may be stale or dCloud slow); NOT minting a new one")
+
+    with ctx.expect_page(timeout=45_000) as info:
+        _clicked = pg.evaluate("""() => {const b=Array.from(document.querySelectorAll('button,a'))
+            .find(x=>/^view$/i.test((x.innerText||'').trim()));
+            if(b){b.click(); return true;} return false;}""")
+        if not _clicked:
+            _log("iDAC 'View' vanished between check and click")
     t = info.value
     t.wait_for_load_state("load", timeout=30_000)
     for _ in range(18):
