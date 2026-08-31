@@ -1897,10 +1897,36 @@ def fetch_idac_url_from_dcloud(log=None, pod_id: str = "",
             f"Failed to write temp script on jump host: {r.std_err.decode()[:300]}"
         )
 
+    # Find an interpreter that actually has idac_sdk, rather than assuming a
+    # version-specific path. C:\Python311\python.exe was hardcoded, and a newer
+    # jump host image ships Python 3.12 at C:\Python312 instead — with idac_sdk
+    # 0.7.4 already installed. The bootstrap failed with "The term
+    # 'C:\Python311\python.exe' is not recognized", which reads like a missing
+    # Python when nothing was missing at all.
+    _log("locating a Python with idac_sdk on the jump host...")
+    _find = sess.run_ps(
+        r"""
+        $cands = @()
+        $cands += (Get-ChildItem 'C:\' -Filter 'Python*' -Directory -EA SilentlyContinue |
+                   ForEach-Object { Join-Path $_.FullName 'python.exe' })
+        $cmd = (Get-Command python -EA SilentlyContinue).Source
+        if ($cmd) { $cands += $cmd }
+        foreach ($c in ($cands | Select-Object -Unique)) {
+            if (Test-Path $c) {
+                $has = & $c -c "import idac_sdk; print('yes')" 2>$null
+                if ($has -eq 'yes') { Write-Output $c; break }
+            }
+        }
+        """)
+    _py = _find.std_out.decode("utf-8", errors="replace").strip().split("\n")[0].strip()
+    if not _py:
+        raise RuntimeError(
+            "no Python with idac_sdk found on the jump host — checked every "
+            "C:\\Python* install and the one on PATH")
+    _log(f"using interpreter: {_py}")
+
     _log("running idac_sdk on jump host (may take ~30s)...")
-    r2 = sess.run_cmd(
-        r"C:\Python311\python.exe", [r"C:\Windows\Temp\get_idac.py"]
-    )
+    r2 = sess.run_cmd(_py, [r"C:\Windows\Temp\get_idac.py"])
     url = r2.std_out.decode("utf-8", errors="replace").strip()
     err = r2.std_err.decode("utf-8", errors="replace").strip()
 
