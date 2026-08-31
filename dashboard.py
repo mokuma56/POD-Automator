@@ -1,6 +1,6 @@
 """POD Dashboard — upload events CSV, start pipelines, monitor live progress."""
 
-import sqlite3, json, threading, csv, io, os, time, sys, subprocess
+import sqlite3, json, threading, csv, io, os, time, sys, subprocess, re
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request
@@ -311,6 +311,186 @@ def set_step(pod_id, step_name, status, result=""):
 def index():
     return render_template_string(DASHBOARD_HTML)
 
+_res_cache = {"at": 0.0, "data": None}
+_res_lock = threading.Lock()
+
+
+def _sh(cmd, timeout=6):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              timeout=timeout).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _mac_memory():
+    """Physical memory in MB: (total, used). macOS has no /proc, and psutil is
+    not installed, so read hw.memsize and derive used from vm_stat pages."""
+    total_b = 0
+    try:
+        total_b = int(_sh("/usr/sbin/sysctl -n hw.memsize") or 0)
+    except ValueError:
+        pass
+    used_mb = 0
+    vm = _sh("/usr/bin/vm_stat")
+    if vm:
+        page = 4096
+        m = re.search(r"page size of (\d+) bytes", vm)
+        if m:
+            page = int(m.group(1))
+        vals = {}
+        for line in vm.splitlines():
+            mm = re.match(r'"?([A-Za-z ]+?)"?:\s+(\d+)', line.strip())
+            if mm:
+                vals[mm.group(1).strip().lower()] = int(mm.group(2))
+        # macOS "memory used" ~= active + wired + compressed
+        used_pages = (vals.get("pages active", 0)
+                      + vals.get("pages wired down", 0)
+                      + vals.get("pages occupied by compressor", 0))
+        used_mb = int(used_pages * page / 1024 / 1024)
+    return int(total_b / 1024 / 1024), used_mb
+
+
+def _parse_mem(tok):
+    """'12.78MiB' / '1.23GiB' -> MB."""
+    m = re.match(r"([\d.]+)\s*([A-Za-z]+)", (tok or "").strip())
+    if not m:
+        return 0.0
+    n, unit = float(m.group(1)), m.group(2).lower()
+    return n * {"b": 1 / 1048576, "kib": 1 / 1024, "kb": 1 / 1024,
+                "mib": 1, "mb": 1, "gib": 1024, "gb": 1024}.get(unit, 0)
+
+
+@app.route("/api/resources")
+def api_resources():
+    """Host + Docker + browser footprint, so the operator can see how much room
+    is left before starting more PODs.
+
+    Cached for 4s: `docker stats --no-stream` takes a second or two and the UI
+    polls this on the same cadence as everything else.
+    """
+    with _res_lock:
+        if _res_cache["data"] and (time.time() - _res_cache["at"]) < 4:
+            return jsonify(_res_cache["data"])
+
+    host_total, host_used = _mac_memory()
+
+    # Docker containers
+    containers, docker_mb, docker_cpu = [], 0.0, 0.0
+    raw = _sh('docker stats --no-stream --format "{{.Name}}|{{.MemUsage}}|{{.CPUPerc}}"', timeout=10)
+    for line in [l for l in raw.splitlines() if "|" in l]:
+        name, mem, cpu = (line.split("|") + ["", ""])[:3]
+        used = _parse_mem(mem.split("/")[0])
+        try:
+            cpuv = float((cpu or "0").replace("%", "").strip())
+        except ValueError:
+            cpuv = 0.0
+        docker_mb += used
+        docker_cpu += cpuv
+        containers.append({"name": name.strip(), "mem_mb": round(used, 1), "cpu": cpuv})
+
+    docker_limit_mb = 0
+    try:
+        docker_limit_mb = int(int(_sh("docker info --format '{{.MemTotal}}'") or 0) / 1024 / 1024)
+    except ValueError:
+        pass
+
+    # Host-side Playwright browsers (the Duo card drives Chromium on the Mac;
+    # container-side browsers are already counted in the Docker figures).
+    # Match the ms-playwright cache path, NOT "chromium"/"Chrome": the broad
+    # match counted 39 of the operator's own Chrome helper processes as
+    # automation browsers.
+    browsers, browser_mb = 0, 0.0
+    ps = _sh("ps -Ao rss,command | grep ms-playwright | grep -v grep")
+    for line in ps.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            # count only the top-level browser processes, not every helper
+            if "--type=" in parts[1]:
+                browser_mb += int(parts[0]) / 1024
+                continue
+            browsers += 1
+            browser_mb += int(parts[0]) / 1024
+
+    pods_running = len([c for c in containers if c["name"].startswith("pipeline-")])
+    vpns = len([c for c in containers if c["name"].startswith("vpn-")])
+
+    try:
+        load1 = os.getloadavg()[0]
+    except Exception:
+        load1 = 0.0
+
+    # Estimated SAFE ceilings, not hard limits — the point is to show headroom
+    # before starting more PODs.
+    #   memory   : 85% of physical / of the Docker Desktop allocation; past that
+    #              macOS starts swapping and Docker starts OOM-killing.
+    #   pipelines: Docker allocation / ~400MB, the measured footprint of a
+    #              pipeline container (11.67GB sized ~28 containers).
+    #   browsers : DUO_MAX_CONCURRENT, the semaphore the Duo card already
+    #              enforces host-side.
+    #   load     : one per CPU.
+    cpus = os.cpu_count() or 1
+    safe = {
+        "host_mb": int(host_total * 0.85),
+        "docker_mb": int(docker_limit_mb * 0.85),
+        "pipelines": max(1, int(docker_limit_mb * 0.85 / 400)) if docker_limit_mb else 8,
+        "browsers": DUO_MAX_CONCURRENT,
+        "load": cpus,
+    }
+
+    data = {
+        "safe": safe,
+        "host": {"total_mb": host_total, "used_mb": host_used,
+                 "cpus": cpus, "load1": round(load1, 2)},
+        "docker": {"used_mb": round(docker_mb, 1), "limit_mb": docker_limit_mb,
+                   "cpu": round(docker_cpu, 1), "containers": len(containers)},
+        "browsers": {"count": browsers, "mem_mb": round(browser_mb, 1)},
+        "pods": {"pipelines": pods_running, "vpns": vpns},
+        "top": sorted(containers, key=lambda c: -c["mem_mb"])[:6],
+    }
+    with _res_lock:
+        _res_cache.update({"at": time.time(), "data": data})
+    return jsonify(data)
+
+
+def _addon_progress(conn, pod_id: str, run_addons: str) -> dict:
+    """Step counts for the optional cards this POD was launched with.
+
+    A run launched as "+ Duo + ISE" is 38 steps, not 21 — the pipeline's own 21
+    plus Duo's 12 and ISE's 5 — so both the table and the summary must count
+    them or a half-finished run reads as 21/21 done. Steps are counted from the
+    canonical order lists, not from whatever rows happen to exist, so a POD that
+    has selected an addon but not reached it yet still shows the full total.
+    """
+    addons = [a for a in (run_addons or "").split(",") if a]
+    total = done = 0
+    running = ""
+    for key, table, mod_name, attr in (
+        ("duo", "duo_steps", "duo_automation", "DUO_CARD_STEPS"),
+        ("ise", "ise_steps", "ise_integrations", "ISE_STEPS"),
+    ):
+        if key not in addons:
+            continue
+        try:
+            mod = __import__(mod_name)
+            order = list(getattr(mod, attr))
+        except Exception:
+            order = []
+        total += len(order)
+        try:
+            rows = {r["step_name"]: r["status"] for r in conn.execute(
+                f"SELECT step_name, status FROM {table} WHERE pod_id=?", (pod_id,))}
+        except sqlite3.Error:
+            rows = {}
+        for name in order:
+            st = rows.get(name, "")
+            if st in ("completed", "skipped"):
+                done += 1
+            elif st == "running" and not running:
+                running = name
+    return {"addon_total": total, "addon_done": done, "addon_running": running}
+
+
 @app.route("/api/pods")
 def api_pods():
     conn = _db()
@@ -328,6 +508,10 @@ def api_pods():
                 p[f"{s['step_name']}_result"] = (s["result"] or "")[:80]
         except Exception:
             pass
+        try:
+            p.update(_addon_progress(conn, p["pod_id"], p.get("run_addons") or ""))
+        except Exception:
+            p.update({"addon_total": 0, "addon_done": 0, "addon_running": ""})
         # Duo card completion, for the "DUO Configured" tile. A POD counts only
         # when EVERY step of the card is completed — a partially-green card is
         # not a configured POD, and the whole point of this dashboard is not to
@@ -482,6 +666,14 @@ def api_pipeline_summary():
         rows = conn.execute(
             "SELECT pod_id, step_name, status, started_at, completed_at "
             "FROM pipeline_steps").fetchall()
+        addon_rows = {}
+        for _t in ("duo_steps", "ise_steps"):
+            addon_rows[_t] = {}
+            try:
+                for _r in conn.execute(f"SELECT pod_id, step_name, status FROM {_t}"):
+                    addon_rows[_t].setdefault(_r["pod_id"], {})[_r["step_name"]] = _r["status"]
+            except sqlite3.Error:
+                pass
     finally:
         conn.close()
 
@@ -505,7 +697,7 @@ def api_pipeline_summary():
         seq, running, done = [], "", 0
         for name in PIPELINE_STEP_NAMES:
             st = (steps.get(name) or {}).get("status", "")
-            seq.append({"name": name, "status": st})
+            seq.append({"name": name, "status": st, "phase": "pipeline"})
             if st in ("completed", "skipped"):
                 done += 1
             elif st == "running":
@@ -521,6 +713,31 @@ def api_pipeline_summary():
         ends = [x for x in ends if x]
         ended = "" if running else (max(ends).strftime("%Y-%m-%dT%H:%M:%SZ") if ends else "")
 
+        # Addon phases are part of the run when the POD was launched with them,
+        # so their steps belong in the dots and in done/total. Without this a
+        # "+ Duo + ISE" run reads 21/21 while 17 steps are still outstanding.
+        _ad = {"addon_total": 0, "addon_done": 0, "addon_running": ""}
+        addons = [a for a in ((p.get("run_addons") or "").split(",")) if a]
+        for key, table, mod_name, attr, label in (
+            ("duo", "duo_steps", "duo_automation", "DUO_CARD_STEPS", "duo"),
+            ("ise", "ise_steps", "ise_integrations", "ISE_STEPS", "ise"),
+        ):
+            if key not in addons:
+                continue
+            try:
+                mod = __import__(mod_name)
+                order = list(getattr(mod, attr))
+            except Exception:
+                order = []
+            arows = addon_rows.get(table, {}).get(p["pod_id"], {})
+            for name in order:
+                st = arows.get(name, "")
+                seq.append({"name": f"{label}: {name}", "status": st, "phase": label})
+                if st in ("completed", "skipped"):
+                    done += 1
+                elif st == "running" and not running:
+                    running = f"{label}: {name}"
+
         out.append({
             "pod_id": p["pod_id"],
             "pod_number": p.get("pod_number") or "",
@@ -528,7 +745,7 @@ def api_pipeline_summary():
             "steps": seq,
             "running": running,
             "done": done,
-            "total": len(PIPELINE_STEP_NAMES),
+            "total": len(seq),
             "failed": any(x["status"] == "failed" for x in seq),
             "started_at": started,
             "ended_at": ended,
@@ -2069,7 +2286,8 @@ def api_step_timings():
 
     out = {}
     conn = _db()
-    for table, key in (("pipeline_steps", "pipeline"), ("duo_steps", "duo")):
+    for table, key in (("pipeline_steps", "pipeline"), ("duo_steps", "duo"),
+                       ("ise_steps", "ise"), ("scc_checklist", "scc")):
         durs = {}
         try:
             rows = conn.execute(
@@ -5467,6 +5685,237 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                 return False, f"cdFMC pxGrid page not found at {_fmc_tab.url}"
             log_fn("[cdfmc-nav] pxGrid Identity Sources page loaded ✓")
 
+            # ── Already integrated? Then we are done. ─────────────────────────
+            # cdFMC binds an OTP to the application instance that is currently
+            # registered, so a re-run against a WORKING integration can never
+            # redeem a new OTP: it fails with "OTP was issued for a different
+            # application", and the only way through would be to tear down a
+            # healthy integration and rebuild it. The dialog says as much --
+            # "You should deactivate the app instance on the Cisco DNA Portal
+            # before deleting it here." So make the step idempotent: if this
+            # POD's tenant already has an ACTIVE instance, report success.
+            _tenant = ""
+            try:
+                _c = sqlite3.connect(str((DATA_DIR / "data" / "pod_state.db").resolve()))
+                _row = _c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+                _c.close()
+                import re as _re2
+                _m = _re2.search(r"pseudoco-(\d+)", (_row[0] if _row else "") or "", _re2.I)
+                if _m:
+                    _tenant = f"PseudoCo-{_m.group(1)}"
+            except Exception as _te:
+                log_fn(f"[cdfmc-nav] could not derive tenant: {_te}")
+
+            if _tenant:
+                try:
+                    _existing = _fmc_tab.evaluate("""(tenant) => {
+                        const rows = Array.from(document.querySelectorAll(
+                            'div.ReactVirtualized__Table__row'));
+                        for (const r of rows) {
+                            const txt = (r.innerText || '');
+                            if (!txt.includes(tenant)) continue;
+                            const b = r.querySelector('[data-testid$="-active-icon"]');
+                            const active = !!(b && b.querySelector('[data-testid="icon-success"]'));
+                            if (active) return txt.split(String.fromCharCode(10))[0].trim();
+                        }
+                        return null;
+                    }""", _tenant)
+                except Exception as _ee:
+                    log_fn(f"[cdfmc-nav] active-instance check failed: {_ee}")
+                    _existing = None
+                if _existing:
+                    log_fn(f"[cdfmc-nav] {_tenant} already has an ACTIVE pxGrid instance "
+                           f"{_existing!r} — nothing to do")
+                    return True, (f"cdFMC pxGrid already integrated: instance {_existing!r} "
+                                  f"active for {_tenant}")
+                log_fn(f"[cdfmc-nav] no active instance for {_tenant} — creating one")
+
+            def _purge_instances(keep_name, why):
+                """Delete every pxGrid Application Instance except `keep_name`.
+
+                Runs BEFORE creating as well as after saving. cdFMC binds an OTP
+                to the application instance currently registered: with the
+                previous instance still present, redeeming a freshly-issued OTP
+                fails with "OTP was issued for a different application and
+                cannot be redeemed", the Create dialog never closes, and the
+                step fails even though ISE issued a perfectly good OTP. ISE
+                shows no Deactivate control on that page (only Push/Activate),
+                so clearing the stale instance here is the only lever available.
+                """
+                log_fn(f"[cdfmc-nav] {why}")
+                _fmc_tab.wait_for_timeout(2000)
+                _inventoried = False
+                _confirm_dumped = False
+                _any_deleted_overall = False
+                for _ in range(5):
+                    _deleted_any = False
+                    try:
+                        _all_rows = _fmc_tab.locator('div.ReactVirtualized__Table__row').all()
+                    except Exception:
+                        _all_rows = []
+                    for _row in _all_rows:
+                        try:
+                            _row_txt = _row.inner_text() or ""
+                            if keep_name and keep_name in _row_txt:
+                                continue
+                            if not _row_txt.strip():
+                                continue
+                            # NEVER try to delete the currently-active instance.
+                            # cdFMC will not remove the identity source that is in
+                            # use, so the click no-ops. The old loop always picked
+                            # the first non-matching row -- which was the ACTIVE
+                            # one -- clicked its trash, re-scanned, found it still
+                            # there, and burned all 5 attempts on it. The genuinely
+                            # stale row (SEC-NET-CL25-POD5) was never reached.
+                            try:
+                                _is_active = _row.evaluate('''(r) => {
+                                    const b = r.querySelector('[data-testid$="-active-icon"]');
+                                    return !!(b && b.querySelector('[data-testid="icon-success"]'));
+                                }''')
+                            except Exception:
+                                _is_active = False
+                            if _is_active:
+                                log_fn(f"[cdfmc-nav] skipping ACTIVE instance: "
+                                       f"{_row_txt.strip()[:60]!r}")
+                                continue
+                            # The trash control often only renders on hover in this
+                            # ReactVirtualized table.
+                            try:
+                                _row.hover(timeout=2000)
+                                _fmc_tab.wait_for_timeout(400)
+                            except Exception:
+                                pass
+                            # One-time inventory of what is actually clickable in the
+                            # row. The previous selectors matched nothing, so the
+                            # fallback clicked the row's LAST <button> -- which
+                            # deleted nothing: the same row was retried 5 times with
+                            # no "Delete confirmed", and the stale instance survived
+                            # to reject the next OTP.
+                            if not _inventoried:
+                                try:
+                                    _inv = _row.evaluate('''(r) => Array.from(
+                                        r.querySelectorAll('button,a,svg,[role="button"],[class*="icon"]')
+                                    ).map(e => ({tag: e.tagName,
+                                                 cls: String(e.getAttribute('class') || '').slice(0, 45),
+                                                 aria: e.getAttribute('aria-label') || '',
+                                                 title: e.getAttribute('title') || '',
+                                                 tid: e.getAttribute('data-testid') || '',
+                                                 txt: (e.textContent || '').trim().slice(0, 20)}))''')
+                                    log_fn(f"[cdfmc-nav] row controls: {_inv}")
+                                except Exception as _ie:
+                                    log_fn(f"[cdfmc-nav] row inventory failed: {_ie}")
+                                _inventoried = True
+                            _del_btn = None
+                            for _ds in ['button[aria-label*="delete" i]',
+                                        'button[title*="delete" i]',
+                                        'button[data-testid*="delete" i]',
+                                        'button[class*="delete" i]',
+                                        '[role="button"][aria-label*="delete" i]',
+                                        '[aria-label*="remove" i]',
+                                        '[title*="remove" i]',
+                                        '[data-testid*="trash" i]',
+                                        '[class*="trash" i]']:
+                                try:
+                                    _b = _row.locator(_ds).first
+                                    if _b.is_visible(timeout=800):
+                                        _del_btn = _b
+                                        break
+                                except Exception:
+                                    continue
+                            if _del_btn is None:
+                                _btns = _row.locator('button').all()
+                                if _btns:
+                                    _del_btn = _btns[-1]
+                            if _del_btn:
+                                log_fn(f"[cdfmc-nav] Deleting instance: {_row_txt.strip()[:80]!r}")
+                                _del_btn.click(force=True, timeout=5000)
+                                _fmc_tab.wait_for_timeout(2500)
+                                _deleted_any = True
+                                _any_deleted_overall = True
+                                # The delete BUTTON was always being clicked correctly
+                                # (row-0-delete-icon is the row's last button, which the
+                                # fallback picks). What failed was the CONFIRMATION:
+                                # Delete/Yes/Confirm matched nothing, the modal stayed
+                                # up, and the same row was retried 5 times without ever
+                                # logging "Delete confirmed". Dump the dialog once so
+                                # the real control is named rather than guessed at.
+                                if not _confirm_dumped:
+                                    try:
+                                        _dlg = _fmc_tab.evaluate('''() => Array.from(
+                                            document.querySelectorAll('button,[role="button"]'))
+                                            .filter(e => e.getClientRects().length)
+                                            .map(e => ({txt: (e.textContent || '').trim().slice(0, 25),
+                                                        tid: e.getAttribute('data-testid') || '',
+                                                        cls: String(e.getAttribute('class') || '').slice(0, 35)}))
+                                            .slice(0, 25)''')
+                                        log_fn(f"[cdfmc-nav] visible buttons after delete click: {_dlg}")
+                                    except Exception as _de:
+                                        log_fn(f"[cdfmc-nav] confirm dump failed: {_de}")
+                                    _confirm_dumped = True
+                                _confirmed = False
+                                # cdFMC raises "Delete pxGrid Application Instance?"
+                                # with Cancel / Delete. Scope to the dialog first so we
+                                # cannot re-click a row's trash icon by accident.
+                                for _conf in ['[role="dialog"] button:has-text("Delete")',
+                                              '[class*="modal" i] button:has-text("Delete")',
+                                              '[data-testid*="confirm" i]',
+                                              'button:has-text("Delete")',
+                                              'button:has-text("Yes")',
+                                              'button:has-text("Confirm")',
+                                              'button:has-text("Remove")']:
+                                    try:
+                                        _cb = _fmc_tab.locator(_conf).last
+                                        if _cb.is_visible(timeout=2000):
+                                            _cb.click(force=True)
+                                            _fmc_tab.wait_for_timeout(2500)
+                                            log_fn(f"[cdfmc-nav] Delete confirmed via {_conf!r} ✓")
+                                            _confirmed = True
+                                            break
+                                    except Exception:
+                                        pass
+                                if not _confirmed:
+                                    log_fn("[cdfmc-nav] WARNING: no confirm control matched — "
+                                           "the instance will survive and block the next OTP")
+                                break
+                        except Exception:
+                            continue
+                    if not _deleted_any:
+                        break
+
+                # Persist the deletions. The Identity Sources page is a FORM with
+                # Cancel/Save at top right: the trash icon only removes the row from
+                # the UI, and nothing is committed until Save is clicked. Every purge
+                # before this was discarded on navigation -- including the run that
+                # logged "Deleting old instance: 'SEC-NET-CL25-POD5...'" and appeared
+                # to succeed, while the row was still there afterwards.
+                if _any_deleted_overall:
+                    _saved = False
+                    for _sv in ['[data-testid*="save" i]',
+                                'button:has-text("Save")',
+                                '[role="button"]:has-text("Save")']:
+                        try:
+                            _sb = _fmc_tab.locator(_sv).last
+                            if _sb.is_visible(timeout=3000):
+                                _sb.click(force=True)
+                                _fmc_tab.wait_for_timeout(4000)
+                                log_fn(f"[cdfmc-nav] deletions saved via {_sv!r} ✓")
+                                _saved = True
+                                break
+                        except Exception:
+                            continue
+                    if not _saved:
+                        log_fn("[cdfmc-nav] WARNING: could not click Save — deletions "
+                               "will be discarded and the stale instance will remain")
+
+            # Clear any previously-bound instance BEFORE creating the new one,
+            # otherwise the fresh OTP cannot be redeemed (see _purge_instances).
+            # Best-effort. A surviving stale connector is cosmetic: it must never
+            # turn a working integration red. Log and carry on.
+            try:
+                _purge_instances(None, "Clearing existing pxGrid instances before create...")
+            except Exception as _pe:
+                log_fn(f"[cdfmc-nav] stale-instance cleanup skipped (non-fatal): {_pe}")
+
             # ── 5. Click Create pxGrid Application Instance ───────────────────
             _fmc_tab.locator('button:has-text("Create pxGrid Application Instance")').first.click(timeout=10000)
             _fmc_tab.wait_for_timeout(4000)
@@ -5673,66 +6122,11 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_after_save_{pod_id}.png"))
             log_fn("[cdfmc-nav] Save clicked ✓")
 
-            # ── 10. Delete old stale instances (any row NOT matching our name) ──
-            log_fn("[cdfmc-nav] Cleaning up old instances...")
-            _fmc_tab.wait_for_timeout(2000)
-            for _del_attempt in range(5):
-                _deleted_any = False
-                try:
-                    # ReactVirtualized table — rows are DIV not <tr>
-                    _all_rows = _fmc_tab.locator('div.ReactVirtualized__Table__row').all()
-                except Exception:
-                    _all_rows = []
-                for _row in _all_rows:
-                    try:
-                        _row_txt = _row.inner_text() or ""
-                        if instance_name in _row_txt:
-                            continue  # skip our new instance
-                        if not _row_txt.strip():
-                            continue  # skip empty rows
-                        # This is an old instance row — find its trash/delete button.
-                        # Try named selectors first, then fall back to the last button
-                        # in the row (Actions column: Test link + trash icon button).
-                        _del_btn = None
-                        for _ds in [
-                            'button[aria-label*="delete" i]',
-                            'button[title*="delete" i]',
-                            'button[data-testid*="delete" i]',
-                            'button[class*="delete" i]',
-                        ]:
-                            try:
-                                _b = _row.locator(_ds).first
-                                if _b.is_visible(timeout=800):
-                                    _del_btn = _b
-                                    break
-                            except Exception:
-                                continue
-                        if _del_btn is None:
-                            # Fallback: last button in the row is the trash icon
-                            _btns = _row.locator('button').all()
-                            if _btns:
-                                _del_btn = _btns[-1]
-                        if _del_btn:
-                            log_fn(f"[cdfmc-nav] Deleting old instance: {_row_txt.strip()[:80]!r}")
-                            _del_btn.click(force=True, timeout=5000)
-                            _fmc_tab.wait_for_timeout(2000)
-                            _deleted_any = True
-                            # Confirm delete modal if it appears
-                            for _conf in ['button:has-text("Delete")', 'button:has-text("Yes")', 'button:has-text("Confirm")']:
-                                try:
-                                    _cb = _fmc_tab.locator(_conf).first
-                                    if _cb.is_visible(timeout=3000):
-                                        _cb.click(force=True)
-                                        _fmc_tab.wait_for_timeout(2000)
-                                        log_fn("[cdfmc-nav] Delete confirmed ✓")
-                                        break
-                                except Exception:
-                                    pass
-                            break  # re-scan rows after each deletion
-                    except Exception:
-                        continue
-                if not _deleted_any:
-                    break  # no more old instances
+            # ── 10. Delete anything superseded by the instance we just saved ──
+            try:
+                _purge_instances(instance_name, "Cleaning up superseded instances...")
+            except Exception as _pe:
+                log_fn(f"[cdfmc-nav] superseded-instance cleanup skipped (non-fatal): {_pe}")
 
             _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_final_{pod_id}.png"))
             log_fn("[cdfmc-nav] ✓ cdFMC pxGrid Application Instance created, selected, and saved")
@@ -5782,8 +6176,19 @@ def _cdfmc_otp_watcher():
                     )
                     _res = {"ok": _ok, "message": _msg}
                     log(_pod_id, f"[cdfmc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
-                    _result_path = DATA_DIR / "data" / f"ise_cdfmc_result_{_pod_id}.json"
-                    _result_path.write_text(json.dumps(_res))
+                    # Absolute + atomic. DATA_DIR is Path(__file__).parent, which is
+                    # RELATIVE when the dashboard is started as `python3 dashboard.py`,
+                    # so every write here depended on the process CWD. Write via a
+                    # temp file + os.replace so the container can never observe a
+                    # half-written file, then confirm it landed -- on 2026-08-31 the
+                    # nav reported OK at 15:34:48 and the container still timed out at
+                    # 15:38:15 having never seen a result, with no traceback anywhere.
+                    _result_path = (DATA_DIR / "data").resolve() / f"ise_cdfmc_result_{_pod_id}.json"
+                    _tmp = _result_path.with_suffix(".json.tmp")
+                    _tmp.write_text(json.dumps(_res))
+                    os.replace(str(_tmp), str(_result_path))
+                    log(_pod_id, f"[cdfmc-nav] result written to {_result_path} "
+                                 f"(exists={_result_path.exists()})")
                 except Exception as _e:
                     try:
                         log("CDFMC_WATCHER", f"[cdfmc-nav] watcher error: {_e}")
@@ -7913,12 +8318,69 @@ DASHBOARD_HTML = """
   .sum-row { display:flex; align-items:center; gap:10px; padding:6px 10px; border-radius:6px;
              background:#112240; margin-bottom:4px; cursor:pointer; }
   .sum-row:hover { background:#16305c; }
-  .sum-pod { width:88px; font-size:12px; font-weight:700; color:#00bceb; flex-shrink:0; }
-  .sum-dots { display:flex; gap:3px; flex:1; min-width:0; flex-wrap:nowrap; overflow:hidden; }
-  .sum-dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+  /* Sized so a full "+ Duo + ISE" run (38 dots + 2 phase dividers) still fits
+     on one line at a 1280px viewport: measured 896px of content in a 662px box
+     before this, which silently truncated the run at about dot 28. */
+  .sum-pod { width:150px; font-size:12px; font-weight:700; color:#00bceb; flex-shrink:0;
+             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sum-dots { display:flex; gap:8px; flex:1; min-width:0; flex-wrap:nowrap;
+              overflow:hidden; align-items:center; }
+  /* Each phase is its own tinted block with an inline caption, so the three
+     stages of a "+ Duo + ISE" run read as distinct groups rather than one
+     undifferentiated string of 38 dots. */
+  .sum-ph { display:flex; align-items:center; gap:5px; padding:3px 7px;
+            border-radius:5px; flex-shrink:0; }
+  .sum-ph-lbl { font-size:9px; font-weight:700; letter-spacing:.3px;
+                text-transform:uppercase; white-space:nowrap; opacity:.85; }
+  .sum-ph-pipeline { background:rgba(0,188,235,.10);  border:1px solid rgba(0,188,235,.30); }
+  .sum-ph-pipeline .sum-ph-lbl { color:#00bceb; }
+  .sum-ph-duo      { background:rgba(124,92,255,.12); border:1px solid rgba(124,92,255,.35); }
+  .sum-ph-duo .sum-ph-lbl { color:#b39ddb; }
+  .sum-ph-ise      { background:rgba(255,165,2,.10);  border:1px solid rgba(255,165,2,.30); }
+  .sum-ph-ise .sum-ph-lbl { color:#ffa502; }
+  .sum-dot { width:14px; height:14px; border-radius:50%; flex-shrink:0;
+             display:flex; align-items:center; justify-content:center;
+             font-size:8px; font-weight:700; line-height:1; }
   .sum-meta { font-size:11px; color:#8899aa; white-space:nowrap; flex-shrink:0; }
   .sum-step { font-size:11px; color:#02c8ff; white-space:nowrap; overflow:hidden;
-              text-overflow:ellipsis; max-width:190px; flex-shrink:0; }
+              text-overflow:ellipsis; flex:0 1 330px; min-width:120px;
+              text-align:right; padding-right:6px; }
+  .sum-pct { font-size:11px; font-weight:700; color:#e8eef7; width:38px; text-align:right;
+             flex-shrink:0; }
+
+  /* Resource gauges. Each bar fills against an ESTIMATED SAFE ceiling (served
+     by /api/resources), marked by the dashed line — so the question answered is
+     "how much headroom is left", not "what is the raw total". */
+  .res-panel { margin-left:auto; display:flex; align-items:flex-end;
+               justify-content:space-around; gap:6px;
+               width:min(600px, 40vw); min-width:300px; height:92px;
+               background:#0d1b32; border:1px solid #1c2f52; border-radius:8px;
+               padding:6px 12px 8px 12px; box-sizing:border-box; }
+  /* On a wide display, lift it out of the flow: the toolbar row keeps its
+     natural button height instead of stretching to the panel's, and the panel
+     drops into the empty block to the right of the view-toggle row. Below this
+     width it stays in normal flow and simply wraps, so it can never overlap. */
+  @media (min-width: 1650px) {
+    /* top:-10px centres it in the band between the stat tiles and the POD
+       table: measured 20px of clearance above and 0 below at top:0. */
+    .res-panel { position:absolute; right:0; top:-10px; margin:0; }
+  }
+  .rv { display:flex; flex-direction:column; align-items:center; gap:3px;
+        cursor:default; flex:1; min-width:0; }
+  .rv-track { position:relative; width:22px; height:40px; background:#0a1628;
+              border:1px solid #1c2f52; border-radius:4px; overflow:hidden; }
+  .rv-fill { position:absolute; left:0; right:0; bottom:0; border-radius:3px;
+             transition:height .4s ease; }
+  .rv-max { position:absolute; left:-1px; right:-1px; height:0;
+            border-top:1px dashed #ff6b7a; }
+  .rv-val { font-size:13px; font-weight:700; color:#e8eef7; line-height:1; }
+  .rv-lbl { font-size:10px; color:#cdd6e0; font-weight:600; white-space:nowrap;
+            overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+  .rv-sub { font-size:9px; color:#7d8fa3; white-space:nowrap; }
+
+  .card-time { font-size:11px; font-weight:400; color:#7d8fa3; margin-left:8px;
+              white-space:nowrap; }
+  .card-time-run { color:#02c8ff; }
 
   .pipeline-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
   .step-card { background: #0a1628; border-radius: 6px; padding: 10px; text-align: center; }
@@ -8100,7 +8562,7 @@ DASHBOARD_HTML = """
 
    <div class="summary" id="summary"></div>
 
-   <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+   <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;position:relative;">
      <button class="btn-start-all" id="btn-check-update" onclick="checkForUpdates()" style="background:#1a3a1a;border:1px solid #22c55e;color:#22c55e;">&#8593; Check for Updates</button>
       <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
      <select id="run-all-mode" title="What to run for every POD" style="background:#0a1628;border:1px solid #7c3aed;color:#b39ddb;border-radius:5px;padding:5px 7px;font-size:12px;">
@@ -8116,6 +8578,13 @@ DASHBOARD_HTML = """
       <span id="scc-reset-all-status" style="font-size:12px;color:#667788;"></span>
       <span id="scc-refresh-global-status" style="font-size:12px;color:#667788;"></span>
      <span id="docker-status" style="font-size:12px;color:#667788;"></span>
+     <!-- Resource panel: fills the empty block to the right of the buttons.
+          In normal flow (not absolutely positioned) so it can never overlap
+          the toolbar when the window is narrowed — it wraps instead. -->
+     <div id="res-inline" class="res-panel"></div>
+   </div>
+
+
    </div>
 
   <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
@@ -8162,19 +8631,22 @@ DASHBOARD_HTML = """
       </div>
     </div>
      <div class="detail-tabs">
+       <!-- Order follows the lab workflow. EVPN / SDA Fabric sit at the end
+            because they are branch-specific and come after the core run; the
+            Knowledge Base tab was removed because the KB card on the home page
+            already serves it. -->
        <button class="tab-btn active" onclick="switchTab(this, 'steps')">Pipeline Steps</button>
        <button class="tab-btn" onclick="switchTab(this, 'logs')">Live Logs</button>
        <button class="tab-btn" onclick="switchTab(this, 'switches')">Switches / Routes</button>
        <button class="tab-btn" onclick="switchTab(this, 'cdfmc')">cdFMC</button>
        <button class="tab-btn" onclick="switchTab(this, 'ad')">AD Verify</button>
-       <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
-        <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
-        <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
-         <button class="tab-btn" onclick="switchTab(this, 'duo')">&#x1F512; Duo</button>
-         <button class="tab-btn" onclick="switchTab(this, 'ise')">&#x1F4F6; ISE</button>
-         <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
+       <button class="tab-btn" onclick="switchTab(this, 'scc')">SCC Reset</button>
+       <button class="tab-btn" onclick="switchTab(this, 'duo')">&#x1F512; Duo</button>
+       <button class="tab-btn" onclick="switchTab(this, 'ise')">&#x1F4F6; ISE</button>
+       <button class="tab-btn" onclick="switchTab(this, 'baseconfig')">&#8635; Base Config Reset</button>
        <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
-       <button class="tab-btn" onclick="switchTab(this, 'kb')">&#128218; Knowledge Base</button>
+       <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
+       <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
      </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
@@ -8268,11 +8740,6 @@ DASHBOARD_HTML = """
       </div>
     </div>
 
-     <div class="tab-content" id="tab-kb">
-       <div id="kb-grid" style="padding:16px;min-height:300px;">
-         <div style="color:#667788;font-size:13px;">Loading knowledge base...</div>
-       </div>
-     </div>
    </div>
 
 <!-- ── Standalone KB Modal (top-level, always accessible) ─────────────────── -->
@@ -8399,6 +8866,7 @@ async function load() {
      // logs tab has its own 2s poller; kb tab is static
   }
   loadSccGlobalStatus();
+  refreshResources();   // inline toolbar readout, main 5s cadence
 }
 
 async function loadSccGlobalStatus() {
@@ -8411,8 +8879,10 @@ async function loadSccGlobalStatus() {
     const sd = await sr.json();
     const entries = Object.entries(sd);
     if (entries.length === 0) {
-      statusEl.style.color = '#667788';
-      statusEl.textContent = 'No stored sessions (iDAC login used on demand)';
+      // Nothing to say: iDAC logs in on demand, so "no stored sessions" is the
+      // normal state and the line was pure noise. Space reclaimed for the live
+      // log + resources panels below.
+      statusEl.textContent = '';
       return;
     }
     const SESSION_TTL_H = 12;
@@ -8488,10 +8958,82 @@ function _sumDotColor(st) {
   return '#2d3f50';                            // not reached yet
 }
 
+// Number colour that stays legible on each dot fill: dark ink on the bright
+// states, muted grey on the dim "not reached yet" fill.
+function _sumDotInk(st) {
+  return (st === 'completed' || st === 'skipped' || st === 'failed' || st === 'running')
+    ? '#06131f' : '#7d8fa3';
+}
+
 function _fmtDur(secs) {
   if (secs == null || secs < 0) return '';
   const m = Math.floor(secs / 60), sec = Math.floor(secs % 60);
   return m >= 60 ? Math.floor(m / 60) + 'h' + (m % 60) + 'm' : (m > 0 ? m + 'm' + sec + 's' : sec + 's');
+}
+
+// ── Resource gauges (toolbar panel) ─────────────────────────────────────────
+// Bars fill against the SAFE ceiling from /api/resources; the dashed line is
+// that ceiling, drawn at 80% of the track so an overshoot is still visible.
+// Green / amber at 75% of safe / red at or over it. Detail is in the tooltip.
+function _rvGauge(label, sub, valTxt, used, safe, tip) {
+  const pctOfSafe = safe > 0 ? (used / safe) * 100 : 0;
+  const colour = pctOfSafe >= 100 ? '#ff4757'
+               : (pctOfSafe >= 75 ? '#ffa502' : '#00e68a');
+  const scale = 0.8;
+  const fillH = Math.max(used > 0 ? 3 : 0, Math.min(100, Math.round(pctOfSafe * scale)));
+  return '<span class="rv" title="' + escHtml(tip) + '">'
+       + '<span class="rv-val" style="color:' + colour + '">' + escHtml(valTxt) + '</span>'
+       + '<span class="rv-track">'
+       + '<span class="rv-fill" style="height:' + fillH + '%;background:' + colour + '"></span>'
+       + '<span class="rv-max" style="bottom:' + Math.round(scale * 100) + '%"></span>'
+       + '</span>'
+       + '<span class="rv-lbl">' + escHtml(label) + '</span>'
+       + '<span class="rv-sub">' + escHtml(sub) + '</span></span>';
+}
+
+async function refreshResources() {
+  const box = document.getElementById('res-inline');
+  if (!box) return;
+  let d;
+  try { d = await (await fetch('/api/resources')).json(); } catch (e) { return; }
+  const sf = d.safe || {};
+  const gb = mb => (mb / 1024).toFixed(1);
+
+  const macFree = Math.max(0, d.host.total_mb - d.host.used_mb);
+  const dkrFree = Math.max(0, d.docker.limit_mb - d.docker.used_mb);
+  const podsLeft = Math.max(0, (sf.pipelines || 0) - d.pods.pipelines);
+  const brLeft = Math.max(0, (sf.browsers || 0) - d.browsers.count);
+
+  const html =
+      _rvGauge('Mac Memory', gb(macFree) + ' GB free',
+               Math.round(d.host.used_mb / (d.host.total_mb || 1) * 100) + '%',
+               d.host.used_mb, sf.host_mb || d.host.total_mb,
+               'Mac memory: ' + gb(d.host.used_mb) + ' of ' + gb(d.host.total_mb)
+               + ' GB used, ' + gb(macFree) + ' GB free. Safe max '
+               + gb(sf.host_mb || 0) + ' GB (85% of physical) — past that macOS swaps.')
+    + _rvGauge('Docker Memory', gb(dkrFree) + ' GB free',
+               Math.round(d.docker.used_mb / (d.docker.limit_mb || 1) * 100) + '%',
+               d.docker.used_mb, sf.docker_mb || d.docker.limit_mb || 1,
+               'Docker: ' + gb(d.docker.used_mb) + ' of ' + gb(d.docker.limit_mb)
+               + ' GB allocated to Docker Desktop, ' + gb(dkrFree) + ' GB free. Safe max '
+               + gb(sf.docker_mb || 0) + ' GB (85%) — past that containers are OOM-killed. '
+               + d.docker.containers + ' containers, ' + d.docker.cpu + '% cpu.')
+    + _rvGauge('Running PODs', podsLeft + ' more OK',
+               String(d.pods.pipelines), d.pods.pipelines, sf.pipelines || 8,
+               'Pipeline containers running: ' + d.pods.pipelines + ' of ~'
+               + (sf.pipelines || 8) + ' safe (Docker allocation / ~400MB each, an '
+               + 'estimate). ' + d.pods.vpns + ' VPN containers up.')
+    + _rvGauge('Browsers', brLeft + ' more OK',
+               String(d.browsers.count), d.browsers.count, sf.browsers || 5,
+               'Host-side Playwright browsers: ' + d.browsers.count + ' of '
+               + (sf.browsers || 5) + ' (DUO_MAX_CONCURRENT), using '
+               + gb(d.browsers.mem_mb) + ' GB. Container browsers count under Docker.')
+    + _rvGauge('CPU Load', d.host.cpus + ' cores',
+               String(d.host.load1), d.host.load1, sf.load || d.host.cpus || 1,
+               '1-minute load average ' + d.host.load1 + ' across ' + d.host.cpus
+               + ' CPUs. Safe max is one per core.');
+
+  if (box._sig !== html) { box.innerHTML = html; box._sig = html; }
 }
 
 async function renderPodSummary() {
@@ -8503,9 +9045,26 @@ async function renderPodSummary() {
 
   const tmap = (window.STEP_SECS || {}).pipeline || {};
   const html = pods.map(p => {
-    const dots = p.steps.map(x =>
-      '<span class="sum-dot" style="background:' + _sumDotColor(x.status) + '" title="'
-      + escHtml(x.name.replace(/_/g, ' ')) + (x.status ? ' — ' + x.status : '') + '"></span>').join('');
+    // Group the dots into tinted per-phase blocks with inline captions.
+    const PH_NAME = {pipeline: 'Main Pipeline', duo: 'Duo / Secure Access',
+                     ise: 'ISE Integrations'};
+    const groups = [];
+    p.steps.forEach((x, i) => {
+      const ph = x.phase || 'pipeline';
+      if (!groups.length || groups[groups.length - 1].phase !== ph) {
+        groups.push({phase: ph, items: []});
+      }
+      groups[groups.length - 1].items.push({x: x, n: i + 1});
+    });
+    const dots = groups.map(g =>
+      '<span class="sum-ph sum-ph-' + g.phase + '">'
+      + '<span class="sum-ph-lbl">' + escHtml(PH_NAME[g.phase] || g.phase) + '</span>'
+      + g.items.map(it =>
+          '<span class="sum-dot" style="background:' + _sumDotColor(it.x.status)
+          + ';color:' + _sumDotInk(it.x.status) + '" title="'
+          + escHtml(it.n + '. ' + it.x.name.replace(/_/g, ' '))
+          + (it.x.status ? ' — ' + it.x.status : '') + '">' + it.n + '</span>').join('')
+      + '</span>').join('');
 
     // Elapsed freezes once nothing is running, so an idle POD stops counting up.
     const start = parseStamp(p.started_at);
@@ -8520,20 +9079,51 @@ async function renderPodSummary() {
       }
     });
 
+    const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+
     const meta = [
       p.done + '/' + p.total,
       elapsed != null ? _fmtDur(elapsed) : '',
       (p.running && remain > 0) ? '~' + _fmtDur(remain) + ' left' : '',
     ].filter(Boolean).join(' · ');
 
+    // One-line description of where this POD actually is: which phase, the
+    // step's position inside that phase and overall, and its name.
+    const PH_SHORT = {pipeline: 'Pipeline', duo: 'Duo', ise: 'ISE'};
+    let stepTxt;
+    if (p.running) {
+      let idx = -1;
+      for (let i = 0; i < p.steps.length; i++) {
+        if (p.steps[i].status === 'running') { idx = i; break; }
+      }
+      const cur = idx >= 0 ? p.steps[idx] : null;
+      const ph = cur ? (cur.phase || 'pipeline') : 'pipeline';
+      const inPhase = p.steps.filter(z => (z.phase || 'pipeline') === ph);
+      const posInPhase = cur ? inPhase.indexOf(cur) + 1 : 0;
+      const bare = String(p.running).replace(/^(duo|ise):\s*/, '').replace(/_/g, ' ');
+      stepTxt = (PH_SHORT[ph] || ph) + ' ' + posInPhase + '/' + inPhase.length
+              + ' · ' + bare + '  (' + (idx + 1) + '/' + p.total + ')';
+    } else if (p.failed) {
+      const bad = p.steps.filter(z => z.status === 'failed')[0];
+      stepTxt = bad
+        ? 'failed at ' + String(bad.name).replace(/_/g, ' ')
+        : 'failed';
+    } else if (p.done === p.total && p.total) {
+      stepTxt = 'all ' + p.total + ' steps complete';
+    } else if (!p.done) {
+      stepTxt = 'not started';
+    } else {
+      stepTxt = 'idle at ' + p.done + '/' + p.total;
+    }
+
     const addons = p.run_addons ? ' <span style="color:#b39ddb">+' +
       escHtml(p.run_addons.toUpperCase().replace(',', ' +')) + '</span>' : '';
 
-    return '<div class="sum-row" onclick="showPipeline(\'' + p.pod_id + '\')">'
+    return `<div class="sum-row" onclick="showPipeline('${p.pod_id}')">`
       + '<div class="sum-pod">' + escHtml(p.pod_id) + addons + '</div>'
       + '<div class="sum-dots">' + dots + '</div>'
-      + '<div class="sum-step">' + escHtml(p.running ? p.running.replace(/_/g, ' ')
-                                          : (p.failed ? 'failed' : (p.done === p.total ? 'complete' : 'idle'))) + '</div>'
+      + '<div class="sum-step">' + escHtml(stepTxt) + '</div>'
+      + '<div class="sum-pct">' + pct + '%</div>'
       + '<div class="sum-meta">' + meta + '</div></div>';
   }).join('');
 
@@ -8610,19 +9200,29 @@ function pipelineBadge(val, result, name) {
 }
 
 function pipelinePhase(p) {
+  // Totals must follow the RUN TYPE. A POD launched as "+ Duo + ISE" is 38
+  // steps (21 + 12 + 5); counting only PIPELINE_ORDER made such a run read
+  // "21/21 done" while 17 steps were still outstanding.
   const phases = PIPELINE_ORDER;
+  const addonTotal = p.addon_total || 0;
+  const addonDone  = p.addon_done  || 0;
+  const total = phases.length + addonTotal;
   let done = 0, skipped = 0;
   for (let i = 0; i < phases.length; i++) {
     const v = p[phases[i]];
     if (v === 'completed') done++;
     if (v === 'skipped')   { done++; skipped++; }
-    if (v === 'running') return { pct: Math.round(done / phases.length * 100), text: (i+1) + '/' + phases.length + ' running', state: 'running', skipped };
-    if (v === 'failed')  return { pct: Math.round(done / phases.length * 100), text: (i+1) + '/' + phases.length + ' failed',  state: 'failed',  skipped };
+    if (v === 'running') return { pct: Math.round(done / total * 100), text: (i+1) + '/' + total + ' running', state: 'running', skipped };
+    if (v === 'failed')  return { pct: Math.round(done / total * 100), text: (i+1) + '/' + total + ' failed',  state: 'failed',  skipped };
   }
-  const pct = Math.round(done / phases.length * 100);
-  if (done === phases.length && skipped === 0) return { pct, text: phases.length + '/' + phases.length + ' done', state: 'done', skipped: 0 };
-  if (done === phases.length && skipped > 0)  return { pct, text: phases.length + '/' + phases.length + ' (' + skipped + ' warn)', state: 'warn', skipped };
-  return { pct, text: (done + 1) + '/' + phases.length + ' pending', state: 'pending', skipped };
+  done += addonDone;
+  const pct = Math.round(done / total * 100);
+  if (p.addon_running) {
+    return { pct, text: done + '/' + total + ' running', state: 'running', skipped };
+  }
+  if (done === total && skipped === 0) return { pct, text: total + '/' + total + ' done', state: 'done', skipped: 0 };
+  if (done === total && skipped > 0)  return { pct, text: total + '/' + total + ' (' + skipped + ' warn)', state: 'warn', skipped };
+  return { pct, text: (done + 1) + '/' + total + ' pending', state: 'pending', skipped };
 }
 
 // ── Sort state ───────────────────────────────────────────────────
@@ -8971,6 +9571,63 @@ function parseStamp(v) {
   return isNaN(t) ? null : t;
 }
 
+// ── Consistent elapsed / time-remaining chip for every card ─────────────────
+// One implementation so the pipeline, Duo, ISE, SCC and addon-phase cards all
+// report progress the same way. `rows` is any array of step records carrying
+// status/started_at/completed_at; `phaseKey` selects the measured medians from
+// window.STEP_SECS (pipeline | duo | ise | scc).
+function cardTimeChip(rows, phaseKey) {
+  const med = (window.STEP_SECS || {})[phaseKey] || {};
+  const list = (rows || []).filter(Boolean);
+  if (!list.length) return '';
+
+  // Elapsed is the SUM of per-step durations, not first-start-to-last-finish.
+  // A card that has been re-run over the course of a day would otherwise report
+  // the whole wall-clock span including the idle gaps between runs — the ISE
+  // card read "2h 11m" for about 11 minutes of actual work.
+  let spent = 0;
+  let running = false, anyStarted = false;
+  let remain = 0;
+  list.forEach(r => {
+    const st = r.status || '';
+    const nm = r.name || r.step_name || '';
+    if (st === 'running') running = true;
+    const s0 = parseStamp(r.started_at);
+    const e0 = parseStamp(r.completed_at);
+    if (s0 !== null) anyStarted = true;
+    if (s0 !== null && e0 !== null && e0 >= s0) spent += (e0 - s0);
+    else if (s0 !== null && st === 'running') spent += Math.max(0, Date.now() - s0);
+    if (st === 'running') {
+      // Credit the time this step has already burned, the way the Duo card
+      // did before this was shared — otherwise a step half-way through still
+      // contributes its whole median and the estimate never falls.
+      const est = med[nm] || 0;
+      const rs = parseStamp(r.started_at);
+      remain += Math.max(0, est - (rs ? Math.round((Date.now() - rs) / 1000) : 0));
+    } else if (st !== 'completed' && st !== 'skipped' && st !== 'failed') {
+      remain += (med[nm] || 0);
+    }
+  });
+
+  const totalEst = Object.keys(med).length
+    ? list.reduce((a, r) => a + (med[r.name || r.step_name] || 0), 0) : 0;
+
+  if (!anyStarted) {
+    return totalEst
+      ? ' <span class="card-time">&#9201; ~' + elapsedStr(totalEst * 1000) + ' est</span>'
+      : '';
+  }
+
+  const elapsed = Math.max(0, spent);
+
+  let txt = '&#9201; ' + elapsedStr(elapsed) + ' elapsed';
+  if (running && remain > 0) txt += ' &middot; ~' + elapsedStr(remain * 1000) + ' left';
+  else if (!running && remain > 0) txt += ' &middot; paused';
+  else if (!running) txt = '&#9201; ' + elapsedStr(elapsed) + ' total';
+  const cls = running ? 'card-time card-time-run' : 'card-time';
+  return ' <span class="' + cls + '">' + txt + '</span>';
+}
+
 function updateTimer(startTime) {
   const el = document.getElementById('elapsed-timer');
   if (!startTime) { el.innerHTML = ''; return; }
@@ -9097,9 +9754,11 @@ async function renderAddonPhases(podId) {
         + '</div>';
     }).join('');
 
+    const _phRows = order.map(n => Object.assign({name: n}, byName[n] || {}));
     return '<div style="margin-top:14px;">'
       + '<div style="font-size:12px;color:#02c8ff;font-weight:600;padding:4px 0;">'
-      + escHtml(ph.title) + ' &mdash; ' + done + '/' + order.length + '</div>'
+      + escHtml(ph.title) + ' &mdash; ' + done + '/' + order.length
+      + cardTimeChip(_phRows, ph.key) + '</div>'
       + '<div class="pipeline-grid">' + cards + '</div></div>';
   }).join('');
 
@@ -10675,7 +11334,6 @@ function switchTab(btn, name) {
   if (name === 'fabric')     { if (podId) loadFabricStatus(podId); }
   if (name === 'sda')        { if (podId) loadSdaStatus(podId); }
   if (name === 'baseconfig') { if (podId) loadBaseConfig(podId); }
-  if (name === 'kb')         { loadKbTab(); }
 }
 
 const FABRIC_STEPS = [
@@ -10780,7 +11438,9 @@ function renderFabricGrid(podId, steps) {
   // ── Status bar ───────────────────────────────────────────────────────────────
   html += '<div style="margin-bottom:14px;">';
   html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
-  html += '<span>' + labelText + '</span>';
+  html += '<span>' + labelText
+        + cardTimeChip(FABRIC_STEPS.map(n => Object.assign({name: n}, (steps || {})[n] || {})), 'fabric')
+        + '</span>';
   html += '<span>' + pct + '% (' + done + '/' + total + ')</span>';
   html += '</div>';
   html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
@@ -11465,18 +12125,9 @@ function renderDuoGrid(podId, data) {
   // Progress bar
   html += '<div style="margin-bottom:14px;">';
   html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
-  let remain = 0;
-  DUO_CARD_STEPS.forEach(s2 => {
-    const i2 = steps[s2] || {}, st2 = i2.status || 'pending';
-    const e2 = ((window.STEP_SECS || {}).duo || {})[s2] ?? (DUO_STEP_SECS[s2] || 0);
-    if (st2 === 'pending') remain += e2;
-    else if (st2 === 'running') {
-      const t0 = duoStarted(i2.started_at);
-      remain += Math.max(0, e2 - (t0 ? Math.round((Date.now() - t0) / 1000) : 0));
-    }
-  });
-  const remainTxt = (running && remain > 0) ? ' \u2022 ~' + duoEta(remain) + ' remaining' : '';
-  html += '<span>' + labelText + remainTxt + '</span><span>' + pct + '% (' + done + '/' + total + ')</span></div>';
+  const _duoRows = DUO_CARD_STEPS.map(n => Object.assign({name: n}, steps[n] || {}));
+  html += '<span>' + labelText + cardTimeChip(_duoRows, 'duo') + '</span><span>'
+        + pct + '% (' + done + '/' + total + ')</span></div>';
   html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
   html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
   html += '</div></div>';
@@ -12995,7 +13646,9 @@ function renderIseGrid(podId, data) {
   html += '</div></div>';
   html += '<div style="margin-bottom:14px;">';
   html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
-  html += '<span>' + labelText + '</span><span>' + pct + '% (' + done + '/' + total + ')</span></div>';
+  html += '<span>' + labelText
+        + cardTimeChip(ISE_STEPS.map(n => Object.assign({name: n}, steps[n] || {})), 'ise')
+        + '</span><span>' + pct + '% (' + done + '/' + total + ')</span></div>';
   html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
   html += '<div style="height:100%;border-radius:4px;background:' + barColor + ';width:' + pct + '%;transition:width 0.4s;"></div>';
   html += '</div></div>';
