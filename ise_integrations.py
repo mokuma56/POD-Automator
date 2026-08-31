@@ -2275,7 +2275,13 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # PseudoCo-502, region us-west-2, Mode Active, Deregister offered --
             # report "not connected after 3 min".
             _panel = {}
-            for _attempt in range(18):  # 18 × 10s ≈ 3 min
+            # 10 minutes, not 3. ISE reports its own transient
+            # "Cisco ISE could not connect to pxGrid." while the cloud link is
+            # still settling; that is NOT terminal. POD-24 was failed at the
+            # 3-minute mark and verified Connected (PseudoCo-524, us-west-2,
+            # Active, Deregister present) shortly after — the registration had
+            # succeeded and only this check was wrong.
+            for _attempt in range(60):  # 60 × 10s = 10 min
                 await page.wait_for_timeout(10000)
                 _panel = await _pxgrid_panel(page)
                 if _pxgrid_is_registered(_panel):
@@ -2331,8 +2337,10 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 await page.screenshot(path=_shot, full_page=True)
             except Exception:
                 _shot = "(screenshot failed)"
-            return False, (f"pxGrid Cloud registration saved but not Connected after 3 min "
-                           f"— panel: {_panel}; screenshot {_shot}")
+            return False, (f"pxGrid Cloud registration saved but not Connected after 10 min "
+                           f"— panel: {_panel}; screenshot {_shot}. NOTE the registration "
+                           f"itself may still have succeeded: check the ISE node pxGrid panel "
+                           f"for Status=Connected before re-running.")
 
         except Exception as e:
             try:

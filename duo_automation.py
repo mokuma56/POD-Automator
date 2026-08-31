@@ -3550,6 +3550,38 @@ def _scc_click(p, text, exact=True):
     return True
 
 
+def _scim_token_valid(token: str, log=None) -> tuple[bool, str]:
+    """Is this SCIM token actually accepted by Secure Access?
+
+    PRESENCE IS NOT VALIDITY. sa_scim_token is per-ORG and survives in
+    org_credentials after the dCloud session that issued it has ended. The
+    generation step used to short-circuit on "a token exists", so a dead token
+    was handed to scim_push, which got 401, and sso_test then failed with "no
+    provisioned users in Secure Access to test with" — three Duo steps failing
+    on one stale string, none of them naming the real cause.
+
+    Only a definite 401/403 counts as invalid. A network error means we do not
+    know, and regenerating on "unknown" would litter Secure Access with a new
+    directory on every transient failure.
+    """
+    _log = log or (lambda m: None)
+    if not token:
+        return False, "empty"
+    try:
+        r = requests.get("https://api.sse.cisco.com/identity/v2/scim/Users",
+                         headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    except Exception as e:
+        _log(f"SCIM token probe could not reach Secure Access ({type(e).__name__}) "
+             "— keeping the stored token")
+        return True, "probe unreachable"
+    if r.status_code in (401, 403):
+        return False, f"rejected with {r.status_code}"
+    if r.ok:
+        return True, "accepted"
+    _log(f"SCIM token probe returned {r.status_code} — keeping the stored token")
+    return True, f"inconclusive {r.status_code}"
+
+
 def sa_generate_scim_token_ui(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
     """Generate the Secure Access SCIM token for this pod's org, unattended.
 
@@ -3590,8 +3622,13 @@ def sa_generate_scim_token_ui(pod_id: str, db_path: str, log=None) -> tuple[bool
         return False, "no stored idac_url — cannot open an SCC session"
     if not sa_org:
         return False, f"org {org_num} has no sa_org_id"
-    if (oc.get("sa_scim_token") or "").strip():
-        return True, "SCIM token already present — nothing to do"
+    _tok = (oc.get("sa_scim_token") or "").strip()
+    if _tok:
+        _ok, _why = _scim_token_valid(_tok, _log)
+        if _ok:
+            return True, f"SCIM token already present and valid ({_why})"
+        _log(f"stored sa_scim_token {_why} — regenerating")
+        # fall through and mint a new one
 
     # Unique per run: Secure Access rejects a duplicate directory name, and a
     # pod may already carry one from an earlier attempt.
@@ -10786,6 +10823,17 @@ def duo_run_card(
         the SCC UI and scrapes the once-only token out of the DOM.
         """
         nonlocal scim_tok
+        # The docstring above assumes every session gets a brand new org, so a
+        # stored token is always fresh. That is NOT true: orgs are reused across
+        # dCloud sessions (org 518 is), and sa_scim_token is keyed by ORG, so a
+        # token from a dead session survives in org_credentials. Gating purely on
+        # "not scim_tok" then reuses it, scim_push gets 401, and sso_test fails
+        # with "no provisioned users" — three steps failing on one stale string.
+        if scim_tok:
+            _v_ok, _v_why = _scim_token_valid(scim_tok, _log)
+            if not _v_ok:
+                _log(f"stored sa_scim_token {_v_why} — discarding and regenerating")
+                scim_tok = ""
         if not scim_tok:
             _log("no SCIM token for this org — generating one via Secure Access")
             g_ok, g_msg = sa_generate_scim_token_ui(pod_id, db_path, log=_log)
