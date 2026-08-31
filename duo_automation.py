@@ -2458,10 +2458,26 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
         _log(f"org {org_num}: reusing stored iDAC URL (minting a new one would "
              f"rotate the pod's Duo/SCC/Meraki orgs)")
     else:
-        _log(f"org {org_num}: no stored iDAC URL — minting one via jump host "
-             f"(this provisions fresh Duo/SCC/Meraki orgs)")
-        idac = fetch_idac_url_from_dcloud(log=_log, pod_id=pod_id,
-                                          allow_rotation=True)
+        # NEVER mint here. An empty idac_url means WE HAVE NOT RECORDED ONE, not
+        # that the pod lacks orgs — every pod is provisioned with its Duo, SCC
+        # and Meraki orgs when the dCloud session spins up. Minting rotates all
+        # three, orphaning everything already registered against the originals:
+        # on 2026-08-30 this gave POD-18 a brand new SCC org while its firewall
+        # stayed registered to the original, splitting the pod in half. The
+        # docstring on fetch_idac_url_from_dcloud records the same damage
+        # happening before ("walked one pod from SCC org 517 to 502 and
+        # abandoned six Duo orgs").
+        #
+        # fetch_idac_url_from_dcloud defaults to allow_rotation=False for this
+        # reason; passing True defeated the safeguard. If the URL is missing,
+        # stop and let a human supply it.
+        raise RuntimeError(
+            f"org {org_num}: no iDAC URL stored for this pod. Refusing to mint "
+            f"one — idac_sdk reprovisions the pod's Duo, SCC AND Meraki orgs, "
+            f"orphaning anything already registered (the firewall, ISE, SCC "
+            f"integrations). Paste the session's existing iDAC URL into "
+            f"org_credentials.idac_url for org {org_num} and re-run."
+        )
 
     # _pw_activate_duo_admin() runs its own sync_playwright(); nesting a second
     # one raises "Sync API inside the asyncio loop". Activate first, then open
