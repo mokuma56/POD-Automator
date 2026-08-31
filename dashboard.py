@@ -453,6 +453,9 @@ def api_resources():
     return jsonify(data)
 
 
+_SOFT_PREFIX = "[soft-fail]"
+
+
 def _addon_progress(conn, pod_id: str, run_addons: str) -> dict:
     """Step counts for the optional cards this POD was launched with.
 
@@ -664,14 +667,15 @@ def api_pipeline_summary():
         pods = [dict(r) for r in conn.execute(
             "SELECT pod_id, pod_number, run_addons FROM pods ORDER BY pod_id")]
         rows = conn.execute(
-            "SELECT pod_id, step_name, status, started_at, completed_at "
+            "SELECT pod_id, step_name, status, result, started_at, completed_at "
             "FROM pipeline_steps").fetchall()
         addon_rows = {}
         for _t in ("duo_steps", "ise_steps"):
             addon_rows[_t] = {}
             try:
-                for _r in conn.execute(f"SELECT pod_id, step_name, status FROM {_t}"):
-                    addon_rows[_t].setdefault(_r["pod_id"], {})[_r["step_name"]] = _r["status"]
+                for _r in conn.execute(f"SELECT pod_id, step_name, status, result FROM {_t}"):
+                    addon_rows[_t].setdefault(_r["pod_id"], {})[_r["step_name"]] = {
+                        "status": _r["status"], "result": _r["result"]}
             except sqlite3.Error:
                 pass
     finally:
@@ -696,8 +700,14 @@ def api_pipeline_summary():
         steps = by_pod.get(p["pod_id"], {})
         seq, running, done = [], "", 0
         for name in PIPELINE_STEP_NAMES:
-            st = (steps.get(name) or {}).get("status", "")
-            seq.append({"name": name, "status": st, "phase": "pipeline"})
+            _row = steps.get(name) or {}
+            st = _row.get("status", "")
+            # A "skipped" row carrying [soft-fail] is a stepped-over FAILURE, not
+            # a deliberate skip. Without this the summary counts it toward done
+            # and reports "all N steps complete / 100%" over a real gap.
+            _soft = str(_row.get("result") or "").startswith(_SOFT_PREFIX)
+            seq.append({"name": name, "status": st, "phase": "pipeline",
+                        "soft": _soft})
             if st in ("completed", "skipped"):
                 done += 1
             elif st == "running":
@@ -731,8 +741,11 @@ def api_pipeline_summary():
                 order = []
             arows = addon_rows.get(table, {}).get(p["pod_id"], {})
             for name in order:
-                st = arows.get(name, "")
-                seq.append({"name": f"{label}: {name}", "status": st, "phase": label})
+                _ar = arows.get(name) or {}
+                st = _ar.get("status", "") if isinstance(_ar, dict) else _ar
+                _res = _ar.get("result", "") if isinstance(_ar, dict) else ""
+                seq.append({"name": f"{label}: {name}", "status": st, "phase": label,
+                            "soft": str(_res or "").startswith(_SOFT_PREFIX)})
                 if st in ("completed", "skipped"):
                     done += 1
                 elif st == "running" and not running:
@@ -8323,12 +8336,12 @@ DASHBOARD_HTML = """
      before this, which silently truncated the run at about dot 28. */
   .sum-pod { width:150px; font-size:12px; font-weight:700; color:#00bceb; flex-shrink:0;
              white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .sum-dots { display:flex; gap:8px; flex:1; min-width:0; flex-wrap:nowrap;
+  .sum-dots { display:flex; gap:6px; flex:1; min-width:0; flex-wrap:nowrap;
               overflow:hidden; align-items:center; }
   /* Each phase is its own tinted block with an inline caption, so the three
      stages of a "+ Duo + ISE" run read as distinct groups rather than one
      undifferentiated string of 38 dots. */
-  .sum-ph { display:flex; align-items:center; gap:5px; padding:3px 7px;
+  .sum-ph { display:flex; align-items:center; gap:4px; padding:2px 5px;
             border-radius:5px; flex-shrink:0; }
   .sum-ph-lbl { font-size:9px; font-weight:700; letter-spacing:.3px;
                 text-transform:uppercase; white-space:nowrap; opacity:.85; }
@@ -8338,12 +8351,12 @@ DASHBOARD_HTML = """
   .sum-ph-duo .sum-ph-lbl { color:#b39ddb; }
   .sum-ph-ise      { background:rgba(255,165,2,.10);  border:1px solid rgba(255,165,2,.30); }
   .sum-ph-ise .sum-ph-lbl { color:#ffa502; }
-  .sum-dot { width:14px; height:14px; border-radius:50%; flex-shrink:0;
+  .sum-dot { width:12px; height:12px; border-radius:50%; flex-shrink:0;
              display:flex; align-items:center; justify-content:center;
-             font-size:8px; font-weight:700; line-height:1; }
+             font-size:7px; font-weight:700; line-height:1; }
   .sum-meta { font-size:11px; color:#8899aa; white-space:nowrap; flex-shrink:0; }
   .sum-step { font-size:11px; color:#02c8ff; white-space:nowrap; overflow:hidden;
-              text-overflow:ellipsis; flex:0 1 330px; min-width:120px;
+              text-overflow:ellipsis; flex:0 1 250px; min-width:110px;
               text-align:right; padding-right:6px; }
   .sum-pct { font-size:11px; font-weight:700; color:#e8eef7; width:38px; text-align:right;
              flex-shrink:0; }
@@ -8362,8 +8375,12 @@ DASHBOARD_HTML = """
      width it stays in normal flow and simply wraps, so it can never overlap. */
   @media (min-width: 1650px) {
     /* top:-10px centres it in the band between the stat tiles and the POD
-       table: measured 20px of clearance above and 0 below at top:0. */
+       table: measured 20px of clearance above and 0 below at top:0.
+       padding-right on the row RESERVES the panel's column so the buttons can
+       never run underneath it — absolute positioning alone overlapped the
+       "Reset All SCC Orgs" button on any viewport under ~1859px. */
     .res-panel { position:absolute; right:0; top:-10px; margin:0; }
+    .toolbar-row { padding-right:620px; }
   }
   .rv { display:flex; flex-direction:column; align-items:center; gap:3px;
         cursor:default; flex:1; min-width:0; }
@@ -8562,7 +8579,7 @@ DASHBOARD_HTML = """
 
    <div class="summary" id="summary"></div>
 
-   <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;position:relative;">
+   <div class="toolbar-row" style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;position:relative;">
      <button class="btn-start-all" id="btn-check-update" onclick="checkForUpdates()" style="background:#1a3a1a;border:1px solid #22c55e;color:#22c55e;">&#8593; Check for Updates</button>
       <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
      <select id="run-all-mode" title="What to run for every POD" style="background:#0a1628;border:1px solid #7c3aed;color:#b39ddb;border-radius:5px;padding:5px 7px;font-size:12px;">
@@ -8960,6 +8977,17 @@ function _sumDotColor(st) {
 
 // Number colour that stays legible on each dot fill: dark ink on the bright
 // states, muted grey on the dim "not reached yet" fill.
+// Percentage colour follows the WORST state in the run, so a green 100% can
+// never sit on top of a failed or degraded step.
+function _sumPctColor(p) {
+  const st = p.steps || [];
+  if (p.failed || st.some(z => z.status === 'failed')) return '#ff4757';
+  if (st.some(z => z.soft)) return '#ff6b7a';
+  if (st.some(z => z.status === 'skipped')) return '#ffa502';
+  if (p.total && p.done === p.total) return '#00e68a';
+  return '#e8eef7';
+}
+
 function _sumDotInk(st) {
   return (st === 'completed' || st === 'skipped' || st === 'failed' || st === 'running')
     ? '#06131f' : '#7d8fa3';
@@ -9046,8 +9074,9 @@ async function renderPodSummary() {
   const tmap = (window.STEP_SECS || {}).pipeline || {};
   const html = pods.map(p => {
     // Group the dots into tinted per-phase blocks with inline captions.
-    const PH_NAME = {pipeline: 'Main Pipeline', duo: 'Duo / Secure Access',
-                     ise: 'ISE Integrations'};
+    // Short captions: the per-phase tint already carries the identity, and the
+    // full names cost ~215px, which is what pushed 38 dots past the row width.
+    const PH_NAME = {pipeline: 'Pipeline', duo: 'Duo', ise: 'ISE'};
     const groups = [];
     p.steps.forEach((x, i) => {
       const ph = x.phase || 'pipeline';
@@ -9056,14 +9085,16 @@ async function renderPodSummary() {
       }
       groups[groups.length - 1].items.push({x: x, n: i + 1});
     });
+    const _dotColour = (x) => x.soft ? '#ff4757' : _sumDotColor(x.status);
     const dots = groups.map(g =>
       '<span class="sum-ph sum-ph-' + g.phase + '">'
       + '<span class="sum-ph-lbl">' + escHtml(PH_NAME[g.phase] || g.phase) + '</span>'
       + g.items.map(it =>
-          '<span class="sum-dot" style="background:' + _sumDotColor(it.x.status)
-          + ';color:' + _sumDotInk(it.x.status) + '" title="'
+          '<span class="sum-dot" style="background:' + _dotColour(it.x)
+          + ';color:' + _sumDotInk(it.x.soft ? 'failed' : it.x.status) + '" title="'
           + escHtml(it.n + '. ' + it.x.name.replace(/_/g, ' '))
-          + (it.x.status ? ' — ' + it.x.status : '') + '">' + it.n + '</span>').join('')
+          + (it.x.status ? ' — ' + (it.x.soft ? 'degraded (soft-fail)' : it.x.status) : '')
+          + '">' + it.n + '</span>').join('')
       + '</span>').join('');
 
     // Elapsed freezes once nothing is running, so an idle POD stops counting up.
@@ -9109,7 +9140,18 @@ async function renderPodSummary() {
         ? 'failed at ' + String(bad.name).replace(/_/g, ' ')
         : 'failed';
     } else if (p.done === p.total && p.total) {
-      stepTxt = 'all ' + p.total + ' steps complete';
+      // "done" counts skipped rows, so a soft-failed step used to read as
+      // "all N steps complete / 100%" over a real gap. Name the gap instead.
+      const soft = p.steps.filter(z => z.soft).length;
+      const skipped = p.steps.filter(z => z.status === 'skipped' && !z.soft).length;
+      if (soft) {
+        stepTxt = 'complete — ' + soft + ' degraded'
+                + (skipped ? ', ' + skipped + ' skipped' : '');
+      } else if (skipped) {
+        stepTxt = 'complete — ' + skipped + ' skipped';
+      } else {
+        stepTxt = 'all ' + p.total + ' steps complete';
+      }
     } else if (!p.done) {
       stepTxt = 'not started';
     } else {
@@ -9123,7 +9165,7 @@ async function renderPodSummary() {
       + '<div class="sum-pod">' + escHtml(p.pod_id) + addons + '</div>'
       + '<div class="sum-dots">' + dots + '</div>'
       + '<div class="sum-step">' + escHtml(stepTxt) + '</div>'
-      + '<div class="sum-pct">' + pct + '%</div>'
+      + '<div class="sum-pct" style="color:' + _sumPctColor(p) + '">' + pct + '%</div>'
       + '<div class="sum-meta">' + meta + '</div></div>';
   }).join('');
 
