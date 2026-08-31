@@ -304,16 +304,35 @@ conn.close()
             m = _re.search(r"scc_org=([^\s|]+)", result)
             if m:
                 _scc = m.group(1)
-                try:
-                    subprocess.run([sys.executable, "-c", f"""
-import sqlite3
-conn = sqlite3.connect('{DB_PATH}')
-conn.execute("UPDATE pods SET scc_org=?, updated_at=datetime('now') WHERE pod_id=?", ('{_scc}', '{pod_id}'))
-conn.commit()
-conn.close()
-"""], timeout=5)
-                except Exception:
-                    pass
+                # Write it HERE, in-process, with a retry — and never swallow a
+                # failure. This used to shell out to a 5s subprocess wrapped in
+                # `except Exception: pass`. On 2026-08-31 two PODs ran at once,
+                # the write lost a SQLite race, and the exception vanished: the
+                # org WAS discovered ("scc_org=cisco-pseudoco-524...") but never
+                # stored, so scc_reset_check skipped, Duo failed with "Cannot
+                # determine org number from scc_org=''", and ISE never ran — all
+                # for a reason none of them named.
+                import sqlite3 as _sq_org   # not imported at module level here
+                _saved = False
+                _last = None
+                for _try in range(5):
+                    try:
+                        _c = _sq_org.connect(DB_PATH, timeout=20)
+                        _c.execute("UPDATE pods SET scc_org=?, updated_at=datetime('now') "
+                                   "WHERE pod_id=?", (_scc, pod_id))
+                        _c.commit()
+                        _c.close()
+                        _saved = True
+                        break
+                    except Exception as _pe:
+                        _last = _pe
+                        time.sleep(1 + _try)
+                if _saved:
+                    live_log(f"  scc_org stored: {_scc}")
+                else:
+                    # Loud, because everything downstream needs this value.
+                    live_log(f"  ✗ COULD NOT STORE scc_org={_scc} after 5 tries: {_last} "
+                             f"— SCC reset, Duo and ISE will all fail until this is set")
     except Exception as e:
         log_line = f"✗ {step_name} FAILED: {str(e)[:200]}"
         print(log_line)
