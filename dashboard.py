@@ -7245,14 +7245,23 @@ def _wait_for_pipeline(pod_id: str, log_fn, timeout_s: int = 5400) -> tuple:
     if hard:
         return False, f"pipeline hard-failed at {', '.join(hard)}"
 
+    # Steps can legitimately finish WITHOUT a row. onboard.py `continue`s past the
+    # 11 SDWAN_STEPS when SD-WAN is already online, and past anything already
+    # completed, writing nothing in either case. Requiring a row per step made
+    # this reject the normal rebuild case: POD-17 came back 10/21 accounted for
+    # (21 - 11 skipped SD-WAN steps) on a pipeline that had done everything asked
+    # of it, and the optional cards were skipped over a healthy run.
+    #
+    # The container exiting is the completion signal; the rows only decide
+    # whether anything FAILED.
     terminal = [n for n in PIPELINE_STEP_NAMES
                 if rows.get(n) in ("completed", "skipped", "failed")]
     soft = [n for n, st in rows.items() if st == "failed"]
-    if len(terminal) < len(PIPELINE_STEP_NAMES):
-        return False, (f"pipeline container exited with only "
-                       f"{len(terminal)}/{len(PIPELINE_STEP_NAMES)} steps accounted for")
-    return True, (f"pipeline finished ({len(terminal)}/{len(PIPELINE_STEP_NAMES)}"
-                  + (f", {len(soft)} soft-failed" if soft else "") + ")")
+    if not rows:
+        return False, "pipeline container exited without recording a single step"
+    return True, (f"pipeline finished ({len(terminal)} step(s) recorded"
+                  + (f", {len(soft)} soft-failed" if soft else "")
+                  + f"; {len(PIPELINE_STEP_NAMES) - len(terminal)} skipped without a row)")
 
 
 def _start_pipeline_container(pod_id: str) -> tuple:
@@ -8437,7 +8446,9 @@ async function runPod(podId) {
   if (data.status === 'ok') {
     // Open the detail panel and start polling pipeline cards immediately
     await showPipeline(podId);
-    if (!stepPollId) {
+    if (!stepPollId || stepPollPod !== podId) {
+      if (stepPollId) clearInterval(stepPollId);
+      stepPollPod = podId;
       stepPollId = setInterval(() => loadSteps(podId), 5000);
     }
   }
@@ -8552,6 +8563,12 @@ async function disconnectVpn(podId) {
 
 let timerInterval = null;
 let stepPollId = null;
+// Which POD stepPollId is polling for. The `if (!stepPollId)` guards below
+// meant the FIRST POD to start a poller kept it forever: switching to another
+// POD painted the new one, then the stale interval repainted the old one 5s
+// later, and the detail view visibly flipped between PODs. Only shows up once
+// two PODs are running at the same time.
+let stepPollPod = null;
 
 function elapsedStr(ms) {
   if (ms < 0) return '';
@@ -8673,10 +8690,19 @@ async function renderAddonPhases(podId) {
     data = await (await fetch('/api/pipeline-full/' + podId)).json();
   } catch (e) { host.innerHTML = ''; return; }
 
-  const extra = (data.phases || []).filter(ph => ph.key !== 'pipeline');
-  if (!extra.length) { host.innerHTML = ''; return; }   // pipeline-only POD
+  // This is not awaited by loadSteps, so a response for a POD the user has since
+  // navigated away from can land late and paint stale phases over the current
+  // one. The grid records which POD it is showing — bail if that moved on.
+  const grid = document.getElementById('pipeline-grid');
+  if (grid && grid._podId && grid._podId !== podId) return;
 
-  host.innerHTML = extra.map(ph => {
+  const extra = (data.phases || []).filter(ph => ph.key !== 'pipeline');
+  if (!extra.length) {
+    if (host.innerHTML !== '') { host.innerHTML = ''; host._sig = ''; }
+    return;   // pipeline-only POD
+  }
+
+  const built = extra.map(ph => {
     const byName = {};
     (ph.steps || []).forEach(s => { byName[s.step_name] = s; });
     const order = (ph.order && ph.order.length) ? ph.order : (ph.steps || []).map(s => s.step_name);
@@ -8711,6 +8737,16 @@ async function renderAddonPhases(podId) {
       + escHtml(ph.title) + ' &mdash; ' + done + '/' + order.length + '</div>'
       + '<div class="pipeline-grid">' + cards + '</div></div>';
   }).join('');
+
+  // Only touch the DOM when the content actually changed. This runs on the 5s
+  // poll, and an unconditional innerHTML assignment tore the whole section down
+  // and rebuilt it every cycle — the section sits below the pipeline grid, so
+  // the page height changed each time and the view visibly jumped. The pipeline
+  // grid diff-updates its cards for exactly this reason; this was bypassing it.
+  if (host._sig !== built) {
+    host.innerHTML = built;
+    host._sig = built;
+  }
 }
 
 async function loadSteps(podId) {
@@ -8862,11 +8898,13 @@ async function loadSteps(podId) {
 
   // Auto-poll steps while pipeline is running (keeps countdown live on any tab)
   if (running) {
-    if (!stepPollId) {
+    if (!stepPollId || stepPollPod !== podId) {
+      if (stepPollId) clearInterval(stepPollId);
+      stepPollPod = podId;
       stepPollId = setInterval(() => loadSteps(podId), 5000);
     }
   } else {
-    if (stepPollId) { clearInterval(stepPollId); stepPollId = null; }
+    if (stepPollId) { clearInterval(stepPollId); stepPollId = null; stepPollPod = null; }
   }
 }
 
@@ -11700,7 +11738,7 @@ function closeDetail() {
   el.textContent = '';
   el.dataset.podId = '';
   if (logPollId) clearInterval(logPollId);
-  if (stepPollId) { clearInterval(stepPollId); stepPollId = null; }
+  if (stepPollId) { clearInterval(stepPollId); stepPollId = null; stepPollPod = null; }
   // Clear CatC tile polls and reset _initialized so buttons re-wire on next open
   if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
   if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
