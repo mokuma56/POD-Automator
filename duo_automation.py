@@ -1925,8 +1925,14 @@ def fetch_idac_url_from_dcloud(log=None, pod_id: str = "",
             "C:\\Python* install and the one on PATH")
     _log(f"using interpreter: {_py}")
 
-    _log("running idac_sdk on jump host (may take ~30s)...")
-    r2 = sess.run_cmd(_py, [r"C:\Windows\Temp\get_idac.py"])
+    # idac_sdk provisions Duo/SCC/Meraki orgs and takes ~30s to ~4min. The
+    # default run_cmd timeouts give a 40-second subprocess kill — POD-18 died at
+    # exactly 40s with a docker-exec CalledProcessError that read like a broken
+    # proxy container. winrm polls in op_timeout-sized windows, so a long
+    # read_timeout is what lets the call span them.
+    _log("running idac_sdk on jump host (may take up to ~5 min)...")
+    r2 = sess.run_cmd(_py, [r"C:\Windows\Temp\get_idac.py"],
+                      op_timeout=60, read_timeout=330)
     url = r2.std_out.decode("utf-8", errors="replace").strip()
     err = r2.std_err.decode("utf-8", errors="replace").strip()
 
@@ -5363,9 +5369,17 @@ class DockerWinRMSession:
             status_code = result.returncode
         return _R()
 
-    def run_cmd(self, cmd: str, args=()):
+    def run_cmd(self, cmd: str, args=(), op_timeout: int = 25, read_timeout: int = 30):
+        """Run a command on the target host.
+
+        The timeouts matter: run_ps derives the docker-exec subprocess timeout as
+        max(op_timeout, read_timeout) + 10, so the defaults give a 40-second hard
+        kill. Anything slower than that must raise them or it dies mid-flight
+        with a CalledProcessError that looks like a transport fault rather than a
+        timeout.
+        """
         ps = cmd + " " + " ".join(str(a) for a in args)
-        return self.run_ps(ps)
+        return self.run_ps(ps, op_timeout=op_timeout, read_timeout=read_timeout)
 
     def close(self):
         if self._container:
