@@ -238,13 +238,47 @@ def _ise_api_put(path: str, body: dict, timeout: int = 15) -> tuple[bool, dict]:
 # ── ISE browser helpers ────────────────────────────────────────────────────────
 
 async def _ise_dismiss_modal(page):
-    """Force-remove ISE post-login Bootstrap modal via JS so it doesn't block clicks."""
+    """Clear anything that would intercept clicks: the post-login Bootstrap modal
+    AND any leftover Dijit dialog underlay.
+
+    The Dijit half matters as much as the Bootstrap half. On the Deployment page
+    a dialog called `deployInfo` leaves DIV#deployInfo_underlay behind with
+    display:block and pointer-events:auto, and it never clears — still there
+    after 25s. The `ise` node link is present and visible underneath it, so the
+    selector matches, but document.elementFromPoint() at the link's centre
+    returns the underlay. Playwright's actionability check then waits for the
+    link to receive events and times out:
+
+        Could not click ise node link: Locator.click: Timeout 10000ms exceeded
+
+    which reads like a missing element when the element was there all along.
+    Closing the dialog through Dijit lets the widget tear its own underlay down;
+    the second pass neutralises anything still covering the page.
+    """
     try:
         await page.evaluate("""
             const modal = document.getElementById('ise-modal');
             if (modal) modal.remove();
             document.querySelectorAll('.modal-backdrop, .post-loging-modal').forEach(el => el.remove());
             if (document.body) document.body.classList.remove('modal-open');
+
+            let reg = null;
+            if (window.dijit && window.dijit.byId) reg = window.dijit;
+            else if (window.require) { try { reg = window.require('dijit/registry'); } catch (e) {} }
+
+            document.querySelectorAll('.dijitDialogUnderlay').forEach(u => {
+                const id = (u.id || '').replace(/_underlay$/, '');
+                if (reg && reg.byId && id) {
+                    const w = reg.byId(id);
+                    if (w && typeof w.hide === 'function') { try { w.hide(); } catch (e) {} }
+                }
+            });
+            document.querySelectorAll('.dijitDialogUnderlay, .dijitDialogUnderlayWrapper').forEach(u => {
+                if (u.getClientRects().length) {
+                    u.style.display = 'none';
+                    u.style.pointerEvents = 'none';
+                }
+            });
         """)
     except Exception:
         pass
@@ -406,8 +440,9 @@ def _scc_file_ipc_cdfmc(pod_id: str, otp_token: str, instance_name: str, log) ->
         "pod_id": pod_id, "otp_token": otp_token,
         "instance_name": instance_name, "ts": _t.time(),
     }))
-    log("cdFMC OTP written to shared volume — waiting for host nav (up to 5 min)...")
-    _deadline = _t.time() + 300
+    log(f"cdFMC OTP written to shared volume — waiting for host nav "
+        f"(up to 10 min), watching {_result_path}")
+    _deadline = _t.time() + 600
     while _t.time() < _deadline:
         if _result_path.exists():
             try:
@@ -420,7 +455,16 @@ def _scc_file_ipc_cdfmc(pod_id: str, otp_token: str, instance_name: str, log) ->
             return _res.get("ok", False), _res.get("message", "no message")
         _t.sleep(3)
     _otp_path.unlink(missing_ok=True)
-    return False, "Host cdFMC nav timed out — no result after 5 min (is dashboard running?)"
+    # Say what was actually on the volume, so a repeat is diagnosable in one shot
+    # instead of needing a forensic pass over timestamps.
+    try:
+        _seen = sorted(x.name for x in Path("/pipeline/host-data").glob("ise_cdfmc_*"))
+    except Exception as _le:
+        _seen = [f"<listing failed: {_le}>"]
+    log(f"cdFMC IPC timeout — /pipeline/host-data holds: {_seen}")
+    return False, ("Host cdFMC nav timed out — no result after 10 min. "
+                   f"Volume held: {_seen}. Check the [cdfmc-nav] lines: if they end "
+                   "in OK the SCC work SUCCEEDED and only this handoff failed.")
 
 
 def _scc_file_ipc_sgt_verify(pod_id: str, sa_org_id: str, log) -> tuple:
@@ -632,9 +676,53 @@ async def _navigate_to_integration_catalog(page, log) -> bool:
             el.click();
             return true;
         }"""
+        HAS = """(lbl) => Array.from(document.querySelectorAll('a,button,span,div,li'))
+            .some(e => e.getClientRects().length && (e.innerText || '').trim() === lbl)"""
+
+        async def _wait_for_menu(lbl, timeout_s=60):
+            """Wait for a menu item to actually exist before clicking it.
+
+            The click used to fire immediately. ISE renders its left nav
+            asynchronously, and this function skips the post-login settle
+            whenever the URL is already /admin/ -- so on a slow or
+            service-restarting ISE the item simply is not there yet and the step
+            failed with "menu item 'Administration' not found". Repeated
+            activate/deactivate cycles trigger restartAction.do, which is
+            exactly when the UI is slowest.
+            """
+            for i in range(timeout_s // 3):
+                if await page.evaluate(HAS, lbl):
+                    if i:
+                        log(f"menu item {lbl!r} appeared after ~{i * 3}s")
+                    return True
+                # A collapsed nav hides the labels entirely -- open it and retry.
+                if i == 2:
+                    try:
+                        await page.evaluate("""() => {
+                            const b = document.querySelector(
+                                '[class*="hamburger"], [aria-label*="menu" i], '
+                                + '[class*="menu-toggle"], button[class*="nav"]');
+                            if (b) b.click();
+                        }""")
+                    except Exception:
+                        pass
+                await page.wait_for_timeout(3000)
+            return False
+
         for label in ("Administration", "Integration Catalog"):
+            if not await _wait_for_menu(label):
+                try:
+                    await page.screenshot(
+                        path=f"/pipeline/host-data/ise_menu_missing_{label.split()[0]}.png",
+                        full_page=False)
+                    _snip = (await page.inner_text("body"))[:220].replace("\n", " | ")
+                except Exception:
+                    _snip = "<unreadable>"
+                log(f"Integration Catalog nav: menu item {label!r} not found after 60s "
+                    f"(url={page.url}) body: {_snip!r}")
+                return False
             if not await page.evaluate(CLICK, label):
-                log(f"Integration Catalog nav: menu item {label!r} not found")
+                log(f"Integration Catalog nav: menu item {label!r} vanished before click")
                 return False
             await page.wait_for_timeout(9000)
 
@@ -964,6 +1052,124 @@ _PXGRID_PANEL_JS = """() => {
         deregister,
     };
 }"""
+
+
+async def _ise_pxcloud_checked(page):
+    """Current state of the Enable pxGrid Cloud box, or None if unreadable."""
+    try:
+        return await page.evaluate("""() => {
+            const i = document.getElementById('enablePxCloudServices');
+            return i ? !!i.checked : null;
+        }""")
+    except Exception:
+        return None
+
+
+async def _ise_click_pxcloud_checkbox(page, log, want: bool) -> bool:
+    """Click Enable pxGrid Cloud and confirm it reached `want`.
+
+    Coordinates MUST be recomputed on every click. An earlier version cached
+    them before the off-click and reused them for the on-click; the confirmation
+    dialog shifts the layout, so the second click landed elsewhere, the box
+    never came back on, and the form never built ("section did not finish
+    loading within 90s") while the log still claimed it had been re-enabled.
+    """
+    for attempt in range(3):
+        coords = await page.evaluate("""() => {
+            const inp = document.getElementById('enablePxCloudServices');
+            if (!inp) return null;
+            const wrap = inp.closest('.dijitCheckBox') || inp.parentElement;
+            const icon = wrap.querySelector('.dijitCheckBoxIcon') || wrap;
+            icon.scrollIntoView({behavior: 'instant', block: 'center'});
+            const r = icon.getBoundingClientRect();
+            return r.width > 0
+                ? {x: r.left + r.width / 2, y: r.top + r.height / 2} : null;
+        }""")
+        if not coords:
+            log("Enable pxGrid Cloud checkbox not clickable")
+            return False
+        await page.mouse.click(coords["x"], coords["y"])
+        await page.wait_for_timeout(1500)
+
+        # Turning it OFF raises a confirmation; turning it ON does not.
+        if want is False:
+            for sel in ('button:has-text("Disable")', 'span:has-text("Disable")'):
+                try:
+                    await page.locator(sel).first.click(timeout=3000)
+                    break
+                except Exception:
+                    continue
+        else:
+            await _ise_cancel_pxgrid_disable(page, log)
+        await page.wait_for_timeout(2000)
+
+        state = await _ise_pxcloud_checked(page)
+        if state is want:
+            log(f"Enable pxGrid Cloud is now {'ON' if want else 'OFF'}")
+            return True
+        log(f"checkbox still {state!r}, wanted {want} — retry {attempt + 1}/3")
+    return False
+
+
+async def _ise_pxgrid_section_built(page) -> bool:
+    """True once ISE has finished constructing the pxGrid Cloud form."""
+    try:
+        return bool(await page.evaluate("""() => {
+            const sec = document.getElementById('pxCloud_region_section');
+            const reg = document.getElementById('pxCloud_region');
+            if (!sec) return false;
+            const r = reg ? reg.getBoundingClientRect() : null;
+            return sec.innerHTML.length > 0 && !!r && r.width > 0 && r.height > 0;
+        }"""))
+    except Exception:
+        return False
+
+
+async def _ise_wait_pxgrid_region(page, log, timeout_s: int = 90) -> bool:
+    """Wait for the region dropdown to finish loading.
+
+    ISE builds this section ASYNCHRONOUSLY behind a "Loading..." overlay and
+    it takes ~15s. The old code probed for td#pxCloud_region immediately,
+    logged "Could not locate pxCloud_region element", and clicked Register
+    with no region set — which is why registration produced
+    "Fail to receive server response" and never sent an enrollment request.
+    Measured on POD-5: not present at t+10s, present at t+15s.
+    """
+    for i in range(timeout_s // 5):
+        if await _ise_pxgrid_section_built(page):
+            log(f"pxGrid Cloud section built after ~{(i + 1) * 5}s "
+                "(region dropdown present)")
+            return True
+        await page.wait_for_timeout(5000)
+    log(f"WARNING: pxGrid Cloud section did not finish loading within {timeout_s}s")
+    return False
+
+
+async def _ise_cancel_pxgrid_disable(page, log) -> bool:
+    """Cancel ISE's "disable the pxGrid Cloud?" confirmation if it is showing.
+
+    Answering Disable — or leaving the modal up — silently defeats the whole
+    step: the dialog is modal, so Register stays greyed out and no enrollment
+    request is ever sent. Always Cancel, never Disable.
+    """
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        return False
+    if "disable the pxgrid cloud" not in body:
+        return False
+    log("ISE is asking to DISABLE pxGrid Cloud — answering Cancel")
+    for sel in ('button:has-text("Cancel")', '[role="button"]:has-text("Cancel")',
+                'span:has-text("Cancel")', 'a:has-text("Cancel")'):
+        try:
+            await page.locator(sel).first.click(timeout=3000)
+            await page.wait_for_timeout(1000)
+            log("Cancelled the pxGrid Cloud disable confirmation")
+            return True
+        except Exception:
+            continue
+    log("WARNING: could not click Cancel on the disable confirmation")
+    return False
 
 
 async def _pxgrid_panel(page) -> dict:
@@ -1297,23 +1503,38 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     # The domNode is the outer wrapper div — we need the dijitCheckBoxIcon
                     # span inside it which is the actual clickable element that triggers
                     # Dijit's onChange and expands the pxGrid Cloud form section.
-                    log(f"Forcing enablePxCloudServices ON (id={_enable_coords['id']!r})")
-
-                    # First set Dijit state programmatically
-                    await page.evaluate("""(id) => {
+                    # Read the REAL state before touching anything.
+                    #
+                    # This block used to set checked=true and THEN physically click
+                    # the icon as belt-and-braces. A click on a checkbox is a TOGGLE,
+                    # so on an ISE where pxGrid Cloud was already enabled the pair
+                    # turned it OFF and ISE raised a modal:
+                    #   "Are you sure you want to disable the pxGrid Cloud?"
+                    # That modal then blocked the whole page — Register stayed greyed
+                    # out, no ENROLL request was ever sent ("modified 0"), the
+                    # "Select an Account" dialog never appeared, and the connect poll
+                    # read status='' 18 times. The trailing set('checked', true)
+                    # restored the widget state but could not dismiss the dialog.
+                    # Click ONLY when the box is genuinely unchecked.
+                    _already_on = await page.evaluate("""(id) => {
                         if (typeof dijit !== 'undefined' && dijit.byId) {
                             const w = dijit.byId(id);
-                            if (w && typeof w.set === 'function') {
-                                w.set('checked', true);
-                                w.set('value', true);
-                                if (typeof w.onChange === 'function') w.onChange(true);
-                            }
+                            if (w && typeof w.get === 'function') return !!w.get('checked');
                         }
+                        const el = document.getElementById(id);
+                        if (el) {
+                            const cb = el.matches('input[type="checkbox"]')
+                                ? el : el.querySelector('input[type="checkbox"]');
+                            if (cb) return !!cb.checked;
+                        }
+                        return null;
                     }""", _enable_coords['id'])
-                    await page.wait_for_timeout(500)
+                    log(f"Enable pxGrid Cloud (id={_enable_coords['id']!r}) currently checked={_already_on}")
 
                     # Then physically click the dijitCheckBoxIcon span (the visible box)
-                    _icon_coords = await page.evaluate("""(id) => {
+                    # — but ONLY when it is off. Clicking an already-enabled box
+                    # disables pxGrid Cloud (see above).
+                    _icon_coords = None if _already_on else await page.evaluate("""(id) => {
                         if (typeof dijit !== 'undefined' && dijit.byId) {
                             const w = dijit.byId(id);
                             if (w && w.domNode) {
@@ -1328,7 +1549,23 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                         return null;
                     }""", _enable_coords['id'])
 
-                    if _icon_coords:
+                    if _already_on:
+                        # Checked — but ISE only BUILDS the name/region form on a
+                        # real unchecked->checked transition. On a box left checked
+                        # by an earlier run the section stays empty forever, so the
+                        # region dropdown never exists. Cycle it in that case:
+                        # off (accepting ISE's confirmation, safe because nothing is
+                        # registered yet) then straight back on.
+                        if await _ise_pxgrid_section_built(page):
+                            log("pxGrid Cloud already enabled and form built — not clicking")
+                        else:
+                            log("pxGrid Cloud checked but form never built — cycling it "
+                                "off/on so ISE constructs the region dropdown")
+                            if await _ise_click_pxcloud_checkbox(page, log, False):
+                                await _ise_click_pxcloud_checkbox(page, log, True)
+                            else:
+                                log("WARNING: could not turn pxGrid Cloud off to rebuild the form")
+                    elif _icon_coords:
                         await page.mouse.click(_icon_coords['x'], _icon_coords['y'])
                         log(f"Clicked dijitCheckBoxIcon at ({_icon_coords['x']:.0f},{_icon_coords['y']:.0f})")
                     else:
@@ -1336,6 +1573,9 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                         log(f"Clicked wrapper at ({_enable_coords['x']:.0f},{_enable_coords['y']:.0f})")
 
                     await page.wait_for_timeout(500)
+                    await _ise_cancel_pxgrid_disable(page, log)
+                    # The form loads asynchronously (~15s) — wait before probing it.
+                    await _ise_wait_pxgrid_region(page, log)
 
                     # Final Dijit set() to ensure state sticks after click
                     await page.evaluate("""(id) => {
@@ -1513,6 +1753,11 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # ── Select region us-west-2 — physical mouse click on dropdown ────────
             # td#pxCloud_region is the Dijit Select widget's display cell.
             # Physical click opens the dropdown; then click the us-west-2 menu item.
+            # The guide is explicit: "Make sure you Select the Region us-west-2".
+            # ISE defaults this cell to ap-southeast-1. Make sure the section has
+            # finished loading first — probing early is what made this step fail.
+            if not await _ise_pxgrid_section_built(page):
+                await _ise_wait_pxgrid_region(page, log)
             log("Selecting region us-west-2")
             _set_region = False
             _region_coords = await page.evaluate("""() => {
@@ -1848,12 +2093,26 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 _popup_handled = await _handle_oauth_popup(_popup)
                 log(f"OAuth popup handler returned: {_popup_handled}")
 
-                # Wait for popup to close (it closes after Register ISE is clicked)
+                # Cisco's activate page normally closes the popup itself once the
+                # device is activated, and ISE then raises its "Select an Account"
+                # dialog in the MAIN page. When the popup lingers that handoff
+                # never happens: on POD-5 the popup stayed open, the account
+                # dialog never appeared, and the enrollment request was never
+                # sent at all — "Region intercept route removed (modified 0)"
+                # with no ENROLL POST among the 13 seen. Close it ourselves
+                # rather than only waiting for it.
                 try:
                     await _popup.wait_for_event("close", timeout=15000)
                     log("OAuth popup closed")
                 except Exception:
-                    log("OAuth popup did not close within 15s — continuing")
+                    log("OAuth popup did not close on its own — closing it so ISE "
+                        "can show the account dialog")
+                    try:
+                        await _popup.close()
+                        await page.wait_for_timeout(2000)
+                        log("OAuth popup closed by us")
+                    except Exception as _ce:
+                        log(f"could not close the OAuth popup: {_ce}")
 
             except Exception as _pe:
                 _popup_err = str(_pe).split("\n")[0][:160]
@@ -2052,6 +2311,13 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                             wait_until="domcontentloaded", timeout=60000)
                         await page.wait_for_timeout(10000)
                         await _ise_dismiss_session_info(page)
+                        # _ise_dismiss_modal clears the Dijit dialog underlay that
+                        # covers the node link. Without it this click times out
+                        # every time, the panel is never reloaded, and the poll
+                        # reports status='' for all 18 attempts no matter what the
+                        # real registration state is — which is exactly what
+                        # POD-5 did.
+                        await _ise_dismiss_modal(page)
                         await page.locator('a:text-is("ise")').first.click(timeout=10000)
                         await page.wait_for_timeout(9000)
                         log("Re-opened node edit page to refresh the pxGrid panel")
@@ -2079,6 +2345,59 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
 
 
 # ── Step 3: ISE → cdFMC Integration ───────────────────────────────────────────
+
+async def _ise_config_tab_open(page) -> bool:
+    """True when the integration's Configuration panel is actually showing.
+
+    The Configuration panel is the only one carrying the instance radios and
+    the Data scopes, so their presence is the signal. The "About this
+    integration" panel shows Overview/Provider/Supported regions instead.
+    """
+    try:
+        return bool(await page.evaluate("""() => {
+            const t = (document.body.innerText || '').toLowerCase();
+            return t.includes('new instance') || t.includes('existing instance')
+                || t.includes('data scope');
+        }"""))
+    except Exception:
+        return False
+
+
+async def _ise_open_configuration_tab(page, log) -> bool:
+    """Switch to the Configuration tab and CONFIRM the panel rendered.
+
+    The old code did page.locator('text=Configuration').first.click() inside a
+    try/except that swallowed failures. 'text=' is a substring match, so .first
+    could resolve to "Profiling Configuration" or any wrapper containing the
+    word, and nothing verified the switch. On POD-5 the tab never changed: the
+    step ran the whole Activate hunt against the "About this integration"
+    panel, which has no radios and no Activate button, and reported
+    "Activate button not found" with only a 'Push' button on the page.
+    """
+    for attempt in range(3):
+        if await _ise_config_tab_open(page):
+            log("Configuration tab is open")
+            return True
+        for sel in ('[role="tab"]:text-is("Configuration")',
+                    'a:text-is("Configuration")',
+                    'span:text-is("Configuration")',
+                    'div:text-is("Configuration")',
+                    ':text-is("Configuration")'):
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2500):
+                    await el.scroll_into_view_if_needed()
+                    await el.click(timeout=5000, force=True)
+                    await page.wait_for_timeout(2500)
+                    if await _ise_config_tab_open(page):
+                        log(f"Configuration tab opened via {sel!r}")
+                        return True
+            except Exception:
+                continue
+        log(f"Configuration tab not open yet — retry {attempt + 1}/3")
+        await page.wait_for_timeout(2500)
+    return False
+
 
 async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_path: str, log) -> tuple[bool, str]:
     from playwright.async_api import async_playwright
@@ -2255,14 +2574,16 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
 
             await page.wait_for_timeout(2000)
 
-            # Click "Configuration" tab
+            # Click "Configuration" tab — and verify it actually switched.
             log("Clicking Configuration tab")
             await _ise_dismiss_session_info(page)
-            try:
-                await page.locator('text=Configuration').first.click(timeout=8000)
-                await page.wait_for_timeout(2000)
-            except Exception:
-                pass
+            await _ise_dismiss_modal(page)
+            if not await _ise_open_configuration_tab(page, log):
+                await page.screenshot(
+                    path="/pipeline/host-data/ise_cdfmc_no_config_tab.png", full_page=True)
+                return False, ("Could not open the FMC Configuration tab — the "
+                               "'About this integration' panel stayed active "
+                               "(see ise_cdfmc_no_config_tab.png)")
 
             # Check page state
             page_text = (await page.inner_text("body")).lower()
@@ -2462,7 +2783,16 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
             # Docker VPN breaks Okta silent-renew — same as step 2.
             # Hand off OTP to host dashboard via file IPC; host navigates SCC
             # to find cdFMC management UI and submits the OTP.
-            instance_name = f"ISE-FMC-POD-{pod_id}"
+            # Unique per run. A fixed name made every re-run collide: cdFMC
+            # rejects duplicates with 'PxgridInstance with "..." name already
+            # exists', the Create dialog then never closes, and the step reports
+            # failure even though the PREVIOUS run had created, activated and
+            # saved the instance successfully. The cleanup pass below deletes the
+            # superseded instances, which is the guide's "you may now Delete the
+            # Application Instance after the new one is saved".
+            import time as _tn
+            instance_name = f"ISE-FMC-POD-{pod_id}-{int(_tn.time()) % 10000:04d}"
+            log(f"cdFMC instance name for this run: {instance_name}")
             _ipc_ok, _ipc_msg = _scc_file_ipc_cdfmc(pod_id, otp_token, instance_name, log)
             if not _ipc_ok:
                 return False, _ipc_msg
