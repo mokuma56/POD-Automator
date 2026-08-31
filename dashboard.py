@@ -2316,16 +2316,22 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
         # stale-file path.
         log_fn(f"[scc-nav] could not read idac_url for {pod_id}: {_e}")
 
-    # Self-heal: fetch the URL dCloud already wrote for this session rather than
-    # making someone populate it by hand. It lives in the session log on the jump
-    # host, which is only reachable from the pod's VPN namespace — hence the
-    # short-lived container. Read-only; nothing is minted.
+    # ALWAYS re-read the session log — do not trust a stored URL.
     #
-    # This has to happen HERE rather than in the orchestrator because the SCC
-    # reset runs as pipeline step 21, before any of the optional cards, and its
-    # browser half cannot authenticate without a URL. POD-18 failed exactly that
-    # way three times.
-    if not idac:
+    # The iDAC URL is scoped to the dCloud SESSION but we key it by ORG, so a
+    # session reset leaves a stale URL behind. A stale URL does not necessarily
+    # FAIL: it can succeed against the WRONG org and silently configure another
+    # tenant. Org 533's stored URL resolved to org 506 exactly that way.
+    #
+    # session_id cannot be used to detect staleness either — POD-5 carries the
+    # same session_id (1353154) that POD-18 had before it was deleted.
+    #
+    # The log lives on the jump host, reachable only from the pod's VPN
+    # namespace, hence the short-lived container. Read-only; nothing is minted.
+    # This must happen HERE rather than in the orchestrator: the SCC reset is
+    # pipeline step 21, before any optional card, and its browser half cannot
+    # authenticate without a URL (POD-18 failed that way three times).
+    if True:
         log_fn(f"[scc-nav] no stored iDAC URL for {pod_id} — reading the "
                f"session's own URL from the jump host")
         try:
@@ -2352,8 +2358,14 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
                 # the way in filed the URL under the wrong org. The enterprise
                 # id returned by the login is authoritative, so the write happens
                 # after the session opens, below.
+                if idac and _found != idac:
+                    log_fn("[scc-nav] session log URL differs from the stored one "
+                           "— the stored URL was stale, using the session's")
                 idac = _found
                 log_fn("[scc-nav] read the session iDAC URL from the jump host")
+            elif idac:
+                log_fn("[scc-nav] could not read the session log — falling back "
+                       "to the stored URL (it may be stale)")
             else:
                 log_fn("[scc-nav] no iDAC URL in the jump host session log")
         except Exception as _e:
@@ -2384,6 +2396,22 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
                 if _own and (_own["idac_url"] or "").strip() != idac:
                     _c3.execute("UPDATE org_credentials SET idac_url=? WHERE org_number=?",
                                 (idac, _own["org_number"]))
+                    # Drop the same URL from any OTHER org. A URL can end up
+                    # filed against the wrong org (org 533 held one that resolved
+                    # to org 506), and correcting the right org would otherwise
+                    # leave that wrong pointer in place for the next run to find.
+                    _stray = _c3.execute(
+                        "SELECT org_number FROM org_credentials "
+                        "WHERE idac_url=? AND org_number<>?",
+                        (idac, _own["org_number"])).fetchall()
+                    if _stray:
+                        _c3.execute(
+                            "UPDATE org_credentials SET idac_url='' "
+                            "WHERE idac_url=? AND org_number<>?",
+                            (idac, _own["org_number"]))
+                        log_fn(f"[scc-nav] cleared the same URL from org(s) "
+                               f"{', '.join(str(r[0]) for r in _stray)} — it belongs "
+                               f"to org {_own['org_number']}")
                     _c3.commit()
                     log_fn(f"[scc-nav] stored the session iDAC URL for org "
                            f"{_own['org_number']} (enterprise {eid[:8]}...)")
