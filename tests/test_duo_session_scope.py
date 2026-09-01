@@ -158,18 +158,45 @@ def test_unreachable_jump_host_never_wipes_credentials(tmp_path, fake_session):
     assert row["idac_url"] == OLD_URL
 
 
-def test_no_stored_url_records_without_clearing(tmp_path, fake_session):
-    """An empty idac_url is what a partial manual reset looks like, not proof of
-    a new session — so record the URL but leave the credentials alone."""
+def test_no_stored_url_also_clears(tmp_path, fake_session):
+    """An empty stored URL is NOT a safe case — it must clear too.
+
+    A new session remaps PODs onto different SCC orgs from the pool, so a POD can
+    land on an org carrying duo_ikey/skey/host from some older run with no iDAC
+    URL beside them. Org 507 was in exactly that state on 2026-09-01. Treating it
+    as "rotation unproven" left the stale credentials in place, and if the old Duo
+    org still answers /admin/v1/info/summary the card configures the WRONG tenant.
+
+    Stored Duo credentials are trustworthy only when the stored URL EXACTLY
+    matches the live one; absent counts as not matching.
+    """
     db = _make_db(tmp_path, stored_url="")
     fake_session(NEW_URL)
 
-    assert da.duo_refresh_session_scope("POD-5", db, "518", log=lambda m: None) == "stored"
+    assert da.duo_refresh_session_scope("POD-5", db, "518", log=lambda m: None) == "rotated"
 
     row = _row(db)
     assert row["idac_url"] == NEW_URL
-    for col, expected in STALE_DUO.items():
-        assert row[col] == expected
+    for col in STALE_DUO:
+        assert row[col] == "", f"{col} survived with no matching iDAC URL"
+    for col, expected in STABLE.items():
+        assert row[col] == expected, f"{col} was cleared but its org is stable"
+
+
+def test_nothing_to_clear_reports_stored(tmp_path, fake_session):
+    """A genuinely fresh org has no Duo state, so say so rather than crying
+    rotation — the distinction is what makes the log line meaningful."""
+    db = _make_db(tmp_path, stored_url="")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE org_credentials SET "
+                 + ", ".join(f"{c}=''" for c in STALE_DUO)
+                 + " WHERE org_number='518'")
+    conn.commit()
+    conn.close()
+    fake_session(NEW_URL)
+
+    assert da.duo_refresh_session_scope("POD-5", db, "518", log=lambda m: None) == "stored"
+    assert _row(db)["idac_url"] == NEW_URL
 
 
 def test_scoped_columns_all_exist_in_the_real_schema():
