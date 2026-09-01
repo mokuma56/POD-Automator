@@ -2717,6 +2717,36 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
             admin_host = act.url.split("/")[2]
             cdp2, auth2 = _pw_add_virtual_authenticator(ctx, act)
 
+            # An ALREADY-ACTIVATED admin lands on /login here rather than inside
+            # the account. Activation is one-shot: the "Create password" step is
+            # skipped, so this tab never becomes authenticated, and the enrolment
+            # code below then hunts for "Add Passkey" on a login page and reports
+            # "passkey enrolment produced no credential". That made bootstrap
+            # impossible to run twice against the same admin.
+            #
+            # Log in instead. The password is never ours to lose — it is the
+            # "Suggested Password" printed on the iDAC card, re-read on every run
+            # by _pw_activate_duo_admin — so this needs nothing from the DB. With
+            # no second factor enrolled Duo goes straight to factor enrolment,
+            # which the virtual authenticator attached above satisfies and the
+            # existing code below completes. If a factor IS enrolled that we
+            # cannot satisfy, this leaves act on /login and the enrolment below
+            # fails exactly as it did before — no worse, and now logged.
+            if "/login" in act.url:
+                _log("admin already activated — logging in to reach passkey enrolment")
+                try:
+                    act.fill('input[type="email"]', email)
+                    act.get_by_role("button", name="Continue").click()
+                    act.wait_for_timeout(4_000)
+                    act.fill('input[type="password"]', password)
+                    # "Log in as someone else" also contains "Log in"; a substring
+                    # match hits it and resets the flow to the email step forever.
+                    act.get_by_role("button", name="Log in", exact=True).click()
+                    act.wait_for_timeout(9_000)
+                    _log(f"after login -> {act.url[:80]}")
+                except Exception as e:
+                    _log(f"login attempt failed: {type(e).__name__}: {str(e)[:120]}")
+
             for label in ("Continue", "Skip for now"):
                 try:
                     act.get_by_role("button", name=label, exact=False).first.click(timeout=6_000)
