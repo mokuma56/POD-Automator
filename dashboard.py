@@ -2421,7 +2421,10 @@ def api_ise_run(pod_id):
                     status=excluded.status,
                     started_at=CASE WHEN excluded.status='running' THEN excluded.started_at ELSE started_at END,
                     completed_at=NULL
-                WHERE ise_steps.status NOT IN ('completed', 'skipped')
+                WHERE ise_steps.status NOT IN ('completed', 'skipped', 'running')
+                  -- 'running' added: without it a second seeding pass
+                  -- (a re-run launched while a step is live) knocks the
+                  -- active step back to 'pending' and the card looks idle
             """, (pod_id, _s, _status, "", _now if _status == "running" else ""))
         _c.commit(); _c.close()
     except Exception as _pre_err:
@@ -5842,7 +5845,12 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                             if _del_btn:
                                 log_fn(f"[cdfmc-nav] Deleting instance: {_row_txt.strip()[:80]!r}")
                                 _del_btn.click(force=True, timeout=5000)
-                                _fmc_tab.wait_for_timeout(2500)
+                                # 2.5s was too tight: on POD-24 the first delete
+                                # found no dialog and logged "no confirm control
+                                # matched", and only the retry pass caught it.
+                                # The dialog is worth waiting for — it is the
+                                # difference between a real delete and a no-op.
+                                _fmc_tab.wait_for_timeout(4000)
                                 _deleted_any = True
                                 _any_deleted_overall = True
                                 # The delete BUTTON was always being clicked correctly
@@ -5869,6 +5877,13 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                                 # cdFMC raises "Delete pxGrid Application Instance?"
                                 # with Cancel / Delete. Scope to the dialog first so we
                                 # cannot re-click a row's trash icon by accident.
+                                # Poll for the dialog rather than probing once —
+                                # cdFMC renders it in a portal and it can lag.
+                                for _wait_round in range(3):
+                                    if _fmc_tab.locator(
+                                        '[role="dialog"], [class*="modal" i]').count():
+                                        break
+                                    _fmc_tab.wait_for_timeout(1500)
                                 for _conf in ['[role="dialog"] button:has-text("Delete")',
                                               '[class*="modal" i] button:has-text("Delete")',
                                               '[data-testid*="confirm" i]',
@@ -8341,6 +8356,18 @@ DASHBOARD_HTML = """
   /* Each phase is its own tinted block with an inline caption, so the three
      stages of a "+ Duo + ISE" run read as distinct groups rather than one
      undifferentiated string of 38 dots. */
+  /* Instant, readable tooltip for the summary dots. The native title=
+     attribute works but waits ~1s and renders the raw step name. */
+  .sum-tip { position:fixed; z-index:9999; pointer-events:none; display:none;
+             background:#0a1628; border:1px solid #2a4a72; border-radius:6px;
+             padding:7px 10px; font-size:11.5px; line-height:1.5;
+             color:#dbe5f0; box-shadow:0 6px 18px rgba(0,0,0,.55);
+             max-width:320px; white-space:normal; }
+  .sum-tip .tt-step { color:#00bceb; font-weight:700; }
+  .sum-tip .tt-phase { color:#7d8fa3; }
+  .sum-tip .tt-status { font-weight:700; }
+  .sum-dot { cursor:help; }
+
   .sum-ph { display:flex; align-items:center; gap:4px; padding:2px 5px;
             border-radius:5px; flex-shrink:0; }
   .sum-ph-lbl { font-size:9px; font-weight:700; letter-spacing:.3px;
@@ -8979,6 +9006,69 @@ function _sumDotColor(st) {
 // states, muted grey on the dim "not reached yet" fill.
 // Percentage colour follows the WORST state in the run, so a green 100% can
 // never sit on top of a failed or degraded step.
+// Human-readable step name. ISE ships real labels; pipeline and Duo do not,
+// so their raw names are prettified (detect_pod_number -> Detect Pod Number).
+// Built without regex escapes on purpose: this JS lives inside a Python string,
+// where a lone backslash is eaten before the browser ever sees it.
+function _stepLabel(x) {
+  const raw = String(x.name || '');
+  const bare = raw.indexOf(': ') >= 0 ? raw.split(': ').slice(1).join(': ') : raw;
+  // const declarations do not become window properties, so reference it
+  // directly behind a typeof guard rather than via window.
+  const known = (typeof ISE_STEP_LABELS !== 'undefined' ? ISE_STEP_LABELS : {})[bare];
+  if (known) return known;
+  return bare.split('_').filter(Boolean)
+             .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+             .join(' ');
+}
+
+function _sumTipEl() {
+  let el = document.getElementById('sum-tip');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'sum-tip';
+    el.className = 'sum-tip';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+// Delegated so it keeps working after the 5s repaint replaces every dot.
+function _wireSummaryTips() {
+  const host = document.getElementById('pod-summary');
+  if (!host || host._tipsWired) return;
+  host._tipsWired = true;
+  host.addEventListener('mouseover', (e) => {
+    const d = e.target.closest ? e.target.closest('.sum-dot') : null;
+    if (!d) return;
+    const tip = _sumTipEl();
+    const colour = d.dataset.status.indexOf('degraded') === 0 ? '#ff4757'
+                 : d.dataset.status === 'failed'    ? '#ff4757'
+                 : d.dataset.status === 'completed' ? '#00e68a'
+                 : d.dataset.status === 'running'   ? '#02c8ff'
+                 : d.dataset.status === 'skipped'   ? '#ffa502' : '#8899aa';
+    tip.innerHTML =
+        '<span class="tt-step">Step ' + d.dataset.n + ' of ' + d.dataset.total + '</span>'
+      + ' <span class="tt-phase">&middot; ' + d.dataset.phase + '</span><br>'
+      + escHtml(d.dataset.label) + '<br>'
+      + '<span class="tt-status" style="color:' + colour + '">'
+      + escHtml(d.dataset.status) + '</span>';
+    tip.style.display = 'block';
+    const r = d.getBoundingClientRect();
+    const tr = tip.getBoundingClientRect();
+    let left = r.left + r.width / 2 - tr.width / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - tr.width - 8));
+    let top = r.top - tr.height - 8;
+    if (top < 8) top = r.bottom + 8;          // flip under the dot near the top
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+  });
+  host.addEventListener('mouseout', (e) => {
+    const d = e.target.closest ? e.target.closest('.sum-dot') : null;
+    if (d) _sumTipEl().style.display = 'none';
+  });
+}
+
 function _sumPctColor(p) {
   const st = p.steps || [];
   if (p.failed || st.some(z => z.status === 'failed')) return '#ff4757';
@@ -9077,6 +9167,8 @@ async function renderPodSummary() {
     // Short captions: the per-phase tint already carries the identity, and the
     // full names cost ~215px, which is what pushed 38 dots past the row width.
     const PH_NAME = {pipeline: 'Pipeline', duo: 'Duo', ise: 'ISE'};
+    const PH_FULL = {pipeline: 'Main Pipeline', duo: 'Duo / Secure Access',
+                     ise: 'ISE Integrations'};
     const groups = [];
     p.steps.forEach((x, i) => {
       const ph = x.phase || 'pipeline';
@@ -9091,10 +9183,13 @@ async function renderPodSummary() {
       + '<span class="sum-ph-lbl">' + escHtml(PH_NAME[g.phase] || g.phase) + '</span>'
       + g.items.map(it =>
           '<span class="sum-dot" style="background:' + _dotColour(it.x)
-          + ';color:' + _sumDotInk(it.x.soft ? 'failed' : it.x.status) + '" title="'
-          + escHtml(it.n + '. ' + it.x.name.replace(/_/g, ' '))
-          + (it.x.status ? ' — ' + (it.x.soft ? 'degraded (soft-fail)' : it.x.status) : '')
-          + '">' + it.n + '</span>').join('')
+          + ';color:' + _sumDotInk(it.x.soft ? 'failed' : it.x.status) + '"'
+          + ' data-n="' + it.n + '" data-total="' + p.total + '"'
+          + ' data-phase="' + escHtml(PH_FULL[g.phase] || g.phase) + '"'
+          + ' data-label="' + escHtml(_stepLabel(it.x)) + '"'
+          + ' data-status="' + escHtml(it.x.soft ? 'degraded (soft-fail)'
+                                                 : (it.x.status || 'not started')) + '"'
+          + '>' + it.n + '</span>').join('')
       + '</span>').join('');
 
     // Elapsed freezes once nothing is running, so an idle POD stops counting up.
@@ -9170,6 +9265,7 @@ async function renderPodSummary() {
   }).join('');
 
   if (host._sig !== html) { host.innerHTML = html; host._sig = html; }
+  _wireSummaryTips();
 }
 
 function renderStats(pods) {
