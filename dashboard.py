@@ -7256,7 +7256,16 @@ def upload_event():
                 (pod_id, status, device_data, router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, assigned_to, notes)
                 VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 'Imported from event CSV')""",
                 (pod_id, json.dumps(device_data), router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, assigned_to))
-        conn.execute("DELETE FROM pipeline_steps WHERE pod_id = ?", (pod_id,))
+        # Clear EVERY pod_id-keyed table, not just pipeline_steps. Importing a
+        # CSV row loads a new session onto this pod_id and resets the POD to
+        # 'pending', but the Duo and ISE card rows used to survive it — so a
+        # freshly loaded POD inherited the previous session's card state and
+        # showed a failed ISE step it had never run. Card state belongs to the
+        # session that produced it, exactly like the pipeline steps beside it.
+        #
+        # failure_events is deliberately NOT in this list: it is append-only and
+        # outliving the run that produced it is the whole point of it.
+        _delete_all_pod_data(conn, pod_id)
         conn.commit()
         conn.close()
         created += 1
