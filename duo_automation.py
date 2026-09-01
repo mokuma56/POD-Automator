@@ -1978,29 +1978,36 @@ def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
     if live == stored:
         return "unchanged"
 
-    if not stored:
-        # Nothing to compare against, so rotation is unproven. Record the URL but
-        # do not clear: an empty idac_url with populated Duo columns is what a
-        # partial manual reset looks like, not evidence of a new session.
-        try:
-            with _sq_rs.connect(db_path) as conn:
-                conn.execute(
-                    "INSERT INTO org_credentials (org_number, idac_url) VALUES (?,?) "
-                    "ON CONFLICT(org_number) DO UPDATE SET idac_url=excluded.idac_url, "
-                    "updated_at=datetime('now')", (org_num, live))
-        except _sq_rs.Error as e:
-            _log(f"could not store the iDAC URL: {e}")
-            return "unavailable"
-        _log(f"stored this session's iDAC URL for org {org_num}")
-        return "stored"
-
-    # Differs from a URL we previously recorded: this is a new session, and every
-    # Duo value in the row belongs to the org the PREVIOUS session created.
+    # Anything other than an exact match means these Duo values cannot be shown
+    # to belong to THIS session — and dCloud builds a new Duo org every session,
+    # so they describe an org that no longer has anything to do with this pod.
+    #
+    # An empty stored URL is NOT the safe case it looks like. A new session
+    # remaps pods onto different SCC orgs from the pool, so a pod can land on an
+    # org carrying duo_ikey/skey/host from some older run with no iDAC URL beside
+    # them — org 507 was in exactly that state on 2026-09-01. Treating that as
+    # "rotation unproven" left the stale credentials in place, and if the old Duo
+    # org still answers, the card configures the WRONG tenant.
+    #
+    # Clearing is safe precisely BECAUSE the URL does not match: a different
+    # session means a new, never-activated admin, so bootstrap re-reads
+    # everything from the iDAC card. (Clearing while the URL DOES match is what
+    # locked two admins out on 2026-08-31 — same session, already-activated
+    # admin, one-shot activation link. Hence the exact-match check above.)
     try:
         with _sq_rs.connect(db_path) as conn:
+            conn.row_factory = _sq_rs.Row
             cols = {r[1] for r in conn.execute(
                 "PRAGMA table_info(org_credentials)")}
             clear = [c for c in DUO_SESSION_SCOPED_COLUMNS if c in cols]
+            # The row may not exist at all: a new session can map a pod onto an
+            # org this DB has never seen.
+            conn.execute("INSERT OR IGNORE INTO org_credentials (org_number) "
+                         "VALUES (?)", (org_num,))
+            prev = conn.execute(
+                f"SELECT {', '.join(clear)} FROM org_credentials WHERE org_number=?",
+                (org_num,)).fetchone()
+            had = [c for c in clear if prev and (prev[c] or "").strip()]
             conn.execute(
                 f"UPDATE org_credentials SET idac_url=?, updated_at=datetime('now'), "
                 f"{', '.join(c + '=?' for c in clear)} WHERE org_number=?",
@@ -2009,11 +2016,17 @@ def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
         _log(f"could not clear stale Duo credentials: {e}")
         return "unavailable"
 
-    _log(f"NEW SESSION detected for org {org_num} — the iDAC URL changed, so "
-         f"dCloud has built a new Duo org. Cleared {len(clear)} stale Duo "
-         f"credential(s); the card will rebuild them rather than configure the "
-         f"previous session's tenant.")
-    return "rotated"
+    why = ("the iDAC URL changed" if stored
+           else "no iDAC URL had been recorded for this org")
+    if had:
+        _log(f"NEW SESSION for org {org_num} — {why}, so dCloud has built a new "
+             f"Duo org. Cleared {len(had)} stale Duo credential(s) "
+             f"({', '.join(had)}); the card will rebuild them rather than "
+             f"configure a previous session's tenant.")
+        return "rotated"
+    _log(f"stored this session's iDAC URL for org {org_num} "
+         f"(no stale Duo state to clear)")
+    return "stored"
 
 
 def fetch_idac_url_from_dcloud(log=None, pod_id: str = "",
