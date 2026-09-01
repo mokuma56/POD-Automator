@@ -456,6 +456,96 @@ def api_resources():
 _SOFT_PREFIX = "[soft-fail]"
 
 
+# ── Phase 1 failure triage: detect, classify, escalate (no remediation) ──────
+def _failure_log_tail(conn, pod_id: str, n: int = 40) -> str:
+    """The last few log lines for this POD — the context a fingerprint alone
+    cannot carry. Kept with the event because pipeline_logs gets trimmed."""
+    try:
+        rows = conn.execute(
+            "SELECT log_line FROM pipeline_logs WHERE pod_id=? ORDER BY id DESC LIMIT ?",
+            (pod_id, n)).fetchall()
+        return "\n".join((r[0] or "") for r in reversed(rows))[:8000]
+    except Exception:
+        return ""
+
+
+def _sweep_failures():
+    """Record failed / soft-failed steps into failure_events.
+
+    A sweeper rather than a hook in each step: the step tables are the one place
+    every phase already reports to, so this catches pipeline, Duo and ISE without
+    touching any automation path. It must run promptly — a reset or re-run
+    overwrites those rows, which is how a full day of real failures became
+    unrecoverable on 2026-08-31.
+    """
+    import failure_triage as _ft
+    while True:
+        try:
+            conn = _db()
+            conn.row_factory = sqlite3.Row
+            try:
+                _ft.ensure_table(conn)
+                stale = False
+                try:
+                    stale = bool(_image_staleness().get("stale"))
+                except Exception:
+                    pass
+                for table, phase in (("pipeline_steps", "pipeline"),
+                                     ("duo_steps", "duo"),
+                                     ("ise_steps", "ise")):
+                    try:
+                        rows = conn.execute(
+                            f"SELECT pod_id, step_name, status, result, completed_at "
+                            f"FROM {table} WHERE status IN ('failed','skipped') "
+                            f"AND COALESCE(result,'') != ''").fetchall()
+                    except sqlite3.Error:
+                        continue
+                    for r in rows:
+                        res = r["result"] or ""
+                        soft = res.startswith("[soft-fail]")
+                        # A deliberate SKIP is not a failure. Only a skipped row
+                        # carrying [soft-fail] is a stepped-over failure.
+                        if r["status"] == "skipped" and not soft:
+                            continue
+                        org = ""
+                        try:
+                            _o = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?",
+                                              (r["pod_id"],)).fetchone()
+                            org = (_o[0] or "") if _o else ""
+                        except Exception:
+                            pass
+                        _ft.record(conn,
+                                   pod_id=r["pod_id"], phase=phase,
+                                   step_name=r["step_name"],
+                                   status="degraded" if soft else "failed",
+                                   result=res,
+                                   log_tail=_failure_log_tail(conn, r["pod_id"]),
+                                   image_stale=stale, org=org,
+                                   step_done_at=r["completed_at"] or "")
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        time.sleep(15)
+
+
+threading.Thread(target=_sweep_failures, daemon=True, name="failure-sweeper").start()
+
+
+@app.route("/api/failures")
+def api_failures():
+    """What is actually failing, and does it recur across PODs?"""
+    import failure_triage as _ft
+    conn = _db()
+    try:
+        return jsonify({
+            "incidence": _ft.incidence(conn, days=int(request.args.get("days", 7))),
+            "recent": _ft.recent(conn, limit=int(request.args.get("limit", 30))),
+        })
+    finally:
+        conn.close()
+
+
 def _addon_progress(conn, pod_id: str, run_addons: str) -> dict:
     """Step counts for the optional cards this POD was launched with.
 
