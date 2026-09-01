@@ -3622,13 +3622,13 @@ def sa_generate_scim_token_ui(pod_id: str, db_path: str, log=None) -> tuple[bool
         return False, "no stored idac_url — cannot open an SCC session"
     if not sa_org:
         return False, f"org {org_num} has no sa_org_id"
-    _tok = (oc.get("sa_scim_token") or "").strip()
-    if _tok:
-        _ok, _why = _scim_token_valid(_tok, _log)
-        if _ok:
-            return True, f"SCIM token already present and valid ({_why})"
-        _log(f"stored sa_scim_token {_why} — regenerating")
-        # fall through and mint a new one
+    # No presence check here on purpose. This function GENERATES; whether a
+    # stored token is still good is the caller's decision, and the sole caller
+    # (step_saml_scim_config) now validates and clears it first. The old
+    # "already present — nothing to do" short-circuit lived here and is exactly
+    # where the stale-token bug hid: it made the function a no-op precisely when
+    # regeneration was needed, and left a second redundant probe behind once the
+    # gate started validating.
 
     # Unique per run: Secure Access rejects a duplicate directory name, and a
     # pod may already carry one from an earlier attempt.
