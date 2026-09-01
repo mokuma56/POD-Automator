@@ -3510,18 +3510,47 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
 
             await page.screenshot(path="/pipeline/host-data/ise_scc_config_tab.png", full_page=False)
 
-            # If already Active (Deactivate button visible) — skip, nothing to do.
-            for act_chk in [
-                'button:has-text("Deactivate")',
-                ':text-is("Active")',
-                ':text-is("Activated")',
-            ]:
+            # Is the integration already Active, in which case there is nothing
+            # to create?
+            #
+            # This used to accept ':text-is("Active")' or ':text-is("Activated")'
+            # matching ANY element on the page — a column header, a legend, an
+            # unrelated component's status — and returned success on the first
+            # hit. Two problems with that, and the second is the serious one:
+            #
+            #   1. The selectors were unscoped. "Active" is one of the most
+            #      common words on an ISE admin page.
+            #   2. It only ever consulted ISE's HALF of a two-sided integration.
+            #      ISE goes on reporting Active after the SCC end is deleted, so
+            #      on 2026-09-01 POD-5 skipped this step with nothing in SCC at
+            #      all — the SCC reset had removed ISE-POD-POD-5-493 an hour
+            #      earlier and ISE never noticed.
+            #
+            # Require the Deactivate CONTROL specifically. Unlike the word
+            # "Active", a Deactivate button only exists when this panel has a
+            # live registration to deactivate, so it is evidence about this
+            # integration rather than about the page. Ambiguous states now fall
+            # through and re-create, which is safe: step 3 deactivates and
+            # reactivates immediately afterwards and must always run anyway (SCC
+            # never reaches Active without that cycle).
+            _already_active = False
+            for act_chk in ['button:has-text("Deactivate")',
+                            '[role="button"]:has-text("Deactivate")',
+                            'a:has-text("Deactivate")']:
                 try:
                     if await page.locator(act_chk).first.is_visible(timeout=2000):
-                        log("ISE→SCC integration already Active — skipping")
-                        return True, "ISE→SCC integration already Active (skipped)"
+                        _already_active = True
+                        break
                 except Exception:
                     continue
+            if _already_active:
+                # Even a Deactivate control only proves ISE's side. Say so, so a
+                # green here is never mistaken for "verified in SCC" — the host
+                # half checks the Active Integrations table, this cannot.
+                log("Deactivate control present — ISE side already Active; skipping create")
+                return True, ("ISE→SCC integration already Active on the ISE side "
+                              "(skipped create; SCC side not verified here)")
+            log("no Deactivate control — treating as not yet integrated, creating")
 
             # Scroll down and select New instance
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
