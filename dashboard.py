@@ -2347,7 +2347,10 @@ def api_duo_run(pod_id):
     import threading, duo_automation as _da_run
     _ensure_duo_table()
     data = request.get_json(silent=True) or {}
-    from_step = int(data.get("from_step", 0))
+    # Accept from_step as a query param too, matching /api/ise/run. Only the body
+    # was read here, so POST /api/duo/run/POD-5?from_step=4 silently restarted the
+    # card at bootstrap and re-ran ten minutes of already-green steps.
+    from_step = int(request.args.get("from_step", data.get("from_step", 0)))
     db_path = str(DB_PATH)
 
     def _run():
@@ -2710,6 +2713,30 @@ def api_ise_reactivate(pod_id):
     return jsonify({"status": "started", "pod_id": pod_id, "step": "ise_scc_deactivate_reactivate"})
 
 
+def _idac_child_reason(proc) -> str:
+    """Why did the containerised iDAC-URL read come back empty?
+
+    read_idac_url_from_session distinguishes jump host unreachable, log file
+    missing, log present but no match, and read failed after retries — but it
+    reports that through its `log` callback, and only URL-looking lines were
+    ever parsed out of the child's stdout. So every cause read as "no iDAC URL
+    in the jump host session log", which on 2026-09-01 hid WinRM simply being
+    off and sent an hour into a non-existent design gap.
+    """
+    if proc is None:
+        return "no result from the reader"
+    lines = [ln.split("IDAC-LOG:", 1)[1].strip()
+             for ln in (proc.stdout or "").splitlines() if "IDAC-LOG:" in ln]
+    if lines:
+        return "; ".join(lines[-2:])
+    err = (proc.stderr or "").strip().splitlines()
+    if err:
+        return f"reader stderr: {err[-1][:160]}"
+    if getattr(proc, "returncode", 0) != 0:
+        return f"reader exited rc={proc.returncode} with no diagnostic"
+    return "reader produced no diagnostic"
+
+
 def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tuple:
     """Open an authenticated SCC session on the host. Returns (context, page, enterprise_id).
 
@@ -2776,7 +2803,11 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
                 "pod-automator:latest", "-u", "-c",
                 "import sys; sys.path.insert(0,'/pipeline'); "
                 "import duo_automation as d; "
-                f"print(d.read_idac_url_from_session('{pod_id}') or '')",
+                # Pass a log through. Without it read_idac_url_from_session's
+                # _log defaults to a no-op, so the ONE thing that tells us why
+                # the read failed was thrown away inside the container.
+                "print(d.read_idac_url_from_session("
+                f"'{pod_id}', log=lambda m: print('IDAC-LOG:', m)) or '')",
             ], capture_output=True, text=True, timeout=180)
             _found = ""
             for _line in (_r.stdout or "").splitlines():
@@ -2798,11 +2829,25 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
                 log_fn("[scc-nav] read the session iDAC URL from the jump host")
             elif idac:
                 log_fn("[scc-nav] could not read the session log — falling back "
-                       "to the stored URL (it may be stale)")
+                       "to the stored URL (it may be stale): "
+                       f"{_idac_child_reason(_r)}")
             else:
-                log_fn("[scc-nav] no iDAC URL in the jump host session log")
+                # Say WHY, not just "no URL". read_idac_url_from_session already
+                # distinguishes jump-host-unreachable / file-missing / no-match,
+                # but only URL lines were parsed out of the child's stdout, so
+                # every cause collapsed into one misleading message. On
+                # 2026-09-01 step 21 logged "no iDAC URL in the jump host session
+                # log" for both PODs when the real cause was WinRM not yet being
+                # enabled — the identical code read the URL fine 15 minutes later
+                # once it was. That cost an hour chasing a design gap that did
+                # not exist, and it silently skipped the browser half of the SCC
+                # reset, which left stale SSO config behind and failed sso_saml
+                # on both PODs four steps later.
+                log_fn("[scc-nav] no iDAC URL obtained — the browser half of the "
+                       f"SCC reset will be skipped. Cause: {_idac_child_reason(_r)}")
         except Exception as _e:
-            log_fn(f"[scc-nav] could not read the session log: {_e}")
+            log_fn(f"[scc-nav] could not read the session log: "
+                   f"{type(_e).__name__}: {_e}")
 
     if idac:
         ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
@@ -2826,6 +2871,60 @@ def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tupl
                 _own = _c3.execute(
                     "SELECT org_number, idac_url FROM org_credentials WHERE scc_org_uuid=?",
                     (eid,)).fetchone()
+
+                # SELF-CORRECT a stale scc_org_uuid.
+                #
+                # When no row carries this enterprise id the old code silently did
+                # nothing, so the mismatch survived every session. Org 507 held
+                # 6918f5f3 while POD-24's session was really enterprise 1a385f37;
+                # the URL was never filed, and reading "enterpriseId unchanged"
+                # as a failed org switch sent me chasing a wrong-tenant incident
+                # that was not happening.
+                #
+                # Do NOT fall back to the org parsed from pods.scc_org: that is
+                # the cdFMC host and it genuinely disagrees sometimes (POD-17's
+                # cdFMC is org 517 while its iDAC resolves to org 502), so
+                # trusting it would file the URL against the wrong org — the very
+                # bug the enterprise-id keying exists to prevent.
+                #
+                # Ask SCC instead. The org picker renders the name, and the org
+                # number is in it ("PseudoCo-507"), which ties this enterprise id
+                # to an org number authoritatively.
+                if not _own:
+                    _name_org = ""
+                    try:
+                        _txt = page.inner_text("body")
+                        _mm = re.findall(r"PseudoCo-(\d+)", _txt or "")
+                        if _mm and len(set(_mm)) == 1:
+                            _name_org = _mm[0]
+                    except Exception as _ne:
+                        log_fn(f"[scc-nav] could not read the org name: {_ne}")
+                    if _name_org:
+                        _clash = _c3.execute(
+                            "SELECT org_number FROM org_credentials "
+                            "WHERE scc_org_uuid=? AND org_number<>?",
+                            (eid, _name_org)).fetchone()
+                        if _clash:
+                            log_fn(f"[scc-nav] enterprise {eid[:8]}… is already filed "
+                                   f"against org {_clash['org_number']} — not "
+                                   f"reassigning it to {_name_org}")
+                        else:
+                            _c3.execute(
+                                "INSERT INTO org_credentials (org_number, scc_org_uuid) "
+                                "VALUES (?,?) ON CONFLICT(org_number) DO UPDATE SET "
+                                "scc_org_uuid=excluded.scc_org_uuid, "
+                                "updated_at=datetime('now')", (_name_org, eid))
+                            _c3.commit()
+                            log_fn(f"[scc-nav] corrected org {_name_org}'s enterprise id "
+                                   f"to {eid[:8]}… (SCC reports this session as "
+                                   f"PseudoCo-{_name_org})")
+                            _own = _c3.execute(
+                                "SELECT org_number, idac_url FROM org_credentials "
+                                "WHERE scc_org_uuid=?", (eid,)).fetchone()
+                    else:
+                        log_fn(f"[scc-nav] enterprise {eid[:8]}… matches no org and the "
+                               f"page does not name exactly one PseudoCo org — leaving "
+                               f"the iDAC URL unfiled rather than guessing")
                 if _own and (_own["idac_url"] or "").strip() != idac:
                     _c3.execute("UPDATE org_credentials SET idac_url=? WHERE org_number=?",
                                 (idac, _own["org_number"]))
@@ -3429,14 +3528,58 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             except Exception:
                 pass
 
-            # ── Early-exit: if SCC already shows ISE as Connected on Integration Hub,
-            # the OTP was consumed and the integration is live — no Save needed. ──
-            _presave_txt = page.inner_text("body").lower()
-            _on_int_hub = "integration hub" in _presave_txt or "cisco integrations" in _presave_txt
-            _ise_connected = "connected" in _presave_txt and "identity services engine" in _presave_txt
-            if _on_int_hub and _ise_connected:
-                log_fn("[scc-nav] Integration Hub shows ISE Connected — integration already live, no Save needed")
-                return True, "ISE → SCC integration complete (Connected)"
+            # ── Early-exit: the integration may already be live, in which case the
+            # OTP was consumed and no Save is needed. ──
+            #
+            # This used to decide that from two substrings anywhere in the page
+            # body: "connected" AND "identity services engine". On an Integration
+            # Hub page "Identity Services Engine" is the name of the AVAILABLE
+            # catalog card, and "connected" comes from any other integration's
+            # row, a legend or help text — so the test passed while nothing had
+            # been submitted. POD-5 returned "complete (Connected)" on
+            # 2026-09-01 with no ISE integration in SCC at all, and the chain
+            # then ran deactivate/reactivate against something that did not
+            # exist.
+            #
+            # A pass here now requires the SAME evidence the post-save path
+            # demands: the integration present in the Active Integrations table.
+            # And a negative only skips the shortcut — it falls through to Save
+            # rather than failing, so this can save time but never invent a pass.
+            # Check in a SEPARATE TAB. Navigating `page` would abandon the form
+            # this function has just filled with a single-use OTP, and the Save
+            # path below still needs it — the fall-through has to leave the form
+            # exactly as it was.
+            _early_ok = False
+            _chk = None
+            try:
+                _chk = page.context.new_page()
+                _chk.goto(
+                    "https://security.cisco.com/integrations/main/my-integrations"
+                    f"?enterpriseId={_eid}",
+                    wait_until="domcontentloaded", timeout=60000)
+                _chk.wait_for_timeout(6000)
+                # Scope to the ROW that names ISE and read THAT row's status,
+                # rather than asking whether the words occur on the page at all.
+                _early_ok = bool(_chk.evaluate("""() => Array.from(
+                    document.querySelectorAll('tr,li,[class*="row" i],[class*="card" i]'))
+                    .filter(r => /identity services engine/i.test(r.innerText || ''))
+                    .some(r => /\\bconnected\\b|\\bactive\\b/i.test(r.innerText || ''))"""))
+                log_fn(f"[scc-nav] Active Integrations shows ISE live: {_early_ok}")
+            except Exception as _ee:
+                log_fn(f"[scc-nav] could not check Active Integrations "
+                       f"({type(_ee).__name__}: {_ee}) — continuing to Save")
+            finally:
+                try:
+                    if _chk:
+                        _chk.close()
+                except Exception:
+                    pass
+            if _early_ok:
+                log_fn("[scc-nav] ISE already listed as live in Active Integrations "
+                       "— integration is up, no Save needed")
+                return True, ("ISE → SCC integration already live — confirmed in the "
+                              "Active Integrations table")
+            log_fn("[scc-nav] ISE not confirmed live — proceeding with Save")
 
             log_fn("[scc-nav] Clicking Save button")
             _saved = False
@@ -5870,8 +6013,11 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                                   f"active for {_tenant}")
                 log_fn(f"[cdfmc-nav] no active instance for {_tenant} — creating one")
 
+            # Only instances WE created are ours to delete. cdFMC is shared.
+            OURS_PREFIX = "ISE-FMC-POD-"
+
             def _purge_instances(keep_name, why):
-                """Delete every pxGrid Application Instance except `keep_name`.
+                """Delete OUR stale pxGrid Application Instances except `keep_name`.
 
                 Runs BEFORE creating as well as after saving. cdFMC binds an OTP
                 to the application instance currently registered: with the
@@ -5881,12 +6027,24 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                 step fails even though ISE issued a perfectly good OTP. ISE
                 shows no Deactivate control on that page (only Push/Activate),
                 so clearing the stale instance here is the only lever available.
+
+                SCOPED TO OUR OWN INSTANCES (2026-09-01). This used to delete
+                EVERY instance except keep_name, and this cdFMC is shared: it
+                destroyed ONE-CISCO-LAB-JL, SEC-NET-CL04 and SEC-NET-CL26-04,
+                none of which we created. Only the ACTIVE guard below saved
+                SEC-NET-CL26-14 and SEC-NET-POD06, and that guard is an accident
+                of state, not a statement of ownership — an idle instance
+                belonging to someone else looked exactly like our own litter.
+                We name ours ISE-FMC-POD-<pod>-<nnnn> (see ise_integrations.py),
+                so anything without that prefix is not ours to touch.
                 """
                 log_fn(f"[cdfmc-nav] {why}")
                 _fmc_tab.wait_for_timeout(2000)
                 _inventoried = False
                 _confirm_dumped = False
                 _any_deleted_overall = False
+                # Log each foreign instance once, not once per row per attempt.
+                _foreign_logged = {}
                 for _ in range(5):
                     _deleted_any = False
                     try:
@@ -5899,6 +6057,16 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                             if keep_name and keep_name in _row_txt:
                                 continue
                             if not _row_txt.strip():
+                                continue
+                            # OWNERSHIP GATE — before anything else, and before
+                            # the ACTIVE check, so a foreign instance is never a
+                            # deletion candidate regardless of its state.
+                            if OURS_PREFIX not in _row_txt:
+                                if not _foreign_logged.get(_row_txt[:40]):
+                                    _foreign_logged[_row_txt[:40]] = True
+                                    log_fn(f"[cdfmc-nav] leaving alone (not ours, "
+                                           f"no {OURS_PREFIX!r}): "
+                                           f"{_row_txt.strip()[:60]!r}")
                                 continue
                             # NEVER try to delete the currently-active instance.
                             # cdFMC will not remove the identity source that is in
@@ -6069,9 +6237,54 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                 log_fn(f"[cdfmc-nav] stale-instance cleanup skipped (non-fatal): {_pe}")
 
             # ── 5. Click Create pxGrid Application Instance ───────────────────
-            _fmc_tab.locator('button:has-text("Create pxGrid Application Instance")').first.click(timeout=10000)
+            #
+            # Both PODs soft-failed here on 2026-09-01 with "Locator.click:
+            # Timeout 10000ms exceeded ... locator resolved to <button ...>".
+            # Note it RESOLVED the button and then timed out: the element exists
+            # and is not actionable, which Playwright's click waits out rather
+            # than reporting. That is the documented SCC behaviour — React
+            # synthetic events ignore a plain click, and the working pattern in
+            # this file (see the scc-reset chevron/toggle handling) is a JS
+            # coordinate lookup followed by page.mouse.click(), which arrives as
+            # a trusted event.
+            #
+            # Try the locator first since it is cheaper and reports better, then
+            # fall back to coordinates. Log `disabled`, because a disabled button
+            # means a precondition upstream is unmet and no click will ever work.
+            try:
+                _fmc_tab.locator(
+                    'button:has-text("Create pxGrid Application Instance")'
+                ).first.click(timeout=10000)
+                log_fn("[cdfmc-nav] Clicked Create pxGrid Application Instance")
+            except Exception as _ce:
+                log_fn(f"[cdfmc-nav] locator click failed ({str(_ce).splitlines()[0][:90]}) "
+                       f"— retrying as a trusted coordinate click")
+                _info = _fmc_tab.evaluate("""() => {
+                    const b = Array.from(document.querySelectorAll('button,[role="button"]'))
+                        .find(x => /create\\s+pxgrid\\s+application\\s+instance/i
+                                   .test((x.innerText || '').trim()));
+                    if (!b) return null;
+                    b.scrollIntoView({block: 'center', behavior: 'instant'});
+                    const r = b.getBoundingClientRect();
+                    return {x: r.left + r.width / 2, y: r.top + r.height / 2,
+                            w: r.width, h: r.height,
+                            disabled: !!b.disabled || b.getAttribute('aria-disabled') === 'true'};
+                }""")
+                if not _info:
+                    raise RuntimeError("'Create pxGrid Application Instance' button "
+                                       "not present on the cdFMC tab")
+                if _info["disabled"]:
+                    raise RuntimeError(
+                        "'Create pxGrid Application Instance' is DISABLED — a "
+                        "precondition is unmet (no click will help); check the "
+                        "cdFMC tab state")
+                if _info["w"] <= 0 or _info["h"] <= 0:
+                    raise RuntimeError("'Create pxGrid Application Instance' has zero "
+                                       "size — it is present but not rendered")
+                _fmc_tab.mouse.click(_info["x"], _info["y"])
+                log_fn(f"[cdfmc-nav] Clicked Create pxGrid Application Instance via "
+                       f"mouse.click at ({_info['x']:.0f}, {_info['y']:.0f})")
             _fmc_tab.wait_for_timeout(4000)
-            log_fn("[cdfmc-nav] Clicked Create pxGrid Application Instance")
 
             # ── 6. Fill name and OTP ──────────────────────────────────────────
             _name_input = _fmc_tab.locator('input[name="name"]').first

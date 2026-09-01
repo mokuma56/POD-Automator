@@ -1135,6 +1135,17 @@ async def _ise_reopen_node(page, log) -> bool:
     does not help that — it just makes the wrong answer take longer. So this
     retries, and reports whether the panel was actually refreshed.
     """
+    # The navigation was never the problem — the CLICK on the node link was. On
+    # POD-24 it timed out at 12s on all three attempts, twice in two sessions, so
+    # every poll re-read the previous DOM and reported "Cisco ISE could not
+    # connect to pxGrid." for 30+ rounds while an out-of-band read of the same
+    # node showed status='Connected', mode='Active'. The lab was fine; the read
+    # was not.
+    #
+    # A standalone probe doing the identical sequence with a 20s click and longer
+    # settles succeeded first time, so the deployment grid on this box is simply
+    # slower to become clickable than 12s allows. Give it room, wait for the row
+    # to be actionable rather than merely present, and grow the budget per retry.
     for _try in range(3):
         try:
             await page.goto(
@@ -1145,19 +1156,26 @@ async def _ise_reopen_node(page, log) -> bool:
             await _ise_dismiss_session_info(page)
             await _ise_dismiss_modal(page)
             try:
-                await page.wait_for_selector('table tbody tr, .dijitGrid', timeout=20000)
+                await page.wait_for_selector('table tbody tr, .dijitGrid', timeout=30000)
             except Exception:
                 await page.wait_for_timeout(4000)
             await _ise_dismiss_modal(page)
-            await page.locator(
-                'table tbody tr a:text-is("ise"), td a:text-is("ise")'
-            ).first.click(timeout=12000)
+            node = page.locator(
+                'table tbody tr a:text-is("ise"), td a:text-is("ise")').first
+            # Present is not the same as clickable under Dojo: the grid renders
+            # the row before it wires the handler, and clicking in that window is
+            # what times out.
+            try:
+                await node.wait_for(state="visible", timeout=20000 + _try * 10000)
+            except Exception:
+                pass
+            await node.click(timeout=20000 + _try * 10000)
             await page.wait_for_timeout(8000)
             await _ise_dismiss_modal(page)
             return True
         except Exception as e:
             log(f"re-open node attempt {_try + 1}/3 failed: {str(e).splitlines()[0][:110]}")
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(3000 + _try * 3000)
     return False
 
 
@@ -2382,7 +2400,71 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                                   f"name {_panel.get('name')}, region {_panel.get('region')}) "
                                   f"— confirmed on the final re-read after a stale poll")
             else:
-                log("could not re-navigate for the final read either")
+                # LAST RESORT: a brand-new browser context.
+                #
+                # If we get here the page is unusable for reading state, so the
+                # panel in hand proves nothing — and failing on it is how this
+                # step twice marked a live registration as broken (POD-24, both
+                # 2026-08-31 and 2026-09-01, while an independent fresh-context
+                # read of the same node returned Connected / Active). A new
+                # context cannot inherit the stale DOM, and re-logging in is
+                # cheap next to falsely failing the step.
+                log("could not re-navigate for the final read — retrying in a "
+                    "brand-new browser context")
+                _ctx2 = _p2 = None
+                try:
+                    _ctx2 = await page.context.browser.new_context(
+                        ignore_https_errors=True)
+                    _p2 = await _ctx2.new_page()
+                    if await _ise_login(_p2, log):
+                        await _p2.goto(
+                            f"{ISE_URL}/admin/#administration/administration_system"
+                            f"/administration_system_deployment",
+                            wait_until="domcontentloaded", timeout=60000)
+                        await _p2.wait_for_timeout(5000)
+                        await _ise_dismiss_session_info(_p2)
+                        await _ise_dismiss_modal(_p2)
+                        try:
+                            await _p2.wait_for_selector(
+                                'table tbody tr, .dijitGrid', timeout=30000)
+                        except Exception:
+                            await _p2.wait_for_timeout(6000)
+                        await _ise_dismiss_modal(_p2)
+                        await _p2.locator(
+                            'table tbody tr a:text-is("ise"), td a:text-is("ise")'
+                        ).first.click(timeout=25000)
+                        await _p2.wait_for_timeout(7000)
+                        await _ise_dismiss_modal(_p2)
+                        _fresh = await _pxgrid_panel(_p2)
+                        log(f"fresh-context panel read: {_fresh}")
+                        if _pxgrid_is_registered(_fresh):
+                            _bad = []
+                            if deployment_name and _fresh.get("name") != deployment_name:
+                                _bad.append(f"deployment name {_fresh.get('name')!r} "
+                                            f"!= {deployment_name!r}")
+                            if PXGRID_REGION not in (_fresh.get("region") or ""):
+                                _bad.append(f"region {_fresh.get('region')!r} "
+                                            f"!= {PXGRID_REGION!r}")
+                            if _bad:
+                                return False, ("pxGrid Cloud connected but registered "
+                                               "wrongly: " + "; ".join(_bad))
+                            return True, (f"pxGrid Cloud registered and connected "
+                                          f"(account {_fresh.get('account')}, "
+                                          f"name {_fresh.get('name')}, "
+                                          f"region {_fresh.get('region')}) — confirmed "
+                                          f"in a fresh browser context after the poll "
+                                          f"lost the ability to refresh")
+                        _panel = _fresh   # fail on a read we can actually trust
+                except Exception as _fe:
+                    log(f"fresh-context read failed too: {type(_fe).__name__}: "
+                        f"{str(_fe).splitlines()[0][:110]}")
+                finally:
+                    for _o in (_ctx2,):
+                        try:
+                            if _o:
+                                await _o.close()
+                        except Exception:
+                            pass
 
             # Timed out. Report what the panel actually said -- the old message
             # pointed at a screenshot that could be months old.
