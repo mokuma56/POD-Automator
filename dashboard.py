@@ -9628,10 +9628,22 @@ function renderTable(pods) {
       else tbody.appendChild(newTr);
       _rowCache[p.pod_id] = newHtml;
     } else if (_rowCache[p.pod_id] !== newHtml) {
-      // Row changed — only replace if the user isn't focused inside this row
+      // Row changed — replace it unless the user is mid-TEXT-ENTRY in this row.
+      //
+      // This used to skip on ANY focus inside the row, which froze the row for
+      // as long as the run-mode dropdown kept focus after a change — and it
+      // keeps focus right after being changed. Selecting "+ Duo + ISE" saved
+      // fine and pipelinePhase() computed 1/38, but the cell went on showing
+      // 1/21 because this branch returned before the row was rebuilt, so the
+      // addon steps looked like they had not loaded.
+      //
+      // A committed <select> needs no protection: its change event has already
+      // fired and persisted. Only a caret in a text field is worth keeping.
       const active = document.activeElement;
-      if (active && existing.contains(active)) {
-        // User is typing in this row — skip update to avoid losing focus
+      const typing = active && existing.contains(active) &&
+                     (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' ||
+                      active.isContentEditable);
+      if (typing) {
         return;
       }
       const tmp = document.createElement('tbody');
@@ -9640,6 +9652,28 @@ function renderTable(pods) {
       _rowCache[p.pod_id] = newHtml;
     }
     // else: identical — no DOM update needed
+  });
+
+  // Reconcile the run-mode selects against the server, independently of the
+  // row-diff cache above. Two paths let the DOM drift from the DB, and both
+  // ended with the dropdown still showing "+ Duo + ISE" while pods.run_addons
+  // was empty: the focus guard above skips a row WITHOUT updating _rowCache, and
+  // a POD reset clears run_addons server-side while the rendered row keeps the
+  // old value. Re-picking the value already displayed fires no change event at
+  // all, so there was no way to re-assert it — the selection looked correct,
+  // nothing was ever POSTed, and the summary and full table kept showing only
+  // the 21 pipeline steps.
+  //
+  // Skip a select the user is actively using, so this cannot yank a choice out
+  // from under an open dropdown.
+  pods.forEach(p => {
+    const sel = tbody.querySelector('select.run-mode[data-pod="' + p.pod_id + '"]');
+    if (!sel || sel === document.activeElement) return;
+    const server = p.run_addons || '';
+    if (sel.value !== server || (sel.dataset.saved || '') !== server) {
+      sel.value = server;
+      sel.dataset.saved = server;
+    }
   });
 }
 
@@ -9658,15 +9692,26 @@ async function saveRunAddons(sel) {
   if (sel.value === (sel.dataset.saved || '')) return;
   const addons = sel.value ? sel.value.split(',') : [];
   try {
-    await fetch('/api/pods/' + podId + '/run-addons', {
+    const resp = await fetch('/api/pods/' + podId + '/run-addons', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({addons})
     });
-    sel.dataset.saved = sel.value;
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    // Trust the server's echo rather than sel.value. The 5s poll can re-render
+    // this row while the request is in flight, which detaches this element — so
+    // stamping sel.value onto a detached node silently lost the save.
+    const data = await resp.json().catch(() => null);
+    const saved = (data && typeof data.run_addons === 'string') ? data.run_addons : sel.value;
+    sel.dataset.saved = saved;
     const p = (window._lastPods || []).find(x => x.pod_id === podId);
-    if (p) p.run_addons = sel.value;   // keep the cache in step until the next poll
+    if (p) p.run_addons = saved;       // keep the cache in step until the next poll
+    delete _rowCache[podId];           // force the next render to rebuild from server truth
+    renderPodSummary();                // show the new step count now, not in 5s
   } catch (e) {
     console.warn('could not save run mode', e);
+    // Put the control back to what the server last confirmed, so a failed save
+    // cannot leave the UI claiming a mode that was never persisted.
+    sel.value = sel.dataset.saved || '';
   }
 }
 
