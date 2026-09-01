@@ -1125,6 +1125,42 @@ async def _ise_pxgrid_section_built(page) -> bool:
         return False
 
 
+async def _ise_reopen_node(page, log) -> bool:
+    """Reload the node edit page so the pxGrid panel shows CURRENT state.
+
+    The connect poll refreshes by re-opening this page. When that click failed
+    the poll silently kept re-reading the SAME DOM, so it reported ISE's
+    transient "Cisco ISE could not connect to pxGrid." for 47 straight rounds
+    while a fresh browser session showed Connected. Extending the poll window
+    does not help that — it just makes the wrong answer take longer. So this
+    retries, and reports whether the panel was actually refreshed.
+    """
+    for _try in range(3):
+        try:
+            await page.goto(
+                f"{ISE_URL}/admin/#administration/administration_system"
+                f"/administration_system_deployment",
+                wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(6000)
+            await _ise_dismiss_session_info(page)
+            await _ise_dismiss_modal(page)
+            try:
+                await page.wait_for_selector('table tbody tr, .dijitGrid', timeout=20000)
+            except Exception:
+                await page.wait_for_timeout(4000)
+            await _ise_dismiss_modal(page)
+            await page.locator(
+                'table tbody tr a:text-is("ise"), td a:text-is("ise")'
+            ).first.click(timeout=12000)
+            await page.wait_for_timeout(8000)
+            await _ise_dismiss_modal(page)
+            return True
+        except Exception as e:
+            log(f"re-open node attempt {_try + 1}/3 failed: {str(e).splitlines()[0][:110]}")
+            await page.wait_for_timeout(3000)
+    return False
+
+
 async def _ise_wait_pxgrid_region(page, log, timeout_s: int = 90) -> bool:
     """Wait for the region dropdown to finish loading.
 
@@ -2281,6 +2317,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # 3-minute mark and verified Connected (PseudoCo-524, us-west-2,
             # Active, Deregister present) shortly after — the registration had
             # succeeded and only this check was wrong.
+            _refreshed = True   # the panel was just loaded by the register flow
             for _attempt in range(60):  # 60 × 10s = 10 min
                 await page.wait_for_timeout(10000)
                 _panel = await _pxgrid_panel(page)
@@ -2303,32 +2340,49 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                                   f"(account {_panel.get('account')}, "
                                   f"name {_panel.get('name')}, region {_panel.get('region')})")
 
-                log(f"Poll {_attempt + 1}/18: status={_panel.get('status')!r} "
-                    f"deregister={_panel.get('deregister')}")
+                log(f"Poll {_attempt + 1}/60: status={_panel.get('status')!r} "
+                    f"deregister={_panel.get('deregister')} "
+                    f"(panel refreshed: {_refreshed})")
 
                 # Re-navigate periodically: the panel is populated when the node
                 # edit page loads, so a stale page can sit on pre-registration
                 # content indefinitely.
                 if _attempt % 6 == 5:
-                    try:
-                        await page.goto(
-                            f"{ISE_URL}/admin/#administration/administration_system"
-                            f"/administration_system_deployment",
-                            wait_until="domcontentloaded", timeout=60000)
-                        await page.wait_for_timeout(10000)
-                        await _ise_dismiss_session_info(page)
-                        # _ise_dismiss_modal clears the Dijit dialog underlay that
-                        # covers the node link. Without it this click times out
-                        # every time, the panel is never reloaded, and the poll
-                        # reports status='' for all 18 attempts no matter what the
-                        # real registration state is — which is exactly what
-                        # POD-5 did.
-                        await _ise_dismiss_modal(page)
-                        await page.locator('a:text-is("ise")').first.click(timeout=10000)
-                        await page.wait_for_timeout(9000)
+                    _refreshed = await _ise_reopen_node(page, log)
+                    if _refreshed:
                         log("Re-opened node edit page to refresh the pxGrid panel")
-                    except Exception as _re:
-                        log(f"Re-navigation failed (continuing): {_re}")
+                    else:
+                        log("WARNING: could not refresh the panel — the status above "
+                            "may be stale, NOT the live registration state")
+
+            # FINAL AUTHORITATIVE READ before declaring failure.
+            #
+            # Twice on 2026-08-31 this step failed a registration that was
+            # actually live: POD-24 polled 47 times reporting "Cisco ISE could
+            # not connect to pxGrid." while a FRESH browser session showed
+            # Connected / PseudoCo-524 / us-west-2 / Active. The poll had lost
+            # its ability to refresh the page and was re-reading a stale DOM,
+            # so no amount of extra waiting could ever have produced the right
+            # answer. A clean re-navigation is the only read worth failing on.
+            log("Poll exhausted — doing one clean re-navigation before failing")
+            if await _ise_reopen_node(page, log):
+                _panel = await _pxgrid_panel(page)
+                log(f"authoritative panel read: {_panel}")
+                if _pxgrid_is_registered(_panel):
+                    _bad = []
+                    if deployment_name and _panel.get("name") != deployment_name:
+                        _bad.append(f"deployment name {_panel.get('name')!r} != {deployment_name!r}")
+                    if PXGRID_REGION not in (_panel.get("region") or ""):
+                        _bad.append(f"region {_panel.get('region')!r} != {PXGRID_REGION!r}")
+                    if _bad:
+                        return False, ("pxGrid Cloud connected but registered wrongly: "
+                                       + "; ".join(_bad))
+                    return True, (f"pxGrid Cloud registered and connected "
+                                  f"(account {_panel.get('account')}, "
+                                  f"name {_panel.get('name')}, region {_panel.get('region')}) "
+                                  f"— confirmed on the final re-read after a stale poll")
+            else:
+                log("could not re-navigate for the final read either")
 
             # Timed out. Report what the panel actually said -- the old message
             # pointed at a screenshot that could be months old.
@@ -3630,6 +3684,21 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
             _log(f"[warn] skip-check DB error for {step}: {_skip_e} — proceeding to run step")
 
         _ise_step_set(pod_id, step, "running", "", db_path)
+        # Confirm the mark actually landed. POD-24's ise_scc_integrate showed
+        # 'pending' with no started_at for the whole time it was running, so the
+        # card looked idle during a multi-minute step. The UPSERT is correct in
+        # isolation, so log what the row really says — next time this happens it
+        # is diagnosable instead of gone with the run.
+        try:
+            with closing(_db_connect(db_path)) as _vdb:
+                _vr = _vdb.execute(
+                    "SELECT status, started_at FROM ise_steps WHERE pod_id=? AND step_name=?",
+                    (pod_id, step)).fetchone()
+            if not _vr or _vr[0] != "running":
+                _log(f"[warn] {step} did not take the 'running' mark — row reads "
+                     f"{_vr[0] if _vr else 'MISSING'!r}; the card will look idle")
+        except Exception as _ve:
+            _log(f"[warn] could not verify the running mark for {step}: {_ve}")
         _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]}")
 
         try:
