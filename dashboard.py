@@ -5553,6 +5553,41 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                 # FAIL detail is how a dirty org reads as a clean one on the card.
                 _persist("ise_pxgrid", "failed" if _remaining else "completed", _detail)
                 log_fn(f"[scc-reset] ise_pxgrid: {_detail}")
+
+                # Invalidate the ISE card steps this deletion just falsified.
+                #
+                # Deleting the SCC-side integration leaves ise_steps still saying
+                # "completed", and the card treats completed/skipped as done and
+                # skips them — ?from_step= does not override that either. So the
+                # DB kept describing integrations the reset had removed and there
+                # was NO path back except editing rows by hand. On 2026-09-01
+                # POD-24 ended with nothing in its ISE Integration Catalog while
+                # every step read green, and its "rebuild" exited in about a
+                # second having skipped all five.
+                #
+                # pxGrid Cloud registration is ISE-side and survives this (both
+                # PODs read Connected/Active immediately afterwards), so
+                # ise_pxgrid_register is deliberately NOT reset — only the SCC
+                # integration and what depends on it.
+                if _deleted:
+                    _INVALIDATED = ("ise_scc_integrate", "ise_scc_deactivate_reactivate",
+                                    "ise_cdfmc_integrate", "ise_sgt_verify")
+                    try:
+                        _ic = _db()
+                        _ic.execute(
+                            "UPDATE ise_steps SET status='pending', result='', "
+                            "started_at=NULL, completed_at=NULL WHERE pod_id=? AND "
+                            f"step_name IN ({','.join('?' * len(_INVALIDATED))})",
+                            (pod_id, *_INVALIDATED))
+                        _n = _ic.total_changes
+                        _ic.commit(); _ic.close()
+                        log_fn(f"[scc-reset] reset {_n} ISE card step(s) to pending — "
+                               f"the integration they recorded no longer exists")
+                    except sqlite3.Error as _re_e:
+                        # Loud, because silently leaving them green is the bug.
+                        log_fn(f"[scc-reset] WARNING: could not reset ISE card steps "
+                               f"({_re_e}) — they still claim integrations that were "
+                               f"just deleted; reset them before re-running the card")
             except Exception as _e:
                 _persist("ise_pxgrid", "failed", f"Error: {str(_e)[:120]}")
                 log_fn(f"[scc-reset] ise_pxgrid error: {_e}")
