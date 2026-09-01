@@ -3,7 +3,7 @@
 import sqlite3, json, threading, csv, io, os, time, sys, subprocess, re
 from datetime import datetime
 from pathlib import Path
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, make_response
 
 sys.path.insert(0, str(Path(__file__).parent))
 import onboard_router
@@ -330,7 +330,24 @@ def set_step(pod_id, step_name, status, result=""):
 # ---- Flask routes ----
 @app.route("/")
 def index():
-    return render_template_string(DASHBOARD_HTML)
+    # Never let the browser reuse this page without asking.
+    #
+    # All the UI — ~5,000 lines of JS — is inline in DASHBOARD_HTML, so a cached
+    # page means cached CODE. With no cache headers at all, browsers fall back to
+    # heuristic caching and may serve a stale copy without revalidating, which is
+    # how a fixed dashboard keeps behaving like the broken one. On 2026-09-01 the
+    # run-mode fix was live in the server and confirmed in the served HTML while
+    # the browser still ran the old renderTable, and the addon steps went on
+    # failing to load until a hard reload. That cost a diagnosis twice, because
+    # every server-side check says the fix is present.
+    #
+    # The page is only served from localhost, so revalidating every load costs
+    # nothing next to shipping stale code.
+    resp = make_response(render_template_string(DASHBOARD_HTML))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 _res_cache = {"at": 0.0, "data": None}
 _res_lock = threading.Lock()
