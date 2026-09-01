@@ -82,8 +82,17 @@ def _db_connect(db_path: str, retries: int = 8, delay: float = 0.4) -> sqlite3.C
     for attempt in range(retries):
         try:
             conn = sqlite3.connect(db_path, timeout=30)
-            conn.execute("PRAGMA journal_mode=DELETE")
-            conn.execute("PRAGMA synchronous=OFF")
+            # WAL, matching dashboard.py's _db(). These MUST agree: flipping a
+            # WAL database back to DELETE needs an exclusive lock, so with the
+            # dashboard connected this raised "database is locked" and took the
+            # whole dashboard down at import time.
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Was synchronous=OFF. In WAL that risks a corrupt file on an OS
+            # crash or power loss, and this database was already corrupted once
+            # on 2026-09-01 by concurrent writers. NORMAL is the standard WAL
+            # setting: safe against corruption, at worst losing the last commits.
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=15000")
             return conn
         except sqlite3.OperationalError as e:
             if ("disk I/O error" in str(e) or "unable to open database file" in str(e)) and attempt < retries - 1:

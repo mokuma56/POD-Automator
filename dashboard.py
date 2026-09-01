@@ -62,10 +62,31 @@ def check_pod_vpn(pod_id):
 
 # ---- DB helpers ----
 def _db():
-    conn = sqlite3.connect(str(DB_PATH))
+    # WAL, not DELETE. On 2026-09-01 this database was corrupted mid-run
+    # ("database disk image is malformed") with three writers on it at once — the
+    # dashboard plus two ISE containers — over the Docker bind mount. In DELETE
+    # mode every writer takes an exclusive lock on the database file itself and
+    # rewrites the rollback journal beside it, which is exactly the pattern that
+    # filesystem hurts; in WAL, readers never block the writer and the writer
+    # appends to a separate log.
+    #
+    # Verified WAL actually works over this bind mount before switching: a
+    # container opened the same file, reported journal_mode=wal, wrote, and the
+    # host read the row back with quick_check ok. That check matters because WAL
+    # needs shared-memory mapping, which is what makes it unreliable on some
+    # network filesystems and is the likely reason DELETE was chosen here.
+    #
+    # journal_mode is a persistent property of the FILE, so this also fixes the
+    # container-side connections in duo_automation / ise_integrations / onboard*
+    # without touching their ~50 call sites.
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
+    # Wait rather than raising "database is locked" the instant a writer holds
+    # it. WAL removes most contention, not all — the checkpointer still needs
+    # the write lock.
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 def _get_global_config(conn, key, default=""):
@@ -2061,6 +2082,79 @@ def api_fabric_reset(pod_id):
 # Watchdog helper — clears stuck 'running' rows after a container exits
 # ---------------------------------------------------------------------------
 
+# PODs whose Duo card this process is currently running. Duo runs in-process,
+# so a 'running' duo_steps row left by a previous process is stale by
+# definition — the thread that owned it no longer exists.
+_DUO_INFLIGHT = set()
+
+
+def _card_already_running(pod_id, table):
+    """Is a card already mid-run for this POD? Returns the step name, or "".
+
+    Two cards on one POD is not merely wasteful — it corrupted the database on
+    2026-09-01. A POD-24 ISE run was started while an earlier one was still
+    going, and with three writers on one SQLite file over the Docker bind mount
+    the file went "database disk image is malformed" and had to be recovered.
+    The two runs also fought over ISE admin sessions, producing a spurious
+    "[soft-fail] ISE login failed", and the older container finished by writing a
+    row whose step had already been reset — leaving completed_at set with
+    started_at NULL.
+
+    Nothing stopped that: the endpoints happily launched a second container. So
+    refuse instead, and make the caller stop the first one deliberately.
+    """
+    try:
+        c = _db()
+        try:
+            row = c.execute(
+                f"SELECT step_name FROM {table} WHERE pod_id=? AND status='running' "
+                f"LIMIT 1", (pod_id,)).fetchone()
+        finally:
+            c.close()
+    except sqlite3.Error:
+        # Never block a run because the check itself failed — the guard is a
+        # safety net, not a gate we can afford to fail closed on.
+        return ""
+    if not row:
+        return ""
+
+    # A 'running' ROW is not a running CARD. If a container was killed — or the
+    # dashboard was restarted mid-run — the row stays 'running' forever, and
+    # guarding on it alone would lock that POD out permanently. That is a worse
+    # failure than the one this guard exists to prevent, so confirm against
+    # something real before refusing.
+    if table == "ise_steps":
+        # ISE cards run as `docker run` with no --name, so identify them by the
+        # VPN namespace they attach to.
+        try:
+            _vpn = subprocess.run(
+                ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.Id}}"],
+                capture_output=True, text=True, timeout=10)
+            _vpn_id = (_vpn.stdout or "").strip()
+            if not _vpn_id:
+                return ""
+            _ps = subprocess.run(
+                ["docker", "ps", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=10)
+            for _name in (_ps.stdout or "").split():
+                if _name.startswith("vpn-"):
+                    continue
+                _ins = subprocess.run(
+                    ["docker", "inspect", _name, "--format",
+                     "{{.HostConfig.NetworkMode}}"],
+                    capture_output=True, text=True, timeout=10)
+                if (_ins.stdout or "").strip() == f"container:{_vpn_id}":
+                    return (row["step_name"] or "")
+            # Row says running, no container backing it — stale.
+            return ""
+        except Exception:
+            # Cannot tell; prefer letting the operator proceed.
+            return ""
+
+    # Duo runs in THIS process, so a live run is one this process started.
+    return (row["step_name"] or "") if pod_id in _DUO_INFLIGHT else ""
+
+
 def _clear_stuck_running(pod_id, table, mode=None):
     """After a docker container exits, any row still at status='running' for
     this pod was never updated (container crashed/OOM/killed).  Mark them
@@ -2351,6 +2445,14 @@ def api_duo_run(pod_id):
     # was read here, so POST /api/duo/run/POD-5?from_step=4 silently restarted the
     # card at bootstrap and re-ran ten minutes of already-green steps.
     from_step = int(request.args.get("from_step", data.get("from_step", 0)))
+
+    _busy = _card_already_running(pod_id, "duo_steps")
+    if _busy:
+        return jsonify({"status": "error", "message":
+                        f"Duo card is already running on {pod_id} (step {_busy!r}). "
+                        f"Wait for it rather than starting a second — Duo runs in "
+                        f"this process and two would share a Playwright slot and "
+                        f"the same DB."}), 409
     db_path = str(DB_PATH)
 
     def _run():
@@ -2361,7 +2463,12 @@ def api_duo_run(pod_id):
             log(pod_id, f"[duo] {'OK' if ok else 'FAILED'}: {result}")
         except Exception as e:
             log(pod_id, f"[duo] exception: {e}")
+        finally:
+            # Must be in a finally: an exception here would otherwise leave the
+            # POD permanently marked in-flight and refuse every later run.
+            _DUO_INFLIGHT.discard(pod_id)
 
+    _DUO_INFLIGHT.add(pod_id)
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "pod_id": pod_id, "from_step": from_step})
 
@@ -2511,6 +2618,13 @@ def api_ise_run(pod_id):
     _ensure_ise_table()
     data = request.get_json(silent=True) or {}
     from_step = int(request.args.get("from_step", data.get("from_step", 0)))
+
+    _busy = _card_already_running(pod_id, "ise_steps")
+    if _busy:
+        return jsonify({"status": "error", "message":
+                        f"ISE card is already running on {pod_id} (step {_busy!r}). "
+                        f"Wait for it or stop its container first — two cards on one "
+                        f"POD fight over ISE sessions and corrupted the DB once."}), 409
 
     # Verify VPN container is running
     r = subprocess.run(
