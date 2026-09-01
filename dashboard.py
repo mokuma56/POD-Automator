@@ -2413,6 +2413,40 @@ def api_step_timings():
     return jsonify(out)
 
 
+@app.route("/api/ise/logs/<pod_id>")
+def api_ise_logs(pod_id):
+    """Incremental ISE-card log lines for the live panel.
+
+    The ISE card's output is spread across several prefixes because the work
+    spans the container and two host-side helpers: [ise] itself, plus
+    [scc-nav], [cdfmc-nav], [sgt-verify] and [ise-teardown]. Filtering to just
+    "[ise]" would hide exactly the parts that fail most often.
+    """
+    try:
+        since = int(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        since = 0
+    try:
+        limit = min(int(request.args.get("limit", 400)), 2000)
+    except (TypeError, ValueError):
+        limit = 400
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT id, log_line, timestamp FROM pipeline_logs "
+            "WHERE pod_id=? AND id>? AND ("
+            "     log_line LIKE '[ise]%' OR log_line LIKE '[scc-nav]%'"
+            "  OR log_line LIKE '[cdfmc-nav]%' OR log_line LIKE '[sgt-verify]%'"
+            "  OR log_line LIKE '[ise-teardown]%') "
+            "ORDER BY id LIMIT ?",
+            (pod_id, since, limit)).fetchall()
+        lines = [{"id": r[0], "log_line": r[1], "timestamp": r[2]} for r in rows]
+        last_id = lines[-1]["id"] if lines else since
+        return jsonify({"lines": lines, "last_id": last_id})
+    finally:
+        conn.close()
+
+
 @app.route("/api/duo/logs/<pod_id>")
 def api_duo_logs(pod_id):
     """Incremental Duo-card log lines for the live panel.
@@ -8483,34 +8517,43 @@ DASHBOARD_HTML = """
      "how much headroom is left", not "what is the raw total". */
   .res-panel { margin-left:auto; display:flex; align-items:flex-end;
                justify-content:space-around; gap:6px;
-               width:min(600px, 40vw); min-width:300px; height:92px;
+               width:min(620px, 36vw); min-width:360px; height:108px;
                background:#0d1b32; border:1px solid #1c2f52; border-radius:8px;
-               padding:6px 12px 8px 12px; box-sizing:border-box; }
+               padding:8px 18px 10px 18px; box-sizing:border-box; }
   /* On a wide display, lift it out of the flow: the toolbar row keeps its
      natural button height instead of stretching to the panel's, and the panel
      drops into the empty block to the right of the view-toggle row. Below this
      width it stays in normal flow and simply wraps, so it can never overlap. */
-  @media (min-width: 1650px) {
+  /* Engage the absolute layout only when the toolbar genuinely has room for
+     BOTH. Reserving space the row does not have just moves the problem: at a
+     620px reservation it wrapped the last button onto a second line instead of
+     overlapping it. With "Reset All SCC Orgs" removed the buttons measure
+     1046px, so 1046 + 640 reserved + margins fits from ~1730px up; below that
+     the panel returns to normal flow on its own line. */
+  @media (min-width: 1730px) {
     /* top:-10px centres it in the band between the stat tiles and the POD
        table: measured 20px of clearance above and 0 below at top:0.
        padding-right on the row RESERVES the panel's column so the buttons can
        never run underneath it — absolute positioning alone overlapped the
        "Reset All SCC Orgs" button on any viewport under ~1859px. */
-    .res-panel { position:absolute; right:0; top:-10px; margin:0; }
-    .toolbar-row { padding-right:620px; }
+    /* The band between the stat tiles and the POD table measures 112px and the
+       gauge stack needs ~108px, so a 108px box centres with 2px clearance top
+       and bottom — no overhang onto the table, nothing escaping the box. */
+    .res-panel { position:absolute; right:0; top:-18px; margin:0; }
+    .toolbar-row { padding-right:640px; }
   }
   .rv { display:flex; flex-direction:column; align-items:center; gap:3px;
         cursor:default; flex:1; min-width:0; }
-  .rv-track { position:relative; width:22px; height:40px; background:#0a1628;
+  .rv-track { position:relative; width:32px; height:44px; background:#0a1628;
               border:1px solid #1c2f52; border-radius:4px; overflow:hidden; }
   .rv-fill { position:absolute; left:0; right:0; bottom:0; border-radius:3px;
              transition:height .4s ease; }
   .rv-max { position:absolute; left:-1px; right:-1px; height:0;
             border-top:1px dashed #ff6b7a; }
-  .rv-val { font-size:13px; font-weight:700; color:#e8eef7; line-height:1; }
-  .rv-lbl { font-size:10px; color:#cdd6e0; font-weight:600; white-space:nowrap;
+  .rv-val { font-size:15px; font-weight:700; color:#e8eef7; line-height:1; }
+  .rv-lbl { font-size:11.5px; color:#cdd6e0; font-weight:600; white-space:nowrap;
             overflow:hidden; text-overflow:ellipsis; max-width:100%; }
-  .rv-sub { font-size:9px; color:#7d8fa3; white-space:nowrap; }
+  .rv-sub { font-size:10.5px; color:#7d8fa3; white-space:nowrap; }
 
   .card-time { font-size:11px; font-weight:400; color:#7d8fa3; margin-left:8px;
               white-space:nowrap; }
@@ -8708,8 +8751,6 @@ DASHBOARD_HTML = """
      <button class="btn-start-all" id="btn-run-all" onclick="runAllPods()" style="background:#7c3aed;color:#fff;">&#9654; Run All POD Automation</button>
       <button class="btn-start-all" id="btn-full-reset" onclick="fullReset()" style="background:#7f1d1d;border-color:#ef4444;color:#fca5a5;">&#9888; Full Reset</button>
      <button class="btn-start-all" onclick="window.location.href='/api/generate-lab-pdf'" style="background:#0d4f6e;border-color:#00bceb;color:#00bceb;">&#128196; Generate Lab Details</button>
-      <button class="btn-start-all" id="btn-scc-reset-all" onclick="resetAllSccOrgs()" style="background:#2d3f50;border-color:#445566;color:#cdd6e0;">&#9881; Reset All SCC Orgs</button>
-      <span id="scc-reset-all-status" style="font-size:12px;color:#667788;"></span>
       <span id="scc-refresh-global-status" style="font-size:12px;color:#667788;"></span>
      <span id="docker-status" style="font-size:12px;color:#667788;"></span>
      <!-- Resource panel: fills the empty block to the right of the buttons.
@@ -8850,6 +8891,21 @@ DASHBOARD_HTML = """
        <div class="tab-content" id="tab-ise">
          <div id="ise-grid" style="padding:16px;min-height:260px;">
            <div style="color:#667788;font-size:13px;">Select a POD to manage ISE integrations</div>
+         </div>
+         <!-- Sibling of #ise-grid on purpose, exactly as the Duo card does it:
+              renderIseGrid replaces that element's innerHTML on every poll, which
+              would wipe the log and reset the scroll position mid-run. -->
+         <div id="ise-log-wrap" style="padding:0 16px 16px;display:none;">
+           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+             <span style="font-size:12px;font-weight:600;color:#cdd6e0;">Live log</span>
+             <span>
+               <label style="font-size:11px;color:#8899aa;cursor:pointer;">
+                 <input type="checkbox" id="ise-log-follow" checked style="vertical-align:middle;"> follow
+               </label>
+               <button id="ise-log-clear" style="background:#1c2733;color:#cdd6e0;border:none;padding:2px 9px;border-radius:3px;cursor:pointer;font-size:11px;margin-left:8px;">Clear</button>
+             </span>
+           </div>
+           <pre id="ise-log" style="background:#0d1117;border:1px solid #1c2733;border-radius:6px;padding:10px 12px;margin:0;max-height:260px;overflow:auto;font-size:11px;line-height:1.5;color:#9fb0c0;white-space:pre-wrap;word-break:break-word;"></pre>
          </div>
        </div>
 
@@ -13840,6 +13896,50 @@ function _iseStartPoller(podId) {
   }, 3000);
 }
 
+// ── ISE live log panel ───────────────────────────────────────────────────────
+// Mirrors the Duo card. Incremental by id so a long-lived POD's pipeline_logs
+// (thousands of rows) is not refetched every poll, and it keeps the ISE card's
+// several prefixes — [ise], [scc-nav], [cdfmc-nav], [sgt-verify] — because the
+// host-side helpers are where this card usually fails.
+async function pollIseLogs(podId) {
+  const wrap = document.getElementById('ise-log-wrap');
+  const pre  = document.getElementById('ise-log');
+  if (!wrap || !pre) return;
+  if (window._iseLogPod !== podId) {        // POD switched — start clean
+    window._iseLogPod = podId;
+    window._iseLogSince = 0;
+    pre.textContent = '';
+  }
+  try {
+    const r = await fetch('/api/ise/logs/' + podId + '?since=' + (window._iseLogSince || 0));
+    if (!r.ok) return;
+    const d = await r.json();
+    wrap.style.display = 'block';
+    if (d.lines && d.lines.length) {
+      const follow = document.getElementById('ise-log-follow');
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+      d.lines.forEach(l => {
+        const t = (l.timestamp || '').substring(11, 19);
+        pre.textContent += (t ? t + '  ' : '') + (l.log_line || '') + String.fromCharCode(10);
+      });
+      window._iseLogSince = d.last_id;
+      // Only autoscroll when the reader has not scrolled up to look at something.
+      if (!follow || (follow.checked && atBottom)) pre.scrollTop = pre.scrollHeight;
+    }
+  } catch (e) { /* transient fetch error — next tick retries */ }
+}
+
+function wireIseLogControls() {
+  const clr = document.getElementById('ise-log-clear');
+  if (clr && !clr._wired) {
+    clr._wired = true;
+    clr.onclick = () => {
+      const pre = document.getElementById('ise-log');
+      if (pre) pre.textContent = '';
+    };
+  }
+}
+
 function renderIseGrid(podId, data) {
   const grid = document.getElementById('ise-grid');
   if (!grid) return;
@@ -13868,7 +13968,6 @@ function renderIseGrid(podId, data) {
   html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">ISE Integrations</span>';
   html += '<div style="display:flex;gap:8px;">';
    html += '<button id="ise-run-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u25b6 Run</button>';
-   html += '<button id="ise-reactivate-btn" title="Re-run only the ISE\u2192SCC Deactivate+Reactivate step" style="background:#f0a500;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;"' + (isRunning ? ' disabled' : '') + '>\u21ba Reactivate SCC</button>';
    html += '<button id="ise-sgt-recheck-btn" title="Immediately recheck SGTs in Secure Access" style="background:#00e68a;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">\U0001F50D Re-verify SGTs</button>';
    html += '<button id="ise-reset-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;"' + (isRunning ? ' disabled' : '') + '>\u21bb Reset</button>';
   html += '</div></div>';
@@ -13904,14 +14003,14 @@ function renderIseGrid(podId, data) {
 
   grid.innerHTML = html;
   grid._lastHtml = true;
+  pollIseLogs(podId);
+  wireIseLogControls();
 
   setTimeout(() => {
     const runBtn        = document.getElementById('ise-run-btn');
-    const reactivateBtn = document.getElementById('ise-reactivate-btn');
     const sgtRecheckBtn = document.getElementById('ise-sgt-recheck-btn');
     const resetBtn      = document.getElementById('ise-reset-btn');
     if (runBtn)         runBtn.onclick        = () => iseRun(podId);
-    if (reactivateBtn)  reactivateBtn.onclick = () => iseReactivate(podId);
     if (sgtRecheckBtn)  sgtRecheckBtn.onclick = () => iseSgtRecheck(podId);
     if (resetBtn)       resetBtn.onclick      = () => iseReset(podId);
   }, 0);
