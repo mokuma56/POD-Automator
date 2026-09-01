@@ -1841,7 +1841,7 @@ SESSION_AUTOMATION_LOG = r"C:\dcloud\session_automation.log"
 
 
 def read_idac_url_from_session(pod_id: str, log=None) -> str:
-    """Read the iDAC URL dCloud already created for this session. Read-only.
+    r"""Read the iDAC URL dCloud already created for this session. Read-only.
 
     dCloud writes the session's iDAC URL into C:\dcloud\session_automation.log
     on the jump host when the pod spins up. That URL corresponds to the orgs the
@@ -1862,27 +1862,158 @@ def read_idac_url_from_session(pod_id: str, log=None) -> str:
     except Exception as e:
         _log(f"could not reach the jump host to read the session log: {e}")
         return ""
+    # Report a FAILED read differently from a log that genuinely holds no URL.
+    # Those were indistinguishable — both produced "no iDAC URL found in the
+    # session log" — and a transient WinRM drop was read as a clean negative on
+    # POD-5, whose log did contain the URL all along. That matters twice over:
+    # duo_refresh_session_scope() cannot detect a rotated session without this
+    # value, so a mislabelled transient silently disables it on exactly the run
+    # it exists for. Emit a sentinel so the three cases stay distinct, and retry
+    # once, because the failure we saw was transient.
+    #
+    # Note the file is only ~6KB: matching remotely buys nothing and the earlier
+    # Select-String pipeline was itself what timed out, so read the file whole
+    # and match locally.
+    ps = (r"$p='" + SESSION_AUTOMATION_LOG + r"'; "
+          r"if (Test-Path $p) { Get-Content $p -Raw } else { Write-Output '@@MISSING@@' }")
     try:
-        r = sess.run_ps(
-            "$m = Select-String -Path '" + SESSION_AUTOMATION_LOG + "' "
-            "-Pattern 'https://idac\\.cat-dcloud\\.com[^\\s\"'']*' ; "
-            "$m | ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } | "
-            "Select-Object -Unique -First 1"
-        )
-        url = r.std_out.decode("utf-8", errors="replace").strip().split("\n")[0].strip()
-        if url.startswith("https://idac.cat-dcloud.com"):
-            _log(f"read existing iDAC URL from the session log ({len(url)} chars)")
-            return url
-        _log("no iDAC URL found in the session log")
+        for attempt in (1, 2):
+            r = sess.run_ps(ps)
+            out = (r.std_out or b"").decode("utf-8", errors="replace")
+            err = (r.std_err or b"").decode("utf-8", errors="replace").strip()
+            if getattr(r, "status_code", 0) != 0 or (not out.strip() and err):
+                _log(f"session log read FAILED (attempt {attempt}/2, "
+                     f"rc={getattr(r, 'status_code', '?')}): {err[:160]}")
+                continue
+            if "@@MISSING@@" in out:
+                _log(f"{SESSION_AUTOMATION_LOG} does not exist on the jump host")
+                return ""
+            m = _re.search(r"https://idac\.cat-dcloud\.com[^\s\"'<>]+", out)
+            if m:
+                url = m.group(0)
+                _log(f"read existing iDAC URL from the session log ({len(url)} chars)")
+                return url
+            _log(f"no iDAC URL in the session log ({len(out)} chars read) — the "
+                 f"log exists but records no iDAC redirect for this session")
+            return ""
+        _log("could not read the session log after 2 attempts — treating the "
+             "iDAC URL as UNKNOWN, not as absent")
         return ""
     except Exception as e:
-        _log(f"could not read the session log: {e}")
+        _log(f"could not read the session log: {type(e).__name__}: {e}")
         return ""
     finally:
         try:
             sess.close()
         except Exception:
             pass
+
+
+# Columns describing the pod's DUO org specifically. dCloud builds a NEW Duo org
+# for every session, so these go stale together — while the row holding them,
+# keyed by the SCC org number, stays perfectly valid. Deliberately excludes
+# sa_scim_token / sa_scim_url: those belong to Secure Access, whose org is stable
+# across sessions, and the token already has its own validity probe
+# (_scim_token_valid) in the saml_scim_config gate.
+DUO_SESSION_SCOPED_COLUMNS = (
+    "duo_ikey", "duo_skey", "duo_host",
+    "duo_admin_email", "duo_admin_password", "duo_admin_host",
+    "duo_passkey_cred", "duo_passkey_hwm", "duo_admin_totp_secret",
+    "duo_saml_app_ikey",
+    "authproxy_ikey", "authproxy_skey", "authproxy_cfg",
+    "authproxy_enroll_blob", "authproxy_blob_saved_at", "authproxy_sso_cfg",
+)
+
+
+def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
+                              log=None) -> str:
+    """Detect a new dCloud session and drop the Duo credentials it invalidated.
+
+    THE PROBLEM
+        A new lab session maps fresh PODs onto the SAME SCC orgs but gives each
+        pod a BRAND NEW Duo org. org_credentials is keyed by the SCC org number,
+        so every Duo column still holds the previous session's values under a key
+        that is still correct — nothing about the key reveals the staleness.
+
+        Presence checks then read as "already configured". duo_passkey_login
+        returned "already has Admin API credentials — nothing to do" and the card
+        went green having configured nothing. Worse, when the previous session's
+        Duo org still answers, the whole card succeeds against the WRONG tenant —
+        the same failure shape as the stale iDAC URL that resolved org 533 to
+        org 506.
+
+    THE SIGNAL
+        The iDAC URL is scoped to the SESSION, so it changes exactly when the Duo
+        org does. session_id cannot be used instead: POD-5 carries the same
+        session_id POD-18 had before it was deleted. Reading the URL from the
+        jump host's session log is read-only and never mints — see
+        read_idac_url_from_session and the warning on fetch_idac_url_from_dcloud.
+
+    Returns "unchanged" | "rotated" | "stored" | "unavailable".
+    """
+    import sqlite3 as _sq_rs
+    _log = log or (lambda m: print(f"  [duo-session] {m}"))
+
+    try:
+        with _sq_rs.connect(db_path) as conn:
+            conn.row_factory = _sq_rs.Row
+            row = conn.execute(
+                "SELECT idac_url FROM org_credentials WHERE org_number=?",
+                (org_num,)).fetchone()
+        stored = ((row["idac_url"] if row else "") or "").strip()
+    except _sq_rs.Error as e:
+        _log(f"could not read the stored iDAC URL: {e}")
+        return "unavailable"
+
+    live = read_idac_url_from_session(pod_id, log=_log)
+
+    # No live URL means we lost the jump host, NOT that the session rotated.
+    # Wiping good credentials on a WinRM blip would turn a transient outage into
+    # a full rebuild against an org that never changed.
+    if not live:
+        _log("could not read the session's iDAC URL — leaving stored Duo "
+             "credentials alone (cannot prove the session rotated)")
+        return "unavailable"
+
+    if live == stored:
+        return "unchanged"
+
+    if not stored:
+        # Nothing to compare against, so rotation is unproven. Record the URL but
+        # do not clear: an empty idac_url with populated Duo columns is what a
+        # partial manual reset looks like, not evidence of a new session.
+        try:
+            with _sq_rs.connect(db_path) as conn:
+                conn.execute(
+                    "INSERT INTO org_credentials (org_number, idac_url) VALUES (?,?) "
+                    "ON CONFLICT(org_number) DO UPDATE SET idac_url=excluded.idac_url, "
+                    "updated_at=datetime('now')", (org_num, live))
+        except _sq_rs.Error as e:
+            _log(f"could not store the iDAC URL: {e}")
+            return "unavailable"
+        _log(f"stored this session's iDAC URL for org {org_num}")
+        return "stored"
+
+    # Differs from a URL we previously recorded: this is a new session, and every
+    # Duo value in the row belongs to the org the PREVIOUS session created.
+    try:
+        with _sq_rs.connect(db_path) as conn:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(org_credentials)")}
+            clear = [c for c in DUO_SESSION_SCOPED_COLUMNS if c in cols]
+            conn.execute(
+                f"UPDATE org_credentials SET idac_url=?, updated_at=datetime('now'), "
+                f"{', '.join(c + '=?' for c in clear)} WHERE org_number=?",
+                [live] + [""] * len(clear) + [org_num])
+    except _sq_rs.Error as e:
+        _log(f"could not clear stale Duo credentials: {e}")
+        return "unavailable"
+
+    _log(f"NEW SESSION detected for org {org_num} — the iDAC URL changed, so "
+         f"dCloud has built a new Duo org. Cleared {len(clear)} stale Duo "
+         f"credential(s); the card will rebuild them rather than configure the "
+         f"previous session's tenant.")
+    return "rotated"
 
 
 def fetch_idac_url_from_dcloud(log=None, pod_id: str = "",
@@ -2501,8 +2632,23 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
                            (org_num,)).fetchone()
         oc = dict(row) if row else {}
 
+    # Presence is not validity. A new dCloud session gives the pod a NEW Duo org
+    # while this row — keyed by the stable SCC org number — still holds the old
+    # org's ikey/skey/host, so returning on presence alone reported success
+    # having done nothing, against the previous session's tenant.
+    # duo_refresh_session_scope() normally clears these before we get here; this
+    # probe covers the case where the session log could not be read, and matches
+    # what the bootstrap step already does further down.
     if oc.get("duo_ikey") and oc.get("duo_skey") and oc.get("duo_host"):
-        return True, f"org {org_num} already has Admin API credentials — nothing to do"
+        try:
+            _duo_request(oc["duo_ikey"], oc["duo_skey"], oc["duo_host"],
+                         "GET", "/admin/v1/info/summary")
+            return True, f"org {org_num} already has Admin API credentials — nothing to do"
+        except Exception as e:
+            if "401" not in str(e) and "403" not in str(e):
+                raise
+            _log(f"org {org_num}: stored Admin API credentials rejected "
+                 f"({str(e)[:60]}) — re-creating them")
 
     # DESTRUCTIVE: each idac_sdk run reprovisions the whole pod identity — a new
     # Duo org AND a new SCC org AND a new Meraki org. Never mint a URL when one
@@ -10632,6 +10778,24 @@ def duo_run_card(
     except Exception as e:
         return False, f"DB error: {e}"
 
+    # ── Has dCloud handed this pod a new Duo org since we last ran? ───────────
+    # Must happen BEFORE the credentials below are read into locals, and before
+    # any step's presence check runs — otherwise the card configures the previous
+    # session's Duo tenant and reports success. See duo_refresh_session_scope.
+    try:
+        _scope = duo_refresh_session_scope(pod_id, db_path, org_num, log=_log)
+        if _scope == "rotated":
+            with _sq.connect(db_path) as conn:
+                conn.row_factory = _sq.Row
+                oc = dict(conn.execute(
+                    "SELECT * FROM org_credentials WHERE org_number=?", (org_num,)
+                ).fetchone() or {})
+    except Exception as e:
+        # Never block the card on this check: it is a safety net, and the steps
+        # below have their own validity probes.
+        _log(f"session-scope check did not complete ({type(e).__name__}: {e}) — "
+             f"continuing with stored credentials")
+
     duo_ikey      = oc.get("duo_ikey", "").strip()
     duo_skey      = oc.get("duo_skey", "").strip()
     duo_host      = oc.get("duo_host", "").strip()
@@ -10650,7 +10814,12 @@ def duo_run_card(
         _log("no Duo Admin API credentials — bootstrap step will create them")
 
     # ── Detect mode ───────────────────────────────────────────────────────────
-    # SCC / SA / Duo orgs are permanently coupled — never torn down.
+    # SCC and Secure Access orgs are stable across sessions — the same SCC org
+    # number is reused by whichever pod a new session maps onto it. The DUO org
+    # is NOT: dCloud builds a new one every session. That asymmetry is why
+    # duo_refresh_session_scope() runs above; without it the Duo columns in this
+    # row describe an org from a previous session while the row's key stays
+    # valid, and every presence check below reads as "already configured".
     # Every run is effectively a session re-integration: push authproxy,
     # sync AD users, verify app.  No "full setup vs refresh" distinction needed.
     is_refresh = True
