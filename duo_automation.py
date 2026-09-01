@@ -5167,6 +5167,24 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
 
     _log = log or (lambda s: print(f"     [duo-saml] {s}"))
 
+    # This is the one Duo entry point that does NOT go through duo_run_card —
+    # the /api/duo/saml-setup button calls it directly — so the new-session check
+    # has to happen here too. Without it a run started from that button on a new
+    # lab session would authenticate with the PREVIOUS session's iDAC URL and
+    # configure the Duo org that session created. Step 2 below opens SCC with
+    # exactly that URL, so this must precede the credential load.
+    try:
+        with _sq.connect(db_path) as _c0:
+            _c0.row_factory = _sq.Row
+            _p0 = _c0.execute("SELECT scc_org FROM pods WHERE pod_id=?",
+                              (pod_id,)).fetchone()
+        _m0 = _re5.search(r"pseudoco-(\d+)", (_p0["scc_org"] or "") if _p0 else "")
+        if _m0:
+            duo_refresh_session_scope(pod_id, db_path, _m0.group(1), log=_log)
+    except Exception as e:
+        _log(f"session-scope check did not complete ({type(e).__name__}: {e}) — "
+             f"continuing with stored credentials")
+
     # ── 1. Load credentials ───────────────────────────────────────────────────
     _log("loading credentials from DB...")
     try:
