@@ -3790,16 +3790,33 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
                     "SELECT status, result FROM ise_steps WHERE pod_id=? AND step_name=?",
                     (pod_id, step)
                 ).fetchone()
-            if _row and _row[0] in ("completed", "skipped"):
-                # A row marked 'skipped' by an earlier soft-fail is a carried-over
-                # failure, not a success — carry the degradation forward so a
-                # re-run of the remaining steps cannot launder it into a green card.
-                prior = ("degraded" if (_row[1] or "").startswith("[soft-fail]")
-                         else _row[0])
+            _prev_status = _row[0] if _row else ""
+            _prev_result = (_row[1] or "") if _row else ""
+            _was_soft_fail = _prev_result.startswith("[soft-fail]")
+
+            # A '[soft-fail]' row is a FAILURE that was stepped over, not a step
+            # that decided it had nothing to do. It must be retried.
+            #
+            # This code already recognised the distinction — it labelled such a
+            # row "degraded" — and then skipped it anyway, so a soft-failed step
+            # could never re-run. Once cdFMC soft-failed on POD-5 (an ISE login
+            # that failed inside the database-corruption window, minutes after
+            # three clean logins), every subsequent re-run reported "already
+            # skipped, skipping" and the POD kept its failure permanently. The
+            # only way out was editing the row by hand, which is not a workflow.
+            #
+            # A deliberate self-skip is different — "pxGrid Cloud already
+            # registered and connected" is a step verifying live state and
+            # finding nothing to do. Those still count as done.
+            if _row and _prev_status in ("completed", "skipped") and not _was_soft_fail:
                 _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — "
-                     f"already {_row[0]}, skipping")
-                outcomes.append((step, prior, _row[1] or f"already {_row[0]}"))
+                     f"already {_prev_status}, skipping")
+                outcomes.append((step, _prev_status, _prev_result or f"already {_prev_status}"))
                 continue
+            if _was_soft_fail:
+                _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — "
+                     f"retrying a previously soft-failed step "
+                     f"({_prev_result[:80]})")
         except Exception as _skip_e:
             _log(f"[warn] skip-check DB error for {step}: {_skip_e} — proceeding to run step")
 
