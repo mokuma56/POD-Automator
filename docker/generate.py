@@ -205,7 +205,9 @@ def action_down(pods):
         if db_path.exists():
             pod_ids = [p["pod_id"] for p in pods]
             conn = _sqlite3.connect(str(db_path))
-            conn.execute("PRAGMA journal_mode=DELETE")
+            # WAL — must match the other connectors; see dashboard.py _db().
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=15000")
             for pod_id in pod_ids:
                 conn.execute("DELETE FROM pipeline_steps WHERE pod_id=?", (pod_id,))
                 conn.execute("DELETE FROM pipeline_logs WHERE pod_id=?", (pod_id,))

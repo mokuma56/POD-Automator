@@ -29,8 +29,12 @@ SPREADSHEET_PATH = DATA_DIR / "hw_pod_status.csv"
 def _db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=DELETE")
+    # WAL — must match dashboard.py _db() and ise_integrations._db_connect.
+    # Flipping a WAL db back to DELETE needs an exclusive lock and fails with
+    # "database is locked" whenever another process is connected.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA busy_timeout=15000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pods (
             pod_id TEXT PRIMARY KEY,
