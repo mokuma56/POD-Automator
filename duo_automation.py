@@ -11379,8 +11379,19 @@ def duo_run_card(
             except _sq.Error as _ce:
                 gaps.append(f"could not read duo_admin_totp_secret ({_ce})")
 
+            # Must use a JUMP HOST session, not `sess`.
+            #
+            # `sess` is _winrm_connect_for_pod, which targets AD1 (AD_DC_IP) —
+            # correct for the Auth Proxy checks above, because the proxy runs
+            # there. The student login page is published to the JUMP HOST by
+            # duo_publish_totp_page via _winrm_connect_jump. Checking AD1 for it
+            # looked for the files on the wrong machine and reported
+            # "Duo-Login.html,Duo Login.lnk = false,false" immediately after a
+            # publish that had just written them successfully.
+            _jump = None
             try:
-                _pg = sess.run_ps(
+                _jump = _winrm_connect_jump(pod_id, log=_log)
+                _pg = _jump.run_ps(
                     r"$a=Test-Path 'C:\Users\Public\Duo-Login.html'; "
                     r"$b=Test-Path 'C:\Users\Public\Desktop\Duo Login.lnk'; "
                     r"Write-Output ('' + $a + ',' + $b)"
@@ -11389,7 +11400,14 @@ def duo_run_card(
                     gaps.append(f"student login page/shortcut missing on the jump "
                                 f"host (Duo-Login.html,Duo Login.lnk = {_pg or '?'})")
             except Exception as _pe:
-                gaps.append(f"could not check the student login page ({type(_pe).__name__})")
+                gaps.append(f"could not check the student login page on the jump "
+                            f"host ({type(_pe).__name__}: {str(_pe)[:70]})")
+            finally:
+                try:
+                    if _jump:
+                        _jump.close()
+                except Exception:
+                    pass
 
             if gaps:
                 return False, ("Auth Proxy healthy but the student login path is "
