@@ -1,76 +1,109 @@
-# Enable WinRM on Jumphost1 so POD Automator can publish the student Duo
-# passcode page and read the iDAC URL.
+# Enable WinRM on Jumphost1 so POD Automator can reach it.
 #
-# WHY THIS CANNOT BE AUTOMATED
-# WinRM is the only channel the automation has to the jump host, so it cannot
-# be used to turn itself on. Bake this into the dCloud base image, or push the
-# equivalent by GPO from AD1 (which we can reach), and it survives rebuilds.
+# Run as Administrator, from RDP or the console — NOT over WinRM (see below).
+# Safe to re-run: every step is idempotent, and the firewall rule is recreated
+# rather than skipped so a stale or wrongly-scoped rule gets repaired.
 #
-# WHAT THE AUTOMATION ACTUALLY DOES HERE
-#   * writes C:\Users\Public\Duo-Login.html and a .lnk on the Public Desktop
-#   * stages a Duo .ico alongside them
-#   * runs idac_sdk to mint a fresh iDAC URL
-# Nothing else. It connects as the local Administrator over HTTP/5985 using
-# NTLM, which encrypts the payload — Basic auth and AllowUnencrypted are NOT
-# needed and are deliberately not enabled here.
+# EVERY SETTING HERE SURVIVES A REBOOT. Service startup type, the WSMan listener,
+# the firewall rule, the registry policy and the shell limits are all persistent
+# stores. Restart-Service is the only runtime action, and StartupType=Automatic
+# covers boot.
 #
-# Run as Administrator. Safe to re-run.
+# GOLDEN IMAGE: if you sysprep /generalize, Windows REMOVES the WinRM listener.
+# The service, registry policy and firewall rule survive, so the image boots
+# looking correct with nothing listening on 5985. Either snapshot without
+# generalizing, or re-create the listener on first boot from
+# C:\Windows\Setup\Scripts\SetupComplete.cmd.
 
-$ErrorActionPreference = 'Stop'
+# --- Do not kill our own session -------------------------------------------
+# Restarting WinRM while connected THROUGH WinRM drops the session mid-script,
+# so the verification below never runs and a good configuration looks failed.
+$OverWinRM = [bool]$PSSenderInfo
+if ($OverWinRM) {
+  Write-Host 'NOTE: running over WinRM — the service restart will be SKIPPED.' -ForegroundColor Yellow
+  Write-Host '      Reboot, or re-run locally, to apply the service restart.' -ForegroundColor Yellow
+  Write-Host ''
+}
 
-Write-Host '== Enabling PowerShell remoting ==' -ForegroundColor Cyan
+# --- PowerShell remoting ----------------------------------------------------
 # -SkipNetworkProfileCheck matters: a dCloud NIC often lands on the Public
-# profile, and plain Enable-PSRemoting refuses to create the firewall rule
-# there, leaving WinRM running but unreachable.
+# profile, where plain Enable-PSRemoting refuses to create the firewall rule and
+# leaves WinRM running but unreachable.
 Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
 
-Write-Host '== Ensuring the HTTP listener on 5985 ==' -ForegroundColor Cyan
-$listener = Get-ChildItem WSMan:\localhost\Listener -ErrorAction SilentlyContinue |
-    Where-Object { $_.Keys -contains 'Transport=HTTP' }
-if (-not $listener) {
-    New-Item -Path WSMan:\localhost\Listener -Transport HTTP -Address * -Force | Out-Null
-    Write-Host '   created HTTP listener'
-} else {
-    Write-Host '   HTTP listener already present'
-}
+# --- HTTP listener on 5985 --------------------------------------------------
+if (-not (Get-ChildItem WSMan:\localhost\Listener -EA SilentlyContinue | Where-Object { $_.Keys -contains 'Transport=HTTP' })) { New-Item -Path WSMan:\localhost\Listener -Transport HTTP -Address * -Force | Out-Null }
 
-Write-Host '== Firewall: allow inbound 5985 on every profile ==' -ForegroundColor Cyan
-if (-not (Get-NetFirewallRule -DisplayName 'WinRM-HTTP-In-5985' -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName 'WinRM-HTTP-In-5985' -Direction Inbound `
-        -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any | Out-Null
-    Write-Host '   rule created'
-} else {
-    Write-Host '   rule already present'
-}
+# --- Firewall ---------------------------------------------------------------
+# Remove first, then create. A guard that skips when a rule of this name already
+# exists cannot repair one that is disabled or scoped to the wrong profile —
+# which is exactly why re-pasting an earlier version of this script did nothing.
+Get-NetFirewallRule -DisplayName 'WinRM-HTTP-In-5985*' -EA SilentlyContinue | Remove-NetFirewallRule
+New-NetFirewallRule -DisplayName 'WinRM-HTTP-In-5985-Any' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any -Enabled True | Out-Null
+Enable-NetFirewallRule -Name 'WINRM-HTTP-In-TCP*' -EA SilentlyContinue
+Set-NetFirewallRule -Name 'WINRM-HTTP-In-TCP*' -Profile Any -EA SilentlyContinue
 
-Write-Host '== Allowing the local Administrator to authenticate over the network ==' -ForegroundColor Cyan
-# Without this, UAC remote token filtering hands a NON-elevated token to a
-# local (non-domain) admin connecting over the network. WinRM then connects
-# but every privileged operation fails with Access Denied — which looks like a
-# credentials problem and is not.
-New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
-    -Name 'LocalAccountTokenFilterPolicy' -Value 1 -PropertyType DWord -Force | Out-Null
+# --- Let the local Administrator authenticate over the network --------------
+# Without this, UAC remote token filtering hands a NON-elevated token to a local
+# (non-domain) admin connecting over the network. WinRM connects, then every
+# privileged operation fails with Access Denied — which reads as a bad password
+# and is not.
+New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'LocalAccountTokenFilterPolicy' -Value 1 -PropertyType DWord -Force | Out-Null
 
-Write-Host '== Shell limits ==' -ForegroundColor Cyan
-# The passcode page is pushed as a base64 blob in a single command; the stock
-# 150MB/shell is ample, but the default 5 concurrent shells is not when
-# several PODs publish at once.
+# --- Shell limits -----------------------------------------------------------
+# The default 5 concurrent shells is not enough when several PODs publish at once.
 Set-Item WSMan:\localhost\Shell\MaxMemoryPerShellMB 1024 -Force
 Set-Item WSMan:\localhost\Shell\MaxShellsPerUser 30 -Force
 
-Write-Host '== Service startup ==' -ForegroundColor Cyan
+# --- Service ----------------------------------------------------------------
 Set-Service -Name WinRM -StartupType Automatic
-Restart-Service WinRM
+if (-not $OverWinRM) { Restart-Service WinRM }
+
+# --- Verification -----------------------------------------------------------
+Write-Host ''
+Write-Host '================ VERIFICATION ================' -ForegroundColor Cyan
+
+$svc = Get-Service WinRM
+$okSvc = ($svc.Status -eq 'Running') -and ($svc.StartType -like 'Automatic*')
+$listeners = @(Get-ChildItem WSMan:\localhost\Listener -EA SilentlyContinue | Where-Object { $_.Keys -contains 'Transport=HTTP' })
+$okListener = $listeners.Count -gt 0
+# Rule enumeration is INFORMATIONAL only — see the verdict below.
+#
+# Two earlier versions of this check reported [FAIL] on a host whose port 5985
+# was open and serving: first because it matched -DisplayName '*WinRM*' (the
+# built-ins are called "Windows Remote Management (HTTP-In)"), then because
+# Get-NetFirewallRule returns Enabled as an ENUM so -eq 'True' was false on
+# enabled rules. Enumerating rules is a fragile way to prove something the port
+# test proves directly, so it no longer gates the result.
+$fw = @(Get-NetFirewallRule -EA SilentlyContinue | Where-Object {
+  $_.Direction -eq 'Inbound' -and [string]$_.Enabled -eq 'True' -and
+  ($_.DisplayName -like '*WinRM*' -or $_.DisplayName -like '*Windows Remote Management*' -or $_.Name -like 'WINRM-HTTP-In-TCP*')
+})
+$latfp = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -EA SilentlyContinue).LocalAccountTokenFilterPolicy
+$okReg = ($latfp -eq 1)
+$okPort = (Test-NetConnection -ComputerName localhost -Port 5985 -WarningAction SilentlyContinue).TcpTestSucceeded
+
+function Show($label, $ok, $detail) {
+  $mark = if ($ok) { '[ OK ]' } else { '[FAIL]' }
+  $col  = if ($ok) { 'Green' } else { 'Red' }
+  Write-Host ("{0} {1,-34} {2}" -f $mark, $label, $detail) -ForegroundColor $col
+}
+
+Show 'WinRM service'            $okSvc      ("{0} / {1}" -f $svc.Status, $svc.StartType)
+Show 'HTTP listener on 5985'    $okListener (($listeners | ForEach-Object { $_.Keys -join ' ' }) -join ' | ')
+Write-Host ('[INFO] {0,-34} {1}' -f 'Inbound WinRM rules', $(if ($fw.Count) { ($fw | ForEach-Object { $_.DisplayName + ' [' + $_.Profile + ']' }) -join ' | ' } else { 'none enumerated (port test above is authoritative)' })) -ForegroundColor DarkGray
+Show 'LocalAccountTokenFilterPolicy' $okReg ("value = {0}" -f $(if ($null -eq $latfp) { '<missing>' } else { $latfp }))
+Show 'TCP 5985 reachable'       $okPort     ("Test-NetConnection = {0}" -f $okPort)
 
 Write-Host ''
-Write-Host '== Verification ==' -ForegroundColor Cyan
-Test-WSMan -ComputerName localhost | Out-Null
-Write-Host '   Test-WSMan: OK'
-Get-Service WinRM | Format-Table Name, Status, StartType -AutoSize
-Get-ChildItem WSMan:\localhost\Listener | ForEach-Object {
-    Write-Host ('   listener: ' + ($_.Keys -join ' '))
-}
+Write-Host ('Network profile(s): ' + ((Get-NetConnectionProfile | ForEach-Object { $_.Name + '=' + $_.NetworkCategory }) -join ', '))
 Write-Host ''
-Write-Host 'WinRM is ready. Verify from the POD Automator host with:' -ForegroundColor Green
-Write-Host '  docker run --rm --network container:vpn-POD-17 --entrypoint python3 pod-automator:latest \'
-Write-Host '    -c "import winrm; s=winrm.Session(''http://198.18.133.36:5985/wsman'', auth=(''administrator'',''<password>''), transport=''ntlm''); print(s.run_ps(''hostname'').std_out)"'
+
+if ($okSvc -and $okListener -and $okReg -and $okPort) {
+  Write-Host 'WinRM IS READY — safe to save the golden image.' -ForegroundColor Green
+} else {
+  Write-Host 'WinRM IS NOT READY — see the [FAIL] lines above.' -ForegroundColor Red
+  if (-not $okListener) { Write-Host '  No HTTP listener. If this image was sysprepped, sysprep removed it — re-create it on first boot.' -ForegroundColor Yellow }
+  if (-not $okReg)      { Write-Host '  Registry policy missing: remote logons get a non-elevated token and fail with Access Denied.' -ForegroundColor Yellow }
+  if ($OverWinRM)       { Write-Host '  Service restart was skipped because this ran over WinRM — reboot or re-run locally.' -ForegroundColor Yellow }
+}
