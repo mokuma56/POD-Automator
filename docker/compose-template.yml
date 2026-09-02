@@ -11,18 +11,21 @@ services:
     command: ["{{vpn_host}}", "{{vpn_user}}", "{{vpn_pass}}"]
     restart: unless-stopped
     healthcheck:
-      # Health means "the tunnel carries traffic into the pod", NOT "every
-      # device has finished booting". This probed vManage only, so a freshly
-      # loaded POD reported the VPN red for as long as vManage was down —
-      # POD-3 on 2026-09-02 showed red with the tunnel up, 198.18.0.0/15
-      # routed and the jump host answering, because its router had not been
-      # base-configured yet and vManage sits behind it.
+      # Health means "the tunnel is connected", nothing more.
       #
-      # Pass if EITHER answers: vManage (the pod is fully up) or the jump
-      # host on RDP (the tunnel works and the pod is reachable). The jump
-      # host boots early and is always present, so it is the honest test of
-      # the thing this healthcheck is named for.
-      test: ["CMD", "python3", "-c", "import socket,sys\nfor a in (('{{vmanage_ip}}',443),('198.18.133.36',3389)):\n    try:\n        socket.create_connection(a, timeout=3).close(); sys.exit(0)\n    except Exception: pass\nsys.exit(1)"]
+      # This probed vManage, so a freshly loaded POD showed its VPN red for as
+      # long as vManage was down — which on a new POD is until the router has
+      # been base-configured, since vManage sits behind it. POD-3 on 2026-09-02
+      # read red with the tunnel plainly working: "CSTP connected ... Configured
+      # as 10.16.28.113", 198.18.0.0/15 routed over tun0, jump host answering on
+      # RDP. The dot was reporting "is every device up", which is not what it
+      # says and not what the operator needs from it.
+      #
+      # The jump host is the right target: it boots early, is present in every
+      # pod, sits on the same segment the tunnel routes, and answers on RDP
+      # before anything else is configured. Reaching it proves the tunnel
+      # carries traffic into the pod, which is the whole claim.
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('198.18.133.36', 3389), timeout=3).close()"]
       interval: 15s
       timeout: 5s
       retries: 12
