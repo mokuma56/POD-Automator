@@ -3859,6 +3859,73 @@ def _summarise_outcomes(outcomes: list) -> tuple[bool, str]:
     return (not failed and not degraded), " | ".join(parts)
 
 
+# The pod's own resolvers, same pair Jumphost1 uses. AD1 serves internal names
+# AND forwards external; 198.18.128.1 is the lab's public resolver. Never a
+# general-purpose internet resolver — lab lookups stay in the lab.
+_DNS_FALLBACK = ("198.18.5.102", "198.18.128.1")
+_DNS_SEARCH = "dcloud.cisco.com corp.pseudoco.com"
+
+
+def ensure_dns(log=None) -> bool:
+    """Make sure hostnames resolve before the card does any network work.
+
+    vpnc writes whatever DNS the tunnel advertises into resolv.conf, and on
+    2026-09-02 POD-5's session advertised 198.18.133.1 — a host that does not
+    exist (every port timed out, not just 53). Anything addressed by IP kept
+    working, so ISE, the jump host and SCC were all reachable and nothing looked
+    wrong. The only casualty was the pxGrid Cloud OAuth popup, which has to
+    resolve a public Cisco hostname: it opened to chrome-error://chromewebdata/
+    and the step reported "Register opened no OAuth popup", which points at the
+    browser rather than at DNS. That cost three misdiagnoses.
+
+    Repairing at container start is not enough on its own, because vpnc rewrites
+    resolv.conf every time the tunnel reconnects. Checking here means we check at
+    the point of use, so a mid-session reconnect cannot leave the card running
+    against dead DNS.
+
+    Returns True when names resolve. Best-effort: never raises, and never blocks
+    a card whose DNS is fine.
+    """
+    import socket
+    _log = log or (lambda m: None)
+
+    def _resolves():
+        try:
+            socket.setdefaulttimeout(6)
+            socket.gethostbyname("cloudsso.cisco.com")   # the OAuth host
+            return True
+        except Exception:
+            return False
+
+    if _resolves():
+        return True
+
+    # Only ever rewrite inside a container. On the Mac this file is the host's
+    # own resolver config and must not be touched.
+    if not Path("/.dockerenv").exists():
+        _log("DNS preflight: names do not resolve, but this is not a container — "
+             "refusing to rewrite the host's /etc/resolv.conf")
+        return False
+
+    _log("DNS preflight: hostnames do not resolve — the VPN-advertised resolver "
+         "is not answering; falling back to the pod's own DNS")
+    try:
+        Path("/etc/resolv.conf").write_text(
+            "# Rewritten by ensure_dns(): the VPN-advertised resolver did not answer.\n"
+            + "".join(f"nameserver {n}\n" for n in _DNS_FALLBACK)
+            + f"search {_DNS_SEARCH}\n")
+    except Exception as e:
+        _log(f"DNS preflight: could not rewrite resolv.conf ({type(e).__name__}: {e})")
+        return False
+
+    if _resolves():
+        _log(f"DNS preflight: repaired — using {', '.join(_DNS_FALLBACK)}")
+        return True
+    _log("DNS preflight: still cannot resolve after falling back — the pod's DNS "
+         "may be down; pxGrid Cloud registration will fail at the OAuth popup")
+    return False
+
+
 def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tuple[bool, str]:
     """
     Run the ISE integration card for a POD.
@@ -3871,6 +3938,11 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
     """
     _log = log or (lambda s: print(f"  [ise] {s}"))
     ise_ensure_table(db_path)
+
+    # Before any network work: prove hostnames resolve, and repair if they do
+    # not. Cheap when DNS is healthy (one lookup) and it removes the failure
+    # mode that presented as "Register opened no OAuth popup".
+    ensure_dns(_log)
 
     creds = _load_creds(pod_id, db_path)
     if creds is None:
