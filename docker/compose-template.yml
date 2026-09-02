@@ -11,7 +11,18 @@ services:
     command: ["{{vpn_host}}", "{{vpn_user}}", "{{vpn_pass}}"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('{{vmanage_ip}}', 443), timeout=3).close()"]
+      # Health means "the tunnel carries traffic into the pod", NOT "every
+      # device has finished booting". This probed vManage only, so a freshly
+      # loaded POD reported the VPN red for as long as vManage was down —
+      # POD-3 on 2026-09-02 showed red with the tunnel up, 198.18.0.0/15
+      # routed and the jump host answering, because its router had not been
+      # base-configured yet and vManage sits behind it.
+      #
+      # Pass if EITHER answers: vManage (the pod is fully up) or the jump
+      # host on RDP (the tunnel works and the pod is reachable). The jump
+      # host boots early and is always present, so it is the honest test of
+      # the thing this healthcheck is named for.
+      test: ["CMD", "python3", "-c", "import socket,sys\nfor a in (('{{vmanage_ip}}',443),('198.18.133.36',3389)):\n    try:\n        socket.create_connection(a, timeout=3).close(); sys.exit(0)\n    except Exception: pass\nsys.exit(1)"]
       interval: 15s
       timeout: 5s
       retries: 12
