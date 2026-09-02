@@ -81,7 +81,12 @@ def _db():
     # without touching their ~50 call sites.
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # journal_mode is deliberately NOT set here. It is a property of the
+    # FILE, and changing it requires an EXCLUSIVE lock, so forcing it on
+    # every connection fails with "database is locked" whenever anything
+    # else holds the file open — including Spotlight's mdworker. That
+    # crash-looped the dashboard at import on 2026-09-02. Set the mode once,
+    # out of band, and let connections inherit it.
     conn.execute("PRAGMA synchronous=FULL")
     # Wait rather than raising "database is locked" the instant a writer holds
     # it. WAL removes most contention, not all — the checkpointer still needs

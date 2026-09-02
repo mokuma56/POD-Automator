@@ -4434,6 +4434,40 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
             pass
 
 
+def duo_is_duplicate_resource(exc: Exception) -> bool:
+    """Is this Duo error a 40003 'Duplicate resource'?
+
+    The marker is in the RESPONSE BODY, not the exception message. requests
+    raises only "400 Client Error: Bad Request for url: ...", while Duo's body
+    carries {"code": 40003, "message": "Duplicate resource", "stat": "FAIL"}.
+    A first attempt at this matched str(exc) alone, so it never fired and the
+    duplicate-serial retry looked broken while reporting a bare 400.
+
+    Deliberately tolerant: some callers raise with the body already interpolated
+    into the message, and .response may be missing or unreadable.
+    """
+    body = ""
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        try:
+            body = resp.text or ""
+        except Exception:
+            body = ""
+    hay = f"{exc} {body}"
+    return "40003" in hay or "Duplicate resource" in hay
+
+
+def duo_unique_serial(serial: str) -> str:
+    """Append a short time-based suffix so a reused serial stops colliding.
+
+    Same shape as the cdFMC instance-name fix. The serial is only a label, so
+    uniqueness costs nothing and the alternative is no second factor at all —
+    which also takes out the student login page, since that needs the secret.
+    """
+    import time as _t
+    return f"{serial}-{int(_t.time()) % 10000:04d}"
+
+
 def duo_provision_admin_totp(pod_id: str, db_path: str, serial: str = "",
                              log=None) -> tuple[bool, str]:
     """Give the org's Duo admin a TOTP hardware token, and keep the secret.
@@ -4485,10 +4519,32 @@ def duo_provision_admin_totp(pod_id: str, db_path: str, serial: str = "",
     secret_b32 = _b64.b32encode(raw).decode()
     serial = serial or f"POD{org_num}-PROCTOR"
 
+    def _create(_serial):
+        return _duo_request(ikey, skey, host, "POST", "/admin/v1/tokens",
+                            params={"type": "t6", "serial": _serial,
+                                    "secret": secret_hex}).get("response", {})
+
     try:
-        tok = _duo_request(ikey, skey, host, "POST", "/admin/v1/tokens",
-                           params={"type": "t6", "serial": serial,
-                                   "secret": secret_hex}).get("response", {})
+        try:
+            tok = _create(serial)
+        except Exception as _dup:
+            # Duo 40003 "Duplicate resource": a token with this serial already
+            # exists. The serial is derived from the org number alone, and the
+            # SCC org is REUSED across lab sessions, so the second session on any
+            # org hits this — POD-5 landed on org 524 on 2026-09-02 and failed
+            # against a token left by an earlier session.
+            #
+            # We cannot clean it up: GET /admin/v1/tokens returns 0 tokens to
+            # this Admin API application even while the POST is rejected as a
+            # duplicate, so the conflicting token is invisible to us. Take a
+            # unique serial instead — it is only a label, and the alternative is
+            # no second factor at all, which also takes out the student login
+            # page that depends on the secret.
+            if not duo_is_duplicate_resource(_dup):
+                raise
+            serial = duo_unique_serial(serial)
+            _log(f"serial already in use in this org — retrying as {serial!r}")
+            tok = _create(serial)
         token_id = tok.get("token_id")
         if not token_id:
             return False, f"token creation returned no token_id: {tok}"
@@ -11296,6 +11352,51 @@ def duo_run_card(
                 # Surfaced, never swallowed — the card just does not depend on it.
                 msg += ("; NOTE unrelated section(s) report problems: "
                         + "; ".join(f"[{k}] {problems[k][0]}" for k in other))
+
+            # The student's way in: a TOTP secret, and the login page on the
+            # jump host desktop that renders codes from it.
+            #
+            # Both are provisioned in step_bootstrap, whose result is a long
+            # pipe-joined string — so on 2026-09-02 "totp FAILED: 400 ... |
+            # jumphost page: FAILED — no TOTP secret" sat inside a message that
+            # still reported the step as PASSED, and the card went green with no
+            # second factor and nothing on the desktop. The operator found it by
+            # logging into the jump host, which is not a monitoring strategy.
+            #
+            # Assert it here, where a failure fails the card. Checked in the same
+            # WinRM session that just proved the proxy healthy, so it costs one
+            # extra command.
+            gaps = []
+            try:
+                with _sq.connect(db_path) as _cv:
+                    _cv.row_factory = _sq.Row
+                    _tr = _cv.execute("SELECT duo_admin_totp_secret FROM "
+                                      "org_credentials WHERE org_number=?",
+                                      (org_num,)).fetchone()
+                if not (_tr and (_tr["duo_admin_totp_secret"] or "").strip()):
+                    gaps.append("no duo_admin_totp_secret — the admin has no "
+                                "phone-free second factor (hardware token)")
+            except _sq.Error as _ce:
+                gaps.append(f"could not read duo_admin_totp_secret ({_ce})")
+
+            try:
+                _pg = sess.run_ps(
+                    r"$a=Test-Path 'C:\Users\Public\Duo-Login.html'; "
+                    r"$b=Test-Path 'C:\Users\Public\Desktop\Duo Login.lnk'; "
+                    r"Write-Output ('' + $a + ',' + $b)"
+                ).std_out.decode(errors="replace").strip().lower()
+                if "true,true" not in _pg.replace(" ", ""):
+                    gaps.append(f"student login page/shortcut missing on the jump "
+                                f"host (Duo-Login.html,Duo Login.lnk = {_pg or '?'})")
+            except Exception as _pe:
+                gaps.append(f"could not check the student login page ({type(_pe).__name__})")
+
+            if gaps:
+                return False, ("Auth Proxy healthy but the student login path is "
+                               "incomplete — " + "; ".join(gaps)
+                               + ". Re-run the Duo card's bootstrap step, or call "
+                                 "duo_provision_admin_totp + duo_publish_totp_page.")
+            msg += "; TOTP token + jump host login page present"
             return True, msg
         except Exception as e:
             return False, f"WinRM verify error: {type(e).__name__}: {e}"
