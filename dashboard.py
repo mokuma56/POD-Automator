@@ -2110,6 +2110,33 @@ def api_fabric_reset(pod_id):
 _DUO_INFLIGHT = set()
 
 
+def _dns_preflight(pod_id, log_fn=None):
+    """Repair the VPN namespace's DNS before a run, if it is broken.
+
+    vpnc writes whatever resolver the tunnel advertises, and on 2026-09-02
+    POD-5's session advertised 198.18.133.1 — a host that does not exist at all
+    (every port timed out, not just 53). Everything addressed by IP kept working,
+    so ISE, the jump host and SCC were all reachable and nothing looked wrong.
+    The only casualty was the pxGrid Cloud OAuth popup, which must resolve a
+    public Cisco hostname; it loaded chrome-error:// and the step blamed the
+    browser. Three misdiagnoses followed.
+
+    Runs on the HOST, before any container starts, so it covers the pipeline and
+    both cards from one place. ise_run_card checks again inside the container —
+    vpnc can rewrite resolv.conf on a reconnect at any point, so the two are
+    complementary rather than redundant.
+
+    Best-effort: never raises, never blocks a run.
+    """
+    _l = log_fn or (lambda m: log(pod_id, f"[dns] {m}"))
+    try:
+        sys.path.insert(0, str(Path(__file__).parent / "docker"))
+        from generate import ensure_usable_dns
+        ensure_usable_dns(pod_id)
+    except Exception as e:
+        _l(f"DNS preflight skipped ({type(e).__name__}: {str(e)[:80]})")
+
+
 def _card_already_running(pod_id, table):
     """Is a card already mid-run for this POD? Returns the step name, or "".
 
@@ -2468,6 +2495,8 @@ def api_duo_run(pod_id):
     # card at bootstrap and re-ran ten minutes of already-green steps.
     from_step = int(request.args.get("from_step", data.get("from_step", 0)))
 
+    _dns_preflight(pod_id)
+
     _busy = _card_already_running(pod_id, "duo_steps")
     if _busy:
         return jsonify({"status": "error", "message":
@@ -2640,6 +2669,8 @@ def api_ise_run(pod_id):
     _ensure_ise_table()
     data = request.get_json(silent=True) or {}
     from_step = int(request.args.get("from_step", data.get("from_step", 0)))
+
+    _dns_preflight(pod_id)
 
     _busy = _card_already_running(pod_id, "ise_steps")
     if _busy:
@@ -8503,6 +8534,8 @@ def _run_full_automation(pod_id: str, addons: list):
 
     _log(f"starting: pipeline{''.join(' + ' + a for a in addons)}")
     _warn_if_image_stale(pod_id)
+    # Every run goes through here, so one call covers pipeline + Duo + ISE.
+    _dns_preflight(pod_id, _log)
 
     ok, msg = _start_pipeline_container(pod_id)
     _log(msg)
