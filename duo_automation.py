@@ -1805,7 +1805,19 @@ def get_browser_sessions(idac_url: str, duo_host: str,
 
 # Jump host IP — WinRM port 5985 is open; has Python 3.11.4 + idac_sdk installed.
 JUMP_HOST_IP = "198.18.133.36"
-JUMP_HOST_WINRM_CREDS = ("administrator", "C1sco12345")
+# Jumphost1 authenticates as the DOMAIN user demouser, not administrator.
+# Verified on POD-3 (2026-09-02): "administrator" is rejected outright with
+# InvalidCredentialsError, while corp.pseudoco.com\\demouser succeeds and
+# whoami returns corp-pseudoco\\demouser on jumper1. The name must be domain
+# qualified — bare "demouser" is also rejected. AD1 still uses administrator
+# (see AD_WINRM_USER); the two hosts differ.
+#
+# Read from the environment per CLAUDE.md rather than carrying the literal
+# forward; the defaults keep existing setups working without a .env.
+JUMP_HOST_WINRM_CREDS = (
+    os.environ.get("JUMP_HOST_WINRM_USER", "corp.pseudoco.com\\demouser"),
+    os.environ.get("LAB_PASS", "C1sco12345"),
+)
 
 # Python script written to jump host temp file to generate a fresh iDAC URL.
 # Reads C:\dcloud\session.xml for DCLOUD_SESSION auth credentials.
