@@ -5874,6 +5874,35 @@ def _winrm_connect_for_pod(pod_id: str,
     return DockerWinRMSession(ad_ip, user, pw, pod_id, log=log)
 
 
+# Which account authenticated last, per POD — so the fallback is paid for once
+# rather than on every connect. Each attempt on the Mac spins a proxy container.
+_JUMP_CRED_CACHE: dict[str, tuple[str, str]] = {}
+
+
+def _jump_cred_candidates() -> list[tuple[str, str]]:
+    """Accounts to try on the jump host, in order.
+
+    Pods are not consistent about this: POD-3 (2026-09-02) rejects administrator
+    outright and authenticates corp.pseudoco.com\\demouser, while POD-5 earlier
+    the same day authenticated administrator and returned
+    corp-pseudoco\\administrator from whoami. Rather than pick one and be wrong
+    half the time, try the configured account first and fall back.
+
+    The name must be DOMAIN QUALIFIED — bare "demouser" is rejected the same way
+    a wrong password is.
+    """
+    primary = JUMP_HOST_WINRM_CREDS
+    pw = primary[1]
+    extras = [u.strip() for u in os.environ.get(
+        "JUMP_HOST_WINRM_FALLBACK_USERS",
+        "corp.pseudoco.com\\administrator,administrator").split(",") if u.strip()]
+    out = [primary]
+    for u in extras:
+        if u != primary[0]:
+            out.append((u, pw))
+    return out
+
+
 def _winrm_connect_jump(pod_id: str, log=None):
     """WinRM session to the POD's jump host, valid from either runtime context.
 
@@ -5882,12 +5911,52 @@ def _winrm_connect_jump(pod_id: str, log=None):
     raw winrm.Session to JUMP_HOST_IP fails there. Mirror
     _winrm_connect_for_pod: direct inside the pipeline container, proxied
     through vpn-{pod_id} otherwise.
+
+    Tries each candidate account until one AUTHENTICATES. Constructing a session
+    proves nothing — winrm defers auth to the first command — so each candidate
+    is probed with a trivial command and rejected on a non-zero rc. That matters:
+    a rejected credential otherwise surfaces much later as an empty result from
+    whatever real command ran, which reads as "the command did nothing".
     """
     import os as _os
-    user, pw = JUMP_HOST_WINRM_CREDS
-    if _os.path.exists("/.dockerenv"):
-        return _winrm_connect(JUMP_HOST_IP, user, pw)
-    return DockerWinRMSession(JUMP_HOST_IP, user, pw, pod_id, log=log)
+
+    def _mk(user, pw):
+        if _os.path.exists("/.dockerenv"):
+            return _winrm_connect(JUMP_HOST_IP, user, pw)
+        return DockerWinRMSession(JUMP_HOST_IP, user, pw, pod_id, log=log)
+
+    _log = log or (lambda m: None)
+    cached = _JUMP_CRED_CACHE.get(pod_id)
+    candidates = _jump_cred_candidates()
+    if cached:
+        candidates = [cached] + [c for c in candidates if c[0] != cached[0]]
+
+    errors = []
+    for user, pw in candidates:
+        sess = None
+        try:
+            sess = _mk(user, pw)
+            r = sess.run_ps("$env:USERNAME")
+            if getattr(r, "status_code", 1) == 0:
+                if _JUMP_CRED_CACHE.get(pod_id) != (user, pw):
+                    _log(f"jump host authenticated as {user}")
+                _JUMP_CRED_CACHE[pod_id] = (user, pw)
+                return sess
+            errors.append(f"{user}: rc={getattr(r, 'status_code', '?')}")
+        except Exception as e:
+            errors.append(f"{user}: {type(e).__name__}")
+        try:
+            if sess:
+                sess.close()
+        except Exception:
+            pass
+        _JUMP_CRED_CACHE.pop(pod_id, None)
+
+    raise RuntimeError(
+        f"no jump host credentials worked for {pod_id} at {JUMP_HOST_IP} — tried "
+        + "; ".join(errors)
+        + ". Set JUMP_HOST_WINRM_USER / LAB_PASS, or add accounts to "
+          "JUMP_HOST_WINRM_FALLBACK_USERS. Names must be domain qualified.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
