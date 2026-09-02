@@ -86,7 +86,6 @@ def _db_connect(db_path: str, retries: int = 8, delay: float = 0.4) -> sqlite3.C
             # WAL database back to DELETE needs an exclusive lock, so with the
             # dashboard connected this raised "database is locked" and took the
             # whole dashboard down at import time.
-            conn.execute("PRAGMA journal_mode=WAL")
             # Was synchronous=OFF. In WAL that risks a corrupt file on an OS
             # crash or power loss, and this database was already corrupted once
             # on 2026-09-01 by concurrent writers. NORMAL is the standard WAL
@@ -291,6 +290,50 @@ async def _ise_dismiss_modal(page):
         """)
     except Exception:
         pass
+
+    # ISE's "Information" dialog, which the lab guide does not mention:
+    #
+    #   This node is in Standalone mode. To register other nodes, you must
+    #   first edit this node and change its Administration Role to Primary
+    #                    [ ] Do not show this message again        [ OK ]
+    #
+    # It is purely informational — the pod is a single standalone ISE and never
+    # registers other nodes — but it is a MODAL, so while it is up every click
+    # on the Deployment page lands on its underlay instead of the node link.
+    # It does not appear on every POD, which is worse than if it always did:
+    # the same code passes on one pod and mysteriously times out on another.
+    #
+    # Tick "Do not show this message again" before OK so the pod stops raising
+    # it for the rest of the session, then click OK. Both are best-effort: a POD
+    # that never shows the dialog must not be slowed down or failed by this.
+    try:
+        _info = await page.evaluate("""() => {
+            const dlgs = Array.from(document.querySelectorAll(
+                '.dijitDialog, [role="dialog"], .modal'));
+            for (const d of dlgs) {
+                if (!d.getClientRects().length) continue;
+                const txt = (d.innerText || '');
+                if (!/standalone mode/i.test(txt)) continue;
+                // Suppress future occurrences if the box is offered.
+                for (const cb of d.querySelectorAll('input[type="checkbox"]')) {
+                    const lbl = (cb.closest('label') || cb.parentElement || {}).innerText || '';
+                    if (/do not show/i.test(lbl) && !cb.checked) { cb.click(); }
+                }
+                for (const b of d.querySelectorAll('button,[role="button"],.dijitButtonNode')) {
+                    if ((b.textContent || '').trim().toUpperCase() === 'OK') {
+                        b.click();
+                        return 'dismissed';
+                    }
+                }
+                return 'found-no-ok';
+            }
+            return '';
+        }""")
+        if _info == "dismissed":
+            await page.wait_for_timeout(700)
+    except Exception:
+        pass
+
     await page.wait_for_timeout(300)
 
 
@@ -1924,6 +1967,63 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
 
             async def _click_register_btn():
                 """Try all methods to click the Register button. Returns True if clicked."""
+                # Attempt 0: a TRUSTED click, via real mouse coordinates.
+                #
+                # This must come first. Register opens the pxGrid Cloud OAuth
+                # flow in a POPUP, and browsers only allow window.open() from a
+                # user-initiated gesture. Every method below drives the widget
+                # programmatically — btn.onClick() from page.evaluate(), or
+                # el.click() — which is untrusted, so Chromium suppresses the
+                # popup silently. The click "succeeds", no window appears, and
+                # ctx.expect_page() times out after 15s reporting "Register
+                # opened no OAuth popup" while the form looks perfectly filled.
+                # That is exactly how POD-5 failed twice on 2026-09-02 with
+                # region us-west-2 correctly selected.
+                #
+                # page.mouse.click() dispatches through the browser's real input
+                # pipeline, so the gesture is trusted and window.open() is
+                # permitted. Same reason CLAUDE.md prescribes a coordinate click
+                # for SCC's React controls.
+                try:
+                    _box = await page.evaluate("""() => {
+                        const hit = (el) => {
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0 ? r : null;
+                        };
+                        // Prefer the Dijit button node so we click the widget's
+                        // own clickable surface rather than a text span.
+                        if (typeof dijit !== 'undefined') {
+                            const w = dijit.registry.toArray().find(w => {
+                                const lbl = (w.label || w.title || '').trim();
+                                const txt = w.domNode ? w.domNode.textContent.trim() : '';
+                                return lbl === 'Register' || txt === 'Register';
+                            });
+                            if (w && w.domNode) {
+                                w.domNode.scrollIntoView({block: 'center'});
+                                const r = hit(w.domNode);
+                                if (r) return {x: r.left + r.width/2, y: r.top + r.height/2};
+                            }
+                        }
+                        for (const el of document.querySelectorAll(
+                                'button,[role="button"],.dijitButtonNode')) {
+                            if ((el.textContent || '').trim() !== 'Register') continue;
+                            el.scrollIntoView({block: 'center'});
+                            const r = hit(el);
+                            if (r) return {x: r.left + r.width/2, y: r.top + r.height/2};
+                        }
+                        return null;
+                    }""")
+                    if _box:
+                        await page.mouse.click(_box["x"], _box["y"])
+                        log(f"Register clicked as a TRUSTED mouse event at "
+                            f"({_box['x']:.0f}, {_box['y']:.0f}) — required for the "
+                            f"OAuth popup to be allowed")
+                        return True
+                    log("Register button has no clickable box — falling back to Dijit")
+                except Exception as _mc:
+                    log(f"trusted mouse click failed ({type(_mc).__name__}: "
+                        f"{str(_mc).splitlines()[0][:90]}) — falling back to Dijit")
+
                 # Attempt 1: Dijit widget API
                 _js_dijit = await page.evaluate("""() => {
                     try {
@@ -2133,7 +2233,16 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             _popup_err = ""
             _popup_handled = False
             try:
-                async with ctx.expect_page(timeout=15000) as _popup_info:
+                # 90s, not 15s. Register does not open the OAuth popup
+                # immediately: ISE first shows a "Registering..." spinner while it
+                # submits the enrolment, and only then opens the window. On
+                # 2026-09-02 POD-5 failed three times with "Register opened no
+                # OAuth popup" while a screenshot taken at the moment of failure
+                # showed that spinner still turning — we were abandoning a
+                # registration that was working. The same snapshot also read the
+                # region field as empty, because the form re-renders during
+                # submit, which sent two earlier diagnoses down the wrong path.
+                async with ctx.expect_page(timeout=90000) as _popup_info:
                     _registered = await _click_register_btn()
                     if not _registered:
                         # Frame fallback

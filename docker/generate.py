@@ -143,6 +143,77 @@ def build_image():
     return True
 
 
+# DNS servers the pod actually answers on. AD1 resolves the internal names
+# (ise.corp.pseudoco.com and friends) and is what the jump host itself uses;
+# the public resolver covers the Cisco hostnames the pxGrid Cloud OAuth flow
+# needs. Internal FIRST so pod names are never sent to a public resolver.
+_DNS_INTERNAL = "198.18.5.102"      # AD1
+_DNS_PUBLIC = "8.8.8.8"
+_DNS_SEARCH = "dcloud.cisco.com corp.pseudoco.com"
+
+
+def ensure_usable_dns(pod_id, timeout=90):
+    """Give the VPN namespace a resolver that answers.
+
+    vpnc writes whatever DNS the tunnel advertises into the container's
+    /etc/resolv.conf. On 2026-09-02 POD-5's session pushed 198.18.133.1, which
+    does not respond on :53 at all — so every hostname lookup inside the
+    namespace failed with "Temporary failure in name resolution".
+
+    Everything that talks by IP kept working, which made it hard to spot: ISE,
+    the jump host and SCC were all reachable. What broke was the pxGrid Cloud
+    OAuth popup, which must resolve a public Cisco hostname — it opened to
+    chrome-error://chromewebdata/ and the step reported "Register opened no
+    OAuth popup", pointing at the browser rather than at DNS.
+
+    Best-effort by design: a POD whose pushed DNS works is left alone, and a
+    failure here never blocks the stack coming up. Note vpnc REWRITES this file
+    on reconnect, so this runs at `up` time and may need re-applying if the
+    tunnel drops.
+    """
+    import shutil
+    name = f"vpn-{pod_id}"
+
+    def _sh(*args, **kw):
+        return subprocess.run(args, capture_output=True, text=True, **kw)
+
+    # Wait for the tunnel: vpnc overwrites resolv.conf when it connects, so
+    # patching earlier would simply be undone.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        h = _sh("docker", "inspect", name, "--format", "{{.State.Health.Status}}", timeout=10)
+        if (h.stdout or "").strip() in ("healthy", "<no value>", ""):
+            break
+        time.sleep(3)
+
+    probe = (
+        "import socket,sys\n"
+        "try:\n"
+        "    socket.setdefaulttimeout(6); socket.gethostbyname('www.cisco.com')\n"
+        "    sys.exit(0)\n"
+        "except Exception:\n"
+        "    sys.exit(1)\n"
+    )
+    ok = _sh("docker", "exec", name, "python3", "-c", probe, timeout=40)
+    if ok.returncode == 0:
+        return  # pushed DNS resolves public names — nothing to fix
+
+    conf = (f"# Patched by generate.py: the VPN-pushed resolver did not answer.\n"
+            f"nameserver {_DNS_INTERNAL}\n"
+            f"nameserver {_DNS_PUBLIC}\n"
+            f"search {_DNS_SEARCH}\n")
+    _sh("docker", "exec", name, "sh", "-c",
+        "cp /etc/resolv.conf /etc/resolv.conf.vpnc 2>/dev/null || true", timeout=15)
+    w = _sh("docker", "exec", name, "sh", "-c",
+            f"cat > /etc/resolv.conf <<'EOF'\n{conf}EOF", timeout=15)
+    if w.returncode != 0:
+        print(f"    ⚠ {pod_id}: could not patch DNS ({(w.stderr or '').strip()[:70]})")
+        return
+    again = _sh("docker", "exec", name, "python3", "-c", probe, timeout=40)
+    print(f"    DNS: pushed resolver did not answer — using {_DNS_INTERNAL} + "
+          f"{_DNS_PUBLIC} ({'resolves now' if again.returncode == 0 else 'STILL FAILING'})")
+
+
 def action_up(pods, vpn_only=False):
     if not build_image():
         return
@@ -166,6 +237,7 @@ def action_up(pods, vpn_only=False):
             if r.returncode == 0:
                 print(" ✅")
                 successes += 1
+                ensure_usable_dns(pod_id)
             else:
                 err = r.stderr.strip() or r.stdout.strip()
                 print(f" ❌ {err[:120]}")
@@ -206,7 +278,6 @@ def action_down(pods):
             pod_ids = [p["pod_id"] for p in pods]
             conn = _sqlite3.connect(str(db_path))
             # WAL — must match the other connectors; see dashboard.py _db().
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=15000")
             for pod_id in pod_ids:
                 conn.execute("DELETE FROM pipeline_steps WHERE pod_id=?", (pod_id,))
