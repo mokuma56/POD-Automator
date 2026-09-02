@@ -10091,10 +10091,24 @@ async function saveRunAddons(sel) {
     const data = await resp.json().catch(() => null);
     const saved = (data && typeof data.run_addons === 'string') ? data.run_addons : sel.value;
     sel.dataset.saved = saved;
-    const p = (window._lastPods || []).find(x => x.pod_id === podId);
-    if (p) p.run_addons = saved;       // keep the cache in step until the next poll
-    delete _rowCache[podId];           // force the next render to rebuild from server truth
-    renderPodSummary();                // show the new step count now, not in 5s
+    delete _rowCache[podId];           // force the row to rebuild from server truth
+
+    // Re-FETCH rather than hand-patching the cache.
+    //
+    // This used to set p.run_addons on the cached pod object and leave it there.
+    // But the step total is not computed from run_addons in the browser — the
+    // SERVER derives addon_total / duo_total / ise_total and sends them. Patching
+    // one field left the cache internally inconsistent:
+    //
+    //     _lastPods[POD-5].run_addons  = "duo,ise"   (patched)
+    //     _lastPods[POD-5].addon_total = 0           (stale)
+    //     pipelinePhase() -> 21 + 0 -> "1/21"
+    //
+    // so switching modes updated the server correctly every time while the cell
+    // sat frozen at 1/21. load() refetches /api/pods, replaces _lastPods wholesale
+    // and re-renders, so every derived field moves together.
+    await load();
+    renderPodSummary();                // and the summary now, not in 5s
   } catch (e) {
     console.warn('could not save run mode', e);
     // Put the control back to what the server last confirmed, so a failed save
