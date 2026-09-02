@@ -9130,7 +9130,7 @@ DASHBOARD_HTML = """
    <div class="toolbar-row" style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;position:relative;">
      <button class="btn-start-all" id="btn-check-update" onclick="checkForUpdates()" style="background:#1a3a1a;border:1px solid #22c55e;color:#22c55e;">&#8593; Check for Updates</button>
       <button class="btn-start-all" id="btn-vpn-all" onclick="connectAllVpn()">&#9654; Connect All VPN</button>
-     <select id="run-all-mode" title="What to run for every POD" style="background:#0a1628;border:1px solid #7c3aed;color:#b39ddb;border-radius:5px;padding:5px 7px;font-size:12px;">
+     <select id="run-all-mode" title="What to run for every POD" onchange="applyRunAllMode(this)" style="background:#0a1628;border:1px solid #7c3aed;color:#b39ddb;border-radius:5px;padding:5px 7px;font-size:12px;">
        <option value="">Pipeline only</option>
        <option value="duo">+ Duo</option>
        <option value="ise">+ ISE</option>
@@ -10189,6 +10189,36 @@ async function saveAssigned(podId, value) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({assigned_to: value})
   });
+}
+
+// The toolbar mode selector is a BULK SETTER, not just an argument to the Run
+// All button.
+//
+// It had no onchange handler at all — its value was read once, inside
+// runAllPods(), and nowhere else. So choosing "+ Duo + ISE" there changed
+// nothing: not the per-POD run_addons, not the row, not the summary. The summary
+// kept showing 0/21 next to a dropdown reading "+ Duo + ISE", which is a
+// straightforward contradiction and reads as the step counts being broken again.
+// Its own tooltip says "What to run for every POD", so apply it to every POD.
+async function applyRunAllMode(sel) {
+  const v = sel.value;
+  const addons = v ? v.split(',') : [];
+  const pods = (window._lastPods || []).map(p => p.pod_id);
+  if (!pods.length) return;
+  try {
+    await Promise.all(pods.map(pid =>
+      fetch('/api/pods/' + pid + '/run-addons', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({addons})
+      })));
+    // Same reason as saveRunAddons: addon_total is computed server-side, so
+    // refetch rather than patching the cache.
+    pods.forEach(pid => { delete _rowCache[pid]; });
+    await load();
+    renderPodSummary();
+  } catch (e) {
+    console.warn('could not apply run mode to all PODs', e);
+  }
 }
 
 async function runAllPods() {
