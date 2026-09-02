@@ -143,12 +143,19 @@ def build_image():
     return True
 
 
-# DNS servers the pod actually answers on. AD1 resolves the internal names
-# (ise.corp.pseudoco.com and friends) and is what the jump host itself uses;
-# the public resolver covers the Cisco hostnames the pxGrid Cloud OAuth flow
-# needs. Internal FIRST so pod names are never sent to a public resolver.
-_DNS_INTERNAL = "198.18.5.102"      # AD1
-_DNS_PUBLIC = "8.8.8.8"
+# The pod's OWN resolvers — the same pair Jumphost1 is configured with
+# (Get-DnsClientServerAddress reports {198.18.5.102, 198.18.128.1}).
+#
+# Measured from inside the VPN namespace on 2026-09-02:
+#   198.18.5.102 (AD1)          internal ✓   external ✓   <- resolves both
+#   198.18.128.1 (lab public)   internal ✗   external ✓
+#
+# So AD1 alone is sufficient and 198.18.128.1 is the lab's own fallback for
+# public names. Do NOT put a general-purpose internet resolver here: an earlier
+# version of this used 8.8.8.8, which sends lab queries out to Google, resolves
+# nothing pod-specific, and is not the DNS path this lab is meant to use.
+_DNS_INTERNAL = "198.18.5.102"      # AD1 — serves internal, forwards external
+_DNS_PUBLIC = "198.18.128.1"        # lab's public resolver, external only
 _DNS_SEARCH = "dcloud.cisco.com corp.pseudoco.com"
 
 
