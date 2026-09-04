@@ -8859,14 +8859,18 @@ def sa_upload_idp_metadata(t, sa_org: str, ent: str, idp_path: str,
     t.mouse.click(hit["x"], hit["y"])
     t.wait_for_timeout(14_000)
 
-    # Confirm from the configuration page rather than from the click.
-    t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}/connect/users-and-groups"
-           f"?enterpriseId={ent}", wait_until="load", timeout=45_000)
-    _scc_wait(t, "Configuration management")
-    _scc_click(t, "Configuration management")
-    _scc_wait(t, "SSO authentication")
-    t.wait_for_timeout(6_000)
-    tail = (_scc_text(t) or "").split("SSO authentication")[-1]
+    # Confirm from the configuration page rather than from the click, through
+    # the render-verified navigation — a flat 6s wait sometimes beats the cards
+    # onto the page, which would fail a wizard that actually succeeded.
+    if not _sa_config_page(t, sa_org, ent):
+        return False, ("wizard finished but the Secure Access configuration page "
+                       "never rendered its cards — could not confirm")
+    tail = ""
+    for _ in range(6):
+        tail = (_scc_text(t) or "").split("SSO authentication")[-1]
+        if "DuoSSO" in tail:
+            break
+        t.wait_for_timeout(5_000)
     if "DuoSSO" not in tail:
         return False, "wizard finished but no SSO configuration is listed"
     _log(f"SSO configuration active, authenticating {dirname}")
@@ -9716,16 +9720,21 @@ def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
             ctx = br.new_context(ignore_https_errors=True,
                                  viewport={"width": 1600, "height": 1200})
             t, ent = _scc_open_session(ctx, idac, log=_log)
-            t.goto(f"https://security.cisco.com/secure-access/org/{sa_org}"
-                   f"/connect/users-and-groups?enterpriseId={ent}",
-                   wait_until="load", timeout=45_000)
-            _scc_wait(t, "Configuration management")
-            _scc_click(t, "Configuration management")
-            _scc_wait(t, "SSO authentication")
-            t.wait_for_timeout(6_000)
+            # Go through the render-verified navigation, like every other reader
+            # of this card. Doing its own goto and waiting a flat 6s was not
+            # enough: the SPA paints its shell ~30s before the cards, so the row
+            # lookup below ran against an empty page and reported a configured
+            # org as "no SSO configuration — run sso_saml first" — naming a
+            # cause it had not tested, on a POD whose sso_saml had just verified
+            # the row was listed.
+            if not _sa_config_page(t, sa_org, ent):
+                return False, ("Secure Access configuration page never rendered its "
+                               "cards — cannot tell whether SSO is configured")
 
             # Expand the SSO row via its chevron; the label itself is inert.
-            row = t.evaluate("""() => {
+            # Re-read rather than deciding on one look: the cards can be painted
+            # while the SSO card's own rows are still filling in.
+            _chevron_js = """() => {
                 const e = Array.from(document.querySelectorAll('*'))
                     .filter(x => x.getClientRects().length && x.children.length === 0 &&
                                  /^DuoSSO$/.test((x.innerText||'').trim())).pop();
@@ -9745,9 +9754,16 @@ def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
                 }
                 const r = e.getBoundingClientRect();
                 return {x: r.x - 25, y: r.y + r.height / 2};
-            }""")
+            }"""
+            row = None
+            for _ in range(6):
+                row = t.evaluate(_chevron_js)
+                if row:
+                    break
+                t.wait_for_timeout(5_000)
             if not row:
-                return False, "no SSO configuration listed — run the sso_saml step first"
+                return False, ("SSO row 'DuoSSO' not listed on a fully rendered "
+                               "configuration page — check whether sso_saml ran")
             t.mouse.click(row["x"], row["y"])
             t.wait_for_timeout(6_000)
 
