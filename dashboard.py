@@ -5573,11 +5573,18 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                             _all_del = page.locator('button:has-text("Delete")').all()
                             _best_btn = None
                             _best_y   = 99999
-                            for _db in _all_del:
+                            # NOT _db: that is the module-level DB helper, and binding
+                            # it here makes it a local of this whole function, so the
+                            # _db() call in the ise_pxgrid invalidation below raised
+                            # UnboundLocalError whenever this loop had not run. The
+                            # pxGrid integration was deleted, the invalidation that
+                            # should have followed it never happened, and the item
+                            # reported as needing attention.
+                            for _delbtn in _all_del:
                                 try:
-                                    _dbb = _db.bounding_box()
+                                    _dbb = _delbtn.bounding_box()
                                     if _dbb and _dbb['y'] < _best_y and _dbb['width'] > 0:
-                                        _best_btn = _db
+                                        _best_btn = _delbtn
                                         _best_y   = _dbb['y']
                                 except Exception:
                                     pass
@@ -6101,6 +6108,23 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
         return 'NOT_FOUND';
     }"""
 
+    # Same lookup, but it only LOOKS. Clicking blind after a fixed wait sent the
+    # step into a 40s wait for a popup that could never open, because the page
+    # was still painting skeleton placeholders and there was nothing to click —
+    # then it blamed the popup timeout instead of the NOT_FOUND it already had.
+    _JS_FIND_HBR = """(label) => {
+        function deepQueryAll(root) {
+            const found = [];
+            const all = root.querySelectorAll('*');
+            for (const el of all) {
+                if ((el.textContent||'').trim() === label) found.push(el);
+                if (el.shadowRoot) found.push(...deepQueryAll(el.shadowRoot));
+            }
+            return found;
+        }
+        return deepQueryAll(document).filter(e => e.tagName === 'HBR-BUTTON').length > 0;
+    }"""
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True,
             args=["--disable-popup-blocking", "--no-sandbox", "--disable-dev-shm-usage"])
@@ -6138,6 +6162,24 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_fmc_app_{pod_id}.png"))
 
             # ── 3. Open authenticated cdFMC tab via Platform Settings HBR-BUTTON ──
+            # Wait for the control to actually exist. The 15s above is a fixed
+            # wait, and this SPA can still be rendering skeletons well past it.
+            _btn_seen = False
+            for _probe in range(18):          # up to ~90s
+                try:
+                    if page.evaluate(_JS_FIND_HBR, "Platform Settings"):
+                        _btn_seen = True
+                        break
+                except Exception:
+                    pass
+                page.wait_for_timeout(5000)
+            if not _btn_seen:
+                page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_no_button_{pod_id}.png"))
+                return False, ("Platform Settings control never rendered on the SCC FMC "
+                               "app page — the page was still loading, so there was "
+                               "nothing to click")
+            log_fn(f"[cdfmc-nav] Platform Settings control present after ~{_probe * 5}s")
+
             log_fn("[cdfmc-nav] Opening cdFMC tab via Platform Settings (expect_popup)...")
             try:
                 with page.expect_popup(timeout=40000) as _popup_info:
