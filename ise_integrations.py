@@ -687,7 +687,7 @@ async def _open_integration(page, name: str, log) -> bool:
     return False
 
 
-async def _navigate_to_integration_catalog(page, log) -> bool:
+async def _navigate_to_integration_catalog(page, log, _relogin: bool = True) -> bool:
     """Navigate to ISE Administration -> Integration Catalog. Returns True on success.
 
     This MUST go through the menu. Loading the hash URL directly
@@ -789,6 +789,24 @@ async def _navigate_to_integration_catalog(page, log) -> bool:
                 log(f"Integration Catalog loaded ({n} integration card(s))")
                 return True
             await page.wait_for_timeout(5000)
+
+        # Distinguish "the catalog is empty" from "we are not logged in any
+        # more". ISE can drop the session during this navigation, and every
+        # caller then reported an unpopulated catalog — naming the page it was
+        # looking at rather than the logout that emptied it. One re-login here
+        # fixes all five callers.
+        if "login.jsp" in page.url.lower() or "loginpage" in page.url.lower():
+            if _relogin:
+                log("Integration Catalog nav: session was dropped — logging in "
+                    "again and retrying once")
+                if not await _ise_login(page, log):
+                    log("Integration Catalog nav: re-login failed")
+                    return False
+                return await _navigate_to_integration_catalog(page, log,
+                                                              _relogin=False)
+            log(f"Integration Catalog nav: still logged out after a retry "
+                f"(url={page.url[:90]})")
+            return False
 
         log("Integration Catalog did not populate -- the list never loaded")
         return False
@@ -1358,17 +1376,47 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             if not await _ise_login(page, log):
                 return False, "ISE login failed"
 
-            # Navigate to Administration → Deployment (Dijit SPA warm-up required).
-            # Strategy:
-            #   1. page.goto() to Integration Catalog — fully boots Dijit, waits for
-            #      catalog cards.  This is the ONLY page.goto() hash that works reliably.
-            #   2. From the live SPA, click through the left nav tree to reach Deployment.
-            #      Never use window.location.hash = '#administration/deployment' — that
-            #      hash is invalid on this ISE version and triggers "Page not accessible".
-            log("Warming up Dijit SPA via Integration Catalog...")
-            await _navigate_to_integration_catalog(page, log)
+            # Navigate straight to Administration → Deployment.
+            #
+            # This used to warm the Dijit SPA up by page.goto()-ing the
+            # Integration Catalog first, on the basis that it was "the ONLY
+            # page.goto() hash that works reliably" and that the deployment
+            # hash "is invalid on this ISE version". Neither holds any more:
+            # the catalog goto now fails to populate and leaves the browser on
+            # login.jsp, i.e. it LOGS THE SESSION OUT, while the deployment
+            # hash renders its 34-row node table in about 5s. The step then
+            # carried on ("Deployment table wait timed out — proceeding
+            # anyway") and reported the dead session as
+            # "Could not click ise node link", which is the last thing it
+            # tried rather than the thing that was wrong.
+            log("Navigating to Deployment (direct hash)...")
+            await page.goto(
+                f"https://{ISE_HOST}/admin/"
+                "#administration/administration_system/"
+                "administration_system_deployment",
+                wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_timeout(5_000)
             await _ise_dismiss_modal(page)
             await _ise_dismiss_session_info(page)
+
+            # A dropped session must not look like a missing element. Re-login
+            # once and come back rather than walking on to the node click.
+            if "login.jsp" in page.url.lower() or "loginpage" in page.url.lower():
+                log("session was dropped during navigation — logging in again")
+                if not await _ise_login(page, log):
+                    return False, ("ISE session dropped while opening Deployment "
+                                   "and the re-login failed")
+                await page.goto(
+                    f"https://{ISE_HOST}/admin/"
+                    "#administration/administration_system/"
+                    "administration_system_deployment",
+                    wait_until="domcontentloaded", timeout=60_000)
+                await page.wait_for_timeout(5_000)
+                await _ise_dismiss_modal(page)
+                await _ise_dismiss_session_info(page)
+                if "login.jsp" in page.url.lower():
+                    return False, ("ISE keeps returning to the login page when "
+                                   f"opening Deployment (url={page.url[:90]})")
             # Debug snapshot — shows nav tree state so we can tune selectors if needed
             await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_catalog_nav.png"), full_page=False)
 
@@ -1437,6 +1485,19 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             await _ise_dismiss_modal(page)
             await _ise_dismiss_session_info(page)
 
+            # Never click on a page we are not authenticated on. "Proceeding
+            # anyway" above is fine for a slow grid, but if the session has gone
+            # the node link cannot exist, and the click's timeout then names the
+            # link instead of the logout — which is exactly how a dead session
+            # got reported as "Could not click ise node link".
+            if "login.jsp" in page.url.lower() or "loginpage" in page.url.lower():
+                await page.screenshot(
+                    path=str(Path(__file__).parent / "data" / "ise_deploy_logged_out.png"),
+                    full_page=True)
+                return False, ("ISE logged the session out before the node list "
+                               f"rendered (url={page.url[:90]}) — not a missing "
+                               "element")
+
             log("Clicking ise node to open edit form")
             try:
                 # Use text-is for exact case match ("ise" hostname, not "ISE Community page")
@@ -1445,7 +1506,18 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 await _ise_link.click(timeout=10000)
             except Exception as _e:
                 await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_deploy_fail.png"), full_page=True)
-                return False, f"Could not click ise node link: {_e}"
+                # Say what WAS on the page. A bare locator timeout cannot
+                # distinguish "wrong page" from "node named something else".
+                try:
+                    _seen = await page.evaluate(
+                        """() => Array.from(document.querySelectorAll(
+                                    'table tbody tr a, td a'))
+                                .map(a => (a.textContent || '').trim())
+                                .filter(Boolean).slice(0, 8)""")
+                except Exception:
+                    _seen = []
+                return False, (f"Could not click ise node link: {_e} "
+                               f"[url={page.url[:70]} node links seen={_seen}]")
 
             # Wait for the edit form to load — look for "ISE deployment name" label
             log("Waiting for node edit form to load...")
@@ -1984,42 +2056,71 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 # pipeline, so the gesture is trusted and window.open() is
                 # permitted. Same reason CLAUDE.md prescribes a coordinate click
                 # for SCC's React controls.
-                try:
-                    _box = await page.evaluate("""() => {
-                        const hit = (el) => {
-                            const r = el.getBoundingClientRect();
-                            return r.width > 0 && r.height > 0 ? r : null;
-                        };
+                # Scroll, let the scroll SETTLE, re-measure, and only then click.
+                #
+                # scrollIntoView() and getBoundingClientRect() used to run in the
+                # SAME evaluate, so the rect was measured before the scroll had
+                # finished and the coordinate was already stale by the time
+                # mouse.click() crossed the wire — the trusted click landed on
+                # whatever had slid under it. On 2026-09-09 that emptied the form
+                # (the failure diagnostic showed name and region both "" seconds
+                # after both had been filled and verified) and opened no popup,
+                # so it reported as "Register opened no OAuth popup" on a form
+                # that had been filled perfectly.
+                _FIND_REGISTER = """() => {
+                    if (typeof dijit !== 'undefined') {
+                        const w = dijit.registry.toArray().find(w => {
+                            const lbl = (w.label || w.title || '').trim();
+                            const txt = w.domNode ? w.domNode.textContent.trim() : '';
+                            return lbl === 'Register' || txt === 'Register';
+                        });
                         // Prefer the Dijit button node so we click the widget's
                         // own clickable surface rather than a text span.
-                        if (typeof dijit !== 'undefined') {
-                            const w = dijit.registry.toArray().find(w => {
-                                const lbl = (w.label || w.title || '').trim();
-                                const txt = w.domNode ? w.domNode.textContent.trim() : '';
-                                return lbl === 'Register' || txt === 'Register';
-                            });
-                            if (w && w.domNode) {
-                                w.domNode.scrollIntoView({block: 'center'});
-                                const r = hit(w.domNode);
-                                if (r) return {x: r.left + r.width/2, y: r.top + r.height/2};
-                            }
-                        }
-                        for (const el of document.querySelectorAll(
-                                'button,[role="button"],.dijitButtonNode')) {
-                            if ((el.textContent || '').trim() !== 'Register') continue;
-                            el.scrollIntoView({block: 'center'});
-                            const r = hit(el);
-                            if (r) return {x: r.left + r.width/2, y: r.top + r.height/2};
-                        }
-                        return null;
-                    }""")
-                    if _box:
+                        if (w && w.domNode) return w.domNode;
+                    }
+                    for (const el of document.querySelectorAll(
+                            'button,[role="button"],.dijitButtonNode')) {
+                        if ((el.textContent || '').trim() === 'Register') return el;
+                    }
+                    return null;
+                }"""
+                try:
+                    await page.evaluate(
+                        "(find) => { const el = eval(find)(); if (el) "
+                        "el.scrollIntoView({block: 'center', behavior: 'instant'}); }",
+                        _FIND_REGISTER)
+                    await page.wait_for_timeout(1200)
+
+                    # Re-measure AND confirm the button is what the cursor would
+                    # actually hit. Without this check a drifted coordinate is
+                    # indistinguishable from a button that ignores the click.
+                    _box = await page.evaluate(
+                        "(find) => {"
+                        " const el = eval(find)(); if (!el) return null;"
+                        " const r = el.getBoundingClientRect();"
+                        " if (!(r.width > 0 && r.height > 0)) return null;"
+                        " const x = r.left + r.width / 2, y = r.top + r.height / 2;"
+                        " const at = document.elementFromPoint(x, y);"
+                        " const ok = !!at && (at === el || el.contains(at) || at.contains(el));"
+                        " return {x: x, y: y, ok: ok,"
+                        "         at: at ? ((at.textContent || '').trim().slice(0, 40)"
+                        "                   + ' <' + at.tagName + '>') : 'nothing'};"
+                        "}",
+                        _FIND_REGISTER)
+
+                    if _box and not _box.get("ok"):
+                        # Do NOT click. Clicking here is what cleared the form.
+                        log(f"Register at ({_box['x']:.0f}, {_box['y']:.0f}) is "
+                            f"covered by {_box['at']!r} — not clicking a coordinate "
+                            f"that would hit something else; falling back to Dijit")
+                    elif _box:
                         await page.mouse.click(_box["x"], _box["y"])
                         log(f"Register clicked as a TRUSTED mouse event at "
                             f"({_box['x']:.0f}, {_box['y']:.0f}) — required for the "
                             f"OAuth popup to be allowed")
                         return True
-                    log("Register button has no clickable box — falling back to Dijit")
+                    else:
+                        log("Register button has no clickable box — falling back to Dijit")
                 except Exception as _mc:
                     log(f"trusted mouse click failed ({type(_mc).__name__}: "
                         f"{str(_mc).splitlines()[0][:90]}) — falling back to Dijit")
@@ -2228,6 +2329,74 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
 
             await page.route('**', _fix_region_route)
             log("Region intercept route active (all requests)")
+
+            # Pre-click state, because "no popup" has three very different
+            # causes and the failure diagnostic cannot tell them apart: the
+            # button is disabled (ISE never submits, so no request is made at
+            # all), the click misses, or the submit works and the popup is just
+            # slow. Read the DIJIT widget values, not the DOM inputs — the form
+            # re-renders during submit and the raw inputs read empty even on a
+            # good run, which is documented above as having misled two earlier
+            # diagnoses.
+            try:
+                _pre = await page.evaluate("""() => {
+                    const out = {};
+                    if (typeof dijit !== 'undefined') {
+                        const reg = dijit.registry.toArray();
+                        const btn = reg.find(w => {
+                            const lbl = (w.label || w.title || '').trim();
+                            const txt = w.domNode ? w.domNode.textContent.trim() : '';
+                            return lbl === 'Register' || txt === 'Register';
+                        });
+                        // Not every registry entry is a _WidgetBase, so never
+                        // assume .get() exists -- doing so made this whole
+                        // diagnostic throw ("btn.get is not a function") and
+                        // report nothing at all on the run it was added for.
+                        if (btn) {
+                            if (typeof btn.get === 'function') {
+                                try { out.btn_disabled_prop = !!btn.get('disabled'); }
+                                catch (e) { out.btn_disabled_prop = 'get() threw'; }
+                            } else if ('disabled' in btn) {
+                                out.btn_disabled_prop = !!btn.disabled;
+                            }
+                            const dn = btn.domNode || btn;
+                            if (dn && dn.className !== undefined) {
+                                out.btn_class = String(dn.className).slice(0, 90);
+                            }
+                            if (dn && dn.querySelector) {
+                                const inner = dn.querySelector(
+                                    'button,[role="button"],.dijitButtonNode');
+                                out.btn_dom_disabled = !!(inner && inner.disabled);
+                            }
+                            if (dn && dn.getAttribute) {
+                                out.btn_aria = dn.getAttribute('aria-disabled');
+                            }
+                        } else {
+                            out.btn = 'not in dijit registry';
+                        }
+                        for (const id of ['pxCloud_deviceName', 'pxCloud_region']) {
+                            const w = typeof dijit.byId === 'function' ? dijit.byId(id) : null;
+                            if (!w) continue;
+                            if (typeof w.get === 'function') {
+                                try { out[id] = String(w.get('value')); }
+                                catch (e) { out[id] = 'get() threw'; }
+                            } else if (w.value !== undefined) {
+                                out[id] = String(w.value);
+                            }
+                        }
+                    } else {
+                        out.dijit = 'undefined';
+                    }
+                    const err = Array.from(document.querySelectorAll(
+                            '.dijitValidationTextBoxError, [class*="error" i]'))
+                        .map(e => (e.textContent || '').trim())
+                        .filter(t => t && t.length < 120).slice(0, 3);
+                    if (err.length) out.errors = err;
+                    return out;
+                }""")
+                log(f"pxGrid pre-click state: {_pre}")
+            except Exception as _pe2:
+                log(f"pxGrid pre-click state unavailable: {_pe2}")
 
             # Set up popup listener then click Register
             _popup_err = ""
@@ -4081,30 +4250,130 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
 # treating "the click did not raise" as success.
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _scc_open_session_async(ctx, idac_url: str, log):
+async def _scc_open_session_async(ctx, idac_url: str, log, db_path: str = ""):
     """Async twin of duo_automation._scc_open_session.
 
     Opens an authenticated SCC tab through the iDAC card's SAML auto-login and
     returns (page, enterprise_id). No password, no stored session; loading a
     stored iDAC URL is read-only (only idac_sdk reprovisions).
     """
+    # Pick by SECTION and verify where each candidate lands -- see the comment
+    # on duo_automation.IDAC_SCC_SECTIONS. /^view$/i now matches the Meraki
+    # Dashboard button, which opens a real Meraki dashboard, so a wrong guess
+    # looks like a success and fails much later as "session never settled".
+    # Both card versions are live during the migration ("View" then "Login"),
+    # so the candidate list and its verification are shared with the sync twin.
+    import re as _re
+    import sqlite3 as _sq
+
+    from duo_automation import (IDAC_NON_SCC_SECTIONS, IDAC_SCC_SECTIONS,
+                                _JS_IDAC_BTNS, _JS_IDAC_CLICK, _UUID_RE,
+                                _idac_scc_candidates, _scc_default_db_path)
+
+    def _host(u):
+        return u.split("/")[2] if "://" in u else ""
+
+    def _is_scc(u):
+        h = _host(u)
+        return h.endswith("security.cisco.com") and not h.startswith("sign-on")
+
     pg = await ctx.new_page()
     await pg.goto(idac_url, wait_until="load", timeout=45_000)
     await pg.wait_for_timeout(5_000)
-    async with ctx.expect_page(timeout=25_000) as info:
-        await pg.evaluate("""() => {const b=Array.from(document.querySelectorAll('button,a'))
-            .find(x=>/^view$/i.test((x.innerText||'').trim())); if(b)b.click();}""")
-    tab = await info.value
-    await tab.wait_for_load_state("load", timeout=30_000)
-    for _ in range(18):
-        await tab.wait_for_timeout(5_000)
-        if "enterpriseId=" in tab.url:
-            break
-    if "enterpriseId=" not in tab.url:
-        raise RuntimeError(f"SCC session never settled (url={tab.url[:120]})")
-    ent = tab.url.split("enterpriseId=")[1].split("&")[0]
-    log(f"SCC session established (enterprise {ent[:8]}...)")
-    return tab, ent
+
+    cands = []
+    for _i in range(12):
+        try:
+            _btns = await pg.evaluate(_JS_IDAC_BTNS, list(IDAC_SCC_SECTIONS)
+                                      + list(IDAC_NON_SCC_SECTIONS)) or []
+            cands = _idac_scc_candidates(_btns)
+            if cands:
+                break
+        except Exception:
+            pass
+        await pg.wait_for_timeout(2_500)
+    if not cands:
+        raise RuntimeError(
+            "iDAC card offered no control that could open Security Cloud "
+            "Control after 30s — the card did not render, or its layout "
+            "changed again")
+
+    log("iDAC SCC candidates: "
+        + ", ".join(f"{c['label']!r}"
+                    + (f" in {c['section']!r}" if c.get("section") else " (no section)")
+                    for c in cands[:4]))
+
+    known = set()
+    try:
+        with _sq.connect(db_path or _scc_default_db_path()) as conn:
+            known = {(r[0] or "").strip().lower() for r in conn.execute(
+                "SELECT scc_org_uuid FROM org_credentials "
+                "WHERE scc_org_uuid IS NOT NULL AND scc_org_uuid != ''")}
+    except _sq.Error as e:
+        log(f"could not read known org uuids ({e}) — not guessing an enterprise id")
+
+    attempts = []
+    for _c in cands:
+        _label, _sect = _c.get("label"), _c.get("section") or "no section"
+        try:
+            async with ctx.expect_page(timeout=45_000) as info:
+                await pg.evaluate(_JS_IDAC_CLICK, _c["i"])
+            tab = await info.value
+            await tab.wait_for_load_state("load", timeout=30_000)
+        except Exception as e:
+            attempts.append(f"{_label!r} in {_sect}: no tab opened ({str(e)[:60]})")
+            continue
+
+        for _ in range(18):
+            if "enterpriseId=" in tab.url or _is_scc(tab.url):
+                break
+            await tab.wait_for_timeout(5_000)
+
+        if not _is_scc(tab.url):
+            attempts.append(f"{_label!r} in {_sect}: landed on {tab.url[:70]}")
+            log(f"{_label!r} in {_sect} opened {_host(tab.url)} — not SCC, trying next")
+            try:
+                await tab.close()
+            except Exception:
+                pass
+            continue
+
+        # The id comes off the live page and is accepted only when it matches a
+        # known scc_org_uuid, so a stray UUID cannot point SCC at another org.
+        # Poll: the loop above exits as soon as the HOST is right, well before
+        # the SPA has rendered anything into the DOM.
+        ent = ""
+        for _ in range(18):
+            if "enterpriseId=" in tab.url:
+                ent = tab.url.split("enterpriseId=")[1].split("&")[0]
+                break
+            try:
+                _html = (await tab.content()) or ""
+            except Exception as _ce:
+                # Still navigating -- poll again rather than fail the login.
+                log(f"page still navigating ({str(_ce)[:60]}) — will re-read")
+                _html = ""
+            _cands = list(dict.fromkeys(_re.findall(_UUID_RE, _html)))
+            ent = next((c for c in _cands if c.lower() in known), "")
+            if ent:
+                break
+            await tab.wait_for_timeout(5_000)
+        if not ent:
+            attempts.append(f"{_label!r} in {_sect}: on SCC at {tab.url[:60]} but "
+                            "no enterprise id")
+            try:
+                await tab.close()
+            except Exception:
+                pass
+            continue
+
+        log(f"SCC session established via {_label!r} in {_sect} "
+            f"(enterprise {ent[:8]}...)")
+        return tab, ent
+
+    raise RuntimeError(
+        "could not reach Security Cloud Control from the iDAC card; tried "
+        + "; ".join(attempts))
 
 
 async def _scc_count_ise_integrations(page, eid: str) -> int:
@@ -4237,7 +4506,8 @@ async def _ise_deactivate_scc(page, log) -> tuple[bool, str]:
     return False, "ISE: still shows Deactivate — instance did not go inactive"
 
 
-async def _ise_teardown_async(pod_id: str, creds: dict, log) -> tuple[bool, str]:
+async def _ise_teardown_async(pod_id: str, creds: dict, log,
+                              db_path: str = "") -> tuple[bool, str]:
     from playwright.async_api import async_playwright
 
     idac = (creds.get("idac_url") or "").strip()
@@ -4265,7 +4535,7 @@ async def _ise_teardown_async(pod_id: str, creds: dict, log) -> tuple[bool, str]
                 results.append(("scc", False, "SCC: no idac_url for this org — cannot log in"))
                 log("  SCC: no idac_url for this org — cannot log in")
             else:
-                scc_page, eid = await _scc_open_session_async(ctx, idac, log)
+                scc_page, eid = await _scc_open_session_async(ctx, idac, log, db_path)
                 ok, msg = await _scc_delete_ise_integrations(scc_page, eid, log)
                 log(f"  {msg}")
                 results.append(("scc", ok, msg))
@@ -4294,7 +4564,7 @@ def ise_teardown(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
 
     _log(f"Tearing down ISE integrations for {pod_id}")
     try:
-        ok, msg = asyncio.run(_ise_teardown_async(pod_id, creds, _log))
+        ok, msg = asyncio.run(_ise_teardown_async(pod_id, creds, _log, db_path))
     except Exception as e:
         return False, f"teardown error: {e}"
 

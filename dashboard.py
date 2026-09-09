@@ -3242,6 +3242,49 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             # Platform Management → Integrations → My Integrations → ISE form
             _nav_clicked = False
 
+            # Wait for the sidebar to actually PAINT before looking in it.
+            #
+            # This used to click roughly 6s after landing on /dashboard, and the
+            # SCC shell renders its nav well after that: the failure screenshot
+            # showed the sidebar as grey skeleton placeholders, with the whole
+            # page holding exactly one link ("Security Cloud Control"). The step
+            # then reported "Could not find Platform Management in SCC sidebar",
+            # which reads like a renamed or missing menu item rather than a page
+            # that had not drawn yet. Same trap as the cdFMC Platform Settings
+            # control, and the same fix: poll for the real thing.
+            _pm_seen = False
+            for _pm_try in range(24):          # up to ~120s
+                try:
+                    if page.evaluate(
+                        """() => Array.from(document.querySelectorAll(
+                                'a,button,[role="link"],[role="button"],li'))
+                            .some(e => e.getClientRects().length &&
+                                       (e.textContent || '').trim()
+                                           .includes('Platform Management'))"""):
+                        _pm_seen = True
+                        if _pm_try:
+                            log_fn("[scc-nav] sidebar rendered after "
+                                   f"~{_pm_try * 5}s")
+                        break
+                except Exception:
+                    pass
+                page.wait_for_timeout(5000)
+
+            if not _pm_seen:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"scc_pm_fail_{pod_id}.png"))
+                    _links = page.evaluate(
+                        """() => Array.from(document.querySelectorAll('a,button'))
+                            .map(a => (a.textContent || '').trim())
+                            .filter(Boolean).slice(0, 12)""")
+                except Exception:
+                    _links = []
+                log_fn("[scc-nav] WARN: sidebar never rendered Platform Management "
+                       f"in 120s — saved scc_pm_fail screenshot; controls seen={_links}")
+                return False, ("SCC sidebar never rendered in 120s (still skeleton "
+                               f"placeholders; controls seen={_links}) — not a missing "
+                               "Platform Management menu item")
+
             # Step 1: Click Platform Management in sidebar to expand it
             log_fn("[scc-nav] Clicking Platform Management in sidebar")
             _pm_clicked = False
@@ -3265,10 +3308,12 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             if not _pm_clicked:
                 try:
                     page.screenshot(path=str(DATA_DIR / "data" / f"scc_pm_fail_{pod_id}.png"))
-                    log_fn("[scc-nav] WARN: Platform Management not found — saved scc_pm_fail screenshot")
+                    log_fn("[scc-nav] WARN: Platform Management is on the page but no "
+                           "selector could click it — saved scc_pm_fail screenshot")
                 except Exception:
                     pass
-                return False, "Could not find Platform Management in SCC sidebar — check scc_pm_fail screenshot"
+                return False, ("Platform Management rendered but none of the "
+                               "selectors could click it — check scc_pm_fail screenshot")
 
             # Step 2: Click Integrations in the expanded submenu
             page.wait_for_timeout(1000)
