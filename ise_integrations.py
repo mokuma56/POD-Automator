@@ -72,6 +72,22 @@ def _sanitize(s: str) -> str:
 _SKIP_PREFIX = "SKIP:"
 
 
+from ui_wait import (absent_message, describe_page_async,  # page-state-aware waits
+                     wait_for_async)
+
+
+async def _rendered_body(page) -> str:
+    """The page's lowercased text, but only once it has actually painted.
+
+    Returns "" while the body is too small to judge. Callers that test for the
+    ABSENCE of a marker need this: on an unpainted page the marker is missing
+    for the wrong reason, and "pxGrid Cloud not yet enabled" then sends the
+    operator off to re-run a step on a node that is already registered.
+    """
+    txt = (await page.inner_text("body") or "").lower()
+    return txt if len(txt) > 400 else ""
+
+
 def _db_connect(db_path: str, retries: int = 8, delay: float = 0.4) -> sqlite3.Connection:
     """Connect to SQLite with retry for transient VirtioFS/bind-mount I/O errors.
     macOS Docker bind-mounts can return EIO (disk I/O error) during concurrent
@@ -1800,9 +1816,9 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
 
             if not _cloud_enabled:
                 return False, (
-                    "Could not find or click 'Enable pxGrid Cloud' checkbox — "
-                    "check ise_pxgrid_cloud_enabled.png"
-                )
+                    absent_message("'Enable pxGrid Cloud' checkbox",
+                                   diag=await describe_page_async(page),
+                                   extra="check ise_pxgrid_cloud_enabled.png"))
 
             # ── Diagnose registration form visibility ─────────────────────────────
             # Find out if td#pxCloud_region is in DOM but hidden, and why.
@@ -2460,7 +2476,9 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 log(f"Popup listener error: {_pe} — Register button may not have opened a popup")
 
             if not _registered:
-                return False, "Could not find/click Register button on ISE node edit page"
+                return False, absent_message(
+                    "a clickable Register button on the ISE node edit page",
+                    diag=await describe_page_async(page))
 
             if not _popup_handled:
                 # Capture the MAIN page here. The only screenshot this step took
@@ -3646,7 +3664,10 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
                     await page.wait_for_timeout(3000)
                 else:
                     await page.screenshot(path="/pipeline/host-data/ise_reactivate_fail.png", full_page=True)
-                    return False, "Activate button not found — check ise_reactivate_fail.png"
+                    return False, absent_message(
+                        "Activate button (re-activate)",
+                        diag=await describe_page_async(page),
+                        extra="check ise_reactivate_fail.png")
 
             await page.screenshot(path="/pipeline/host-data/ise_scc_post_activate.png", full_page=True)
             log("Post-activate screenshot: ise_scc_post_activate.png")
@@ -3766,7 +3787,9 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
             await page.wait_for_timeout(1500)
             await _ise_dismiss_modal(page)
             if not await _open_integration(page, "Cisco Security Cloud", log):
-                return False, "Cisco Security Cloud not found in the ISE Integration Catalog"
+                return False, absent_message(
+                    "Cisco Security Cloud in the ISE Integration Catalog",
+                    diag=await describe_page_async(page))
             await page.wait_for_timeout(2000)
 
             # Click "Configuration" tab (default lands on "About this integration")
@@ -3782,9 +3805,18 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
             # NOTE: "Enable pxGrid Cloud and register ISE" is ALWAYS shown as a prerequisite
             # reminder even after registration. The real indicator that ISE is NOT registered
             # is the ABSENCE of "Manage your ISE registration" link on the page.
-            page_text = (await page.inner_text("body")).lower()
+            # Judge only a RENDERED page. The marker below is an absence test,
+            # so an unpainted body silently means "not registered" and sends the
+            # operator off to re-run step 1 on a node that is already fine.
+            page_text = await wait_for_async(
+                page, "the Configuration tab body",
+                lambda: _rendered_body(page), timeout=60,
+                log=lambda m: log(m)) or ""
             if "enable pxgrid cloud and register" in page_text and "manage your ise registration" not in page_text:
-                return False, "pxGrid Cloud not yet enabled on ISE node — run step 1 (pxGrid Cloud Register) first"
+                return False, ("pxGrid Cloud not yet enabled on ISE node — run step 1 "
+                               "(pxGrid Cloud Register) first; " + absent_message(
+                                   "'manage your ise registration'",
+                                   diag=await describe_page_async(page)))
 
             await page.screenshot(path="/pipeline/host-data/ise_scc_config_tab.png", full_page=False)
 
@@ -3872,7 +3904,9 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
                     continue
             if not _activated:
                 await page.screenshot(path="/pipeline/host-data/ise_activate_fail.png", full_page=True)
-                return False, "Could not find Activate button — check ise_activate_fail.png"
+                return False, absent_message(
+                    "Activate button", diag=await describe_page_async(page),
+                    extra="check ise_activate_fail.png")
             await page.wait_for_timeout(3000)
             # Dismiss Session Info popup — it re-appears after Activate and can overlay the OTP modal
             await _ise_dismiss_session_info(page)
@@ -4452,7 +4486,8 @@ async def _scc_delete_ise_integrations(page, eid: str, log) -> tuple[bool, str]:
 async def _ise_deactivate_scc(page, log) -> tuple[bool, str]:
     """Deactivate the Cisco Security Cloud integration on ISE. Verifies the state flipped."""
     if not await _navigate_to_integration_catalog(page, log):
-        return False, "ISE: Integration Catalog did not load"
+        return False, absent_message("the ISE Integration Catalog",
+                                     diag=await describe_page_async(page))
 
     body = (await page.evaluate("() => document.body.innerText") or "")
     if "cisco security cloud" not in body.lower():
