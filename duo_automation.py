@@ -3648,7 +3648,153 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
     return True, detail
 
 
-def _scc_open_session(ctx, idac_url: str, log=None):
+# The iDAC adaptive card carries one section per product, each with its own
+# button, and SEVERAL are labelled "Login" (Webex, Duo, Security Cloud Control,
+# Cisco Cloud Control). Matching on the label used to work because SCC's button
+# was the only "View" — but a Meraki Dashboard section now owns that label, so
+# /^view$/i opened the Meraki dashboard, the tab never grew an enterpriseId, and
+# every SCC-dependent step failed with "SCC session never settled". Matching
+# "view|login" instead is no better: it would take whichever Login comes first,
+# which is Duo's or Webex's.
+#
+# So pick by SECTION, and do not trust the label at all. Walk up from a button
+# to the deepest ancestor whose text names exactly one known section; that
+# ancestor is the button's card. Geometry cannot do this — the sections are
+# laid out as columns, so four different buttons share a single y coordinate.
+#
+# BOTH card versions are in the field while dCloud migrates the iDAC template:
+# older sessions label the SCC control "View", newer ones "Login". So build an
+# ORDERED LIST of candidates and let the caller verify where each one actually
+# lands, rather than betting on one label or one section name. Same shape as
+# _winrm_connect_jump, which tries credential candidates and probes each.
+IDAC_SCC_SECTIONS = ("Cisco Security Cloud Control", "Cisco Cloud Control")
+IDAC_NON_SCC_SECTIONS = ("Meraki Dashboard", "Cisco Duo", "Webex Credentials",
+                         "Cisco SaaS Accounts - ThousandEyes")
+_IDAC_OPENERS = r"^(log ?in|view|open|go|launch)$"
+
+_JS_IDAC_BTNS = """(sections) => {
+    const owner = (el) => {
+        let node = el, found = null, hops = 0;
+        while (node && hops < 14) {
+            node = node.parentElement; hops++;
+            if (!node) break;
+            const hits = sections.filter(s => (node.innerText || '').includes(s));
+            if (hits.length === 1) found = hits[0];
+        }
+        return found;
+    };
+    return Array.from(document.querySelectorAll('button,a'))
+        .filter(x => x.getClientRects().length && (x.innerText || '').trim())
+        .map((x, i) => ({i: i,
+                         label: (x.innerText || '').trim().slice(0, 40),
+                         section: owner(x) || ''}));
+}"""
+
+# Clicks by index into the SAME filtered list _JS_IDAC_BTNS enumerates, so the
+# indices stay meaningful between the two calls.
+_JS_IDAC_CLICK = """(i) => {
+    const b = Array.from(document.querySelectorAll('button,a'))
+        .filter(x => x.getClientRects().length && (x.innerText || '').trim())[i];
+    if (!b) return '';
+    b.click();
+    return (b.innerText || '').trim();
+}"""
+
+
+def _idac_scc_candidates(btns: list) -> list:
+    """Controls that might open SCC from the iDAC card, best guess first.
+
+    Order matters more than cleverness: a button inside a section named for
+    Security Cloud Control is the strongest signal, and only then do we fall
+    back to any opener that is not claimed by a section we know is NOT SCC.
+    That second pass is what keeps pre-migration cards working, where the SCC
+    control is labelled "View" — while still never offering Meraki's "View" or
+    Duo's "Login".
+    """
+    import re as _re
+    opener = _re.compile(_IDAC_OPENERS, _re.I)
+    out, seen = [], set()
+
+    def _add(b):
+        if b.get("i") not in seen:
+            seen.add(b.get("i"))
+            out.append(b)
+
+    for _s in IDAC_SCC_SECTIONS:
+        for b in btns:
+            if b.get("section") == _s and opener.match(b.get("label") or ""):
+                _add(b)
+    for b in btns:
+        if b.get("section") in IDAC_NON_SCC_SECTIONS:
+            continue
+        if opener.match(b.get("label") or ""):
+            _add(b)
+    return out
+
+
+_UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+def _scc_default_db_path() -> str:
+    """The repo's pod_state.db, for helpers that were not given a db_path."""
+    import os as _os
+    return _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                         "data", "pod_state.db")
+
+
+def _scc_enterprise_id(page, db_path: str = "", log=None) -> str:
+    """The enterprise id of the org this SCC session is signed in to.
+
+    SCC used to land on ...?enterpriseId=<uuid> and the id was simply read off
+    the URL. It now lands on a clean /dashboard, so that read returns nothing
+    and the caller's 90s wait reported a perfectly good session as "never
+    settled". The id is still on the page, and SCC still ACCEPTS the parameter
+    on every URL we build, so only the lookup has to change.
+
+    Deliberately NOT derived from pods.scc_org: that column holds the cdFMC
+    host, which is not always the SCC org (POD-17's cdFMC is org 517 while its
+    iDAC resolves to org 502). The live session stays authoritative — we just
+    read it from the body instead of the URL, and accept a scraped UUID only
+    when it matches an scc_org_uuid we already hold, so a stray UUID on the
+    page cannot silently point SCC operations at another lab's org.
+    """
+    import re as _re
+    import sqlite3 as _sq
+
+    _log = log or (lambda s: None)
+    if "enterpriseId=" in page.url:
+        return page.url.split("enterpriseId=")[1].split("&")[0]
+
+    # content() raises "the page is navigating and changing the content" while
+    # the SPA is still redirecting. Callers poll, so an unreadable page means
+    # "not yet", never "no id" — and it must not escape as a login failure.
+    # Same reason _scc_text tolerates the redirect chain tearing down.
+    try:
+        _html = page.content() or ""
+    except Exception as e:
+        _log(f"page still navigating ({str(e)[:60]}) — will re-read")
+        return ""
+
+    cands = list(dict.fromkeys(_re.findall(_UUID_RE, _html)))
+    if not cands:
+        return ""
+    try:
+        with _sq.connect(db_path or _scc_default_db_path()) as conn:
+            known = {(r[0] or "").strip().lower() for r in conn.execute(
+                "SELECT scc_org_uuid FROM org_credentials "
+                "WHERE scc_org_uuid IS NOT NULL AND scc_org_uuid != ''")}
+    except _sq.Error as e:
+        _log(f"could not read known org uuids ({e}) — not guessing an enterprise id")
+        return ""
+    for c in cands:
+        if c.lower() in known:
+            _log(f"enterprise id {c[:8]}… read from the page (matches a known org)")
+            return c
+    _log(f"page had {len(cands)} UUID(s), none matching a known scc_org_uuid")
+    return ""
+
+
+def _scc_open_session(ctx, idac_url: str, log=None, db_path: str = ""):
     """Open an authenticated SCC tab via the iDAC card's SAML auto-login.
 
     No password is involved and no org is rotated — loading a stored iDAC URL
@@ -3659,48 +3805,104 @@ def _scc_open_session(ctx, idac_url: str, log=None):
     pg.goto(idac_url, wait_until="load", timeout=45_000)
     pg.wait_for_timeout(5_000)
 
-    # Wait for the "View" button to actually exist before clicking it.
-    # The click used to be a bare evaluate with `if(b)b.click()`: when the
-    # adaptive card had not finished rendering, b was undefined, NOTHING was
-    # clicked, and the code then sat in expect_page() for 25s waiting for a
-    # popup that was never going to open -- reported as
-    # 'iDAC login failed (Timeout 25000ms exceeded while waiting for event
-    # "page")', which reads like a slow popup rather than a missing button.
-    FIND_VIEW = """() => Array.from(document.querySelectorAll('button,a'))
-        .some(x => /^view$/i.test((x.innerText || '').trim()))"""
-    _have_view = False
+    # Enumerate first, then try candidates in order. The click used to be a
+    # bare evaluate with `if(b)b.click()`: when the card had not finished
+    # rendering, b was undefined, NOTHING was clicked, and the code then sat in
+    # expect_page() waiting for a popup that was never going to open -- reported
+    # as a slow popup rather than a missing button.
+    def _host(u):
+        return u.split("/")[2] if "://" in u else ""
+
+    def _is_scc(u):
+        h = _host(u)
+        return h.endswith("security.cisco.com") and not h.startswith("sign-on")
+
+    cands = []
     for _i in range(12):
         try:
-            if pg.evaluate(FIND_VIEW):
-                _have_view = True
+            _btns = pg.evaluate(_JS_IDAC_BTNS, list(IDAC_SCC_SECTIONS)
+                                + list(IDAC_NON_SCC_SECTIONS)) or []
+            cands = _idac_scc_candidates(_btns)
+            if cands:
                 if _i:
-                    _log(f"iDAC 'View' button appeared after ~{_i * 2.5:.0f}s")
+                    _log(f"iDAC card rendered after ~{_i * 2.5:.0f}s")
                 break
         except Exception:
             pass
         pg.wait_for_timeout(2_500)
-    if not _have_view:
+    if not cands:
         raise RuntimeError(
-            "iDAC card has no 'View' button after 30s — the adaptive card did not "
-            "render (URL may be stale or dCloud slow); NOT minting a new one")
+            "iDAC card offered no control that could open Security Cloud "
+            "Control after 30s — the adaptive card did not render, or its "
+            "layout changed again (URL may be stale or dCloud slow); "
+            "NOT minting a new one")
 
-    with ctx.expect_page(timeout=45_000) as info:
-        _clicked = pg.evaluate("""() => {const b=Array.from(document.querySelectorAll('button,a'))
-            .find(x=>/^view$/i.test((x.innerText||'').trim()));
-            if(b){b.click(); return true;} return false;}""")
-        if not _clicked:
-            _log("iDAC 'View' vanished between check and click")
-    t = info.value
-    t.wait_for_load_state("load", timeout=30_000)
-    for _ in range(18):
-        t.wait_for_timeout(5_000)
-        if "enterpriseId=" in t.url:
-            break
-    if "enterpriseId=" not in t.url:
-        raise RuntimeError("SCC session never settled (no enterpriseId)")
-    ent = t.url.split("enterpriseId=")[1].split("&")[0]
-    _log(f"SCC session established (enterprise {ent[:8]}…)")
-    return t, ent
+    _log("iDAC SCC candidates: "
+         + ", ".join(f"{c['label']!r}"
+                     + (f" in {c['section']!r}" if c.get("section") else " (no section)")
+                     for c in cands[:4]))
+
+    attempts = []
+    for _c in cands:
+        _label, _sect = _c.get("label"), _c.get("section") or "no section"
+        try:
+            with ctx.expect_page(timeout=45_000) as info:
+                if not pg.evaluate(_JS_IDAC_CLICK, _c["i"]):
+                    _log(f"iDAC {_label!r} vanished between enumerate and click")
+            t = info.value
+            t.wait_for_load_state("load", timeout=30_000)
+        except Exception as e:
+            attempts.append(f"{_label!r} in {_sect}: no tab opened ({str(e)[:60]})")
+            continue
+
+        # Settle on SCC itself. The old test was "enterpriseId= in the URL",
+        # which SCC no longer emits, so it spun 90s on a working session.
+        for _ in range(18):
+            if "enterpriseId=" in t.url or _is_scc(t.url):
+                break
+            t.wait_for_timeout(5_000)
+
+        if not _is_scc(t.url):
+            # Say WHERE it landed. Without the URL this read as a slow or
+            # blocked SCC login for a whole run, when in fact the click had
+            # opened the Meraki dashboard and waiting could never have helped.
+            attempts.append(f"{_label!r} in {_sect}: landed on {t.url[:70]}")
+            _log(f"{_label!r} in {_sect} opened {_host(t.url)} — not SCC, trying next")
+            try:
+                t.close()
+            except Exception:
+                pass
+            continue
+
+        # Poll for the id. The loop above exits as soon as the HOST is right,
+        # which is well before the SPA has rendered anything into the DOM.
+        ent = ""
+        for _i in range(18):
+            try:
+                ent = _scc_enterprise_id(t, db_path)
+            except Exception as _ee:
+                # A transient read on a navigating page is not a failed login.
+                _log(f"enterprise id read retrying ({str(_ee)[:60]})")
+                ent = ""
+            if ent:
+                break
+            t.wait_for_timeout(5_000)
+        if not ent:
+            attempts.append(f"{_label!r} in {_sect}: on SCC at {t.url[:60]} but "
+                            "no enterprise id")
+            try:
+                t.close()
+            except Exception:
+                pass
+            continue
+
+        _log(f"SCC session established via {_label!r} in {_sect} "
+             f"(enterprise {ent[:8]}\u2026)")
+        return t, ent
+
+    raise RuntimeError(
+        "could not reach Security Cloud Control from the iDAC card; tried "
+        + "; ".join(attempts))
 
 
 def _scc_text(p, tries=3):
