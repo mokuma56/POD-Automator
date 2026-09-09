@@ -1804,6 +1804,8 @@ def get_browser_sessions(idac_url: str, duo_host: str,
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Jump host IP — WinRM port 5985 is open; has Python 3.11.4 + idac_sdk installed.
+from ui_wait import absent_message  # page-state-aware failure messages
+
 JUMP_HOST_IP = "198.18.133.36"
 # Jumphost1 authenticates as the DOMAIN user demouser, not administrator.
 # Verified on POD-3 (2026-09-02): "administrator" is rejected outright with
@@ -4188,7 +4190,8 @@ def duo_sync_now(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
             return a ? a.getAttribute('href') : '';
         }""")
         if not href:
-            return False, "no directory sync found — run duo_setup_external_directory first"
+            return False, ("no directory sync found — run duo_setup_external_directory "
+                       "first; " + absent_message("a directory sync row", page))
         page.goto(f"https://{host}{href}", wait_until="load", timeout=35_000)
         page.wait_for_timeout(7_000)
 
@@ -6906,7 +6909,7 @@ def _pw_ext_dir_setup(
             "button:has-text('Add External Directory')",
             "a:has-text('Add External Directory')",
         ], timeout=T, log=log):
-            return False, "Could not find 'Add External Directory' button"
+            return False, absent_message("'Add External Directory' button", duo_page)
         duo_page.wait_for_timeout(1000)
 
         if not _pw_click_first(duo_page, [
@@ -6915,7 +6918,7 @@ def _pw_ext_dir_setup(
             "li:has-text('Active Directory')",
             ".card:has-text('Active Directory')",
         ], timeout=T, log=log):
-            return False, "Could not find 'Active Directory' option"
+            return False, absent_message("the 'Active Directory' option", duo_page)
         duo_page.wait_for_timeout(1000)
 
         # Select "Add new connection" radio
@@ -7166,7 +7169,7 @@ def _pw_sso_ext_auth_setup(
             "button:has-text('Add Source')", "a:has-text('Add Source')",
             "button:has-text('+ Add Source')",
         ], timeout=T, log=log):
-            return False, "Could not find '+ Add Source' button"
+            return False, absent_message("the '+ Add Source' button", duo_page)
         duo_page.wait_for_timeout(800)
 
         if not _pw_click_first(duo_page, [
@@ -7174,7 +7177,7 @@ def _pw_sso_ext_auth_setup(
             "a:has-text('Add Active Directory')",
             "li:has-text('Active Directory')",
         ], timeout=T, log=log):
-            return False, "Could not find '+ Add Active Directory' option"
+            return False, absent_message("the '+ Add Active Directory' option", duo_page)
         duo_page.wait_for_timeout(1500)
 
         # Accept the Privacy Statement. It is a CHECKBOX (id/name
@@ -8896,11 +8899,12 @@ def duo_map_username_to_email(page, log=None) -> tuple[bool, str]:
         return {x:r.x+r.width/2, y:r.y+r.height/2, cur:(cb.innerText||'').trim()};
     }""")
     if not hit:
-        return False, "attribute-mapping combobox not found on the Provisioning tab"
+        return False, absent_message("the attribute-mapping combobox on the "
+                                     "Provisioning tab", page)
     page.mouse.click(hit["x"], hit["y"])
     page.wait_for_timeout(4_000)
     if not _leaf_click(page, "^email address$"):
-        return False, "'Email Address' not offered by the attribute combobox"
+        return False, absent_message("'Email Address' in the attribute combobox", page)
     if not _duo_form_submit(page, "outbound-scim-configuration"):
         return False, "could not submit the SCIM configuration form"
 
@@ -9033,7 +9037,8 @@ def sa_download_sp_metadata(t, sa_org: str, ent: str, dest: str, log=None) -> st
     with t.expect_download(timeout=45_000) as dl:
         hit = t.evaluate(_LEAF_HIT, "^download service provider xml file$")
         if not hit:
-            raise RuntimeError("no 'Download Service Provider XML file' control at step 3")
+            raise RuntimeError(absent_message(
+            "the 'Download Service Provider XML file' control at wizard step 3", t))
         t.mouse.click(hit["x"], hit["y"])
     xml = open(dl.value.path(), "rb").read().decode("utf-8", "replace")
     if "EntityDescriptor" not in xml:
@@ -9316,7 +9321,8 @@ def duo_disable_lab_mfa(pod_id: str, db_path: str, log=None) -> tuple[bool, str]
                 return 'todo';
             }""", {"field": field, "value": value})
             if state == "missing":
-                return False, f"option {label!r} not offered in {SECTION_OF[field]}"
+                return False, (f"option {label!r} not offered in {SECTION_OF[field]}; "
+                           + absent_message(f"option {label!r}", page))
             if state == "already":
                 _log(f"{label}: already set")
                 continue
@@ -9613,7 +9619,7 @@ def duo_configure_sso_auth_source(pod_id: str, db_path: str, log=None) -> tuple[
             page.mouse.click(box["x"], box["y"])
             page.wait_for_timeout(4_000)
             if not _leaf_click(page, "^active directory$", wait=3_000):
-                return False, "'Active Directory' not offered as a routing source"
+                return False, absent_message("'Active Directory' as a routing source", page)
             if not _leaf_click(page, "^save$", wait=10_000):
                 return False, "no Save control on the Routing Rules tab"
             notes.append("default routing rule -> Active Directory")
@@ -10156,7 +10162,8 @@ def sa_delete_sso_config(t, sa_org: str, ent: str, name: str = "DuoSSO",
     # Confirm the removal against a page that actually rendered — otherwise
     # "not listed" just means "not loaded yet" and the delete looks successful.
     if not _sa_config_page(t, sa_org, ent):
-        return False, f"deleted {name} but could not confirm — page did not render"
+        return False, (f"deleted {name} but could not confirm — "
+                       + absent_message(f"{name} (to confirm removal)", t))
     if name in (_scc_text(t) or ""):
         return False, f"{name} is still listed after the delete"
     _log(f"deleted the {name} SSO configuration")
@@ -10196,7 +10203,8 @@ def sa_delete_idp_directory(t, sa_org: str, ent: str, log=None) -> tuple[bool, s
     _sa_confirm(t)
 
     if not _sa_config_page(t, sa_org, ent):
-        return False, f"deleted {dirname} but could not confirm — page did not render"
+        return False, (f"deleted {dirname} but could not confirm — "
+                       + absent_message(f"{dirname} (to confirm removal)", t))
     if dirname in (_scc_text(t) or ""):
         return False, f"{dirname} is still listed after the delete"
     _log(f"deleted the {dirname} IdP directory")

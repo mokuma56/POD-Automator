@@ -6,6 +6,8 @@ from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request, make_response
 
 sys.path.insert(0, str(Path(__file__).parent))
+from ui_wait import (absent_message, describe_page,  # page-state-aware waits
+                     wait_for)
 import onboard_router
 try:
     import kb as _kb
@@ -3252,38 +3254,21 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             # which reads like a renamed or missing menu item rather than a page
             # that had not drawn yet. Same trap as the cdFMC Platform Settings
             # control, and the same fix: poll for the real thing.
-            _pm_seen = False
-            for _pm_try in range(24):          # up to ~120s
-                try:
-                    if page.evaluate(
-                        """() => Array.from(document.querySelectorAll(
-                                'a,button,[role="link"],[role="button"],li'))
-                            .some(e => e.getClientRects().length &&
-                                       (e.textContent || '').trim()
-                                           .includes('Platform Management'))"""):
-                        _pm_seen = True
-                        if _pm_try:
-                            log_fn("[scc-nav] sidebar rendered after "
-                                   f"~{_pm_try * 5}s")
-                        break
-                except Exception:
-                    pass
-                page.wait_for_timeout(5000)
-
-            if not _pm_seen:
+            _HAS_PM = """() => Array.from(document.querySelectorAll(
+                    'a,button,[role="link"],[role="button"],li'))
+                .some(e => e.getClientRects().length &&
+                           (e.textContent || '').trim().includes('Platform Management'))"""
+            if not wait_for(page, "Platform Management",
+                            lambda: page.evaluate(_HAS_PM),
+                            timeout=120, log=lambda m: log_fn(f"[scc-nav] {m}")):
                 try:
                     page.screenshot(path=str(DATA_DIR / "data" / f"scc_pm_fail_{pod_id}.png"))
-                    _links = page.evaluate(
-                        """() => Array.from(document.querySelectorAll('a,button'))
-                            .map(a => (a.textContent || '').trim())
-                            .filter(Boolean).slice(0, 12)""")
                 except Exception:
-                    _links = []
-                log_fn("[scc-nav] WARN: sidebar never rendered Platform Management "
-                       f"in 120s — saved scc_pm_fail screenshot; controls seen={_links}")
-                return False, ("SCC sidebar never rendered in 120s (still skeleton "
-                               f"placeholders; controls seen={_links}) — not a missing "
-                               "Platform Management menu item")
+                    pass
+                _msg = absent_message("Platform Management", page,
+                                      extra=f"see scc_pm_fail_{pod_id}.png")
+                log_fn(f"[scc-nav] WARN: {_msg}")
+                return False, _msg
 
             # Step 1: Click Platform Management in sidebar to expand it
             log_fn("[scc-nav] Clicking Platform Management in sidebar")
@@ -3485,13 +3470,42 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                         continue
 
             if not _ise_opened:
+                # Before calling it absent, give the Integrations panel the time
+                # it actually needs and then retry the same selectors once. The
+                # panel is a lazily-mounted React view, so a single pass right
+                # after navigation reliably reports "no Add Integration button"
+                # on a page that grows one seconds later.
+                _HAS_ADD = """() => Array.from(document.querySelectorAll(
+                        'a,button,[role="button"],div[class*="card" i]'))
+                    .some(e => e.getClientRects().length &&
+                               /add integration|\\bISE\\b/i.test(
+                                   (e.textContent || '').trim()))"""
+                if wait_for(page, "Add Integration / ISE card",
+                            lambda: page.evaluate(_HAS_ADD),
+                            log=lambda m: log_fn(f"[scc-nav] {m}")):
+                    for _add_lbl2 in ("Add Integration", "ISE", "Add integration"):
+                        try:
+                            _el2 = page.locator(
+                                f'button:has-text("{_add_lbl2}"), '
+                                f'a:has-text("{_add_lbl2}")').first
+                            if _el2.is_visible(timeout=4000):
+                                _el2.click()
+                                page.wait_for_timeout(2000)
+                                log_fn(f"[scc-nav] Clicked '{_add_lbl2}' on retry")
+                                _ise_opened = True
+                                break
+                        except Exception:
+                            continue
+            if not _ise_opened:
                 try:
                     page.screenshot(path=str(DATA_DIR / "data" / f"scc_add_fail_{pod_id}.png"))
-                    log_fn("[scc-nav] WARN: No Add Integration or ISE card found — saved scc_add_fail screenshot")
                 except Exception:
                     pass
-                return False, ("No Add Integration button or ISE card found on "
-                               "Platform Management → Integrations — check scc_add_fail screenshot")
+                _msg = absent_message("Add Integration button / ISE card", page,
+                                      extra=f"on Platform Management → Integrations; "
+                                            f"see scc_add_fail_{pod_id}.png")
+                log_fn(f"[scc-nav] WARN: {_msg}")
+                return False, _msg
 
             # After Add Integration, we may need to select ISE from a type list
             page.wait_for_timeout(1500)
@@ -3882,7 +3896,9 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                     page.screenshot(path=str(DATA_DIR / "data" / f"scc_nosave_{pod_id}.png"))
                 except Exception:
                     pass
-                return False, f"ISE \u2192 SCC integration FAILED: could not click Save (check scc_nosave_{pod_id}.png)"
+                return False, ("ISE \u2192 SCC integration FAILED: could not click Save "
+                               f"(check scc_nosave_{pod_id}.png) — "
+                               + absent_message("a usable Save control", page))
 
             page.wait_for_timeout(4000)
 
@@ -6251,10 +6267,17 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             _fmc_tab.wait_for_timeout(6000)
             _fmc_tab.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_pxgrid_page_{pod_id}.png"))
 
-            _body = _fmc_tab.inner_text("body").lower()
-            if "create pxgrid application instance" not in _body:
-                log_fn(f"[cdfmc-nav] pxGrid page body: {_body[:300]!r}")
-                return False, f"cdFMC pxGrid page not found at {_fmc_tab.url}"
+            # Poll rather than reading the body once after a flat 6s wait: this
+            # is a freshly-opened cross-domain tab, and "the control is not in
+            # the text yet" is indistinguishable from "wrong page" without it.
+            if not wait_for(_fmc_tab, "Create pxGrid Application Instance",
+                            lambda: "create pxgrid application instance"
+                                    in _fmc_tab.inner_text("body").lower(),
+                            timeout=60,
+                            log=lambda m: log_fn(f"[cdfmc-nav] {m}")):
+                _msg = absent_message("cdFMC pxGrid Identity Sources page", _fmc_tab)
+                log_fn(f"[cdfmc-nav] {_msg}")
+                return False, _msg
             log_fn("[cdfmc-nav] pxGrid Identity Sources page loaded ✓")
 
             # ── Already integrated? Then we are done. ─────────────────────────
