@@ -8049,6 +8049,62 @@ SESSION_TABLES = ("pipeline_steps", "pipeline_logs", "scc_checklist",
 # outliving the run that produced it is the whole point of it.
 
 
+def _existing_tables(conn) -> set:
+    """Table names actually present in this database."""
+    return {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _wipe_tables(conn, tables, pod_id: str = None) -> tuple:
+    """Delete rows from each table that EXISTS, one statement at a time.
+
+    Returns (wiped, missing, failed).
+
+    sda_steps and fabric_steps are created lazily -- by sda_fabric.py and
+    evpn_fabric.py respectively -- so an install that has never run the fabric
+    cards simply does not have them. The wipe used to be one loop over a fixed
+    list, so on those machines it raised "no such table: sda_steps" and every
+    table AFTER it in the list (duo_steps, ise_steps) was never wiped at all,
+    while the reset reported a hard failure. A table that does not exist has no
+    rows to delete: that is a note, not an error.
+
+    Each DELETE is also independent now, so one failure cannot abandon the rest.
+    """
+    present = _existing_tables(conn)
+    wiped, missing, failed = [], [], []
+    for tbl in tables:
+        if tbl not in present:
+            missing.append(tbl)
+            continue
+        try:
+            if pod_id is None:
+                conn.execute(f"DELETE FROM {tbl}")
+            else:
+                conn.execute(f"DELETE FROM {tbl} WHERE pod_id=?", (pod_id,))
+            wiped.append(tbl)
+        except sqlite3.Error as e:
+            failed.append(f"{tbl}: {e}")
+    return wiped, missing, failed
+
+
+def _count_rows(conn, tables, pod_id: str = None) -> dict:
+    """Row counts for the tables that exist; absent tables are simply absent."""
+    present = _existing_tables(conn)
+    out = {}
+    for tbl in tables:
+        if tbl not in present:
+            continue
+        try:
+            if pod_id is None:
+                out[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            else:
+                out[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl} WHERE pod_id=?",
+                                        (pod_id,)).fetchone()[0]
+        except sqlite3.Error:
+            continue
+    return out
+
+
 def _pod_container_names(pod_id: str) -> list:
     """Every container this POD can leave behind, not just the obvious two.
 
@@ -8177,8 +8233,7 @@ def _pod_session_files(pod_id: str) -> list:
 
 def _delete_all_pod_data(conn, pod_id):
     """Delete all session data for a POD across every pod_id-keyed table."""
-    for tbl in SESSION_TABLES:
-        conn.execute(f"DELETE FROM {tbl} WHERE pod_id=?", (pod_id,))
+    _wipe_tables(conn, SESSION_TABLES, pod_id=pod_id)
 
 
 @app.route("/api/delete-pod/<pod_id>", methods=["POST"])
@@ -8217,9 +8272,7 @@ def delete_pod(pod_id):
     # Verify, so a locked DB cannot read as a successful delete.
     try:
         conn = _db()
-        _left = {t: conn.execute(f"SELECT COUNT(*) FROM {t} WHERE pod_id=?",
-                                 (pod_id,)).fetchone()[0]
-                 for t in ("pods",) + SESSION_TABLES}
+        _left = _count_rows(conn, ("pods",) + SESSION_TABLES, pod_id=pod_id)
         conn.close()
         _dirty = {t: n for t, n in _left.items() if n}
         if _dirty:
@@ -9093,11 +9146,18 @@ def full_reset():
     _tables = ("pods",) + SESSION_TABLES
     try:
         _conn = _db()
-        for _tbl in _tables:
-            _conn.execute(f"DELETE FROM {_tbl}")
+        _wiped, _missing, _failed = _wipe_tables(_conn, _tables)
         _conn.commit()
         _conn.close()
-        _steps.append(f"db wiped: {', '.join(_tables)}")
+        _steps.append(f"db wiped: {', '.join(_wiped) or 'nothing'}")
+        if _missing:
+            # Not an error: sda_steps and fabric_steps are created lazily by the
+            # fabric cards, so an install that has never run them has no such
+            # table and therefore no rows to delete.
+            _steps.append(f"not present in this DB (nothing to wipe): "
+                          f"{', '.join(_missing)}")
+        for _f in _failed:
+            _errors.append(f"DB WIPE FAILED for {_f[:150]}")
     except Exception as _e:
         # The failure that used to be silent. A locked DB lands here.
         _errors.append(f"DB WIPE FAILED: {str(_e)[:160]}")
@@ -9105,8 +9165,7 @@ def full_reset():
     # ── 5. Verify, rather than assume ─────────────────────────────────────────
     try:
         _conn = _db()
-        _left = {t: _conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-                 for t in _tables}
+        _left = _count_rows(_conn, _tables)
         _conn.close()
         _dirty = {t: n for t, n in _left.items() if n}
         if _dirty:
@@ -9839,7 +9898,7 @@ async function load() {
   if (detailId) {
     // Only refresh the active tab to avoid re-rendering all tabs and causing page jumps
     const activeTab = document.querySelector('.tab-btn.active');
-    const tabName = activeTab ? activeTab.getAttribute('onclick').match(/switchTab\(this,\s*'(\w+)'\)/)?.[1] : null;
+    const tabName = activeTab ? activeTab.getAttribute('onclick').match(/switchTab\\(this,\\s*'(\\w+)'\\)/)?.[1] : null;
      if (tabName === 'steps' || tabName === 'pipeline' || !tabName) loadSteps(detailId);
      else if (tabName === 'switches')  loadSwitches(detailId);
      else if (tabName === 'cdfmc')     loadCdfmc(detailId);
@@ -10170,7 +10229,7 @@ async function renderPodSummary() {
       const ph = cur ? (cur.phase || 'pipeline') : 'pipeline';
       const inPhase = p.steps.filter(z => (z.phase || 'pipeline') === ph);
       const posInPhase = cur ? inPhase.indexOf(cur) + 1 : 0;
-      const bare = String(p.running).replace(/^(duo|ise):\s*/, '').replace(/_/g, ' ');
+      const bare = String(p.running).replace(/^(duo|ise):\\s*/, '').replace(/_/g, ' ');
       stepTxt = (PH_SHORT[ph] || ph) + ' ' + posInPhase + '/' + inPhase.length
               + ' · ' + bare + '  (' + (idx + 1) + '/' + p.total + ')';
     } else if (p.failed) {
@@ -10318,7 +10377,7 @@ function statusRank(p) {
 }
 
 function podNum(p) {
-  const m = (p.pod_id || '').match(/(\d+)$/);
+  const m = (p.pod_id || '').match(/(\\d+)$/);
   return m ? parseInt(m[1]) : 9999;
 }
 
