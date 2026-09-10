@@ -8043,10 +8043,141 @@ def api_vpn_connect(pod_id):
     except Exception as e:
         return jsonify({"status": "error", "output": str(e)[:500]})
 
+SESSION_TABLES = ("pipeline_steps", "pipeline_logs", "scc_checklist",
+                  "fabric_steps", "sda_steps", "duo_steps", "ise_steps")
+# failure_events is deliberately excluded: it is append-only history and
+# outliving the run that produced it is the whole point of it.
+
+
+def _pod_container_names(pod_id: str) -> list:
+    """Every container this POD can leave behind, not just the obvious two.
+
+    The resets used to look only for vpn-POD-N and pipeline-POD-N. That misses
+    the WinRM proxies (winrm-proxy-pod-N-<epoch>, note the LOWERCASED pod) and
+    any Duo/ISE card container, which docker names randomly and which joins the
+    POD's netns with --network container:vpn-POD-N. A card container that
+    survives the wipe keeps writing its step rows afterwards, so a reset that
+    reported success re-populates seconds later.
+    """
+    import subprocess as _sp
+    found, seen = [], set()
+
+    def _add(name):
+        if name and name not in seen:
+            seen.add(name)
+            found.append(name)
+
+    for _pat in (f"vpn-{pod_id}", f"pipeline-{pod_id}",
+                 f"winrm-proxy-{pod_id.lower()}"):
+        try:
+            r = _sp.run(["docker", "ps", "-a", "--format", "{{.Names}}",
+                         f"--filter=name={_pat}"],
+                        capture_output=True, text=True, timeout=15)
+            for n in r.stdout.split():
+                _add(n.strip())
+        except Exception:
+            pass
+
+    # Containers sharing the POD's network namespace -- the card containers.
+    try:
+        _vid = _sp.run(["docker", "inspect", "-f", "{{.Id}}", f"vpn-{pod_id}"],
+                       capture_output=True, text=True, timeout=15).stdout.strip()
+        if _vid:
+            _ids = _sp.run(["docker", "ps", "-aq"], capture_output=True,
+                           text=True, timeout=15).stdout.split()
+            for _cid in _ids:
+                try:
+                    _nm = _sp.run(["docker", "inspect", "-f",
+                                   "{{.HostConfig.NetworkMode}}", _cid],
+                                  capture_output=True, text=True,
+                                  timeout=10).stdout.strip()
+                    if _nm in (f"container:{_vid}", f"container:vpn-{pod_id}"):
+                        _n = _sp.run(["docker", "inspect", "-f", "{{.Name}}", _cid],
+                                     capture_output=True, text=True,
+                                     timeout=10).stdout.strip().lstrip("/")
+                        _add(_n or _cid)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return found
+
+
+def _stop_pod_containers(pod_id: str, log=None) -> list:
+    """Compose-down the POD, then force-remove anything still standing.
+
+    Runs compose in-process per POD rather than through one generate.py call
+    for every POD. That outer call was wrapped in a single 180s timeout while
+    each compose down gets 60s of its own, so with four or more PODs the parent
+    timed out, the child kept running AND KEPT THE SQLITE DB OPEN, and the wipe
+    that followed could fail on a locked database -- while still reporting
+    success.
+    """
+    import subprocess as _sp
+    _log = log or (lambda m: None)
+    notes = []
+    try:
+        from docker.generate import generate_compose, read_db as _gen_read_db
+        import tempfile as _tf
+        # generate_compose needs read_db's MERGED dict, not a raw pods row: it
+        # renames router_serial -> serial and adds pod_subnet / host_data. Handing
+        # it the raw row fails with "Missing template variable: serial", so
+        # compose down never ran and the POD's network and volume stayed behind
+        # while the containers were force-removed around them.
+        _row = None
+        try:
+            _row = next((p for p in _gen_read_db(status_filter=())
+                         if p["pod_id"] == pod_id), None)
+        except Exception as _re:
+            notes.append(f"{pod_id} could not load compose inputs: {str(_re)[:90]}")
+        if _row is None:
+            # read_db skips PODs with no VPN credentials. Nothing to compose-down
+            # in that case, but the force-remove below still applies.
+            notes.append(f"{pod_id} not renderable for compose (no VPN creds?) — "
+                         f"removing containers by name only")
+        if _row is not None:
+            with _tf.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as _f:
+                _f.write(generate_compose(dict(_row)))
+                _tmp = _f.name
+            try:
+                r = _sp.run(["docker", "compose", "-p", pod_id.lower(), "-f", _tmp,
+                             "down", "-v", "--remove-orphans"],
+                            capture_output=True, text=True, timeout=120)
+                notes.append(f"{pod_id} compose down: "
+                             f"{'ok' if r.returncode == 0 else 'rc=' + str(r.returncode)}")
+            finally:
+                try:
+                    os.unlink(_tmp)
+                except Exception:
+                    pass
+    except Exception as e:
+        notes.append(f"{pod_id} compose down error: {str(e)[:110]}")
+
+    # Whatever compose did not own still has to go.
+    for _cn in _pod_container_names(pod_id):
+        try:
+            _sp.run(["docker", "rm", "-f", _cn], capture_output=True, timeout=20)
+            notes.append(f"{pod_id} removed container {_cn}")
+        except Exception as e:
+            notes.append(f"{pod_id} could not remove {_cn}: {str(e)[:70]}")
+    for n in notes:
+        _log(n)
+    return notes
+
+
+def _pod_session_files(pod_id: str) -> list:
+    """Per-POD files that must not outlive the POD.
+
+    A stale scc_session_POD-N.json is a usable fallback session, so leaving one
+    behind lets the NEXT POD with that id silently reuse the old lab's session.
+    Full Reset already deleted these; per-POD delete did not.
+    """
+    return list((Path(__file__).parent / "data").glob(f"scc_session_{pod_id}.json"))
+
+
 def _delete_all_pod_data(conn, pod_id):
     """Delete all session data for a POD across every pod_id-keyed table."""
-    for tbl in ("pipeline_steps", "pipeline_logs", "scc_checklist",
-                "fabric_steps", "sda_steps", "duo_steps", "ise_steps"):
+    for tbl in SESSION_TABLES:
         conn.execute(f"DELETE FROM {tbl} WHERE pod_id=?", (pod_id,))
 
 
@@ -8054,25 +8185,78 @@ def _delete_all_pod_data(conn, pod_id):
 def delete_pod(pod_id):
     """Delete a POD and all its data from the DB, stopping its Docker containers first."""
     import subprocess as _sp
-    # Stop containers — best-effort, don't fail if docker not running
-    _proj = pod_id.lower()
+    _steps, _errors = [], []
+
+    # Same hazard as Full Reset: a Duo card runs in this process and an ISE card
+    # in its own container, and either will re-create this POD's step rows after
+    # they are deleted.
     try:
-        _sp.run(["docker", "compose", "-p", _proj, "down", "-v", "--remove-orphans"],
-                capture_output=True, text=True, timeout=60)
+        if pod_id in _runners and _runners[pod_id].is_alive():
+            _errors.append(f"a pipeline thread is still running for {pod_id} — its "
+                           f"rows may reappear; stop it and delete again")
     except Exception:
         pass
-    # Force-remove by name in case compose project tracking is stale
-    for _cn in [f"vpn-{pod_id}", f"pipeline-{pod_id}"]:
+    if pod_id in _DUO_INFLIGHT:
+        _errors.append(f"the Duo card is still running for {pod_id} — it will "
+                       f"re-create duo_steps rows after this delete")
+
+    # Compose down plus every container this POD can leave behind: the WinRM
+    # proxies and card containers were previously missed.
+    _steps.extend(_stop_pod_containers(pod_id))
+
+    try:
+        conn = _db()
+        _delete_all_pod_data(conn, pod_id)
+        conn.execute("DELETE FROM pods WHERE pod_id=?", (pod_id,))
+        conn.commit()
+        conn.close()
+        _steps.append(f"db rows deleted for {pod_id}")
+    except Exception as _e:
+        _errors.append(f"DB delete FAILED for {pod_id}: {str(_e)[:150]}")
+
+    # Verify, so a locked DB cannot read as a successful delete.
+    try:
+        conn = _db()
+        _left = {t: conn.execute(f"SELECT COUNT(*) FROM {t} WHERE pod_id=?",
+                                 (pod_id,)).fetchone()[0]
+                 for t in ("pods",) + SESSION_TABLES}
+        conn.close()
+        _dirty = {t: n for t, n in _left.items() if n}
+        if _dirty:
+            _errors.append(f"rows SURVIVED the delete for {pod_id}: {_dirty}")
+        else:
+            _steps.append("verified: no rows remain for this POD")
+    except Exception as _e:
+        _errors.append(f"could not verify the delete: {str(_e)[:120]}")
+
+    # Verify docker too. A compose failure previously left the network and
+    # volume behind while the endpoint still said "deleted".
+    try:
+        _left_c = _pod_container_names(pod_id)
+        if _left_c:
+            _errors.append(f"containers SURVIVED the delete for {pod_id}: {_left_c}")
+        else:
+            _steps.append("verified: no containers remain for this POD")
+    except Exception as _e:
+        _errors.append(f"could not verify containers: {str(_e)[:110]}")
+
+    # Full Reset removed these; per-POD delete did not, so a stale session file
+    # stayed behind for the next POD with the same id to pick up.
+    for _sf in _pod_session_files(pod_id):
         try:
-            _sp.run(["docker", "rm", "-f", _cn], capture_output=True, timeout=10)
-        except Exception:
-            pass
-    conn = _db()
-    _delete_all_pod_data(conn, pod_id)
-    conn.execute("DELETE FROM pods WHERE pod_id=?", (pod_id,))
-    conn.commit()
-    conn.close()
-    return jsonify({"status": "ok", "message": f"{pod_id} deleted"})
+            _sf.unlink()
+            _steps.append(f"session file deleted: {_sf.name}")
+        except Exception as _e:
+            _errors.append(f"could not delete {_sf.name}: {str(_e)[:80]}")
+
+    _ok = not _errors
+    return jsonify({
+        "status": "ok" if _ok else "error",
+        "message": (f"{pod_id} deleted and verified" if _ok
+                    else f"{pod_id} NOT fully deleted: " + " | ".join(_errors)),
+        "errors": _errors,
+        "steps": _steps,
+    }), (200 if _ok else 500)
 
 
 @app.route("/api/reset-pipeline/<pod_id>", methods=["POST"])
@@ -8822,71 +9006,149 @@ def vpn_connect_all():
 
 @app.route("/api/full-reset", methods=["POST"])
 def full_reset():
-    """Full reset: stop ALL POD containers (including orphans), wipe all session
-    data from the DB, and delete SCC session files.  Leaves a clean slate for
-    the next lab session.  Keeps org_credentials, global_config, knowledge_base,
-    and upgrade_config (persistent config, not session data)."""
-    import subprocess as _sp
-    _steps = []
+    """Full reset: stop every POD's containers, wipe all session data from the
+    DB, and delete SCC session files.  Leaves a clean slate for the next lab
+    session.  Keeps org_credentials, global_config, knowledge_base and
+    upgrade_config (persistent config, not session data).
 
-    # ── 1. Stop containers for every known POD via generate.py --db --down ──────
+    This VERIFIES the outcome and reports honestly. The previous version always
+    returned {"status": "ok", "message": "Full reset complete"} regardless of
+    what failed, and the front end only ever printed that message -- so a wipe
+    that died on a locked database looked identical to a clean reset, and the
+    PODs simply stayed on the dashboard with no indication why.
+    """
+    _steps, _errors = [], []
+
+    # ── 1. Card work first. A Duo card runs in THIS process and an ISE card in
+    #       its own container; either one still running will happily write its
+    #       step rows back after the tables are emptied.
     try:
-        _r = _sp.run(
-            [sys.executable, "docker/generate.py", "--db", "--down"],
-            capture_output=True, text=True, timeout=180,
-            cwd=os.path.dirname(os.path.abspath(__file__))
-        )
-        _steps.append(f"compose-down: {'ok' if _r.returncode == 0 else 'err'} "
-                      f"{(_r.stdout + _r.stderr)[:300]}")
-    except Exception as _e:
-        _steps.append(f"compose-down error: {_e}")
+        _live = [p for p, t in list(_runners.items()) if t.is_alive()]
+    except Exception:
+        _live = []
+    if _live:
+        _errors.append(f"pipeline thread(s) still running for {_live} — their rows "
+                       f"may reappear after the wipe; stop them and reset again")
+    if _DUO_INFLIGHT:
+        _errors.append(f"Duo card still running for {sorted(_DUO_INFLIGHT)} — it "
+                       f"writes duo_steps rows in this process and will re-create "
+                       f"them after the wipe")
 
-    # ── 2. Orphan cleanup: force-remove containers from PODs already deleted ─────
-    for _pat in ["vpn-POD-", "pipeline-POD-"]:
+    # ── 2. Per-POD teardown, each with its own timeout ────────────────────────
+    # Read the ids straight from the table. This used to go through
+    # generate.read_db(), which is a VALIDATING loader for launching PODs: its
+    # default status filter is ("pending","available","ready",""), excluding
+    # running / in_progress / completed / failed -- exactly the PODs that have
+    # been used and most need tearing down -- and it also silently skips any POD
+    # whose VPN credentials are missing. Neither condition has anything to do
+    # with whether a POD has containers to remove.
+    try:
+        _c0 = _db()
         try:
-            _ps = _sp.run(
-                ["docker", "ps", "-a", "--format", "{{.Names}}",
-                 f"--filter=name={_pat}"],
-                capture_output=True, text=True, timeout=10
-            )
+            _pods = [r["pod_id"] for r in
+                     _c0.execute("SELECT pod_id FROM pods ORDER BY pod_id")]
+        finally:
+            _c0.close()
+    except Exception as _e:
+        _pods = []
+        _errors.append(f"could not list PODs to tear down: {str(_e)[:120]}")
+    if not _pods:
+        # Derive the list from docker instead. A locked or unreadable DB used to
+        # mean NO per-POD teardown ran at all, which is the worst combination:
+        # the tables get emptied while every compose network and volume stays
+        # behind, with nothing left in the DB to say they exist.
+        try:
+            import subprocess as _sp0
+            _names = _sp0.run(["docker", "ps", "-a", "--format", "{{.Names}}"],
+                              capture_output=True, text=True,
+                              timeout=15).stdout.split()
+            _derived = set()
+            for _n in _names:
+                for _pre in ("vpn-", "pipeline-"):
+                    if _n.startswith(_pre) and _n[len(_pre):].startswith("POD-"):
+                        _derived.add(_n[len(_pre):])
+            if _derived:
+                _pods = sorted(_derived)
+                _steps.append(f"POD list derived from containers: {_pods}")
+        except Exception as _de:
+            _errors.append(f"could not derive PODs from docker: {str(_de)[:110]}")
+    _steps.append(f"tearing down: {_pods or 'no POD rows'}")
+    for _pid in _pods:
+        _steps.extend(_stop_pod_containers(_pid))
+
+    # ── 3. Orphans from PODs already gone from the DB ─────────────────────────
+    import subprocess as _sp
+    for _pat in ("vpn-POD-", "pipeline-POD-", "winrm-proxy-pod-"):
+        try:
+            _ps = _sp.run(["docker", "ps", "-a", "--format", "{{.Names}}",
+                           f"--filter=name={_pat}"],
+                          capture_output=True, text=True, timeout=15)
             for _cn in [c.strip() for c in _ps.stdout.splitlines() if c.strip()]:
-                _sp.run(["docker", "rm", "-f", _cn], capture_output=True, timeout=10)
+                _sp.run(["docker", "rm", "-f", _cn], capture_output=True, timeout=20)
                 _steps.append(f"orphan removed: {_cn}")
         except Exception as _e:
-            _steps.append(f"orphan scan error ({_pat}): {_e}")
+            _errors.append(f"orphan scan ({_pat}): {str(_e)[:100]}")
 
-    # ── 3. Wipe all session tables (keep org_credentials / global_config /
-    #       knowledge_base / upgrade_config — persistent config) ──────────────────
-    _session_tables = (
-        "pods", "pipeline_steps", "pipeline_logs",
-        "scc_checklist", "fabric_steps", "sda_steps",
-        "duo_steps", "ise_steps",
-    )
+    # ── 4. Wipe session tables ────────────────────────────────────────────────
+    _tables = ("pods",) + SESSION_TABLES
     try:
         _conn = _db()
-        for _tbl in _session_tables:
+        for _tbl in _tables:
             _conn.execute(f"DELETE FROM {_tbl}")
         _conn.commit()
         _conn.close()
-        _steps.append(f"db wiped: {', '.join(_session_tables)}")
+        _steps.append(f"db wiped: {', '.join(_tables)}")
     except Exception as _e:
-        _steps.append(f"db wipe error: {_e}")
+        # The failure that used to be silent. A locked DB lands here.
+        _errors.append(f"DB WIPE FAILED: {str(_e)[:160]}")
 
-    # ── 4. Delete SCC session files ──────────────────────────────────────────────
-    _data_dir = Path(__file__).parent / "data"
+    # ── 5. Verify, rather than assume ─────────────────────────────────────────
+    try:
+        _conn = _db()
+        _left = {t: _conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                 for t in _tables}
+        _conn.close()
+        _dirty = {t: n for t, n in _left.items() if n}
+        if _dirty:
+            _errors.append(f"rows SURVIVED the wipe: {_dirty}")
+        else:
+            _steps.append("verified: all session tables empty")
+    except Exception as _e:
+        _errors.append(f"could not verify the wipe: {str(_e)[:120]}")
+
+    try:
+        _still = _sp.run(["docker", "ps", "-a", "--format", "{{.Names}}"],
+                         capture_output=True, text=True, timeout=15).stdout.split()
+        _pod_left = [c for c in _still
+                     if c.startswith(("vpn-POD-", "pipeline-POD-", "winrm-proxy-pod-"))]
+        if _pod_left:
+            _errors.append(f"containers SURVIVED the reset: {_pod_left}")
+        else:
+            _steps.append("verified: no POD containers remain")
+    except Exception as _e:
+        _errors.append(f"could not verify containers: {str(_e)[:120]}")
+
+    # ── 6. SCC session files ──────────────────────────────────────────────────
     _removed = []
-    for _sf in _data_dir.glob("scc_session_POD-*.json"):
+    for _sf in (Path(__file__).parent / "data").glob("scc_session_POD-*.json"):
         try:
             _sf.unlink()
             _removed.append(_sf.name)
-        except Exception:
-            pass
+        except Exception as _e:
+            _errors.append(f"could not delete {_sf.name}: {str(_e)[:80]}")
     if _removed:
         _steps.append(f"session files deleted: {', '.join(_removed)}")
 
-    return jsonify({"status": "ok",
-                    "message": "Full reset complete — clean slate for next session",
-                    "steps": _steps})
+    _ok = not _errors
+    return jsonify({
+        "status": "ok" if _ok else "error",
+        "message": ("Full reset complete and verified — clean slate for next session"
+                    if _ok else
+                    "FULL RESET DID NOT FULLY COMPLETE: " + " | ".join(_errors)),
+        "errors": _errors,
+        "steps": _steps,
+    }), (200 if _ok else 500)
+
 
 @app.route("/api/docker-status")
 def docker_status():
@@ -10311,7 +10573,9 @@ async function deletePod(podId) {
   } else {
     status.textContent = '';
     alert('Error: ' + (data.message || 'Unknown error'));
+    if (data.steps) console.log('delete-pod steps:', data.steps);
   }
+  await load();
 }
 
 async function resetPipeline(podId) {
@@ -13688,13 +13952,32 @@ async function fullReset() {
   btn.textContent = 'Resetting...';
   status.textContent = 'Full reset running — stopping containers and wiping data...';
 
-  const r = await fetch('/api/full-reset', { method: 'POST' });
-  const data = await r.json();
-  status.textContent = data.message || 'Done';
+  let data;
+  try {
+    const r = await fetch('/api/full-reset', { method: 'POST' });
+    data = await r.json();
+  } catch (e) {
+    data = { status: 'error', message: 'Full reset request failed: ' + e };
+  }
   btn.disabled = false;
   btn.textContent = '\u26A0 Full Reset';
-  setTimeout(() => status.textContent = '', 10000);
-  load();
+  // A reset that did not finish used to be indistinguishable from one
+  // that did: the endpoint always said "complete" and this line only
+  // printed that message, so PODs stayed listed with no explanation.
+  if (data.status !== 'ok') {
+    status.textContent = data.message || 'Full reset FAILED';
+    status.style.color = '#fca5a5';
+    alert('Full Reset did not fully complete:\\n\\n'
+          + ((data.errors && data.errors.length)
+               ? data.errors.join('\\n')
+               : (data.message || 'unknown error')));
+    if (data.steps) console.log('full-reset steps:', data.steps);
+  } else {
+    status.style.color = '';
+    status.textContent = data.message || 'Done';
+    setTimeout(() => status.textContent = '', 10000);
+  }
+  await load();
 }
 
 let _sccRefreshPoller = null;  // module-level so re-clicks cancel the old poller
