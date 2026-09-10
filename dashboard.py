@@ -10454,7 +10454,7 @@ function renderTable(pods) {
       <td class="device-col" style="font-size:18px;line-height:1;color:${p.sdwan_online === 'yes' ? '#00e68a' : '#ff4757'}">&#x25cf;</td>
       <td class="device-col" style="font-size:18px;line-height:1;color:${cardDot(p.duo_configured, p.duo_failed, p.duo_done)}" title="${cardTip('Duo', p.duo_configured, p.duo_failed, p.duo_done, p.duo_total, 0)}">&#x25cf;</td>
       <td class="device-col" style="font-size:18px;line-height:1;color:${cardDot(p.ise_configured, p.ise_failed, p.ise_done)}" title="${cardTip('ISE', p.ise_configured, p.ise_failed, p.ise_done, p.ise_total, p.ise_degraded)}">&#x25cf;</td>
-      <td style="font-size:11px;color:#667788;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.scc_org||''}">${p.scc_org ? '<span style="color:#02c8ff">&#x25cf;</span> ' + (p.scc_org.match(/pseudoco-(\d+)--/) ? p.scc_org.match(/pseudoco-(\d+)--/)[1] : p.scc_org) : '<span style="color:#667788">—</span>'}</td>
+      <td style="font-size:11px;color:#667788;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.scc_org||''}">${p.scc_org ? '<span style="color:#02c8ff">&#x25cf;</span> ' + (p.scc_org.match(/pseudoco-(\\d+)--/) ? p.scc_org.match(/pseudoco-(\\d+)--/)[1] : p.scc_org) : '<span style="color:#667788">—</span>'}</td>
       <td>${pipeLabel}</td>
       <td style="display:flex;gap:4px;flex-wrap:wrap;">
         <button class="btn-start" onclick="connectVpn('${p.pod_id}')">Connect VPN</button>
@@ -10792,9 +10792,9 @@ function parseStamp(v) {
   if (!v) return null;
   const s = String(v).trim();
   let iso = null;
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(s)) {
+  if (/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/.test(s)) {
     iso = s;                                   // already ISO/UTC
-  } else if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(s)) {
+  } else if (/^\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2}$/.test(s)) {
     iso = s.replace(' ', 'T') + 'Z';           // naive -> explicit UTC
   } else {
     return null;
@@ -11487,7 +11487,7 @@ async function loadAd(podId) {
 
   // Parse user rows from result string  e.g. "All updated | Kit=kit@rtp04... [OK] | Lee=... [OK]"
   const userRows = result.split('|').filter(p => p.includes('=')).map(p => {
-    const m = p.trim().match(/^(\w+)=([^\s\[]+)\s*\[(\w+)\]$/);
+    const m = p.trim().match(/^(\\w+)=([^\\s\\[]+)\\s*\\[(\\w+)\\]$/);
     if (!m) return `<tr><td colspan="3" style="color:#667788">${escHtml(p.trim())}</td></tr>`;
     const [, name, email, st] = m;
     const color = st === 'OK' ? '#2ed573' : '#ff4757';
@@ -12109,7 +12109,7 @@ async function loadDuoPanel(podId) {
     + '<span style="margin-left:auto;font-size:18px;color:' + statusColor + ';">' + statusIcon + '</span></div>'
     + (stepResult
         ? '<div style="font-size:12px;font-family:monospace;color:#c0ccd8;background:#0a1628;border-radius:4px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;word-break:break-all;">'
-           + escHtml(stepResult.replace(/\s*\|\s*/g, '\\n')) + '</div>'
+           + escHtml(stepResult.replace(/\\s*\\|\\s*/g, '\\n')) + '</div>'
          : '<div style="color:#445566;font-size:12px;margin-top:6px;">No result yet — run the pipeline to execute this step.</div>')
      + '</div>'
      + '<div class="switch-card">'
@@ -12119,7 +12119,7 @@ async function loadDuoPanel(podId) {
      + '<div style="font-size:11px;color:#667788;margin-top:4px;">Configures Duo as IdP for Secure Access SSO via SAML, and syncs users via SCIM. Requires iDAC URL in Org Credentials.</div>'
      + (samlResult
          ? '<div style="font-size:12px;font-family:monospace;color:#c0ccd8;background:#0a1628;border-radius:4px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;word-break:break-all;">'
-           + escHtml(samlResult.replace(/\s*\|\s*/g, '\\n')) + '</div>'
+           + escHtml(samlResult.replace(/\\s*\\|\\s*/g, '\\n')) + '</div>'
         : '<div style="color:#445566;font-size:12px;margin-top:6px;">Not yet run — click "Setup Duo SAML" to execute.</div>')
     + '</div>';
 
@@ -13241,7 +13241,7 @@ function duoEta(secs) {
 }
 // Strict parse — a loose pattern picks up a trailing ':' and yields NaN.
 function duoStarted(ts) {
-  if (!ts || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(ts)) return null;
+  if (!ts || !/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/.test(ts)) return null;
   const t = new Date(ts).getTime();
   return isNaN(t) ? null : t;
 }
@@ -13540,7 +13540,7 @@ async function loadBaseConfig(podId) {
 function _bcStatusBadge(line) {
   if (!line) return { color: '#667788', text: 'Not run', short: '', running: false, startedAt: null };
   if (line.includes('RUNNING')) {
-    const m = line.match(/started_at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)/);
+    const m = line.match(/started_at=(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z)/);
     const startedAt = m ? m[1] : null;
     const ts = startedAt ? new Date(startedAt).getTime() : NaN;
     if (!isNaN(ts)) {
@@ -13549,13 +13549,13 @@ function _bcStatusBadge(line) {
         return { color: '#e74c3c', text: '&#10007; Stale', short: 'Did not complete — try again', running: false, startedAt: null };
       }
     }
-    const shortMsg = line.replace(/^\[.*?\]\s*RUNNING\s+started_at=[\w\-:TZ]+:\s*/, '').trim();
+    const shortMsg = line.replace(/^\\[.*?\\]\\s*RUNNING\\s+started_at=[\\w\\-:TZ]+:\\s*/, '').trim();
     return { color: '#f39c12', text: '&#9696; Running...', short: shortMsg, running: true, startedAt: startedAt };
   }
   // Extract text after the closing bracket tag
-  const afterTag = line.replace(/^\[.*?\]\s*/, '');
-  if (line.includes('FAILED')) return { color: '#e74c3c', text: '&#10007; FAILED', short: afterTag.replace(/^FAILED:\s*/i, '').substring(0, 500).trim(), running: false, startedAt: null };
-  return { color: '#00e68a', text: '&#10003; OK', short: afterTag.replace(/^OK:\s*/i, '').substring(0, 500).trim(), running: false, startedAt: null };
+  const afterTag = line.replace(/^\\[.*?\\]\\s*/, '');
+  if (line.includes('FAILED')) return { color: '#e74c3c', text: '&#10007; FAILED', short: afterTag.replace(/^FAILED:\\s*/i, '').substring(0, 500).trim(), running: false, startedAt: null };
+  return { color: '#00e68a', text: '&#10003; OK', short: afterTag.replace(/^OK:\\s*/i, '').substring(0, 500).trim(), running: false, startedAt: null };
 }
 
 function renderBaseConfigGrid(podId, statusData) {
@@ -14169,7 +14169,7 @@ function kbCatColor(cat) {
 function kbRenderArticleBody(body) {
    // Convert ![alt](url) to <img> for images or a download link for other files.
    // Supports /api/kb/image/ local URLs and raw.githubusercontent URLs.
-   const IMG_EXTS = /\.(png|jpg|jpeg|gif|webp)$/i;
+   const IMG_EXTS = /\\.(png|jpg|jpeg|gif|webp)$/i;
    function _kbRenderMedia(alt, url) {
      const fname = url.split('/').pop().split('?')[0];
      if (IMG_EXTS.test(fname)) {
@@ -14182,8 +14182,8 @@ function kbRenderArticleBody(body) {
    const escaped = (body || '')
      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
    return escaped
-     .replace(/!\[([^\]]*)\]\((\/api\/kb\/image\/[^)]+)\)/g, (_, alt, url) => _kbRenderMedia(alt, url))
-     .replace(/!\[([^\]]*)\]\((https:\/\/raw\.githubusercontent[^)]+)\)/g, (_, alt, url) => _kbRenderMedia(alt, url))
+     .replace(/!\\[([^\\]]*)\\]\\((\\/api\\/kb\\/image\\/[^)]+)\\)/g, (_, alt, url) => _kbRenderMedia(alt, url))
+     .replace(/!\\[([^\\]]*)\\]\\((https:\\/\\/raw\\.githubusercontent[^)]+)\\)/g, (_, alt, url) => _kbRenderMedia(alt, url))
      .replace(/\\n/g,'<br>');
 }
 
@@ -14666,7 +14666,7 @@ async function kbUploadImageToTextarea(file, textareaId, statusId) {
     const d = await r.json();
     if (d.ok) {
       const ta = document.getElementById(textareaId);
-      const md = '\\n![' + file.name.replace(/\.[^.]+$/,'') + '](/api/kb/image/' + d.filename + ')\\n';
+      const md = '\\n![' + file.name.replace(/\\.[^.]+$/,'') + '](/api/kb/image/' + d.filename + ')\\n';
       ta.value += md;
       if (status) { status.textContent = '\u2713 Inserted'; status.style.color = '#27ae60'; setTimeout(() => { status.textContent = ''; }, 2500); }
     } else {
