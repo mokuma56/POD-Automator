@@ -10368,7 +10368,15 @@ async function refreshResources() {
 // with no `status` column and no session. Ordered so ascending reads
 // best-first, matching the full table where READY sorts to the top.
 function summaryRank(p) {
-  const soft     = (p.steps || []).some(s => s.soft);
+  // A warning is EITHER the soft flag or a 'skipped' status. The endpoint sets
+  // soft only when the stored result begins with "[soft-fail]", which is the
+  // ISE card's prefix; a pipeline soft-fail is recorded as status 'skipped'
+  // with a "WARN:" prefix and so carries soft=false. Looking only at soft
+  // ranked POD-18 -- complete with redeploy_config_group skipped -- the same
+  // as a clean POD-17, which made the two tie and left the order unchanged in
+  // both directions. This now matches _sumPctColor and the table's WARN badge,
+  // both of which already treat any skipped step as a warning.
+  const soft     = (p.steps || []).some(s => s.soft || s.status === 'skipped');
   const complete = p.total > 0 && p.done >= p.total;
   if (p.failed)          return 4;   // hard failure — wants attention
   if (complete && !soft) return 0;   // done clean
