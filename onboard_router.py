@@ -41,9 +41,33 @@ def _parse_vrfs(output: str):
     return has_mgmt, extra_vrfs
 
 
+# Anything at or above this is acceptable; newer images must not be reported as
+# a problem. The check used to be the substring "17.12" in the version string,
+# so POD-18 on 2026-09-11 soft-failed verify_border_spine on a switch running
+# 17.18.03 -- a NEWER image than the golden one, with every other check on that
+# line passing -- and it read identically to a switch running something ancient.
+MIN_SWITCH_VERSION = (17, 12, 1)
+
+
+def _version_tuple3(ver_str: str):
+    """Normalise a version to exactly three ints: '17.12.01a' -> (17, 12, 1).
+
+    Compare as NUMBERS, never as text. '17.9.1' sorts ABOVE '17.12.1' as a
+    string while being the older release, so a string comparison would accept
+    precisely the old images this check exists to catch.
+
+    A version with fewer than three components is padded with zeros, which
+    makes a bare "17.12" read as (17, 12, 0) and therefore below the minimum:
+    an unqualified major.minor is not evidence of meeting a patch-level floor.
+    """
+    parts = tuple(_parse_version(ver_str))
+    return (parts + (0, 0, 0))[:3]
+
+
 def _parse_version_str(output: str):
     """Parse 'show version' and return (ver_ok, ver_str).
-    ver_ok is True if version string contains '17.12'.
+
+    ver_ok is True when the version is MIN_SWITCH_VERSION or newer.
     """
     ver_str = "??"
     for line in output.splitlines():
@@ -53,7 +77,11 @@ def _parse_version_str(output: str):
             if m:
                 ver_str = m.group(1).rstrip(",")
                 break
-    ver_ok = "17.12" in ver_str
+    if ver_str == "??":
+        # Distinguish "could not read the version" from "version is too old".
+        # They are different problems and only one of them is about the image.
+        return False, "?? (no version line in 'show version' output)"
+    ver_ok = _version_tuple3(ver_str) >= MIN_SWITCH_VERSION
     return ver_ok, ver_str
 
 # Upgrade config — overridden by dashboard before calling phase functions
