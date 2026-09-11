@@ -10363,6 +10363,40 @@ async function refreshResources() {
   if (box._sig !== html) { box.innerHTML = html; box._sig = html; }
 }
 
+// Status rank for the SUMMARY payload, which is a different shape from
+// /api/pods: it carries done/total/failed/running and a soft flag per step,
+// with no `status` column and no session. Ordered so ascending reads
+// best-first, matching the full table where READY sorts to the top.
+function summaryRank(p) {
+  const soft     = (p.steps || []).some(s => s.soft);
+  const complete = p.total > 0 && p.done >= p.total;
+  if (p.failed)          return 4;   // hard failure — wants attention
+  if (complete && !soft) return 0;   // done clean
+  if (complete && soft)  return 1;   // done with warnings
+  if (p.running)         return 2;   // mid-run
+  return 3;                          // partial or not started
+}
+
+function sumPodNum(p) {
+  if (typeof p.pod_number === 'number') return p.pod_number;
+  const m = String(p.pod_id || '').match(/(\\d+)$/);
+  return m ? parseInt(m[1], 10) : 9999;
+}
+
+function sortSummary(list) {
+  const dir = sortDir === 'desc' ? -1 : 1;
+  // 'session' is deliberately absent from this payload, so a session sort
+  // carried over from the full table falls back to POD rather than silently
+  // producing an arbitrary order.
+  const useStatus = sortField === 'status';
+  return [...list].sort((a, b) => {
+    const d = useStatus ? summaryRank(a) - summaryRank(b)
+                        : sumPodNum(a) - sumPodNum(b);
+    if (d !== 0) return d * dir;
+    return sumPodNum(a) - sumPodNum(b);   // ties always read in POD order
+  });
+}
+
 async function renderPodSummary() {
   const host = document.getElementById('pod-summary');
   if (!host || _podView !== 'summary') return;
@@ -10371,6 +10405,7 @@ async function renderPodSummary() {
   catch (e) { return; }
 
   const tmap = (window.STEP_SECS || {}).pipeline || {};
+  pods = sortSummary(pods);
   const html = pods.map(p => {
     // Group the dots into tinted per-phase blocks with inline captions.
     // Short captions: the per-phase tint already carries the identity, and the
@@ -10473,7 +10508,42 @@ async function renderPodSummary() {
       + '<div class="sum-meta">' + meta + '</div></div>';
   }).join('');
 
-  if (host._sig !== html) { host.innerHTML = html; host._sig = html; }
+  // Sort header. Distinct icon ids from the table's: the table's <thead> is
+  // still in the DOM while this view is showing, and duplicate element ids
+  // would make getElementById return whichever came first.
+  const _ic = (col) => sortField === col ? (sortDir === 'asc' ? '↑' : '↓') : '⇅';
+  const _op = (col) => sortField === col ? '1' : '0.35';
+  const hdr = '<div class="sum-row" style="background:#0d1b2e;font-size:11px;'
+    + 'color:#8899aa;text-transform:uppercase;letter-spacing:.5px;cursor:default;">'
+    + '<div class="sum-pod" data-sumcol="pod" style="cursor:pointer;user-select:none"'
+    + ' title="Sort by POD number">POD <span id="sum-pod-sort-icon"'
+    + ' style="opacity:' + _op('pod') + '">' + _ic('pod') + '</span></div>'
+    + '<div class="sum-dots"></div>'
+    + '<div class="sum-step" data-sumcol="status" style="cursor:pointer;user-select:none"'
+    + ' title="Sort by status: done, then done-with-warnings, then running,'
+    + ' then partial, then failed">Status <span id="sum-status-sort-icon"'
+    + ' style="opacity:' + _op('status') + '">' + _ic('status') + '</span></div>'
+    + '<div class="sum-pct"></div><div class="sum-meta"></div></div>';
+
+  const full = hdr + html;
+  if (host._sig !== full) { host.innerHTML = full; host._sig = full; }
+
+  // Delegated once on the host, so re-rendering the list cannot pile up
+  // duplicate listeners.
+  if (!host.dataset.sortBound) {
+    host.dataset.sortBound = '1';
+    host.addEventListener('click', (ev) => {
+      const el = ev.target.closest('[data-sumcol]');
+      if (!el) return;
+      ev.stopPropagation();
+      const col = el.dataset.sumcol;
+      if (sortField === col) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      else { sortField = col; sortDir = 'asc'; }
+      updateSortHeaders();
+      host._sig = null;            // force a redraw in the new order
+      renderPodSummary();
+    });
+  }
   _wireSummaryTips();
 }
 
@@ -10667,9 +10737,13 @@ function sortPods(pods) {
 }
 
 function updateSortHeaders() {
-  ['pod', 'session', 'status'].forEach(col => {
-    const icon = document.getElementById(col + '-sort-icon');
+  // Both views share sortField/sortDir, so switching between them keeps the
+  // order you chose. The summary has no session data; sortSummary() falls back
+  // to POD in that case.
+  ['pod', 'session', 'status', 'sum-pod', 'sum-status'].forEach(id => {
+    const icon = document.getElementById(id + '-sort-icon');
     if (!icon) return;
+    const col = id.replace('sum-', '');
     const active = sortField === col;
     icon.textContent = active ? (sortDir === 'asc' ? '↑' : '↓') : '⇅';
     icon.style.opacity = active ? '1' : '0.35';
