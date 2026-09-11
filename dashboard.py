@@ -275,6 +275,22 @@ def _migrate():
         INSERT OR IGNORE INTO upgrade_config (device_type, golden_version, image_filename, image_path)
         VALUES ('router', '17.18.2', '', '')
     """)
+    # Last lab-reachability preflight per POD.
+    #
+    # Persisted rather than held in memory: the cache used to live in a dict, so
+    # every dashboard restart wiped it and both PODs went back to a grey "?"
+    # even though the lab was fine. `at` is kept so the badge can still say how
+    # old the evidence is -- a check is only ever evidence about the moment it
+    # ran, which is the whole reason this gate exists.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS preflight_results (
+            pod_id TEXT PRIMARY KEY,
+            ok INTEGER,
+            at REAL,
+            message TEXT DEFAULT '',
+            phases TEXT DEFAULT ''
+        )
+    """)
     # SCC reset checklist table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scc_checklist (
@@ -633,13 +649,14 @@ def _addon_progress(conn, pod_id: str, run_addons: str) -> dict:
 def api_pods():
     conn = _db()
     pods = conn.execute("SELECT * FROM pods ORDER BY pod_id").fetchall()
+    _pf_all = _preflight_load_all()      # one query, not one per POD
     result = []
     for p in pods:
         p = dict(p)
         # Attach the last preflight result. Carried on this payload rather than
         # fetched per POD so the 5s table refresh does not turn into one request
         # per POD, and never computed here -- a GET must not run a probe.
-        p["preflight"] = _PREFLIGHT_CACHE.get(p["pod_id"])
+        p["preflight"] = _pf_all.get(p["pod_id"])
         try:
             steps = conn.execute(
                 "SELECT step_name, status, result FROM pipeline_steps WHERE pod_id = ?",
@@ -1002,9 +1019,34 @@ SWITCH_CHECKS = {
 # Deliberately TIMESTAMPED and never inferred. A bare green tick would recreate
 # the exact failure this project keeps hitting: on 2026-09-10 the VPN read
 # healthy for 43 minutes while the whole 198.18.5.0/24 segment was unreachable.
-# A check is only evidence about the moment it ran, so the badge always carries
+# A check is only evidence about the moment it ran, so the row always carries
 # its age and the UI decides whether that age is still meaningful.
-_PREFLIGHT_CACHE = {}   # pod_id -> {"ok","at","message","targets"}
+#
+# Stored in the DB, not a dict: an in-memory cache did not survive a dashboard
+# restart, so the badge fell back to a grey "?" on a perfectly healthy lab.
+
+
+def _preflight_load_all() -> dict:
+    """Every stored preflight result, keyed by pod_id."""
+    try:
+        conn = _db()
+        try:
+            rows = conn.execute(
+                "SELECT pod_id, ok, at, message, phases FROM preflight_results"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {r["pod_id"]: {"ok": bool(r["ok"]) if r["ok"] is not None else None,
+                              "at": r["at"] or 0,
+                              "message": r["message"] or "",
+                              "phases": [x for x in (r["phases"] or "").split(",") if x]}
+                for r in rows}
+    except sqlite3.Error:
+        return {}
+
+
+def _preflight_load(pod_id: str):
+    return _preflight_load_all().get(pod_id)
 
 
 @app.route("/api/preflight/<pod_id>", methods=["GET", "POST"])
@@ -1015,15 +1057,14 @@ def api_preflight(pod_id):
     per POD per refresh.
     """
     if request.method == "GET":
-        return jsonify(_PREFLIGHT_CACHE.get(pod_id) or {"ok": None, "at": 0,
-                                                        "message": "not checked yet"})
+        return jsonify(_preflight_load(pod_id) or {"ok": None, "at": 0,
+                                                   "message": "not checked yet"})
     data = request.get_json(silent=True) or {}
     phases = data.get("phases") or ["pipeline", "duo", "ise"]
     ok, msg = _preflight_gate(pod_id, phases)
-    entry = {"ok": bool(ok), "at": time.time(), "message": msg,
-             "phases": phases}
-    _PREFLIGHT_CACHE[pod_id] = entry
-    return jsonify(entry)
+    _preflight_remember(pod_id, ok, msg, phases)
+    return jsonify(_preflight_load(pod_id) or {"ok": bool(ok), "at": time.time(),
+                                               "message": msg, "phases": phases})
 
 
 @app.route("/api/switches/<pod_id>")
@@ -2309,13 +2350,26 @@ def _preflight_gate(pod_id, phases, log_fn=None):
 
 
 def _preflight_remember(pod_id, ok, msg, phases):
-    """Record a gate result so the dashboard badge shows real runs, not only
-    checks triggered from the UI."""
+    """Record a gate result so the badge shows real runs, not only UI checks.
+
+    Never raises: a failure to record the outcome of a check must not fail the
+    run that the check just cleared.
+    """
     try:
-        _PREFLIGHT_CACHE[pod_id] = {"ok": bool(ok), "at": time.time(),
-                                    "message": msg, "phases": list(phases)}
-    except Exception:
-        pass
+        conn = _db()
+        try:
+            conn.execute(
+                "INSERT INTO preflight_results (pod_id, ok, at, message, phases) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(pod_id) DO UPDATE SET "
+                "ok=excluded.ok, at=excluded.at, message=excluded.message, "
+                "phases=excluded.phases",
+                (pod_id, 1 if ok else 0, time.time(), str(msg)[:400],
+                 ",".join(phases)))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        log(pod_id, f"[preflight] could not store the result ({e})")
 
 
 def _card_already_running(pod_id, table):
@@ -8237,7 +8291,8 @@ def api_vpn_connect(pod_id):
         return jsonify({"status": "error", "output": str(e)[:500]})
 
 SESSION_TABLES = ("pipeline_steps", "pipeline_logs", "scc_checklist",
-                  "fabric_steps", "sda_steps", "duo_steps", "ise_steps")
+                  "fabric_steps", "sda_steps", "duo_steps", "ise_steps",
+                  "preflight_results")
 # failure_events is deliberately excluded: it is append-only history and
 # outliving the run that produced it is the whole point of it.
 
@@ -10689,30 +10744,33 @@ function preflightBadge(p) {
   const pf = p.preflight;
   if (!pf || pf.ok === null || pf.ok === undefined) {
     return '<span class="pf-badge" data-pod="' + p.pod_id + '" title="Lab pre-checks have not run for this POD. Click to check now."'
-         + ' style="cursor:pointer;font-size:9px;color:#667788;border:1px solid #334455;border-radius:3px;padding:0 3px;margin-left:4px;">?</span>';
+         + ' style="cursor:pointer;font-size:9px;color:#667788;border:1px solid #334455;border-radius:3px;padding:0 3px;margin-left:4px;">? not checked</span>';
   }
   const ageS = Math.max(0, Math.round(Date.now() / 1000 - (pf.at || 0)));
-  const ageTxt = ageS < 90 ? ageS + 's ago'
-               : ageS < 5400 ? Math.round(ageS / 60) + 'm ago'
-               : Math.round(ageS / 3600) + 'h ago';
+  const ageTxt = ageS < 90 ? ageS + 's'
+               : ageS < 5400 ? Math.round(ageS / 60) + 'm'
+               : Math.round(ageS / 3600) + 'h';
   const stale = ageS > PREFLIGHT_STALE_S;
-  // A pass that is old is not a pass now -- draw it muted, never green.
+
+  // The WORD is the label; the age appears only once it matters. A fresh pass
+  // reads "passed" and nothing else, but a stale one shows its age and turns
+  // amber, because a check is evidence about the moment it ran -- on
+  // 2026-09-10 the VPN dot was green and healthy for 43 minutes while AD1, ISE
+  // and Catalyst Center were all unreachable. The exact age is always in the
+  // tooltip regardless.
+  const label = !pf.ok ? '✕ failed'
+              : stale  ? '✓ passed · ' + ageTxt
+                       : '✓ passed';
   const color  = !pf.ok ? '#ff4757' : stale ? '#ffa502' : '#00e68a';
   const border = !pf.ok ? '#ff475755' : stale ? '#ffa50255' : '#00e68a55';
-  const mark   = !pf.ok ? '✕' : stale ? '!' : '✓';
   const what   = (pf.phases || []).join('+') || 'lab';
-  // Separators, not newlines. A backslash-n written here does not survive:
-  // Python turns it into a REAL newline while rendering DASHBOARD_HTML, which
-  // leaves an unterminated JS string and takes the whole page down with
-  // "Invalid or unexpected token". CLAUDE.md documents this for Python->JS
-  // triple-quoted strings, and it broke this very function once already.
   const tip = (pf.ok ? 'Lab pre-checks passed' : 'Lab pre-checks FAILED')
-            + ' (' + what + ') ' + ageTxt
+            + ' (' + what + ') ' + ageTxt + ' ago'
             + (stale && pf.ok ? ' — old enough that the lab may have changed since' : '')
             + ' · ' + (pf.message || '') + ' · Click to re-check now.';
   return '<span class="pf-badge" data-pod="' + p.pod_id + '" title="' + escHtml(tip) + '"'
        + ' style="cursor:pointer;font-size:9px;color:' + color + ';border:1px solid ' + border
-       + ';border-radius:3px;padding:0 3px;margin-left:4px;">' + mark + ' ' + ageTxt + '</span>';
+       + ';border-radius:3px;padding:0 3px;margin-left:4px;white-space:nowrap;">' + label + '</span>';
 }
 
 function sortPods(pods) {
