@@ -10639,11 +10639,24 @@ function preflightBadge(p) {
 
 function sortPods(pods) {
   const dir = sortDir === 'desc' ? -1 : 1;
+  const NO_SESSION = Number.MAX_SAFE_INTEGER;
   return [...pods].sort((a, b) => {
     let d;
-    if (sortField === 'status')       d = statusRank(a) - statusRank(b);
-    else if (sortField === 'session') d = sessionNum(a) - sessionNum(b);
-    else                              d = podNum(a) - podNum(b);
+    if (sortField === 'status') {
+      d = statusRank(a) - statusRank(b);
+    } else if (sortField === 'session') {
+      const na = sessionNum(a), nb = sessionNum(b);
+      // A POD with no session has MISSING data -- it is not a very large or a
+      // very small session. Keep those at the bottom in BOTH directions,
+      // outside the direction multiplier, rather than letting them lead the
+      // list the moment you sort descending.
+      if ((na === NO_SESSION) !== (nb === NO_SESSION)) {
+        return na === NO_SESSION ? 1 : -1;
+      }
+      d = na - nb;
+    } else {
+      d = podNum(a) - podNum(b);
+    }
     if (d !== 0) return d * dir;
     // Break every tie by POD number, ALWAYS ascending, so a status group reads
     // in POD order. Status sorting used to `return 0` here, which left equal
