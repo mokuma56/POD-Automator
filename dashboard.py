@@ -636,6 +636,10 @@ def api_pods():
     result = []
     for p in pods:
         p = dict(p)
+        # Attach the last preflight result. Carried on this payload rather than
+        # fetched per POD so the 5s table refresh does not turn into one request
+        # per POD, and never computed here -- a GET must not run a probe.
+        p["preflight"] = _PREFLIGHT_CACHE.get(p["pod_id"])
         try:
             steps = conn.execute(
                 "SELECT step_name, status, result FROM pipeline_steps WHERE pod_id = ?",
@@ -992,6 +996,35 @@ SWITCH_CHECKS = {
         "AAA (base config only)",
     ]},
 }
+
+# Last preflight result per POD, for the dashboard badge.
+#
+# Deliberately TIMESTAMPED and never inferred. A bare green tick would recreate
+# the exact failure this project keeps hitting: on 2026-09-10 the VPN read
+# healthy for 43 minutes while the whole 198.18.5.0/24 segment was unreachable.
+# A check is only evidence about the moment it ran, so the badge always carries
+# its age and the UI decides whether that age is still meaningful.
+_PREFLIGHT_CACHE = {}   # pod_id -> {"ok","at","message","targets"}
+
+
+@app.route("/api/preflight/<pod_id>", methods=["GET", "POST"])
+def api_preflight(pod_id):
+    """GET returns the last result (if any); POST runs the check now.
+
+    GET never runs a probe, so polling the dashboard cannot spawn a docker exec
+    per POD per refresh.
+    """
+    if request.method == "GET":
+        return jsonify(_PREFLIGHT_CACHE.get(pod_id) or {"ok": None, "at": 0,
+                                                        "message": "not checked yet"})
+    data = request.get_json(silent=True) or {}
+    phases = data.get("phases") or ["pipeline", "duo", "ise"]
+    ok, msg = _preflight_gate(pod_id, phases)
+    entry = {"ok": bool(ok), "at": time.time(), "message": msg,
+             "phases": phases}
+    _PREFLIGHT_CACHE[pod_id] = entry
+    return jsonify(entry)
+
 
 @app.route("/api/switches/<pod_id>")
 def api_switches(pod_id):
@@ -2275,6 +2308,16 @@ def _preflight_gate(pod_id, phases, log_fn=None):
     return True, f"{len(results)} host(s) reachable"
 
 
+def _preflight_remember(pod_id, ok, msg, phases):
+    """Record a gate result so the dashboard badge shows real runs, not only
+    checks triggered from the UI."""
+    try:
+        _PREFLIGHT_CACHE[pod_id] = {"ok": bool(ok), "at": time.time(),
+                                    "message": msg, "phases": list(phases)}
+    except Exception:
+        pass
+
+
 def _card_already_running(pod_id, table):
     """Is a card already mid-run for this POD? Returns the step name, or "".
 
@@ -2638,6 +2681,7 @@ def api_duo_run(pod_id):
     # case where the operator knows the check is wrong.
     if not (request.args.get("skip_preflight") or data.get("skip_preflight")):
         _pf_ok, _pf_msg = _preflight_gate(pod_id, ["duo"])
+        _preflight_remember(pod_id, _pf_ok, _pf_msg, ["duo"])
         if not _pf_ok:
             return jsonify({"status": "error", "message": _pf_msg,
                             "preflight": "blocked"}), 409
@@ -2818,6 +2862,7 @@ def api_ise_run(pod_id):
     _dns_preflight(pod_id)
     if not (request.args.get("skip_preflight") or data.get("skip_preflight")):
         _pf_ok, _pf_msg = _preflight_gate(pod_id, ["ise"])
+        _preflight_remember(pod_id, _pf_ok, _pf_msg, ["ise"])
         if not _pf_ok:
             return jsonify({"status": "error", "message": _pf_msg,
                             "preflight": "blocked"}), 409
@@ -9034,6 +9079,7 @@ def _run_full_automation(pod_id: str, addons: list):
     # Gate on exactly the phases this run was asked for: a pipeline-only run
     # must not be blocked because AD1 is down.
     _pf_ok, _pf_msg = _preflight_gate(pod_id, ["pipeline"] + list(addons), _log)
+    _preflight_remember(pod_id, _pf_ok, _pf_msg, ["pipeline"] + list(addons))
     if not _pf_ok:
         _log(f"ABORTED before starting: {_pf_msg}")
         return
@@ -9786,10 +9832,10 @@ DASHBOARD_HTML = """
   <table id="pod-table">
     <thead>
       <tr id="sort-header">
-        <th>POD</th>
+        <th data-col="pod" style="cursor:pointer;user-select:none" title="Sort by POD number">POD <span id="pod-sort-icon">⇅</span></th>
         <th>Assigned</th>
-        <th>Session</th>
-        <th data-col="status" style="cursor:pointer;user-select:none">Status <span id="status-sort-icon">⇅</span></th>
+        <th data-col="session" style="cursor:pointer;user-select:none" title="Sort by session number">Session <span id="session-sort-icon">⇅</span></th>
+        <th data-col="status" style="cursor:pointer;user-select:none" title="Sort by status: READY, then WARN, then everything else">Status <span id="status-sort-icon">⇅</span></th>
         <th>VPN</th>
         <th>Serial</th>
         <th>SD-WAN</th>
@@ -10041,11 +10087,17 @@ async function load() {
   updateSortHeaders();
   if (!document.getElementById('sort-header').dataset.bound) {
     document.getElementById('sort-header').dataset.bound = '1';
-    document.querySelector('#sort-header th[data-col="status"]').addEventListener('click', () => {
-      statusSortDir = statusSortDir === 'asc' ? 'desc' : 'asc';
-      updateSortHeaders();
-      renderTable(pods);
+    document.querySelectorAll('#sort-header th[data-col]').forEach(th => {
+      th.addEventListener('click', () => {
+        const col = th.dataset.col;
+        // Clicking the active column flips direction; a new column starts ascending.
+        if (sortField === col) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+        else { sortField = col; sortDir = 'asc'; }
+        updateSortHeaders();
+        renderTable(pods);
+      });
     });
+    updateSortHeaders();
   }
   const detailEl = document.getElementById('detail-pod-id');
   const detailId = detailEl ? detailEl.dataset.podId : '';
@@ -10521,7 +10573,11 @@ function pipelinePhase(p) {
 }
 
 // ── Sort state ───────────────────────────────────────────────────
-let statusSortDir = null; // null=unsorted, 'asc', 'desc'
+// Default is POD, ascending, and NUMERIC. There used to be no default at all:
+// sortPods returned the list untouched, which meant the API's own order,
+// `ORDER BY pod_id` -- lexical -- so POD-1, POD-10, POD-17, POD-2.
+let sortField = 'pod';      // 'pod' | 'session' | 'status'
+let sortDir   = 'asc';      // 'asc' | 'desc'
 
 function statusRank(p) {
   if (p.status !== 'ready') return 2;  // pending
@@ -10535,19 +10591,76 @@ function podNum(p) {
   return m ? parseInt(m[1]) : 9999;
 }
 
+function sessionNum(p) {
+  // Sort numerically, and keep blanks at the bottom either way rather than
+  // letting an empty session sort as 0 and head the list.
+  const m = String(p.session_id || '').match(/(\\d+)/);
+  return m ? parseInt(m[1], 10) : Number.MAX_SAFE_INTEGER;
+}
+
+// Preflight badge next to the VPN dot.
+//
+// ALWAYS shows its age. A bare green tick would repeat the failure this whole
+// check exists to catch: on 2026-09-10 the VPN dot was green and healthy for
+// 43 minutes while AD1, ISE and Catalyst Center were all unreachable. A check
+// is evidence about the moment it ran and nothing else, so a stale pass is
+// drawn differently from a fresh one.
+const PREFLIGHT_STALE_S = 15 * 60;
+
+function preflightBadge(p) {
+  const pf = p.preflight;
+  if (!pf || pf.ok === null || pf.ok === undefined) {
+    return '<span class="pf-badge" data-pod="' + p.pod_id + '" title="Lab pre-checks have not run for this POD. Click to check now."'
+         + ' style="cursor:pointer;font-size:9px;color:#667788;border:1px solid #334455;border-radius:3px;padding:0 3px;margin-left:4px;">?</span>';
+  }
+  const ageS = Math.max(0, Math.round(Date.now() / 1000 - (pf.at || 0)));
+  const ageTxt = ageS < 90 ? ageS + 's ago'
+               : ageS < 5400 ? Math.round(ageS / 60) + 'm ago'
+               : Math.round(ageS / 3600) + 'h ago';
+  const stale = ageS > PREFLIGHT_STALE_S;
+  // A pass that is old is not a pass now -- draw it muted, never green.
+  const color  = !pf.ok ? '#ff4757' : stale ? '#ffa502' : '#00e68a';
+  const border = !pf.ok ? '#ff475755' : stale ? '#ffa50255' : '#00e68a55';
+  const mark   = !pf.ok ? '✕' : stale ? '!' : '✓';
+  const what   = (pf.phases || []).join('+') || 'lab';
+  // Separators, not newlines. A backslash-n written here does not survive:
+  // Python turns it into a REAL newline while rendering DASHBOARD_HTML, which
+  // leaves an unterminated JS string and takes the whole page down with
+  // "Invalid or unexpected token". CLAUDE.md documents this for Python->JS
+  // triple-quoted strings, and it broke this very function once already.
+  const tip = (pf.ok ? 'Lab pre-checks passed' : 'Lab pre-checks FAILED')
+            + ' (' + what + ') ' + ageTxt
+            + (stale && pf.ok ? ' — old enough that the lab may have changed since' : '')
+            + ' · ' + (pf.message || '') + ' · Click to re-check now.';
+  return '<span class="pf-badge" data-pod="' + p.pod_id + '" title="' + escHtml(tip) + '"'
+       + ' style="cursor:pointer;font-size:9px;color:' + color + ';border:1px solid ' + border
+       + ';border-radius:3px;padding:0 3px;margin-left:4px;">' + mark + ' ' + ageTxt + '</span>';
+}
+
 function sortPods(pods) {
-  if (!statusSortDir) return pods;
+  const dir = sortDir === 'desc' ? -1 : 1;
   return [...pods].sort((a, b) => {
-    const ra = statusRank(a), rb = statusRank(b);
-    if (ra !== rb) return statusSortDir === 'asc' ? ra - rb : rb - ra;
-    return 0;
+    let d;
+    if (sortField === 'status')       d = statusRank(a) - statusRank(b);
+    else if (sortField === 'session') d = sessionNum(a) - sessionNum(b);
+    else                              d = podNum(a) - podNum(b);
+    if (d !== 0) return d * dir;
+    // Break every tie by POD number, ALWAYS ascending, so a status group reads
+    // in POD order. Status sorting used to `return 0` here, which left equal
+    // status PODs in the API's lexical order -- one of the two reasons status
+    // sorting looked broken.
+    return podNum(a) - podNum(b);
   });
 }
 
 function updateSortHeaders() {
-  const icon = document.getElementById('status-sort-icon');
-  if (!icon) return;
-  icon.textContent = statusSortDir === 'asc' ? '↑' : statusSortDir === 'desc' ? '↓' : '⇅';
+  ['pod', 'session', 'status'].forEach(col => {
+    const icon = document.getElementById(col + '-sort-icon');
+    if (!icon) return;
+    const active = sortField === col;
+    icon.textContent = active ? (sortDir === 'asc' ? '↑' : '↓') : '⇅';
+    icon.style.opacity = active ? '1' : '0.35';
+  });
 }
 
 const _rowCache = {};  // podId -> last rendered HTML string
@@ -10603,7 +10716,7 @@ function renderTable(pods) {
       <td><input type="text" value="${p.assigned_to||''}" placeholder="CCO ID" style="background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:3px 7px;width:100px;font-size:12px;" onchange="saveAssigned('${p.pod_id}', this.value)" /></td>
       <td style="font-size:11px;color:#667788">${p.session_id || ''}</td>
       <td>${readyBadge}</td>
-      <td style="text-align:center"><span style="color:${vpnColor};font-size:18px;line-height:1" title="${p.vpn_detail || ''}">&#x25cf;</span></td>
+      <td style="text-align:center;white-space:nowrap"><span style="color:${vpnColor};font-size:18px;line-height:1" title="${p.vpn_detail || ''}">&#x25cf;</span>${preflightBadge(p)}</td>
       <td style="font-size:11px;color:#667788">${serial}</td>
       <td class="device-col" style="font-size:18px;line-height:1;color:${p.sdwan_online === 'yes' ? '#00e68a' : '#ff4757'}">&#x25cf;</td>
       <td class="device-col" style="font-size:18px;line-height:1;color:${cardDot(p.duo_configured, p.duo_failed, p.duo_done)}" title="${cardTip('Duo', p.duo_configured, p.duo_failed, p.duo_done, p.duo_total, 0)}">&#x25cf;</td>
@@ -10686,6 +10799,52 @@ function renderTable(pods) {
       sel.dataset.saved = server;
     }
   });
+
+  // Re-check on click. Bound here rather than inline so the quoting stays sane.
+  tbody.querySelectorAll('.pf-badge').forEach(el => {
+    if (el.dataset.bound) return;
+    el.dataset.bound = '1';
+    el.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const pod = el.dataset.pod;
+      el.textContent = '…';
+      try {
+        await fetch('/api/preflight/' + pod, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phases: ['pipeline', 'duo', 'ise'] }),
+        });
+      } catch (e) { /* load() below will show whatever the server has */ }
+      await load();
+    });
+  });
+
+  // Put the rows in the sorted order.
+  //
+  // The loop above only ever REPLACES an existing row in place; it never moves
+  // one. Sorted position was applied solely to rows being inserted for the
+  // first time, so clicking a header re-sorted the array and re-rendered the
+  // contents while every already-present row stayed exactly where it was. That
+  // is the other half of why status sorting looked broken.
+  //
+  // Reorder only when the DOM order actually differs, and never while a caret
+  // is in a field inside the table -- moving a node blurs it, and the Assigned
+  // cell is a text input that is edited in place.
+  const _wantOrder = sorted.map(p => p.pod_id).join(',');
+  const _haveOrder = Array.from(tbody.querySelectorAll('tr[data-pod-id]'))
+    .map(tr => tr.dataset.podId).join(',');
+  if (_wantOrder !== _haveOrder) {
+    const _a = document.activeElement;
+    const _typing = _a && tbody.contains(_a) &&
+                    (_a.tagName === 'INPUT' || _a.tagName === 'TEXTAREA' ||
+                     _a.isContentEditable);
+    if (!_typing) {
+      sorted.forEach(p => {
+        const tr = tbody.querySelector('tr[data-pod-id="' + p.pod_id + '"]');
+        if (tr) tbody.appendChild(tr);   // appendChild MOVES an existing node
+      });
+    }
+  }
 }
 
 // Persist the per-POD choice immediately. The table re-renders on a 5s poll and
