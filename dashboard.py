@@ -2139,6 +2139,107 @@ def _dns_preflight(pod_id, log_fn=None):
         _l(f"DNS preflight skipped ({type(e).__name__}: {str(e)[:80]})")
 
 
+# ── Pre-run reachability gate ────────────────────────────────────────────────
+#
+# A VPN tunnel being up says nothing about the lab behind it. On 2026-09-10 the
+# tunnel was healthy for 43 minutes while the whole 198.18.5.0/24 segment --
+# AD1, ISE and Catalyst Center -- answered "No route to host". The run went
+# 19/21 on the pipeline and then lost nine Duo steps and every ISE step to a
+# condition that a 20-second check would have shown before it started.
+#
+# Scoped BY PHASE deliberately: a pipeline-only run must not be blocked because
+# AD1 is down, and a Duo run must not be blocked because a switch is down.
+PREFLIGHT_TARGETS = {
+    "pipeline": [("vManage",      "198.18.133.10", 443),
+                 ("jump host",    "198.18.133.36", 5985),
+                 ("border spine", "198.18.128.24", 22),
+                 ("leaf1",        "198.18.128.22", 22),
+                 ("leaf2",        "198.18.128.23", 22)],
+    "duo":      [("AD1 WinRM",    "198.18.5.102",  5985),
+                 ("AD1 LDAP",     "198.18.5.102",  389),
+                 ("jump host",    "198.18.133.36", 5985)],
+    "ise":      [("ISE",          "198.18.5.101",  443)],
+}
+
+_PREFLIGHT_PY = """
+import json, socket, sys
+out = {}
+for label, host, port in json.loads(sys.argv[1]):
+    try:
+        s = socket.create_connection((host, int(port)), timeout=6); s.close()
+        out[label] = ""
+    except Exception as e:
+        out[label] = f"{type(e).__name__}: {e}"[:70]
+print(json.dumps(out))
+"""
+
+
+def _preflight_probe(pod_id, targets):
+    """TCP-connect to each target from inside the POD's VPN namespace.
+
+    Returns (results, probe_error). results maps label -> "" when reachable or
+    the error text when not. probe_error is set only when the CHECK ITSELF
+    could not run, which is a different thing from the targets being down and
+    must never be reported as one.
+
+    Uses `docker exec` against the existing vpn container, which already has
+    python3, rather than `docker run` off the 8.4GB image: measured about four
+    times faster and with no dependency on that image being present or current.
+    """
+    import json as _json
+    import subprocess as _sp
+    try:
+        r = _sp.run(["docker", "exec", f"vpn-{pod_id}", "python3", "-c",
+                     _PREFLIGHT_PY, _json.dumps([list(t) for t in targets])],
+                    capture_output=True, text=True, timeout=90)
+        line = [l for l in r.stdout.splitlines() if l.strip().startswith("{")]
+        if not line:
+            return {}, (r.stderr or r.stdout or "no output")[-140:]
+        return _json.loads(line[-1]), ""
+    except Exception as e:
+        return {}, f"{type(e).__name__}: {e}"[:140]
+
+
+def _preflight_gate(pod_id, phases, log_fn=None):
+    """Block a run whose phase-required hosts are unreachable.
+
+    Returns (ok, message). ok=False means: do not start, the lab is not ready.
+
+    A probe that cannot RUN does not block. "I could not check" is not "the
+    check failed", and conflating the two is the mistake that has cost this
+    project more time than any other -- so an unrunnable probe warns and lets
+    the run proceed, where an unreachable required host stops it.
+    """
+    _l = log_fn or (lambda m: log(pod_id, f"[preflight] {m}"))
+    wanted = [ph for ph in ("pipeline", "duo", "ise") if ph in (phases or [])]
+    targets, seen = [], set()
+    for ph in wanted:
+        for t in PREFLIGHT_TARGETS.get(ph, []):
+            if t[0] not in seen:
+                seen.add(t[0])
+                targets.append(t)
+    if not targets:
+        return True, "no targets for the selected phases"
+
+    results, probe_error = _preflight_probe(pod_id, targets)
+    if probe_error:
+        _l(f"could not run the reachability check ({probe_error}) — "
+           f"NOT blocking the run on a check that did not happen")
+        return True, f"preflight skipped: {probe_error}"
+
+    down = {k: v for k, v in results.items() if v}
+    if down:
+        detail = "; ".join(f"{k} ({v.split(':')[0]})" for k, v in sorted(down.items()))
+        _l(f"BLOCKED — {len(down)} of {len(results)} required host(s) unreachable "
+           f"for phases {wanted}: {detail}")
+        return False, (f"lab not ready for {'+'.join(wanted)}: {detail}. "
+                       f"The VPN tunnel is up, but these hosts are not answering "
+                       f"— check the dCloud session has finished booting, then "
+                       f"re-run.")
+    _l(f"all {len(results)} required host(s) reachable for {wanted}")
+    return True, f"{len(results)} host(s) reachable"
+
+
 def _card_already_running(pod_id, table):
     """Is a card already mid-run for this POD? Returns the step name, or "".
 
@@ -2498,6 +2599,13 @@ def api_duo_run(pod_id):
     from_step = int(request.args.get("from_step", data.get("from_step", 0)))
 
     _dns_preflight(pod_id)
+    # Stop here rather than 25 minutes in. skip_preflight=1 overrides, for the
+    # case where the operator knows the check is wrong.
+    if not (request.args.get("skip_preflight") or data.get("skip_preflight")):
+        _pf_ok, _pf_msg = _preflight_gate(pod_id, ["duo"])
+        if not _pf_ok:
+            return jsonify({"status": "error", "message": _pf_msg,
+                            "preflight": "blocked"}), 409
 
     _busy = _card_already_running(pod_id, "duo_steps")
     if _busy:
@@ -2673,6 +2781,11 @@ def api_ise_run(pod_id):
     from_step = int(request.args.get("from_step", data.get("from_step", 0)))
 
     _dns_preflight(pod_id)
+    if not (request.args.get("skip_preflight") or data.get("skip_preflight")):
+        _pf_ok, _pf_msg = _preflight_gate(pod_id, ["ise"])
+        if not _pf_ok:
+            return jsonify({"status": "error", "message": _pf_msg,
+                            "preflight": "blocked"}), 409
 
     _busy = _card_already_running(pod_id, "ise_steps")
     if _busy:
@@ -8883,6 +8996,12 @@ def _run_full_automation(pod_id: str, addons: list):
     _warn_if_image_stale(pod_id)
     # Every run goes through here, so one call covers pipeline + Duo + ISE.
     _dns_preflight(pod_id, _log)
+    # Gate on exactly the phases this run was asked for: a pipeline-only run
+    # must not be blocked because AD1 is down.
+    _pf_ok, _pf_msg = _preflight_gate(pod_id, ["pipeline"] + list(addons), _log)
+    if not _pf_ok:
+        _log(f"ABORTED before starting: {_pf_msg}")
+        return
 
     ok, msg = _start_pipeline_container(pod_id)
     _log(msg)
