@@ -214,12 +214,20 @@ vmanage-connection
 # ---------------------------------------------------------------------------
 
 def _check_show_ver(show_ver: str) -> tuple[bool, str]:
-    """Check code version is 17.12.x"""
-    for line in show_ver.splitlines():
-        if "Version" in line and ("17.12" in line or "17.12" in line):
-            ver = line.strip()
-            return True, ver
-    return False, "Version not found or not 17.12.x"
+    """Accept MIN_SWITCH_VERSION or newer, sharing onboard_router's rule.
+
+    This used to look for the substring "17.12" (twice, in an `or` with itself),
+    so a switch on a NEWER image failed exactly like one on an ancient image --
+    the same defect that soft-failed POD-18's verify_border_spine on 17.18.03.
+    The comparison must be numeric: "17.9.1" sorts above "17.12.1" as text while
+    being the older release.
+    """
+    from onboard_router import MIN_SWITCH_VERSION, _parse_version_str
+    ok, ver = _parse_version_str(show_ver)
+    if ok:
+        return True, ver
+    floor = ".".join(str(n) for n in MIN_SWITCH_VERSION)
+    return False, f"Version {ver} is below the {floor} minimum"
 
 def _check_show_vrf(show_vrf: str) -> tuple[bool, str]:
     """Only Mgmt-vrf should exist."""

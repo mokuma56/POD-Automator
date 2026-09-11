@@ -975,19 +975,19 @@ SWITCH_CHECKS = {
     "border_spine": {"name": "Border Spine", "ip": "198.18.128.24", "checks": [
         "OSPF neighbors (expect 2)",
         "VRF (expect Mgmt-vrf only)",
-        "Version (expect 17.12.x)",
+        "Version (expect 17.12.1 or newer)",
         "VLAN (expect default + VLAN 5)",
         "AAA (base config only)",
     ]},
     "leaf1": {"name": "Leaf 1", "ip": "198.18.128.22", "checks": [
         "VRF (expect Mgmt-vrf only)",
-        "Version (expect 17.12.x)",
+        "Version (expect 17.12.1 or newer)",
         "VLAN (expect default only)",
         "AAA (base config only)",
     ]},
     "leaf2": {"name": "Leaf 2", "ip": "198.18.128.23", "checks": [
         "VRF (expect Mgmt-vrf only)",
-        "Version (expect 17.12.x)",
+        "Version (expect 17.12.1 or newer)",
         "VLAN (expect default only)",
         "AAA (base config only)",
     ]},
