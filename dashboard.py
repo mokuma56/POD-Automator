@@ -288,9 +288,18 @@ def _migrate():
             ok INTEGER,
             at REAL,
             message TEXT DEFAULT '',
-            phases TEXT DEFAULT ''
+            phases TEXT DEFAULT '',
+            degraded INTEGER DEFAULT 0
         )
     """)
+    # "degraded" = the run was allowed, but advisory hosts were unreachable.
+    # Without it the badge could only say passed or failed, so a POD with three
+    # dead switches showed a plain green "passed" — true about whether the run
+    # may start, misleading about whether the lab is healthy.
+    try:
+        conn.execute("ALTER TABLE preflight_results ADD COLUMN degraded INTEGER DEFAULT 0")
+    except Exception:
+        pass
     # SCC reset checklist table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scc_checklist (
@@ -1032,14 +1041,15 @@ def _preflight_load_all() -> dict:
         conn = _db()
         try:
             rows = conn.execute(
-                "SELECT pod_id, ok, at, message, phases FROM preflight_results"
-            ).fetchall()
+                "SELECT pod_id, ok, at, message, phases, degraded "
+                "FROM preflight_results").fetchall()
         finally:
             conn.close()
         return {r["pod_id"]: {"ok": bool(r["ok"]) if r["ok"] is not None else None,
                               "at": r["at"] or 0,
                               "message": r["message"] or "",
-                              "phases": [x for x in (r["phases"] or "").split(",") if x]}
+                              "phases": [x for x in (r["phases"] or "").split(",") if x],
+                              "degraded": bool(r["degraded"])}
                 for r in rows}
     except sqlite3.Error:
         return {}
@@ -1061,8 +1071,9 @@ def api_preflight(pod_id):
                                                    "message": "not checked yet"})
     data = request.get_json(silent=True) or {}
     phases = data.get("phases") or ["pipeline", "duo", "ise"]
-    ok, msg = _preflight_gate(pod_id, phases)
-    _preflight_remember(pod_id, ok, msg, phases)
+    _d = {}
+    ok, msg = _preflight_gate(pod_id, phases, detail=_d)
+    _preflight_remember(pod_id, ok, msg, phases, _d.get("degraded"))
     return jsonify(_preflight_load(pod_id) or {"ok": bool(ok), "at": time.time(),
                                                "message": msg, "phases": phases})
 
@@ -2258,16 +2269,36 @@ def _dns_preflight(pod_id, log_fn=None):
 #
 # Scoped BY PHASE deliberately: a pipeline-only run must not be blocked because
 # AD1 is down, and a Duo run must not be blocked because a switch is down.
+# "required" blocks the run; "advisory" is probed and reported but never blocks.
+#
+# The first version of this blocked the pipeline on the three switches while not
+# checking the router at all -- wrong in both directions. All three switch
+# verifies are in onboard.SOFT_FAIL_STEPS, so an unreachable switch DEGRADES a
+# run rather than stopping it, and blocking on them stopped a pipeline that
+# would have finished. Meanwhile onboard_router.ROUTER_IP is the one host the
+# pipeline genuinely cannot start without -- it has its own hard preflight that
+# aborts with "Could not reach router ... Pipeline cannot start" -- and the gate
+# was silent about it. POD-1 on 2026-09-11 showed both faults at once: blocked
+# on the switches, then the run it did allow died on the router anyway.
 PREFLIGHT_TARGETS = {
-    "pipeline": [("vManage",      "198.18.133.10", 443),
-                 ("jump host",    "198.18.133.36", 5985),
-                 ("border spine", "198.18.128.24", 22),
-                 ("leaf1",        "198.18.128.22", 22),
-                 ("leaf2",        "198.18.128.23", 22)],
-    "duo":      [("AD1 WinRM",    "198.18.5.102",  5985),
-                 ("AD1 LDAP",     "198.18.5.102",  389),
-                 ("jump host",    "198.18.133.36", 5985)],
-    "ise":      [("ISE",          "198.18.5.101",  443)],
+    "pipeline": {
+        "required": [("router",       "198.18.133.25", 22),
+                     ("vManage",      "198.18.133.10", 443),
+                     ("jump host",    "198.18.133.36", 5985)],
+        "advisory": [("border spine", "198.18.128.24", 22),
+                     ("leaf1",        "198.18.128.22", 22),
+                     ("leaf2",        "198.18.128.23", 22)],
+    },
+    "duo": {
+        "required": [("AD1 WinRM",    "198.18.5.102",  5985),
+                     ("AD1 LDAP",     "198.18.5.102",  389),
+                     ("jump host",    "198.18.133.36", 5985)],
+        "advisory": [],
+    },
+    "ise": {
+        "required": [("ISE",          "198.18.5.101",  443)],
+        "advisory": [],
+    },
 }
 
 _PREFLIGHT_PY = """
@@ -2309,7 +2340,8 @@ def _preflight_probe(pod_id, targets):
         return {}, f"{type(e).__name__}: {e}"[:140]
 
 
-def _preflight_gate(pod_id, phases, log_fn=None):
+def _preflight_gate(pod_id, phases, log_fn=None, allow_override=False,
+                    detail=None):
     """Block a run whose phase-required hosts are unreachable.
 
     Returns (ok, message). ok=False means: do not start, the lab is not ready.
@@ -2321,12 +2353,16 @@ def _preflight_gate(pod_id, phases, log_fn=None):
     """
     _l = log_fn or (lambda m: log(pod_id, f"[preflight] {m}"))
     wanted = [ph for ph in ("pipeline", "duo", "ise") if ph in (phases or [])]
-    targets, seen = [], set()
+    targets, required, seen = [], set(), set()
     for ph in wanted:
-        for t in PREFLIGHT_TARGETS.get(ph, []):
-            if t[0] not in seen:
-                seen.add(t[0])
-                targets.append(t)
+        spec = PREFLIGHT_TARGETS.get(ph) or {}
+        for kind in ("required", "advisory"):
+            for t in spec.get(kind, []):
+                if t[0] not in seen:
+                    seen.add(t[0])
+                    targets.append(t)
+                if kind == "required":
+                    required.add(t[0])
     if not targets:
         return True, "no targets for the selected phases"
 
@@ -2336,20 +2372,47 @@ def _preflight_gate(pod_id, phases, log_fn=None):
            f"NOT blocking the run on a check that did not happen")
         return True, f"preflight skipped: {probe_error}"
 
-    down = {k: v for k, v in results.items() if v}
-    if down:
-        detail = "; ".join(f"{k} ({v.split(':')[0]})" for k, v in sorted(down.items()))
-        _l(f"BLOCKED — {len(down)} of {len(results)} required host(s) unreachable "
-           f"for phases {wanted}: {detail}")
-        return False, (f"lab not ready for {'+'.join(wanted)}: {detail}. "
+    def _fmt(d):
+        return "; ".join(f"{k} ({v.split(':')[0]})" for k, v in sorted(d.items()))
+
+    down_req = {k: v for k, v in results.items() if v and k in required}
+    down_adv = {k: v for k, v in results.items() if v and k not in required}
+    # Structured, so callers never have to parse the English message to learn
+    # whether anything was wrong.
+    if detail is not None:
+        detail["down_required"] = down_req
+        detail["down_advisory"] = down_adv
+        detail["degraded"] = bool(down_req or down_adv)
+
+    if down_adv:
+        # Reported, never blocking: these back steps that soft-fail by design.
+        _l(f"advisory hosts unreachable (the run will degrade, not stop): "
+           f"{_fmt(down_adv)}")
+
+    if down_req and not allow_override:
+        _l(f"BLOCKED — {len(down_req)} required host(s) unreachable for phases "
+           f"{wanted}: {_fmt(down_req)}")
+        return False, (f"lab not ready for {'+'.join(wanted)}: {_fmt(down_req)}. "
                        f"The VPN tunnel is up, but these hosts are not answering "
                        f"— check the dCloud session has finished booting, then "
-                       f"re-run.")
-    _l(f"all {len(results)} required host(s) reachable for {wanted}")
-    return True, f"{len(results)} host(s) reachable"
+                       f"re-run."
+                       + (f" (also unreachable, but not blocking: "
+                          f"{_fmt(down_adv)})" if down_adv else ""))
+    if down_req and allow_override:
+        _l(f"OVERRIDDEN — proceeding with {len(down_req)} required host(s) "
+           f"unreachable: {_fmt(down_req)}")
+        return True, (f"started with the pre-check overridden — unreachable: "
+                      f"{_fmt(down_req)}")
+
+    msg = f"{len(results) - len(down_adv)} of {len(results)} host(s) reachable"
+    if down_adv:
+        _l(f"required hosts reachable for {wanted}; {_fmt(down_adv)} not answering")
+        return True, msg + f" (not blocking: {_fmt(down_adv)})"
+    _l(f"all {len(results)} host(s) reachable for {wanted}")
+    return True, msg
 
 
-def _preflight_remember(pod_id, ok, msg, phases):
+def _preflight_remember(pod_id, ok, msg, phases, degraded=False):
     """Record a gate result so the badge shows real runs, not only UI checks.
 
     Never raises: a failure to record the outcome of a check must not fail the
@@ -2359,12 +2422,13 @@ def _preflight_remember(pod_id, ok, msg, phases):
         conn = _db()
         try:
             conn.execute(
-                "INSERT INTO preflight_results (pod_id, ok, at, message, phases) "
-                "VALUES (?,?,?,?,?) ON CONFLICT(pod_id) DO UPDATE SET "
+                "INSERT INTO preflight_results "
+                "(pod_id, ok, at, message, phases, degraded) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT(pod_id) DO UPDATE SET "
                 "ok=excluded.ok, at=excluded.at, message=excluded.message, "
-                "phases=excluded.phases",
+                "phases=excluded.phases, degraded=excluded.degraded",
                 (pod_id, 1 if ok else 0, time.time(), str(msg)[:400],
-                 ",".join(phases)))
+                 ",".join(phases), 1 if degraded else 0))
             conn.commit()
         finally:
             conn.close()
@@ -2734,8 +2798,12 @@ def api_duo_run(pod_id):
     # Stop here rather than 25 minutes in. skip_preflight=1 overrides, for the
     # case where the operator knows the check is wrong.
     if not (request.args.get("skip_preflight") or data.get("skip_preflight")):
-        _pf_ok, _pf_msg = _preflight_gate(pod_id, ["duo"])
-        _preflight_remember(pod_id, _pf_ok, _pf_msg, ["duo"])
+        _pf_d = {}
+        _pf_ok, _pf_msg = _preflight_gate(pod_id, ["duo"], detail=_pf_d)
+        _preflight_remember(pod_id, _pf_ok, _pf_msg, ["duo"],
+                            _pf_d.get("degraded"))
+        # (skip_preflight is handled by the enclosing `if`, which bypasses the
+        #  gate entirely rather than overriding it.)
         if not _pf_ok:
             return jsonify({"status": "error", "message": _pf_msg,
                             "preflight": "blocked"}), 409
@@ -2915,8 +2983,12 @@ def api_ise_run(pod_id):
 
     _dns_preflight(pod_id)
     if not (request.args.get("skip_preflight") or data.get("skip_preflight")):
-        _pf_ok, _pf_msg = _preflight_gate(pod_id, ["ise"])
-        _preflight_remember(pod_id, _pf_ok, _pf_msg, ["ise"])
+        _pf_d = {}
+        _pf_ok, _pf_msg = _preflight_gate(pod_id, ["ise"], detail=_pf_d)
+        _preflight_remember(pod_id, _pf_ok, _pf_msg, ["ise"],
+                            _pf_d.get("degraded"))
+        # (skip_preflight is handled by the enclosing `if`, which bypasses the
+        #  gate entirely rather than overriding it.)
         if not _pf_ok:
             return jsonify({"status": "error", "message": _pf_msg,
                             "preflight": "blocked"}), 409
@@ -9118,7 +9190,7 @@ def _start_pipeline_container(pod_id: str) -> tuple:
         os.unlink(tmp.name)
 
 
-def _run_full_automation(pod_id: str, addons: list):
+def _run_full_automation(pod_id: str, addons: list, skip_preflight: bool = False):
     """pipeline -> Duo -> ISE, honouring the agreed failure policy.
 
     Soft-failed pipeline steps do not stop the chain; a hard failure does.
@@ -9133,9 +9205,17 @@ def _run_full_automation(pod_id: str, addons: list):
     _dns_preflight(pod_id, _log)
     # Gate on exactly the phases this run was asked for: a pipeline-only run
     # must not be blocked because AD1 is down.
-    _pf_ok, _pf_msg = _preflight_gate(pod_id, ["pipeline"] + list(addons), _log)
-    _preflight_remember(pod_id, _pf_ok, _pf_msg, ["pipeline"] + list(addons))
+    _phases = ["pipeline"] + list(addons)
+    _pf_d = {}
+    _pf_ok, _pf_msg = _preflight_gate(pod_id, _phases, _log,
+                                      allow_override=skip_preflight,
+                                      detail=_pf_d)
+    _preflight_remember(pod_id, _pf_ok, _pf_msg, _phases, _pf_d.get("degraded"))
     if not _pf_ok:
+        # Should not normally be reached: the endpoint gates first so the
+        # operator gets a 409 they can act on, rather than a POST that reports
+        # "started" and then aborts in a background thread where the only trace
+        # is a log line.
         _log(f"ABORTED before starting: {_pf_msg}")
         return
 
@@ -9241,12 +9321,27 @@ def api_run_pod_full(pod_id):
         finally:
             conn.close()
 
-    threading.Thread(target=_run_full_automation, args=(pod_id, addons),
-                     daemon=True).start()
+    # Gate HERE, not only inside the thread, so a block comes back as a 409 the
+    # operator can see and override instead of a "started" that quietly aborts.
+    _skip = bool(data.get("skip_preflight") or request.args.get("skip_preflight"))
+    if not _skip:
+        _pf_d = {}
+        _pf_ok, _pf_msg = _preflight_gate(pod_id, ["pipeline"] + addons,
+                                          detail=_pf_d)
+        _preflight_remember(pod_id, _pf_ok, _pf_msg, ["pipeline"] + addons,
+                            _pf_d.get("degraded"))
+        if not _pf_ok:
+            return jsonify({"status": "error", "preflight": "blocked",
+                            "message": _pf_msg}), 409
+
+    threading.Thread(target=_run_full_automation,
+                     args=(pod_id, addons, _skip), daemon=True).start()
     return jsonify({"status": "ok", "pod_id": pod_id, "addons": addons,
+                    "overridden": _skip,
                     "message": f"Started pipeline"
                                + "".join(f" + {a.upper()}" for a in addons)
-                               + f" for {pod_id}"})
+                               + f" for {pod_id}"
+                               + (" — pre-check OVERRIDDEN" if _skip else "")})
 
 
 @app.route("/api/run-all", methods=["POST"])
@@ -10758,13 +10853,23 @@ function preflightBadge(p) {
   // 2026-09-10 the VPN dot was green and healthy for 43 minutes while AD1, ISE
   // and Catalyst Center were all unreachable. The exact age is always in the
   // tooltip regardless.
-  const label = !pf.ok ? '✕ failed'
-              : stale  ? '✓ passed · ' + ageTxt
-                       : '✓ passed';
-  const color  = !pf.ok ? '#ff4757' : stale ? '#ffa502' : '#00e68a';
-  const border = !pf.ok ? '#ff475755' : stale ? '#ffa50255' : '#00e68a55';
+  // Green means the lab is actually healthy -- NOT merely that the run is
+  // allowed to start. Those are different questions, and showing the second as
+  // a green "passed" is how POD-1 displayed a clean pre-check with three of its
+  // six hosts unreachable. A degraded pass is amber and says how many are down,
+  // because the run will start and then lose the steps that needed them.
+  const down = pf.degraded ? 'some hosts down' : '';
+  const label = !pf.ok      ? '✕ failed'
+              : pf.degraded ? '⚠ passed, degraded' + (stale ? ' · ' + ageTxt : '')
+              : stale       ? '✓ passed · ' + ageTxt
+                            : '✓ passed';
+  const amber  = stale || pf.degraded;
+  const color  = !pf.ok ? '#ff4757' : amber ? '#ffa502' : '#00e68a';
+  const border = !pf.ok ? '#ff475755' : amber ? '#ffa50255' : '#00e68a55';
   const what   = (pf.phases || []).join('+') || 'lab';
-  const tip = (pf.ok ? 'Lab pre-checks passed' : 'Lab pre-checks FAILED')
+  const tip = (!pf.ok ? 'Lab pre-checks FAILED'
+              : pf.degraded ? 'Lab pre-checks passed but the lab is DEGRADED'
+                            : 'Lab pre-checks passed')
             + ' (' + what + ') ' + ageTxt + ' ago'
             + (stale && pf.ok ? ' — old enough that the lab may have changed since' : '')
             + ' · ' + (pf.message || '') + ' · Click to re-check now.';
@@ -11065,12 +11170,31 @@ async function runPod(podId) {
   // the one that runs most often and should not change behaviour.
   const label = addons.length ? ' + ' + addons.map(a => a.toUpperCase()).join(' + ') : '';
   status.textContent = 'Running automation' + label + ' for ' + podId + '...';
-  const r = addons.length
-    ? await fetch('/api/run-pod-full/' + podId, {
+  const post = (skip) => addons.length
+    ? fetch('/api/run-pod-full/' + podId, {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({addons}) })
-    : await fetch('/api/run-pod/' + podId, { method: 'POST' });
-  const data = await r.json();
+        body: JSON.stringify({addons, skip_preflight: !!skip}) })
+    : fetch('/api/run-pod/' + podId, { method: 'POST' });
+
+  let r = await post(false);
+  let data = await r.json();
+
+  // A failed pre-check is a reason to ask, not a wall. The lab may be mid-boot,
+  // or the operator may know the unreachable host is one this run does not
+  // need, so offer to proceed rather than simply refusing.
+  if (r.status === 409 && data.preflight === 'blocked') {
+    const go = confirm('Lab pre-check FAILED for ' + podId + ':\\n\\n'
+      + (data.message || 'unknown')
+      + '\\n\\nRun anyway? Steps that need those hosts will fail.');
+    if (!go) {
+      status.textContent = 'Cancelled — pre-check failed for ' + podId;
+      setTimeout(() => status.textContent = '', 8000);
+      return;
+    }
+    status.textContent = 'Running automation for ' + podId + ' (pre-check overridden)...';
+    r = await post(true);
+    data = await r.json();
+  }
   status.textContent = data.message || 'Done';
   setTimeout(() => status.textContent = '', 8000);
   load();
