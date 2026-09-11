@@ -1007,8 +1007,16 @@ def api_switches(pod_id):
         name = s["step_name"]
         result_text = s["result"] or ""
         status = s["status"]
+        # A soft-failed step is stored as status 'skipped' with the result
+        # prefixed "WARN: ". The prefix broke the MODEL: detection below, which
+        # is why a warned switch showed no model while its healthy siblings
+        # did. Strip it and remember that it was there.
+        soft = result_text.startswith("WARN:")
+        if soft:
+            result_text = result_text[len("WARN:"):].strip()
         parts = [p.strip() for p in result_text.split("|")]
-        results[name] = {"status": status, "parts": parts, "result_text": result_text}
+        results[name] = {"status": status, "parts": parts,
+                         "result_text": result_text, "soft_failed": soft}
 
     switch_data = []
     for key, info in SWITCH_CHECKS.items():
@@ -1029,11 +1037,17 @@ def api_switches(pod_id):
                 and not check_parts[0].startswith(("PASS", "FAIL", "MODEL:"))):
             error_msg = check_parts[0]  # e.g. "SSH FAILED: timed out"
 
+        # 'skipped' belongs here: it is how a soft-failed step is recorded, and
+        # its result carries a verdict for every check. Leaving it out showed
+        # all five checks as "pending" on a switch that had answered every one
+        # of them, and the card then had nothing to contradict the GUI's claim
+        # that the switch had been unreachable.
+        _DONE = ("completed", "failed", "skipped")
         checks = []
         for i, label in enumerate(info["checks"]):
             if error_msg:
                 checks.append({"label": label, "status": "fail", "result": error_msg})
-            elif step.get("status") in ("completed", "failed") and i < len(check_parts):
+            elif step.get("status") in _DONE and i < len(check_parts):
                 part = check_parts[i]
                 if part.startswith("PASS"):
                     checks.append({"label": label, "status": "pass", "result": part.replace("PASS: ", "")})
@@ -1041,7 +1055,7 @@ def api_switches(pod_id):
                     checks.append({"label": label, "status": "fail", "result": part.replace("FAIL: ", "")})
                 else:
                     checks.append({"label": label, "status": "pass", "result": part})
-            elif step.get("status") in ("completed", "failed"):
+            elif step.get("status") in _DONE:
                 checks.append({"label": label, "status": "na", "result": "no data"})
             elif step.get("status") == "running":
                 checks.append({"label": label, "status": "na", "result": "checking..."})
@@ -1050,6 +1064,26 @@ def api_switches(pod_id):
 
         passed = sum(1 for c in checks if c["status"] == "pass")
         failed = sum(1 for c in checks if c["status"] == "fail")
+
+        # Say what actually went wrong. The card used to print "switch
+        # unreachable during pipeline" for ANY skipped status, so POD-18's
+        # border spine -- which answered every check and failed only on a
+        # version expectation -- was reported as an unreachable switch.
+        note = ""
+        if step.get("status") == "skipped":
+            _bad = [c for c in checks if c["status"] == "fail"]
+            if error_msg:
+                note = f"Verification could not run: {error_msg}"
+            elif _bad:
+                note = ("Verified with warnings: "
+                        + "; ".join(f"{c['label'].split(' (')[0]} — {c['result']}"
+                                    for c in _bad[:3]))
+            elif not any(c["status"] == "pass" for c in checks):
+                note = ("Verification skipped — the switch did not answer during "
+                        "the pipeline. Click Re-check Switches to retry.")
+            else:
+                note = "Verified with a warning (see the step result)"
+
         switch_data.append({
             "name": info["name"],
             "model": model,
@@ -1060,6 +1094,7 @@ def api_switches(pod_id):
             "failed": failed,
             "total": len(checks),
             "step_status": step.get("status", "pending"),
+            "note": note,
         })
 
     # Add connectivity_test as a separate card
@@ -11405,7 +11440,11 @@ async function loadSwitches(podId) {
         (sw.step_status === 'skipped' ? '<span class="badge warn" style="margin-left:auto">WARN</span>' : '') +
         warnBadge + manualRebootBtn +
       '</div>' +
-      (sw.step_status === 'skipped' ? '<div style="font-size:11px;color:#ffa502;margin-bottom:6px;">⚠ Verification skipped — switch unreachable during pipeline. Click Re-check Switches to retry.</div>' : '') +
+      // Print the reason the SERVER derived from the actual result. This line
+      // used to hardcode "switch unreachable during pipeline" for any skipped
+      // status, so a switch that answered every check and merely failed a
+      // version expectation was reported as unreachable.
+      (sw.step_status === 'skipped' && sw.note ? '<div style="font-size:11px;color:#ffa502;margin-bottom:6px;">⚠ ' + escHtml(sw.note) + '</div>' : '') +
       '<div class="switch-bar"><div class="switch-bar-fill" style="width:' + devicePct + '%;background:' + barColor + '"></div></div>' +
       checksHtml +
       rawRoutesHtml +
