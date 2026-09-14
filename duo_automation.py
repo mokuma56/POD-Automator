@@ -1804,6 +1804,7 @@ def get_browser_sessions(idac_url: str, duo_host: str,
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Jump host IP — WinRM port 5985 is open; has Python 3.11.4 + idac_sdk installed.
+import ui_wait                      # wait_for / SETTLE_TIMEOUT, polled waits
 from ui_wait import absent_message  # page-state-aware failure messages
 
 JUMP_HOST_IP = "198.18.133.36"
@@ -4193,16 +4194,42 @@ def duo_sync_now(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
             return False, ("no directory sync found — run duo_setup_external_directory "
                        "first; " + absent_message("a directory sync row", page))
         page.goto(f"https://{host}{href}", wait_until="load", timeout=35_000)
-        page.wait_for_timeout(7_000)
 
-        clicked = page.evaluate("""() => {
+        # Poll for the button instead of reading the DOM once after a fixed 7s.
+        #
+        # POD-7 lost this race on 2026-09-14: it re-logged in at 13:09:43, looked
+        # 12s later, found nothing and reported the button as unavailable. POD-1
+        # and POD-4 ran the identical path at 13 and 12s and both found it. The
+        # page simply had not rendered yet under five concurrent Duo browsers,
+        # and one read cannot tell "not there" from "not there YET".
+        #
+        # The three outcomes are also kept apart rather than collapsed into one
+        # guess. The old message asked "is the connection healthy?" — a cause it
+        # never tested, and which POD-7's own log had contradicted 38s earlier
+        # with "connection status: Connected".
+        _state = ui_wait.wait_for(
+            page, "the 'Sync Now' button",
+            lambda: page.evaluate("""() => {
+                const b = Array.from(document.querySelectorAll('button'))
+                    .find(x => /^sync now$/i.test((x.innerText || '').trim()));
+                if (!b) return '';
+                return b.disabled ? 'disabled' : 'ready';
+            }"""),
+            log=_log)
+
+        if _state != "ready":
+            if _state == "disabled":
+                return False, ("'Sync Now' is present but stayed disabled for "
+                               f"{ui_wait.SETTLE_TIMEOUT}s — the directory connection "
+                               "is unhealthy or a sync is already running")
+            return False, ("'Sync Now' never rendered; " +
+                           absent_message("the 'Sync Now' button", page))
+
+        page.evaluate("""() => {
             const b = Array.from(document.querySelectorAll('button'))
                 .find(x => /^sync now$/i.test((x.innerText || '').trim()));
-            if (b && !b.disabled) { b.click(); return true; }
-            return false;
+            if (b) b.click();
         }""")
-        if not clicked:
-            return False, "'Sync Now' button not available (is the connection healthy?)"
         _log("clicked Sync Now")
         page.wait_for_timeout(4_000)
         # Some builds confirm in a modal; harmless when absent.
@@ -4737,9 +4764,31 @@ def duo_provision_admin_totp(pod_id: str, db_path: str, serial: str = "",
     serial = serial or f"POD{org_num}-PROCTOR"
 
     def _create(_serial):
-        return _duo_request(ikey, skey, host, "POST", "/admin/v1/tokens",
-                            params={"type": "t6", "serial": _serial,
-                                    "secret": secret_hex}).get("response", {})
+        # Retry a timeout here rather than losing the token to one slow call.
+        #
+        # POD-1 on 2026-09-14 failed with "Read timed out. (read timeout=20)" on
+        # this POST. bootstrap treats that as non-fatal and moves on, so the org
+        # ended the run with duo_admin_totp_secret empty and no student login
+        # page, and the only report of it came 11 steps later from verify.
+        #
+        # Retrying a POST is normally ambiguous — a read timeout cannot tell you
+        # whether the token was created. It is safe specifically here because a
+        # token that did land makes the retry fail with Duo 40003 "Duplicate
+        # resource", which the caller below already handles by taking a unique
+        # serial. Worst case we label the token differently; the serial is only
+        # a label. Do not copy this retry to POSTs without that property.
+        _last = None
+        for _attempt in range(3):
+            try:
+                return _duo_request(ikey, skey, host, "POST", "/admin/v1/tokens",
+                                    params={"type": "t6", "serial": _serial,
+                                            "secret": secret_hex},
+                                    timeout=40).get("response", {})
+            except requests.exceptions.Timeout as _te:
+                _last = _te
+                _log(f"token POST timed out (attempt {_attempt + 1}/3) — retrying")
+                time.sleep(3)
+        raise _last
 
     try:
         try:
@@ -11673,7 +11722,13 @@ def duo_run_card(
             # Assert it here, where a failure fails the card. Checked in the same
             # WinRM session that just proved the proxy healthy, so it costs one
             # extra command.
-            gaps = []
+            # Two lists, deliberately. `gaps` is "I looked and it is missing";
+            # `unknown` is "I could not look". Collapsing them is what made POD-4
+            # report a broken student login path on 2026-09-14 when its bootstrap
+            # had logged "totp: TOTP token POD514-PROCTOR bound ... | jumphost
+            # page: ok" — the page was published, WinRM just timed out three times
+            # under load and the step blamed the lab for its own blind spot.
+            gaps, unknown = [], []
             try:
                 with _sq.connect(db_path) as _cv:
                     _cv.row_factory = _sq.Row
@@ -11684,7 +11739,7 @@ def duo_run_card(
                     gaps.append("no duo_admin_totp_secret — the admin has no "
                                 "phone-free second factor (hardware token)")
             except _sq.Error as _ce:
-                gaps.append(f"could not read duo_admin_totp_secret ({_ce})")
+                unknown.append(f"could not read duo_admin_totp_secret ({_ce})")
 
             # Must use a JUMP HOST session, not `sess`.
             #
@@ -11707,8 +11762,8 @@ def duo_run_card(
                     gaps.append(f"student login page/shortcut missing on the jump "
                                 f"host (Duo-Login.html,Duo Login.lnk = {_pg or '?'})")
             except Exception as _pe:
-                gaps.append(f"could not check the student login page on the jump "
-                            f"host ({type(_pe).__name__}: {str(_pe)[:70]})")
+                unknown.append(f"could not check the student login page on the jump "
+                               f"host ({type(_pe).__name__}: {str(_pe)[:70]})")
             finally:
                 try:
                     if _jump:
@@ -11717,10 +11772,27 @@ def duo_run_card(
                     pass
 
             if gaps:
+                # Something is genuinely missing. Only recommend re-provisioning
+                # the TOTP token when the token is the thing that is missing —
+                # the old advice said so unconditionally, and following it on a
+                # POD whose token was fine would mint a new one and invalidate
+                # the code the proctor already has.
+                _fix = ("Call duo_publish_totp_page to republish the page."
+                        if all("totp_secret" not in g for g in gaps) else
+                        "Call duo_provision_admin_totp + duo_publish_totp_page, "
+                        "or re-run the Duo card's bootstrap step.")
+                _also = (f" (also could not verify: {'; '.join(unknown)})"
+                         if unknown else "")
                 return False, ("Auth Proxy healthy but the student login path is "
-                               "incomplete — " + "; ".join(gaps)
-                               + ". Re-run the Duo card's bootstrap step, or call "
-                                 "duo_provision_admin_totp + duo_publish_totp_page.")
+                               "incomplete — " + "; ".join(gaps) + _also
+                               + ". " + _fix)
+            if unknown:
+                # Nothing was found missing; parts of the check could not run.
+                # Pass, but say plainly what was never confirmed, so this reads as
+                # an unverified pass rather than either a failure or a clean one.
+                return True, (msg + "; NOT VERIFIED: " + "; ".join(unknown)
+                              + " — nothing was found missing, but this pass is "
+                                "incomplete; re-run verify to confirm")
             msg += "; TOTP token + jump host login page present"
             return True, msg
         except Exception as e:

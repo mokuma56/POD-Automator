@@ -3361,9 +3361,32 @@ def phase_scc_reset_check():
                 "dns_servers / posture_profiles steps will be skipped"
             )
     except Exception as e:
-        msg = f"SCC auth failed: {e}"
-        for k in ALL_KEYS:
-            _persist(k, "failed", msg)
+        # Name the right product and the right credential.
+        #
+        # This endpoint is api.sse.cisco.com — Secure Access — and it
+        # authenticates with the sa_api_key / sa_api_secret pair, not the CDO
+        # machine account. Calling it "SCC auth failed" sent the operator to
+        # scc_api_key on 2026-09-14 while the stale credential was the SA pair
+        # on org 535, last updated two weeks earlier.
+        #
+        # A 401 here specifically means the key pair was rejected: bad or
+        # revoked client credentials, not an expired session, so re-running
+        # cannot help. Say that rather than leaving it to be rediscovered.
+        _hint = ""
+        if "401" in str(e):
+            _hint = (" — the Secure Access API key pair was REJECTED "
+                     "(sa_api_key / sa_api_secret). Regenerate it for this org "
+                     "in Secure Access and update Org Credentials; re-running "
+                     "will not help.")
+        msg = f"Secure Access (SSE) auth failed: {e}{_hint}"
+        # One credential failure is one problem. Fanning it out as five
+        # independent "item needs attention" entries made a single stale key
+        # read as five broken reset items on POD-22.
+        _persist(ALL_KEYS[0], "failed", msg)
+        for k in ALL_KEYS[1:]:
+            _persist(k, "failed",
+                     f"not checked — blocked by the same auth failure on "
+                     f"{ALL_KEYS[0]}")
         return False, msg
 
     results = {}

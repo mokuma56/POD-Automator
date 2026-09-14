@@ -477,8 +477,25 @@ def _scc_file_ipc(pod_id: str, otp_token: str, log) -> tuple:
     _result_path.unlink(missing_ok=True)
     # Signal host
     _otp_path.write_text(json.dumps({"pod_id": pod_id, "otp_token": otp_token, "ts": _t.time()}))
-    log("OTP written to shared volume — waiting for host SCC nav (up to 3 min)...")
-    _deadline = _t.time() + 180
+    log("OTP written to shared volume — waiting for host SCC nav (up to 10 min)...")
+    # 600s, not 180s. The host watcher is a SINGLE thread that runs these one at a
+    # time, so this budget has to cover queue wait as well as the work — and the
+    # work alone was 84-130s on every POD of the 2026-09-14 eight-POD run. Measured
+    # that day (queue wait -> total -> outcome):
+    #
+    #     POD-4    0s -> 128s  ok        POD-1   40s -> 161s  ok (19s to spare)
+    #     POD-7    1s ->  84s  ok        POD-8   66s -> 194s  TIMED OUT
+    #     POD-2    2s ->  89s  ok        POD-6  129s -> 216s  TIMED OUT
+    #     POD-5    2s -> 130s  ok
+    #
+    # 180s allowed only ~50s of queueing, so the 6th and 8th PODs to arrive lost.
+    # Worse, losing here is a FALSE negative: the host finished both of those jobs
+    # successfully 13s and 35s after the container stopped listening, wrote
+    # ise_scc_result_POD-{6,8}.json, and nobody read them — the integrations were
+    # live in SCC while the step said failed and the whole card stopped at 1/5.
+    # 600 matches the cdFMC IPC below and leaves ~470s of headroom over the worst
+    # total actually observed.
+    _deadline = _t.time() + 600
     while _t.time() < _deadline:
         if _result_path.exists():
             try:
@@ -491,7 +508,9 @@ def _scc_file_ipc(pod_id: str, otp_token: str, log) -> tuple:
             return _res.get("ok", False), _res.get("message", "no message")
         _t.sleep(3)
     _otp_path.unlink(missing_ok=True)
-    return False, "Host SCC nav timed out — no result after 3 min (is dashboard running?)"
+    return False, ("Host SCC nav timed out — no result after 10 min. The host watcher "
+                   "runs these one at a time; check the pod's log for a later "
+                   "'[scc-nav] OK' line before treating this as a real failure.")
 
 
 def _scc_file_ipc_cdfmc(pod_id: str, otp_token: str, instance_name: str, log) -> tuple:
@@ -550,9 +569,20 @@ def _scc_file_ipc_sgt_verify(pod_id: str, sa_org_id: str, log) -> tuple:
     _trigger_path.write_text(json.dumps({
         "pod_id": pod_id, "sa_org_id": sa_org_id, "ts": _t.time(),
     }))
-    log("SGT verify trigger written — host will check SGTs after 15 min propagation wait...")
-    # Max wait: 15 min initial + 10 min retry + 5 min buffer = 30 min
-    _deadline = _t.time() + 1800
+    log("SGT verify trigger written — host checks at 5/10/15/20 min until SGTs appear...")
+    # 2700s. The host half (dashboard.py _host_sgt_verify) checks at 5, 10, 15
+    # and 20 min, so its own work fits inside the old 1800s budget — the thing
+    # 1800s did NOT cover is the wait to be picked up at all. That watcher is a
+    # single thread shared with the other host-nav steps, so the clock starts
+    # when the trigger is written and can run for many minutes before the host
+    # does anything.
+    #
+    # POD-1 on 2026-09-14: trigger 13:42:38, host busy with other PODs until
+    # 14:08:24 (25m46s of queue), container quit at 14:12:38 having allowed the
+    # host 4 of its 20 minutes. The SGTs were found at 14:13:38, 60s later.
+    #
+    # 20 min of host schedule + 25 min of queue tolerance.
+    _deadline = _t.time() + 2700
     while _t.time() < _deadline:
         if _result_path.exists():
             try:
@@ -565,7 +595,9 @@ def _scc_file_ipc_sgt_verify(pod_id: str, sa_org_id: str, log) -> tuple:
             return _res.get("ok", False), _res.get("message", "no message")
         _t.sleep(5)
     _trigger_path.unlink(missing_ok=True)
-    return False, "SGT verify timed out — host did not respond in 30 min (is dashboard running?)"
+    return False, ("SGT verify timed out — host did not respond in 45 min. The host "
+                   "writes its own result to the DB, so check ise_steps for this pod "
+                   "before treating this as a real failure.")
 
 
 def _phase_ise_sgt_verify(pod_id: str, creds: dict, log) -> tuple[bool, str]:

@@ -514,7 +514,14 @@ def api_resources():
                  "cpus": cpus, "load1": round(load1, 2)},
         "docker": {"used_mb": round(docker_mb, 1), "limit_mb": docker_limit_mb,
                    "cpu": round(docker_cpu, 1), "containers": len(containers)},
-        "browsers": {"count": browsers, "mem_mb": round(browser_mb, 1)},
+        # Two separate figures, because they measure different things and
+        # dividing one by the other is what made the gauge read 5/5 while two
+        # Duo slots were free. "browsers" is every host Playwright browser
+        # (Duo card + scc_reset_check + three ISE steps); "duo_slots" is the
+        # only thing DUO_MAX_CONCURRENT actually caps.
+        "browsers": {"count": browsers, "mem_mb": round(browser_mb, 1),
+                     "duo_slots_held": _duo_slots_held,
+                     "duo_slots_max": DUO_MAX_CONCURRENT},
         "pods": {"pipelines": pods_running, "vpns": vpns},
         "top": sorted(containers, key=lambda c: -c["mem_mb"])[:6],
     }
@@ -524,6 +531,30 @@ def api_resources():
 
 
 _SOFT_PREFIX = "[soft-fail]"
+
+# Phrases a step writes into its OWN result when the thing it exists to do did
+# not happen — while still reporting status 'completed'.
+#
+# The 2026-09-14 eight-POD run produced three of these at once. POD-6 read
+# "4/5 completed" with a green ISE dot while its result text said:
+#
+#   ise_scc_deactivate_reactivate  completed  "... — ISE instance pending"
+#   ise_sgt_verify                 completed  "WARN: No SGTs in Secure Access after 20 min"
+#
+# CLAUDE.md already refuses to count a stepped-over '[soft-fail]' skip as done
+# for exactly this reason; a 'completed' row that contradicts itself is the
+# same lie wearing a better status. It is more dangerous than an honest
+# failure, because nothing draws the operator's eye to it.
+#
+# Deliberately NOT included: "already integrated". That is the normal, healthy
+# output of an idempotent re-run, and flagging it would cry wolf on every
+# repeat run — which is its own way of training people to ignore the dot.
+_GREEN_BUT_WRONG = ("WARN", "instance pending", "NOT VERIFIED")
+
+
+def _result_contradicts_success(result: str) -> bool:
+    """True when a 'completed' step's own message reports a bad outcome."""
+    return any(m in (result or "") for m in _GREEN_BUT_WRONG)
 
 
 # ── Phase 1 failure triage: detect, classify, escalate (no remediation) ──────
@@ -687,19 +718,28 @@ def api_pods():
         try:
             import duo_automation as _da_steps
             drows = conn.execute(
-                "SELECT step_name, status FROM duo_steps WHERE pod_id=?",
+                "SELECT step_name, status, COALESCE(result,'') AS result "
+                "FROM duo_steps WHERE pod_id=?",
                 (p["pod_id"],)
             ).fetchall()
-            dmap = {r["step_name"]: r["status"] for r in drows}
+            dmap = {r["step_name"]: (r["status"], r["result"]) for r in drows}
             want = list(_da_steps.DUO_CARD_STEPS)
-            done = [k for k in want if dmap.get(k) in ("completed", "skipped")]
+            ddegraded = [k for k in want
+                         if dmap.get(k, ("", ""))[0] == "completed"
+                         and _result_contradicts_success(dmap[k][1])]
+            done = [k for k in want
+                    if dmap.get(k, ("", ""))[0] in ("completed", "skipped")
+                    and k not in ddegraded]
             p["duo_done"] = len(done)
             p["duo_total"] = len(want)
             p["duo_configured"] = "yes" if len(done) == len(want) else ""
-            p["duo_failed"] = any(v == "failed" for v in dmap.values())
+            p["duo_failed"] = (any(v[0] == "failed" for v in dmap.values())
+                               or bool(ddegraded))
+            p["duo_degraded"] = len(ddegraded)
         except Exception:
             p["duo_done"], p["duo_total"] = 0, 0
             p["duo_configured"], p["duo_failed"] = "", False
+            p["duo_degraded"] = 0
 
         # ISE card completion, for the "ISE Integrated" tile and the ISE column.
         # Same rule as Duo — every step must be accounted for — with one
@@ -720,7 +760,10 @@ def api_pods():
             for k in iwant:
                 st, res = imap.get(k, ("", ""))
                 if st == "completed":
-                    idone.append(k)
+                    # A 'completed' step whose own text reports a bad outcome
+                    # is degraded, not done — see _GREEN_BUT_WRONG.
+                    (idegraded if _result_contradicts_success(res)
+                     else idone).append(k)
                 elif st == "skipped":
                     (idegraded if res.startswith("[soft-fail]") else idone).append(k)
             p["ise_done"] = len(idone)
@@ -9030,6 +9073,17 @@ def run_pod(pod_id):
 DUO_MAX_CONCURRENT = 5
 _duo_slots = threading.Semaphore(DUO_MAX_CONCURRENT)
 
+# How many Duo slots are actually held, tracked explicitly.
+#
+# The resources gauge used to divide the count of ALL host Playwright browsers
+# by DUO_MAX_CONCURRENT, which are two different populations: scc_reset_check
+# and three of the five ISE steps drive host browsers too and are not bounded
+# by this semaphore. On 2026-09-14 that read "5/5" — apparently the Duo cap
+# saturated — when it was 3 Duo cards plus 2 scc_reset_check browsers and two
+# Duo slots were free. It can equally read 8/5.
+_duo_slots_held = 0
+_duo_slots_lock = threading.Lock()
+
 # A pipeline step that fails without being in this set stops the chain. Mirrors
 # onboard.py's SOFT_FAIL_STEPS; several core steps fail routinely on lab
 # hardware and must not block the optional cards.
@@ -9237,6 +9291,9 @@ def _run_full_automation(pod_id: str, addons: list, skip_preflight: bool = False
         if waiting:
             _log(f"queued for a Duo slot ({DUO_MAX_CONCURRENT} run at once)")
             _duo_slots.acquire()
+        global _duo_slots_held
+        with _duo_slots_lock:
+            _duo_slots_held += 1
         # Sample the peak DURING the card, not before it. Reading RSS on the way
         # in reports 0 MB, because Playwright has not launched yet — useless for
         # sizing DUO_MAX_CONCURRENT, which is the whole reason for measuring.
@@ -9264,10 +9321,15 @@ def _run_full_automation(pod_id: str, addons: list, skip_preflight: bool = False
             _log(f"peak host Chromium RSS during Duo: {_peak['mb']:.0f} MB "
                  f"(all Chromium on this host, so with N concurrent this is the "
                  f"combined figure)")
+            with _duo_slots_lock:
+                _duo_slots_held = max(0, _duo_slots_held - 1)
             _duo_slots.release()
 
     if "ise" in addons:
-        # Container-side: bounded by Docker, not by the Duo semaphore.
+        # Partly container-side, but NOT free of host browsers: steps 2, 4 and 5
+        # call _host_scc_integrate / _host_cdfmc_integrate / _host_sgt_verify,
+        # which each drive Chromium on this Mac and are bounded by nothing. The
+        # Duo semaphore is the only host-browser cap in the system.
         _log("ISE card starting")
         proc = subprocess.Popen([
             "docker", "run", "--rm",
@@ -10479,7 +10541,11 @@ async function refreshResources() {
   const macFree = Math.max(0, d.host.total_mb - d.host.used_mb);
   const dkrFree = Math.max(0, d.docker.limit_mb - d.docker.used_mb);
   const podsLeft = Math.max(0, (sf.pipelines || 0) - d.pods.pipelines);
-  const brLeft = Math.max(0, (sf.browsers || 0) - d.browsers.count);
+  // Duo slot occupancy comes from the semaphore's own counter, not from
+  // counting browsers: the browser count includes scc_reset_check and the ISE
+  // host steps, which no semaphore bounds.
+  const dslHeld = d.browsers.duo_slots_held || 0;
+  const dslMax  = d.browsers.duo_slots_max || 5;
 
   const html =
       _rvGauge('Mac Memory', gb(macFree) + ' GB free',
@@ -10500,11 +10566,19 @@ async function refreshResources() {
                'Pipeline containers running: ' + d.pods.pipelines + ' of ~'
                + (sf.pipelines || 8) + ' safe (Docker allocation / ~400MB each, an '
                + 'estimate). ' + d.pods.vpns + ' VPN containers up.')
-    + _rvGauge('Browsers', brLeft + ' more OK',
-               String(d.browsers.count), d.browsers.count, sf.browsers || 5,
-               'Host-side Playwright browsers: ' + d.browsers.count + ' of '
-               + (sf.browsers || 5) + ' (DUO_MAX_CONCURRENT), using '
-               + gb(d.browsers.mem_mb) + ' GB. Container browsers count under Docker.')
+    + _rvGauge('Duo Slots', (dslMax - dslHeld) + ' free',
+               dslHeld + '/' + dslMax, dslHeld, dslMax,
+               'Duo cards holding a slot: ' + dslHeld + ' of ' + dslMax
+               + ' (DUO_MAX_CONCURRENT). This is the only host-browser cap in '
+               + 'the system — scc_reset_check and ISE steps 2, 4 and 5 also '
+               + 'drive host browsers and are not counted against it.')
+    + _rvGauge('Host Browsers', gb(d.browsers.mem_mb) + ' GB',
+               String(d.browsers.count), d.browsers.count,
+               Math.max(d.browsers.count, dslMax),
+               'Every host-side Playwright browser: ' + d.browsers.count
+               + ', using ' + gb(d.browsers.mem_mb) + ' GB. Legitimately '
+               + 'exceeds the Duo cap when a reset or ISE step is also running. '
+               + 'Container browsers count under Docker.')
     + _rvGauge('CPU Load', d.host.cpus + ' cores',
                String(d.host.load1), d.host.load1, sf.load || d.host.cpus || 1,
                '1-minute load average ' + d.host.load1 + ' across ' + d.host.cpus
@@ -10658,8 +10732,23 @@ async function renderPodSummary() {
     const addons = p.run_addons ? ' <span style="color:#b39ddb">+' +
       escHtml(p.run_addons.toUpperCase().replace(',', ' +')) + '</span>' : '';
 
+    // Same POD label as the full table: the AD-confirmed POD number on top and
+    // the dashboard's own row id underneath. This view used to print the raw
+    // pod_id ("POD-1") while the full table showed "POD-13 / ID:1" for the same
+    // machine, so the two views disagreed about what a POD was called even
+    // though pipeline-summary has returned pod_number all along and the column
+    // sort (sumPodNum) was already ordering by it.
+    // Falls back to pod_id when the number is not confirmed yet, because
+    // detect_pod_number is a soft-fail step and may never fill it in.
+    const podLabel = p.pod_number
+      ? '<span style="color:#00bceb;font-weight:700">POD-'
+        + escHtml(String(p.pod_number)) + '</span>' + addons
+        + '<br><span style="color:#445566;font-size:10px;font-weight:400">ID:'
+        + escHtml(p.pod_id.replace('POD-', '')) + '</span>'
+      : escHtml(p.pod_id) + addons;
+
     return `<div class="sum-row" onclick="showPipeline('${p.pod_id}')">`
-      + '<div class="sum-pod">' + escHtml(p.pod_id) + addons + '</div>'
+      + '<div class="sum-pod">' + podLabel + '</div>'
       + '<div class="sum-dots">' + dots + '</div>'
       + '<div class="sum-step">' + escHtml(stepTxt) + '</div>'
       + '<div class="sum-pct" style="color:' + _sumPctColor(p) + '">' + pct + '%</div>'
