@@ -2461,20 +2461,36 @@ def phase_detect_pod_number():
     DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     POD_ID  = os.environ.get("POD_ID", "")
 
-    def _persist(pod_number, source):
+    def _persist(pod_number, source, site=""):
+        # `site` matters because pod_number is NOT unique. It is the digits of
+        # the users' email subdomain, and the site prefix was being discarded:
+        # on 2026-09-14 POD-1 resolved from kit@rtp13... and POD-8 from
+        # kit@sjc13..., so both became "13" and the two PODs were
+        # indistinguishable by the label the dashboard shows. Keeping the site
+        # makes "rtp13" and "sjc13" tell them apart.
         try:
             conn = sqlite3.connect(DB_PATH)
             conn.row_factory = sqlite3.Row
             if POD_ID:
-                conn.execute(
-                    "UPDATE pods SET pod_number=?, updated_at=datetime('now') WHERE pod_id=?",
-                    (pod_number, POD_ID),
-                )
+                try:
+                    conn.execute(
+                        "UPDATE pods SET pod_number=?, pod_site=?, "
+                        "updated_at=datetime('now') WHERE pod_id=?",
+                        (pod_number, site, POD_ID),
+                    )
+                except sqlite3.OperationalError:
+                    # Older DB without pod_site — the number is still worth
+                    # recording, so do not lose it over the new column.
+                    conn.execute(
+                        "UPDATE pods SET pod_number=?, updated_at=datetime('now') "
+                        "WHERE pod_id=?", (pod_number, POD_ID),
+                    )
                 conn.commit()
             conn.close()
         except Exception as db_err:
             return True, f"POD# {pod_number} (via {source}) — WARNING: DB write failed: {db_err}"
-        return True, f"POD# confirmed: {pod_number} (via {source})"
+        _label = f"{site}{pod_number}" if site else pod_number
+        return True, f"POD# confirmed: {_label} (via {source})"
 
     # ── Method 1: session.xml via WinRM ──────────────────────────────────────
     # Authoritative: device names in session.xml always end in -P<NN> where
@@ -2511,12 +2527,15 @@ def phase_detect_pod_number():
         return False, "AD returned no users for Kit/Lee/Pat/Nik — POD not yet provisioned"
 
     detected = None
+    site = ""
     evidence = []
     for u in users:
         mail = u.get("mail", "")
-        m = re.search(r"@[a-z]+(\d+)\.corp\.pseudoco\.com", mail, re.I)
+        # Capture the site prefix as well as the digits — see _persist.
+        m = re.search(r"@([a-z]+)(\d+)\.corp\.pseudoco\.com", mail, re.I)
         if m:
-            detected = m.group(1)
+            site = m.group(1).lower()
+            detected = m.group(2)
             evidence.append(f"{u['sam']}={mail}")
             break  # all 4 users share the same POD number; first hit is enough
 
@@ -2527,7 +2546,7 @@ def phase_detect_pod_number():
             "— run AD automation first"
         )
 
-    return _persist(detected, f"AD ({', '.join(evidence)})")
+    return _persist(detected, f"AD ({', '.join(evidence)})", site=site)
 
 
 def phase_ad_verify():

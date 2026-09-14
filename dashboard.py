@@ -142,6 +142,14 @@ def _migrate():
         conn.execute("ALTER TABLE pods ADD COLUMN pod_number TEXT DEFAULT ''")
     except Exception:
         pass
+    # Migration: add pod_site — the site prefix of the users' email subdomain
+    # ("rtp", "sjc"). pod_number alone is NOT unique: on 2026-09-14 POD-1
+    # resolved from kit@rtp13... and POD-8 from kit@sjc13..., so both showed as
+    # "POD-13" and nothing on screen distinguished them.
+    try:
+        conn.execute("ALTER TABLE pods ADD COLUMN pod_site TEXT DEFAULT ''")
+    except Exception:
+        pass
     # Migration: add SCC API credentials columns
     try:
         conn.execute("ALTER TABLE pods ADD COLUMN scc_api_key TEXT DEFAULT ''")
@@ -828,6 +836,7 @@ def api_generate_lab_pdf():
         pods.append({
             "pod_id":       p.get("pod_id", ""),
             "pod_number":   p.get("pod_number", ""),
+            "pod_site":     p.get("pod_site", ""),
             "session_id":   p.get("session_id", ""),
             "scc_org":      p.get("scc_org", ""),
             "assigned_to":  p.get("assigned_to", ""),
@@ -873,7 +882,7 @@ def api_pipeline_summary():
     conn.row_factory = sqlite3.Row
     try:
         pods = [dict(r) for r in conn.execute(
-            "SELECT pod_id, pod_number, run_addons FROM pods ORDER BY pod_id")]
+            "SELECT pod_id, pod_number, pod_site, run_addons FROM pods ORDER BY pod_id")]
         rows = conn.execute(
             "SELECT pod_id, step_name, status, result, started_at, completed_at "
             "FROM pipeline_steps").fetchall()
@@ -962,6 +971,7 @@ def api_pipeline_summary():
         out.append({
             "pod_id": p["pod_id"],
             "pod_number": p.get("pod_number") or "",
+            "pod_site": p.get("pod_site") or "",
             "run_addons": p.get("run_addons") or "",
             "steps": seq,
             "running": running,
@@ -6663,6 +6673,11 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             except Exception as _te:
                 log_fn(f"[cdfmc-nav] could not derive tenant: {_te}")
 
+            # Defined before the active-instance check below, which needs it to
+            # tell OUR instance from one left by an earlier session on this
+            # reused org. (It is also used further down by _purge_instances.)
+            OURS_PREFIX = "ISE-FMC-POD-"
+
             if _tenant:
                 try:
                     _existing = _fmc_tab.evaluate("""(tenant) => {
@@ -6681,14 +6696,45 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                     log_fn(f"[cdfmc-nav] active-instance check failed: {_ee}")
                     _existing = None
                 if _existing:
-                    log_fn(f"[cdfmc-nav] {_tenant} already has an ACTIVE pxGrid instance "
-                           f"{_existing!r} — nothing to do")
-                    return True, (f"cdFMC pxGrid already integrated: instance {_existing!r} "
-                                  f"active for {_tenant}")
+                    # "This tenant has an active instance" is not the same as
+                    # "this POD's ISE is integrated". SCC orgs are reused across
+                    # lab sessions, so an org routinely carries an instance from
+                    # a previous POD that is still marked active while pointing
+                    # at an ISE node that no longer exists.
+                    #
+                    # On 2026-09-14 that skipped step 4 on three PODs. POD-2
+                    # latched onto 'ISE-FMC-POD-POD-18-0741' and POD-6 onto
+                    # 'PsuedoCo-520-FMC-20260728' — a July artifact. Both
+                    # reported success; both left ISE stuck at "pending" with no
+                    # SGTs, and the operator had to find and delete the stale
+                    # instances by hand before the PODs would work.
+                    #
+                    # Only an instance THIS POD created can be confirmed as
+                    # ours. Anything else is passed but flagged: the WARN prefix
+                    # makes api_pods count it as degraded (see
+                    # _result_contradicts_success) so it shows amber rather than
+                    # green, instead of being deleted — cdFMC is shared, and
+                    # _purge_instances below is deliberate that only instances
+                    # we created are ours to remove.
+                    _ours = f"{OURS_PREFIX}{pod_id}-"
+                    if _existing.startswith(_ours):
+                        log_fn(f"[cdfmc-nav] {_tenant} already has OUR active pxGrid "
+                               f"instance {_existing!r} — nothing to do")
+                        return True, (f"cdFMC pxGrid already integrated: instance "
+                                      f"{_existing!r} active for {_tenant}")
+                    log_fn(f"[cdfmc-nav] {_tenant} has an active pxGrid instance "
+                           f"{_existing!r} that this POD did not create — cannot "
+                           f"confirm it points at this POD's ISE")
+                    return True, (
+                        f"WARN: cdFMC pxGrid instance {_existing!r} is active for "
+                        f"{_tenant} but was not created by this POD (expected a name "
+                        f"starting {_ours!r}). It may belong to an earlier session on "
+                        f"this reused org. Verify it targets this POD's ISE, or delete "
+                        f"it in cdFMC and re-run so a fresh instance is created.")
                 log_fn(f"[cdfmc-nav] no active instance for {_tenant} — creating one")
 
             # Only instances WE created are ours to delete. cdFMC is shared.
-            OURS_PREFIX = "ISE-FMC-POD-"
+            # (OURS_PREFIX is defined above, before the active-instance check.)
 
             def _purge_instances(keep_name, why):
                 """Delete OUR stale pxGrid Application Instances except `keep_name`.
@@ -10742,7 +10788,9 @@ async function renderPodSummary() {
     // detect_pod_number is a soft-fail step and may never fill it in.
     const podLabel = p.pod_number
       ? '<span style="color:#00bceb;font-weight:700">POD-'
-        + escHtml(String(p.pod_number)) + '</span>' + addons
+        + escHtml(String(p.pod_number))
+        + (p.pod_site ? '<span style="color:#6f8">&nbsp;' + escHtml(p.pod_site) + '</span>' : '')
+        + '</span>' + addons
         + '<br><span style="color:#445566;font-size:10px;font-weight:400">ID:'
         + escHtml(p.pod_id.replace('POD-', '')) + '</span>'
       : escHtml(p.pod_id) + addons;
@@ -11058,7 +11106,7 @@ function renderTable(pods) {
 
     const newHtml = `<tr data-pod-id="${p.pod_id}">
       <td class="pod-id" onclick="showPipeline('${p.pod_id}')">
-        ${p.pod_number ? '<span style="color:#00bceb;font-weight:700">POD-' + p.pod_number + '</span><br><span style="color:#445566;font-size:10px">ID:' + p.pod_id.replace('POD-','') + '</span>' : p.pod_id}
+        ${p.pod_number ? '<span style="color:#00bceb;font-weight:700" title="' + (p.pod_site ? 'site ' + escHtml(p.pod_site) + p.pod_number + ' — pod_number is not unique across sites' : 'no site recorded') + '">POD-' + p.pod_number + (p.pod_site ? '<span style="color:#6f8">&nbsp;' + escHtml(p.pod_site) + '</span>' : '') + '</span><br><span style="color:#445566;font-size:10px">ID:' + p.pod_id.replace('POD-','') + '</span>' : p.pod_id}
       </td>
       <td><input type="text" value="${p.assigned_to||''}" placeholder="CCO ID" style="background:#0a1628;border:1px solid #1a2d4a;color:#e0e6ed;border-radius:4px;padding:3px 7px;width:100px;font-size:12px;" onchange="saveAssigned('${p.pod_id}', this.value)" /></td>
       <td style="font-size:11px;color:#667788">${p.session_id || ''}</td>
