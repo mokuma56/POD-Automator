@@ -11732,12 +11732,49 @@ def duo_run_card(
             try:
                 with _sq.connect(db_path) as _cv:
                     _cv.row_factory = _sq.Row
-                    _tr = _cv.execute("SELECT duo_admin_totp_secret FROM "
+                    # ikey/skey/host come from the DB, not from the enclosing
+                    # scope: step_bootstrap re-creates the Admin API application
+                    # and rebinds duo_ikey/duo_skey LOCALLY (no nonlocal), so the
+                    # closure can still hold the pre-rotation pair. Bootstrap
+                    # does write the new pair here, so the row is authoritative.
+                    _tr = _cv.execute("SELECT duo_admin_totp_secret, duo_ikey, "
+                                      "duo_skey, duo_host FROM "
                                       "org_credentials WHERE org_number=?",
                                       (org_num,)).fetchone()
                 if not (_tr and (_tr["duo_admin_totp_secret"] or "").strip()):
                     gaps.append("no duo_admin_totp_secret — the admin has no "
                                 "phone-free second factor (hardware token)")
+                else:
+                    # Our column saying "there is a token" is not evidence that
+                    # Duo has one. POD-7 on 2026-09-14 had duo_admin_totp_secret
+                    # populated from an earlier session on reused org 517, so
+                    # bootstrap logged "totp: token already provisioned" and
+                    # skipped, verify passed green, and the admin in fact had
+                    # phones=0 tokens=0 and only a Playwright virtual passkey —
+                    # nobody could log in. Ask Duo.
+                    #
+                    # The Admin API does not expose admin-to-token bindings
+                    # (GET /admin/v1/admins returns no tokens field), so this
+                    # confirms the token EXISTS in the org, not that it is bound.
+                    # Say exactly that rather than implying more.
+                    try:
+                        _toks = _duo_request((_tr["duo_ikey"] or "").strip(),
+                                             (_tr["duo_skey"] or "").strip(),
+                                             (_tr["duo_host"] or "").strip(),
+                                             "GET", "/admin/v1/tokens"
+                                             ).get("response", [])
+                        _want = f"POD{org_num}-PROCTOR"
+                        if not any(str(t.get("serial", "")).startswith(_want)
+                                   for t in _toks):
+                            gaps.append(
+                                f"duo_admin_totp_secret is stored but Duo has no "
+                                f"token with a {_want!r} serial ({len(_toks)} token(s) "
+                                f"in the org) — the stored secret is stale, most "
+                                f"likely left by an earlier session on this reused "
+                                f"org; run duo_provision_admin_totp")
+                    except Exception as _tke:
+                        unknown.append(f"could not list Duo tokens to confirm the "
+                                       f"stored secret ({type(_tke).__name__})")
             except _sq.Error as _ce:
                 unknown.append(f"could not read duo_admin_totp_secret ({_ce})")
 
@@ -11793,7 +11830,20 @@ def duo_run_card(
                 return True, (msg + "; NOT VERIFIED: " + "; ".join(unknown)
                               + " — nothing was found missing, but this pass is "
                                 "incomplete; re-run verify to confirm")
-            msg += "; TOTP token + jump host login page present"
+            # Precisely what was confirmed, and nothing more. This used to read
+            # "TOTP token + jump host login page present", which POD-7 showed to
+            # be an overclaim: its admin had phones=0 tokens=0 and only a
+            # Playwright virtual passkey, so no human could sign in, while this
+            # step reported the token present because our own column was set.
+            #
+            # Duo's Admin API exposes no admin-to-token binding (GET
+            # /admin/v1/admins returns no tokens field), so the strongest true
+            # statement is that a matching token EXISTS in the org. Whether it
+            # is attached to the admin — and therefore whether anyone can
+            # actually log in — is not checkable from here. Say so.
+            msg += ("; TOTP token exists in the org and the jump host login page "
+                    "is present (Duo's API cannot confirm the token is attached "
+                    "to the admin — sign in once to be sure)")
             return True, msg
         except Exception as e:
             return False, f"WinRM verify error: {type(e).__name__}: {e}"

@@ -4224,7 +4224,29 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
             # A deliberate self-skip is different — "pxGrid Cloud already
             # registered and connected" is a step verifying live state and
             # finding nothing to do. Those still count as done.
-            if _row and _prev_status in ("completed", "skipped") and not _was_soft_fail:
+            # Third case, same logic as the soft-fail one above: a 'completed'
+            # row whose own text reports a bad outcome. "WARN: No SGTs in
+            # Secure Access after 20 min" and "ISE instance pending" are
+            # failures that happen to carry a green status, and skipping them
+            # makes the POD permanently unfixable by re-run.
+            #
+            # That is exactly what happened on 2026-09-14. After the operator
+            # deleted the stale cdFMC instances that had caused those results,
+            # POD-2's re-run logged "Step 4/5 — already completed, skipping"
+            # and "Step 5/5 — already completed, skipping", so the fix went
+            # untested and the POD stayed broken. POD-6 and POD-8 needed their
+            # rows deleted by hand — the same "not a workflow" dead end the
+            # comment above describes, reached through a different door.
+            #
+            # Kept in step with dashboard._GREEN_BUT_WRONG. "already
+            # integrated" is deliberately absent from both: that is the normal
+            # output of an idempotent re-run.
+            _CONTRADICTS = ("WARN", "instance pending", "NOT VERIFIED")
+            _green_but_wrong = (_prev_status == "completed"
+                                and any(m in _prev_result for m in _CONTRADICTS))
+
+            if (_row and _prev_status in ("completed", "skipped")
+                    and not _was_soft_fail and not _green_but_wrong):
                 _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — "
                      f"already {_prev_status}, skipping")
                 outcomes.append((step, _prev_status, _prev_result or f"already {_prev_status}"))
@@ -4233,6 +4255,10 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
                 _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — "
                      f"retrying a previously soft-failed step "
                      f"({_prev_result[:80]})")
+            elif _green_but_wrong:
+                _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — "
+                     f"retrying: previous run was marked completed but reported "
+                     f"a bad outcome ({_prev_result[:80]})")
         except Exception as _skip_e:
             _log(f"[warn] skip-check DB error for {step}: {_skip_e} — proceeding to run step")
 
