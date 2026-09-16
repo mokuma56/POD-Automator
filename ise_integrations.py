@@ -2673,6 +2673,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # Active, Deregister present) shortly after — the registration had
             # succeeded and only this check was wrong.
             _refreshed = True   # the panel was just loaded by the register flow
+            _consec_reopen_fail = 0
             for _attempt in range(60):  # 60 × 10s = 10 min
                 await page.wait_for_timeout(10000)
                 _panel = await _pxgrid_panel(page)
@@ -2706,9 +2707,23 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     _refreshed = await _ise_reopen_node(page, log)
                     if _refreshed:
                         log("Re-opened node edit page to refresh the pxGrid panel")
+                        _consec_reopen_fail = 0
                     else:
                         log("WARNING: could not refresh the panel — the status above "
                             "may be stale, NOT the live registration state")
+                        _consec_reopen_fail += 1
+                        if _consec_reopen_fail >= 2:
+                            # Same-page reopen has now failed on two separate
+                            # cycles in a row (6 clicks). That page/session is
+                            # stuck, not slow — grinding through the remaining
+                            # polls only delays the fresh-context fallback below
+                            # that has actually recovered this exact situation
+                            # before (POD-24). Break out early into the
+                            # "poll exhausted" path instead of waiting it out.
+                            log("Same-page reopen failed twice in a row — "
+                                "skipping ahead to the fresh-context read "
+                                "instead of exhausting the remaining polls")
+                            break
 
             # FINAL AUTHORITATIVE READ before declaring failure.
             #
