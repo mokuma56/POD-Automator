@@ -5663,7 +5663,32 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                             if not _trash:
                                 log_fn("[scc-reset] ravpn_ip_pool: trash can not found on row")
                                 break
-                            _trash.click()
+                            # A stray overlay (leftover modal, tour tip, etc.) can sit on
+                            # top of this button and block the click for the full default
+                            # timeout — one such block used to propagate past this loop
+                            # and abort the whole item via the outer except. Dismiss any
+                            # visible overlay and retry a few times with a shorter timeout
+                            # instead.
+                            _clicked = False
+                            for _click_try in range(3):
+                                try:
+                                    if page.locator('.cds-modal-overlay').first.is_visible(timeout=500):
+                                        page.keyboard.press("Escape")
+                                        page.wait_for_timeout(500)
+                                except Exception:
+                                    pass
+                                try:
+                                    _trash.click(timeout=8000)
+                                    _clicked = True
+                                    break
+                                except Exception as _click_e:
+                                    log_fn(f"[scc-reset] ravpn_ip_pool: click attempt "
+                                           f"{_click_try + 1}/3 failed: "
+                                           f"{str(_click_e).splitlines()[0][:100]}")
+                            if not _clicked:
+                                log_fn("[scc-reset] ravpn_ip_pool: could not click actions "
+                                       "menu after 3 tries — moving on")
+                                break
                             page.wait_for_timeout(1500)
                             _shot("4_ippool_confirm")
                             _confirmed = False
@@ -10907,7 +10932,17 @@ function pipelineBadge(val, result, name) {
   }
   if (val === 'running')   return '<span class="badge running">Run</span>';
   if (val === 'failed')    return '<span class="badge fail">Fail</span>';
-  if (val === 'skipped')   return '<span class="badge skipped">Skip</span>';
+  if (val === 'skipped') {
+    // A deliberate skip ("SD-WAN already online", "already completed") is
+    // done, not a warning. Only flip to green when the result text actually
+    // says so and isn't a stepped-over soft-fail (onboard.py's SOFT_FAIL_STEPS
+    // path prefixes those "WARN:") — callers that don't pass a result string
+    // keep the old amber Skip badge rather than being guessed at.
+    if (result && result.indexOf('WARN:') !== 0) {
+      return '<span class="badge pass">Done</span>';
+    }
+    return '<span class="badge skipped">Skip</span>';
+  }
   return '<span class="badge pending">Pending</span>';
 }
 
