@@ -247,6 +247,7 @@ for step_name, func in steps:
     # Skip SD-WAN router steps if SD-WAN is already online
     if _sdwan_online and step_name in SDWAN_STEPS:
         print(f"  ↷ {step_name} skipped (SD-WAN already online)")
+        report_step(step_name, "skipped", "SD-WAN already online")
         continue
 
     # Skip steps already completed in a previous run
