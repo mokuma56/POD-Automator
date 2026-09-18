@@ -4207,15 +4207,25 @@ def duo_sync_now(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
         # guess. The old message asked "is the connection healthy?" — a cause it
         # never tested, and which POD-7's own log had contradicted 38s earlier
         # with "connection status: Connected".
-        _state = ui_wait.wait_for(
-            page, "the 'Sync Now' button",
-            lambda: page.evaluate("""() => {
-                const b = Array.from(document.querySelectorAll('button'))
-                    .find(x => /^sync now$/i.test((x.innerText || '').trim()));
-                if (!b) return '';
-                return b.disabled ? 'disabled' : 'ready';
-            }"""),
-            log=_log)
+        _sync_now_probe = lambda: page.evaluate("""() => {
+            const b = Array.from(document.querySelectorAll('button'))
+                .find(x => /^sync now$/i.test((x.innerText || '').trim()));
+            if (!b) return '';
+            return b.disabled ? 'disabled' : 'ready';
+        }""")
+        _state = ui_wait.wait_for(page, "the 'Sync Now' button", _sync_now_probe, log=_log)
+
+        if not _state:
+            # A skeleton stuck for the whole 90s settle window has resolved on
+            # reload before (POD-7, 2026-09-14, under concurrent Duo browsers) —
+            # re-polling the same stale DOM for another 90s never helps, so
+            # reload once and give the poll a fresh page instead of failing here.
+            _log("'Sync Now' still not rendered after 90s — reloading and retrying once")
+            try:
+                page.reload(wait_until="load", timeout=35_000)
+            except Exception as e:
+                _log(f"reload failed: {type(e).__name__}: {e}")
+            _state = ui_wait.wait_for(page, "the 'Sync Now' button", _sync_now_probe, log=_log)
 
         if _state != "ready":
             if _state == "disabled":
@@ -4478,21 +4488,20 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
             page.wait_for_timeout(6_000)
             _log(f"sync page: {dirkey}")
 
-            # Groups may already be selected from a previous run (or by hand).
-            # Duo names them "IoT (from AD sync ...)", so match on prefix.
-            existing = []
-            try:
-                gs = _duo_request(oc_ikey, oc_skey, oc_host, "GET",
-                                  "/admin/v1/groups").get("response", [])
-                existing = [g.get("name", "") for g in gs
-                            if any(g.get("name", "").lower().startswith(w.lower())
-                                   for w in AD_GROUPS)]
-            except Exception:
-                pass
-            if len(existing) >= len(AD_GROUPS):
-                _log(f"groups already configured: {existing}")
-                return True, (f"AD directory sync Connected (ikey={ikey}, dc={AD_DC_IP}, "
-                              f"dirkey={dirkey}) — groups already configured: {existing}")
+            # Do NOT shortcut on org-wide group existence (checking
+            # /admin/v1/groups for names like "IoT ...") — that endpoint lists
+            # every group in the ORG, not this connector's own selection, and
+            # Duo orgs get reused across sessions. On POD-10 (org 517,
+            # 2026-09-18) leftover "IoT/MAIN/PROD" groups from an earlier
+            # connector's completed sync satisfied this check, so the code
+            # skipped the picker + Complete Setup entirely on a brand-new,
+            # never-synced connector. That connector was left permanently
+            # `paused` mid-wizard — Duo only shows "Sync Now" after Complete
+            # Setup, never after the fact — and every later ad_sync attempt
+            # failed hunting for a button that could not exist. The per-group
+            # chip check just below is authoritative because it reads THIS
+            # connector's own page, so always run it instead of trusting the
+            # org-wide list.
 
             # The picker is a dropdown, not a checkbox list, and Duo's newer
             # components ignore JS element.click() — the previous version opened
