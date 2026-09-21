@@ -6644,7 +6644,31 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                     _r = page.evaluate(_JS_CLICK_HBR, "Platform Settings")
                     log_fn(f"[cdfmc-nav] JS shadow-DOM click: {_r}")
                 _fmc_tab = _popup_info.value
-                _cdfmc_host = _fmc_tab.url.split("/")[2]  # capture immediately — tab may redirect away after wait
+                # Capturing the host from _fmc_tab.url THE INSTANT the popup
+                # object exists can catch it before Chrome has replaced its
+                # transient "chrome-error://chromewebdata/" placeholder with
+                # the real cdFMC URL — split("/")[2] then reads the literal
+                # string "chromewebdata" as the host, and the identity-sources
+                # navigation below resolves against that nonexistent domain
+                # and fails with net::ERR_NAME_NOT_RESOLVED (POD-3/POD-10,
+                # 2026-09-21). The main page already retries on this same
+                # "chrome-error" transient a few lines up — apply the same
+                # idea here: poll briefly for a real https:// URL before
+                # capturing, deliberately short so this still finishes BEFORE
+                # the longer domcontentloaded wait below, which the original
+                # capture-early design was for — waiting too long risks
+                # catching a LATER app-level redirect away from cdFMC instead.
+                _cdfmc_host = ""
+                for _ in range(10):                      # up to ~5s
+                    _u = _fmc_tab.url
+                    if _u.startswith("https://") and "chromewebdata" not in _u:
+                        _cdfmc_host = _u.split("/")[2]
+                        break
+                    _fmc_tab.wait_for_timeout(500)
+                if not _cdfmc_host:
+                    log_fn(f"[cdfmc-nav] popup URL never left a transient "
+                           f"state: {_fmc_tab.url!r}")
+                    _cdfmc_host = _fmc_tab.url.split("/")[2] if "://" in _fmc_tab.url else ""
                 log_fn(f"[cdfmc-nav] cdFMC tab opened: {_fmc_tab.url}")
             except Exception as _e:
                 page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_no_popup_{pod_id}.png"))
