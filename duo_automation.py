@@ -2667,11 +2667,27 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
     # duo_refresh_session_scope() normally clears these before we get here; this
     # probe covers the case where the session log could not be read, and matches
     # what the bootstrap step already does further down.
+    # Admin API creds and admin-login/passkey creds are TWO separate things
+    # this function can produce, and presence of one says nothing about the
+    # other. POD-3, 2026-09-21: org 5001 had valid duo_ikey/skey/host (reused
+    # from an earlier run on this org) but empty duo_admin_email/_host and no
+    # passkey — the caller's own needs_bootstrap only checks the API triple,
+    # so it skipped straight past activation, and every later browser-driven
+    # step then failed on "duo_admin_host missing" / "no stored passkey".
+    _has_admin_creds = bool(oc.get("duo_admin_email") and oc.get("duo_admin_host")
+                            and oc.get("duo_passkey_cred"))
+    _reuse_api_creds = False
     if oc.get("duo_ikey") and oc.get("duo_skey") and oc.get("duo_host"):
         try:
             _duo_request(oc["duo_ikey"], oc["duo_skey"], oc["duo_host"],
                          "GET", "/admin/v1/info/summary")
-            return True, f"org {org_num} already has Admin API credentials — nothing to do"
+            if _has_admin_creds:
+                return True, (f"org {org_num} already has Admin API + "
+                              f"admin/passkey credentials — nothing to do")
+            _log(f"org {org_num}: Admin API credentials are valid but admin "
+                 f"email/host/passkey are missing — activating the admin and "
+                 f"enrolling a passkey without touching the existing API app")
+            _reuse_api_creds = True
         except Exception as e:
             if "401" not in str(e) and "403" not in str(e):
                 raise
@@ -2812,6 +2828,19 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
             if not _pw_duo_admin_login_passkey(page2, admin_host, email, password, log=_log):
                 return False, "passkey login failed after enrolment"
             hwm = _pw_read_signcount(cdp3, auth3, base)
+
+            if _reuse_api_creds:
+                # The existing Admin API app (verified reachable above) is
+                # still good — only the admin/passkey side was missing, and
+                # creating a second app here would leave the org with two API
+                # apps for no reason. Just bank the fresh signCount.
+                with _sq.connect(db_path) as conn:
+                    conn.execute(
+                        "UPDATE org_credentials SET duo_passkey_hwm=? "
+                        "WHERE org_number=?", (hwm, org_num))
+                return True, (f"org {org_num}: admin activated + passkey "
+                              f"enrolled (admin={email}) — kept existing "
+                              f"Admin API app ikey={oc['duo_ikey']}")
 
             api = _pw_create_admin_api_app(page2, admin_host, log=_log)
 
@@ -10183,6 +10212,20 @@ def _sa_config_page(t, sa_org: str, ent: str) -> bool:
         t.wait_for_timeout(5_000)
         if "Integrate directories" in (_scc_text(t) or ""):
             return True
+
+    # POD-4/POD-5, 2026-09-21: both timed out here (~250s) with 9 PODs
+    # running the Duo card concurrently — genuine SCC slowness under load,
+    # not a missing/misconfigured page. Re-polling the same stale render for
+    # another ~240s rarely helps; a fresh navigation sometimes catches a page
+    # that the first load never got past its skeleton on. One retry only.
+    t.reload(wait_until="load", timeout=45_000)
+    _scc_wait(t, "Configuration management")
+    _scc_click(t, "Configuration management")
+    _scc_wait(t, "SSO authentication")
+    for _ in range(12):
+        t.wait_for_timeout(5_000)
+        if "Integrate directories" in (_scc_text(t) or ""):
+            return True
     return False
 
 
@@ -11291,9 +11334,20 @@ def duo_run_card(
     # exist until the iDAC card is activated. Bootstrap creates it, so this can
     # no longer be a hard gate before the first step runs; only the steps that
     # actually need the Admin API are blocked (see _need_api below).
-    needs_bootstrap = not (duo_ikey and duo_skey and duo_host)
+    # Admin API creds and admin-login/passkey creds are two different things
+    # duo_passkey_bootstrap can produce, and presence of one says nothing
+    # about the other. POD-3, 2026-09-21: org 5001 had valid duo_ikey/skey/
+    # host reused from an earlier run but no duo_admin_email/_host/passkey,
+    # and checking only the API triple here sent step_bootstrap to the
+    # "already bootstrapped" probe-only branch below, which never restores
+    # the admin/passkey side — every later browser-driven step then failed
+    # on "duo_admin_host missing" / "no stored passkey".
+    needs_bootstrap = not (duo_ikey and duo_skey and duo_host) or not (
+        oc.get("duo_admin_email") and oc.get("duo_admin_host")
+        and oc.get("duo_passkey_cred"))
     if needs_bootstrap:
-        _log("no Duo Admin API credentials — bootstrap step will create them")
+        _log("Duo Admin API and/or admin/passkey credentials incomplete — "
+             "bootstrap step will fill in what is missing")
 
     # ── Detect mode ───────────────────────────────────────────────────────────
     # SCC and Secure Access orgs are stable across sessions — the same SCC org
@@ -11687,26 +11741,79 @@ def duo_run_card(
                                f"{', '.join('[' + x + ']' for x in missing)} — "
                                f"has {', '.join('[' + x + ']' for x in present) or 'nothing'}")
 
-            out = sess.run_ps(f"& '{CONN_TOOL}' 2>&1 | Out-String") \
-                      .std_out.decode(errors="replace")
-            if "SUMMARY" not in out:
-                return False, ("the Duo connectivity tool produced no summary — "
-                               f"{' '.join(out.split())[:160] or 'no output'}")
+            def _run_conn_tool():
+                out = sess.run_ps(f"& '{CONN_TOOL}' 2>&1 | Out-String") \
+                          .std_out.decode(errors="replace")
+                if "SUMMARY" not in out:
+                    return None, ("the Duo connectivity tool produced no summary — "
+                                  f"{' '.join(out.split())[:160] or 'no output'}")
+                # Only sections with problems are listed under SUMMARY.
+                summary = out.split("SUMMARY", 1)[1].split(
+                    "The results have also been logged")[0]
+                probs, current = {}, None
+                for line in summary.splitlines():
+                    m = re.search(r"Section \[([^\]]+)\]", line)
+                    if m:
+                        current = m.group(1).strip().lower()
+                        probs.setdefault(current, [])
+                    elif current and "[error]" in line:
+                        probs[current].append(" ".join(line.split())[:120])
+                return {k: v for k, v in probs.items() if v}, None
 
-            # Only sections with problems are listed under SUMMARY.
-            summary = out.split("SUMMARY", 1)[1].split(
-                "The results have also been logged")[0]
-            problems, current = {}, None
-            for line in summary.splitlines():
-                m = re.search(r"Section \[([^\]]+)\]", line)
-                if m:
-                    current = m.group(1).strip().lower()
-                    problems.setdefault(current, [])
-                elif current and "[error]" in line:
-                    problems[current].append(" ".join(line.split())[:120])
-            problems = {k: v for k, v in problems.items() if v}
+            problems, err = _run_conn_tool()
+            if problems is None:
+                return False, err
 
             broken_here = [k for k in problems if k in OWNED]
+            if broken_here and any("time drift" in problems[k][0].lower()
+                                   for k in broken_here):
+                # Fresh jump hosts (a new session means a new jump host, per
+                # the org-rotation notes elsewhere in this file) boot with a
+                # clock w32time has not synced yet — its own schedule can take
+                # far longer than a lab session. Duo's own tool is what
+                # reported the drift, so force one immediate resync and let
+                # that same tool be the authority on whether it is fixed,
+                # rather than failing on a clock issue that a resync clears
+                # in seconds.
+                _log("Auth Proxy connectivity FAILED (time drift) — forcing "
+                     "an NTP resync and re-checking once")
+                _resync_ok = False
+                try:
+                    _resync = sess.run_ps("w32tm /resync /force 2>&1 | Out-String") \
+                                  .std_out.decode(errors="replace")
+                    _log(f"w32tm /resync: {' '.join(_resync.split())[:200]}")
+                    _resync_ok = ("no time data" not in _resync.lower()
+                                  and "did not resync" not in _resync.lower())
+                except Exception as _we:
+                    _log(f"w32tm /resync failed: {type(_we).__name__}: {_we}")
+
+                if not _resync_ok:
+                    # POD-10/POD-11, 2026-09-21: "The computer did not resync
+                    # because no time data was available" — this jump host has
+                    # no NTP peer it can reach at all, so a resync has nothing
+                    # to sync FROM and cannot fix drift by itself. Set the
+                    # clock directly from this controller's own UTC time
+                    # instead, which needs no reachable peer on the jump
+                    # host's network.
+                    import datetime as _dt
+                    _utc_iso = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                    _log(f"no NTP peer reachable — setting the clock directly "
+                         f"from this controller's UTC time ({_utc_iso})")
+                    try:
+                        _setdate = sess.run_ps(
+                            "$c = [DateTime]::Parse('" + _utc_iso + "', $null, "
+                            "[System.Globalization.DateTimeStyles]::RoundtripKind); "
+                            "Set-Date -Date $c 2>&1 | Out-String"
+                        ).std_out.decode(errors="replace")
+                        _log(f"Set-Date: {' '.join(_setdate.split())[:200]}")
+                    except Exception as _sde:
+                        _log(f"Set-Date failed: {type(_sde).__name__}: {_sde}")
+
+                problems2, err2 = _run_conn_tool()
+                if problems2 is not None:
+                    problems = problems2
+                    broken_here = [k for k in problems if k in OWNED]
+
             if broken_here:
                 detail = "; ".join(f"[{k}] {problems[k][0]}" for k in broken_here)
                 return False, f"Auth Proxy connectivity FAILED — {detail}"
