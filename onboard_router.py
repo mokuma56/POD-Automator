@@ -2461,7 +2461,30 @@ def phase_detect_pod_number():
     DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     POD_ID  = os.environ.get("POD_ID", "")
 
+    def _site_from_vpn_host():
+        # Method 1 below (session.xml) never derives a site, only Method 2
+        # (the AD fallback) does — so whenever WinRM is reachable and Method 1
+        # wins, which is the common case, pod_site is silently left blank and
+        # the dashboard stops showing the rtp/sjc suffix. vpn_host is written
+        # earlier in the pipeline and already encodes the site
+        # (dcloud-rtp-anyconnect.cisco.com / dcloud-sjc-anyconnect.cisco.com),
+        # so derive it from there instead of depending on AD email parsing.
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            row = conn.execute(
+                "SELECT vpn_host FROM pods WHERE pod_id=?", (POD_ID,)
+            ).fetchone()
+            conn.close()
+            if row and row[0]:
+                m = re.search(r"dcloud-([a-z]+)-", row[0], re.I)
+                if m:
+                    return m.group(1).lower()
+        except Exception:
+            pass
+        return ""
+
     def _persist(pod_number, source, site=""):
+        site = site or _site_from_vpn_host()
         # `site` matters because pod_number is NOT unique. It is the digits of
         # the users' email subdomain, and the site prefix was being discarded:
         # on 2026-09-14 POD-1 resolved from kit@rtp13... and POD-8 from
