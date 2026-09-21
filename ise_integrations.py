@@ -1230,14 +1230,38 @@ async def _ise_click_pxcloud_checkbox(page, log, want: bool) -> bool:
 
 
 async def _ise_pxgrid_section_built(page) -> bool:
-    """True once ISE has finished constructing the pxGrid Cloud form."""
+    """True once ISE has finished constructing the pxGrid Cloud form AND its
+    fields are actually usable — not merely present and visible.
+
+    POD-2/POD-4/POD-7/POD-9, 2026-09-21: the region section and its inputs
+    were present, visible, and non-empty while genuinely DISABLED — ISE
+    showed a "pxGrid Cloud can be enabled only after registering your Cisco
+    ISE to your Cisco DNA Portal account" banner and greyed out every field,
+    confirmed live: a human could not type into or select anything on the
+    page either. The old check only looked at presence/size, so it read
+    "built" here and skipped the off/on toggle-cycle below that is this
+    file's only mechanism for forcing ISE to reconstruct a stuck form — the
+    exact failure shape ("pxGrid Cloud checked but form never built") that
+    cycle already exists to fix. The name field then could never hold a
+    value no matter how many times it was set afterward, because there was
+    nothing wrong with how it was being set — the widget itself was inert.
+    """
     try:
         return bool(await page.evaluate("""() => {
             const sec = document.getElementById('pxCloud_region_section');
             const reg = document.getElementById('pxCloud_region');
             if (!sec) return false;
             const r = reg ? reg.getBoundingClientRect() : null;
-            return sec.innerHTML.length > 0 && !!r && r.width > 0 && r.height > 0;
+            if (!(sec.innerHTML.length > 0 && !!r && r.width > 0 && r.height > 0)) {
+                return false;
+            }
+            if (typeof dijit !== 'undefined' && dijit.byId) {
+                const w = dijit.byId('pxCloud_deviceName');
+                if (w && typeof w.get === 'function' && w.get('disabled')) {
+                    return false;
+                }
+            }
+            return true;
         }"""))
     except Exception:
         return False
@@ -1624,10 +1648,29 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # Do NOT include "deregister" — it can appear on unregistered pages too.
             _panel = await _pxgrid_panel(page)
             if _pxgrid_is_registered(_panel):
-                log(f"pxGrid Cloud already registered: {_panel}")
-                return True, (f"{_SKIP_PREFIX} pxGrid Cloud already registered and connected "
-                              f"(account {_panel.get('account')}, name {_panel.get('name')}, "
-                              f"region {_panel.get('region')})")
+                # The UI panel can show stale "Connected"/Deregister state right
+                # after a genuine deregister — POD-7, 2026-09-21: a human
+                # deregistered via the admin UI, the enrollment-info API
+                # confirmed un-enrolled moments later, yet the very next fresh
+                # page load here still read status=Connected from this same
+                # panel. Cross-check the authoritative API (the thing that
+                # proved the panel wrong) before trusting it, rather than
+                # skipping registration on a stale read.
+                _ok_enroll, _enroll_data = _ise_api_get(
+                    "/api/v1/pxgrid/cloud/enrollment-info")
+                _enroll_status = (
+                    (_enroll_data or {}).get("response", {}) or {}
+                ).get("enrollmentStatus", "") if _ok_enroll else ""
+                if _ok_enroll and _enroll_status != "enrolled":
+                    log(f"UI panel reads registered ({_panel}) but the API "
+                        f"says enrollmentStatus={_enroll_status!r} — trusting "
+                        f"the API and proceeding with registration instead "
+                        f"of skipping")
+                else:
+                    log(f"pxGrid Cloud already registered: {_panel}")
+                    return True, (f"{_SKIP_PREFIX} pxGrid Cloud already registered and connected "
+                                  f"(account {_panel.get('account')}, name {_panel.get('name')}, "
+                                  f"region {_panel.get('region')})")
 
              # ── Diagnostic: dump all Dijit CheckBox/ToggleButton IDs and their labels ──
             # This helps identify the correct "Enable pxGrid Cloud" widget ID.
@@ -1957,18 +2000,29 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             }""")
             if _name_coords:
                 log(f"Name field found via {_name_coords['method']} — clicking and typing")
+                # Deliberately slow, human-paced timing through this whole
+                # sequence (name/region/checkboxes/Register) as of
+                # 2026-09-21 — a controlled experiment against POD-2/POD-4/
+                # POD-7, where this same field reads empty at click time on
+                # every automated attempt (a fresh browser retried 3x each,
+                # still 3/3 failures) while a human filling the identical
+                # form by hand succeeds every time on the same ISE boxes.
+                # Dojo/Dijit's own async re-render/validation cycle may not
+                # be outrunning a human's natural pauses; nothing else
+                # distinguishes the two. If this does not change the outcome
+                # either, it rules pacing out too.
                 await page.mouse.click(_name_coords['x'], _name_coords['y'])
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(1500)
                 # Select all existing text and replace
                 await page.keyboard.press('Control+a')
                 await page.keyboard.press('Meta+a')
-                await page.wait_for_timeout(100)
+                await page.wait_for_timeout(500)
                 await page.keyboard.press('Backspace')
-                await page.wait_for_timeout(100)
+                await page.wait_for_timeout(500)
                 await page.keyboard.type(deployment_name, delay=60)
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(2500)
                 await page.mouse.click(_name_coords['x'], _name_coords['y'] + 40)  # click away to trigger blur
-                await page.wait_for_timeout(400)
+                await page.wait_for_timeout(2500)
                 _filled_name = True
                 log(f"Deployment name typed via physical click: {deployment_name!r}")
             else:
@@ -1996,7 +2050,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             }""")
             if _region_coords:
                 await page.mouse.click(_region_coords['x'], _region_coords['y'])
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(2500)
                 # Find and click us-west-2 menu item
                 _opt_clicked = False
                 for _opt_sel in ['.dijitMenuItem:has-text("us-west-2")', '[class*="MenuItem"]:has-text("us-west-2")',
@@ -2012,7 +2066,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                                 break
                     except Exception:
                         continue
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(2500)
                 _disp = (await page.inner_text('td#pxCloud_region')).strip()
                 log(f"Region field now shows: {_disp!r}")
                 # NOTE: the displayed value is NOT authoritative. The Dijit Select
@@ -2030,7 +2084,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 log("WARNING: region select may have failed — proceeding anyway (route intercept patches body)")
 
             await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_region_set.png"), full_page=False)
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(2500)
 
             # ── Check Privacy Statement and EULA checkboxes — physical mouse clicks ──
             # Dijit CheckBox set('checked', true) silently fails in newer ISE.
@@ -2065,13 +2119,13 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     _legal_result.append(f"already:{_cb['id']}")
                 else:
                     await page.mouse.click(_cb['x'], _cb['y'])
-                    await page.wait_for_timeout(400)
+                    await page.wait_for_timeout(1500)
                     log(f"Checkbox {_cb['id']!r} clicked via physical mouse at ({_cb['x']:.0f},{_cb['y']:.0f})")
                     _legal_result.append(f"clicked:{_cb['id']}")
             log(f"Legal checkboxes result: {_legal_result}")
             await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_checkboxes.png"), full_page=False)
 
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(3000)
 
             # ── Click Register + handle OAuth Device Flow popup ───────────────────
             # When Register is clicked, ISE opens id.cisco.com/activate?user_code=XXXX
@@ -2386,8 +2440,8 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # re-renders during submit and the raw inputs read empty even on a
             # good run, which is documented above as having misled two earlier
             # diagnoses.
-            try:
-                _pre = await page.evaluate("""() => {
+            async def _read_pxgrid_pre_state():
+                return await page.evaluate("""() => {
                     const out = {};
                     if (typeof dijit !== 'undefined') {
                         const reg = dijit.registry.toArray();
@@ -2442,9 +2496,51 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     if (err.length) out.errors = err;
                     return out;
                 }""")
+
+            _pre = {}
+            try:
+                _pre = await _read_pxgrid_pre_state()
                 log(f"pxGrid pre-click state: {_pre}")
             except Exception as _pe2:
                 log(f"pxGrid pre-click state unavailable: {_pe2}")
+
+            # The physical-typing fill above is flaky at the keystroke level:
+            # on 2026-09-21, POD-4/POD-5/POD-10 all logged "Name field found
+            # ... clicking and typing" with no error, yet pxCloud_deviceName
+            # read back empty here. A first attempt at this (2026-09-21,
+            # same day) treated that as authoritative and BAILED OUT before
+            # ever clicking Register when the name/disabled reads looked
+            # bad — which then regressed POD-2/POD-7/POD-9 onto a NEW,
+            # 100%-reproducible failure ("stayed empty after 3 retries"),
+            # because the name is being cleared by something between typing
+            # and the click (region selection or the checkbox clicks), not
+            # merely failing to type in the first place: re-setting it via
+            # Dijit's own set('value', ...) and re-reading a second later
+            # showed it empty again every single time.
+            #
+            # These Dijit reads are not authoritative anyway — this file
+            # already documents the identical trap for the region field
+            # ("the displayed value is NOT authoritative ... registrations
+            # confirmed landing in us-west-2 despite this field reading
+            # ap-southeast-1"), and the network intercept below has a
+            # dedicated patch for '"name":""' in the actual enroll POST,
+            # which only makes sense if Register can still fire a real
+            # request even when this diagnostic says the name is empty and
+            # the button disabled. So: best-effort re-fill right before the
+            # click, but never let this diagnostic block the click itself —
+            # only the popup-open result decides success or failure.
+            if not _pre.get("pxCloud_deviceName"):
+                log("pxCloud_deviceName reads empty before Register — "
+                    "re-asserting via Dijit set('value', ...) immediately "
+                    "before the click (the network intercept below also "
+                    "patches the POST body if this does not stick either)")
+                try:
+                    await page.evaluate(
+                        "(name) => { const w = dijit.byId('pxCloud_deviceName'); "
+                        "if (w && typeof w.set === 'function') w.set('value', name); }",
+                        deployment_name)
+                except Exception as _se3:
+                    log(f"Dijit set('value') on pxCloud_deviceName failed: {_se3}")
 
             # Set up popup listener then click Register
             _popup_err = ""
@@ -2459,10 +2555,26 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 # registration that was working. The same snapshot also read the
                 # region field as empty, because the form re-renders during
                 # submit, which sent two earlier diagnoses down the wrong path.
-                async with ctx.expect_page(timeout=90000) as _popup_info:
-                    _registered = await _click_register_btn()
-                    if not _registered:
-                        # Frame fallback
+                #
+                # A HAR captured from a real human session on POD-7, 2026-09-21,
+                # showed the actual mechanism: clicking Register makes ISE's own
+                # JS call GET /api/v1/pxgrid/cloud/activation-url (an async XHR)
+                # and ONLY THEN call window.open() on the returned URL. A
+                # window.open() issued after an async round-trip, rather than
+                # synchronously inside the click handler, is exactly the kind of
+                # call a browser's "transient user activation" window can expire
+                # on — automated/headless Chrome consistently missed it on
+                # POD-2/POD-4/POD-7 (name-field state, click trust, and pacing
+                # were all ruled out first; this popup was simply never opening,
+                # deterministically, regardless of any of that). Give the SPA's
+                # own popup a short chance first, then stop depending on it: fetch
+                # the same activation-url ourselves — reusing this page's own
+                # logged-in session via fetch(), so no separate auth is needed —
+                # and open it in a page WE create via Playwright, which is never
+                # subject to that browser-level popup gate at all.
+                async def _click_register_and_frames():
+                    _ok = await _click_register_btn()
+                    if not _ok:
                         for _frame in page.frames:
                             try:
                                 _fb = _frame.locator(
@@ -2472,12 +2584,44 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                                     await _fb.scroll_into_view_if_needed()
                                     await _fb.click()
                                     log(f"Register clicked in frame: {_frame.url!r}")
-                                    _registered = True
+                                    _ok = True
                                     break
                             except Exception:
                                 continue
+                    return _ok
 
-                _popup = await _popup_info.value
+                _popup = None
+                _registered = False
+                try:
+                    # Listener must be armed before the click, not after — a
+                    # popup that opens fast could otherwise fire before
+                    # expect_page() starts listening for it.
+                    async with ctx.expect_page(timeout=15000) as _popup_info:
+                        _registered = await _click_register_and_frames()
+                    _popup = await _popup_info.value
+                    log(f"OAuth popup opened by ISE itself: {_popup.url}")
+                except Exception:
+                    log("No popup from ISE's own window.open() within 15s — "
+                        "fetching activation-url ourselves and opening it directly")
+                    try:
+                        _act = await page.evaluate("""async () => {
+                            const r = await fetch('/api/v1/pxgrid/cloud/activation-url',
+                                {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+                            const j = await r.json();
+                            return j && j.response ? j.response.url : null;
+                        }""")
+                    except Exception as _ae:
+                        _act = None
+                        log(f"activation-url fetch failed: {_ae}")
+                    if _act:
+                        log(f"Got activation URL directly: {_act}")
+                        _popup = await ctx.new_page()
+                        await _popup.goto(_act, wait_until="load", timeout=30000)
+                    else:
+                        raise RuntimeError(
+                            "no popup from window.open() and activation-url "
+                            "fetch returned nothing")
+
                 log(f"OAuth popup detected: {_popup.url}")
                 _popup_handled = await _handle_oauth_popup(_popup)
                 log(f"OAuth popup handler returned: {_popup_handled}")
@@ -3400,16 +3544,31 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
             # ── Detect current Application status ─────────────────────────────
             # If already Inactive (from a prior run) → skip Deactivate entirely.
             # If Connected/Active (Deactivate button present) → Deactivate first.
-            _status_text = await page.evaluate("""() => {
-                // Use body text scan — Inactive must be checked before Active
-                // (Inactive contains the substring Active).
-                // \\b word-boundary ensures 'Active' won't match inside 'Activate'.
-                const t = document.body.innerText || '';
-                if (/\\bInactive\\b/.test(t)) return 'Inactive';
-                if (/\\bConnected\\b/.test(t)) return 'Connected';
-                if (/\\bActive\\b/.test(t)) return 'Active';
-                return null;
-            }""")
+            #
+            # A None read (page still rendering) used to fall straight into the
+            # "assume Active, click Deactivate" branch below — POD-6, 2026-09-21:
+            # the SCC integration had just been created in step 2 and had not
+            # yet settled into Active (the earlier 2-min poll for Active never
+            # confirmed it either), so this page's status text had not painted
+            # yet, "Application status detected: None" logged, and the
+            # Deactivate lookup then failed for the right reason on the wrong
+            # assumption. Poll briefly for a real reading before deciding,
+            # rather than treating "not yet known" as "Active".
+            _status_text = None
+            for _st_try in range(4):                    # up to ~15s
+                _status_text = await page.evaluate("""() => {
+                    // Use body text scan — Inactive must be checked before Active
+                    // (Inactive contains the substring Active).
+                    // \\b word-boundary ensures 'Active' won't match inside 'Activate'.
+                    const t = document.body.innerText || '';
+                    if (/\\bInactive\\b/.test(t)) return 'Inactive';
+                    if (/\\bConnected\\b/.test(t)) return 'Connected';
+                    if (/\\bActive\\b/.test(t)) return 'Active';
+                    return null;
+                }""")
+                if _status_text is not None:
+                    break
+                await page.wait_for_timeout(3500)
             log(f"Application status detected: {_status_text!r}")
 
             _already_inactive = _status_text == 'Inactive'
@@ -4260,12 +4419,31 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
             _green_but_wrong = (_prev_status == "completed"
                                 and any(m in _prev_result for m in _CONTRADICTS))
 
+            # An explicit "start from step i" request is the caller saying
+            # "actually run this one again" — the same class of pain point
+            # already fixed above for soft-fail and green-but-wrong rows, for
+            # a case those two misses: POD-7, 2026-09-21, re-ran from step 0
+            # after the operator deregistered pxGrid Cloud specifically to
+            # re-test a fix for a self-skip ("already registered") that had
+            # been proven WRONG (a stale UI panel read; the enrollment API
+            # said un-enrolled seconds later). The self-skip logic right
+            # below this now cross-checks the API instead of trusting the
+            # panel, but that fix never got to run at all — this same
+            # idempotency check saw the prior row's status="skipped" and
+            # skipped it again before ever reaching it, exactly like the
+            # 2026-09-14 cdFMC incident this block already documents.
             if (_row and _prev_status in ("completed", "skipped")
-                    and not _was_soft_fail and not _green_but_wrong):
+                    and not _was_soft_fail and not _green_but_wrong
+                    and i != from_step):
                 _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — "
                      f"already {_prev_status}, skipping")
                 outcomes.append((step, _prev_status, _prev_result or f"already {_prev_status}"))
                 continue
+            if i == from_step and _prev_status in ("completed", "skipped"):
+                _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — "
+                     f"explicitly requested as the restart point, re-running "
+                     f"despite prior status={_prev_status!r} "
+                     f"({_prev_result[:80]})")
             if _was_soft_fail:
                 _log(f"Step {i+1}/{len(ISE_STEPS)}: {ISE_STEP_LABELS[step]} — "
                      f"retrying a previously soft-failed step "
@@ -4298,6 +4476,31 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
         try:
             if step == "ise_pxgrid_register":
                 ok, msg = asyncio.run(_phase_ise_pxgrid_register_async(pod_id, creds, _log))
+                # The Register button reads genuinely disabled with the name
+                # field empty in a large fraction of runs, and it is not a
+                # fixed, diagnosable state: live inspection on POD-2,
+                # 2026-09-21, showed the same widget genuinely enabled with a
+                # real value in one check and destroyed/re-created mid-
+                # interaction in the next, on the identical page. In-place
+                # fixes (clicking anyway, re-setting the value via Dijit,
+                # forcing the off/on rebuild cycle) all failed the same way —
+                # the click fires as trusted and still opens nothing, no
+                # request even reaches the network intercept. This function
+                # opens its own fresh Playwright browser per call, so
+                # retrying the whole step is a much stronger reset than
+                # anything achievable by patching the same stale page in
+                # place — new browser, new login, new node navigation, from
+                # scratch each time. Retry up to 2 more times (3 attempts
+                # total) rather than 1, since the failure is inconsistent
+                # rather than deterministic — some attempts on the very same
+                # POD land on a working render and some do not.
+                _pxgrid_retries = 0
+                while not ok and "no OAuth popup" in msg and _pxgrid_retries < 2:
+                    _pxgrid_retries += 1
+                    _log(f"pxGrid Register failed with no popup — retrying the "
+                         f"whole step with a fresh browser session "
+                         f"(attempt {_pxgrid_retries + 1}/3)")
+                    ok, msg = asyncio.run(_phase_ise_pxgrid_register_async(pod_id, creds, _log))
             elif step == "ise_scc_integrate":
                 ok, msg = asyncio.run(_phase_ise_scc_integrate_async(pod_id, creds, session_path, _log))
             elif step == "ise_cdfmc_integrate":
