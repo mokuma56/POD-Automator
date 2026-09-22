@@ -1490,7 +1490,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     return False, ("ISE keeps returning to the login page when "
                                    f"opening Deployment (url={page.url[:90]})")
             # Debug snapshot — shows nav tree state so we can tune selectors if needed
-            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_catalog_nav.png"), full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_catalog_nav_{pod_id}.png"), full_page=False)
 
             # ── DOM inspection: log all #administration hrefs (debug — keep for diagnostics) ──
             try:
@@ -1577,7 +1577,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 _ise_link = page.locator('table tbody tr a:text-is("ise"), td a:text-is("ise")').first
                 await _ise_link.click(timeout=10000)
             except Exception as _e:
-                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_deploy_fail.png"), full_page=True)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_deploy_fail_{pod_id}.png"), full_page=True)
                 # Say what WAS on the page. A bare locator timeout cannot
                 # distinguish "wrong page" from "node named something else".
                 try:
@@ -1601,7 +1601,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 )
                 log("Node edit form loaded")
             except Exception:
-                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_deploy_fail.png"), full_page=True)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_deploy_fail_{pod_id}.png"), full_page=True)
                 return False, "Node edit form did not load after clicking ise — see ise_deploy_fail.png"
 
             await _ise_dismiss_modal(page)
@@ -1616,7 +1616,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 });
             """)
             await page.wait_for_timeout(1500)
-            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_form.png"), full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_form_{pod_id}.png"), full_page=False)
 
             # ── Wait for "Loading..." Dijit spinner to clear ──────────────────
             # The pxGrid Cloud section loads lazily after the initial scroll.
@@ -1641,7 +1641,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 });
             """)
             await page.wait_for_timeout(800)
-            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_loaded.png"), full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_loaded_{pod_id}.png"), full_page=False)
 
             # Check if already registered (skip) — only skip on very specific phrases
             # that only appear in a truly connected/registered state.
@@ -1887,7 +1887,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             except Exception as _ce:
                 log(f"Enable pxGrid Cloud check error: {_ce}")
 
-            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_cloud_enabled.png"), full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_cloud_enabled_{pod_id}.png"), full_page=False)
 
             if not _cloud_enabled:
                 return False, (
@@ -1956,7 +1956,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     reg.scrollIntoView({behavior: 'smooth', block: 'center'});
                 }""")
                 await page.wait_for_timeout(1500)
-                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_revealed.png"), full_page=False)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_revealed_{pod_id}.png"), full_page=False)
                 log("Attempted to reveal hidden pxGrid Cloud form fields")
 
             # Fill "ISE deployment name" — try Dijit widget API first, then DOM walk-up fallback
@@ -2028,7 +2028,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             else:
                 log("WARNING: Could not locate deployment name input — route intercept will patch POST body")
 
-            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_name_filled.png"), full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_name_filled_{pod_id}.png"), full_page=False)
 
             # ── Select region us-west-2 — physical mouse click on dropdown ────────
             # td#pxCloud_region is the Dijit Select widget's display cell.
@@ -2083,7 +2083,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             if not _set_region:
                 log("WARNING: region select may have failed — proceeding anyway (route intercept patches body)")
 
-            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_region_set.png"), full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_region_set_{pod_id}.png"), full_page=False)
             await page.wait_for_timeout(2500)
 
             # ── Check Privacy Statement and EULA checkboxes — physical mouse clicks ──
@@ -2123,7 +2123,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     log(f"Checkbox {_cb['id']!r} clicked via physical mouse at ({_cb['x']:.0f},{_cb['y']:.0f})")
                     _legal_result.append(f"clicked:{_cb['id']}")
             log(f"Legal checkboxes result: {_legal_result}")
-            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_checkboxes.png"), full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_checkboxes_{pod_id}.png"), full_page=False)
 
             await page.wait_for_timeout(3000)
 
@@ -2137,7 +2137,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
 
             log("Clicking Register button (watching for OAuth popup)")
             _registered = False
-            await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_before_register.png"), full_page=False)
+            await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_before_register_{pod_id}.png"), full_page=False)
 
             async def _click_register_btn():
                 """Try all methods to click the Register button. Returns True if clicked."""
@@ -2288,7 +2288,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                         await popup.wait_for_load_state("networkidle", timeout=20000)
                     except Exception:
                         await popup.wait_for_load_state("domcontentloaded", timeout=10000)
-                    await popup.screenshot(path="/pipeline/host-data/ise_oauth_1_activate.png")
+                    await popup.screenshot(path=f"/pipeline/host-data/ise_oauth_1_activate_{pod_id}.png")
                     log(f"OAuth popup URL: {popup.url}")
 
                     # Step 1: "Activate your device" — user_code is pre-filled, click Next
@@ -2304,7 +2304,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     except Exception as _e:
                         log(f"OAuth: Next click warning: {_e}")
 
-                    await popup.screenshot(path="/pipeline/host-data/ise_oauth_2_login.png")
+                    await popup.screenshot(path=f"/pipeline/host-data/ise_oauth_2_login_{pod_id}.png")
 
                     # Step 2: Log in — click field, type email char-by-char (fires React events), click Next
                     try:
@@ -2329,7 +2329,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     except Exception as _e:
                         log(f"OAuth: email step warning: {_e}")
 
-                    await popup.screenshot(path="/pipeline/host-data/ise_oauth_3_password.png")
+                    await popup.screenshot(path=f"/pipeline/host-data/ise_oauth_3_password_{pod_id}.png")
 
                     # Step 3: Password — click, type char-by-char, click Verify
                     try:
@@ -2356,7 +2356,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
 
                     # Post-Verify screenshot — popup may already be closed
                     try:
-                        await popup.screenshot(path="/pipeline/host-data/ise_oauth_4_post_verify.png")
+                        await popup.screenshot(path=f"/pipeline/host-data/ise_oauth_4_post_verify_{pod_id}.png")
                     except Exception:
                         # Popup closed immediately after Verify — device was activated
                         log("OAuth: popup closed right after Verify — treating as Device activated")
@@ -2379,14 +2379,14 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                             log("OAuth: popup closed during Device activated wait — treating as success")
                             return True
                     try:
-                        await popup.screenshot(path="/pipeline/host-data/ise_oauth_5_device_activated.png")
+                        await popup.screenshot(path=f"/pipeline/host-data/ise_oauth_5_device_activated_{pod_id}.png")
                     except Exception:
                         pass  # popup may be closing
                     return True
                 except Exception as _pe:
                     log(f"OAuth popup handler error: {_pe}")
                     try:
-                        await popup.screenshot(path="/pipeline/host-data/ise_oauth_error.png")
+                        await popup.screenshot(path=f"/pipeline/host-data/ise_oauth_error_{pod_id}.png")
                     except Exception:
                         pass
                     return False
@@ -2727,7 +2727,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 # was inside the popup handler, so when no popup ever opened
                 # nothing was written and the message sent the reader to a file
                 # that could be months old.
-                _shot = "/pipeline/host-data/ise_pxgrid_no_popup.png"
+                _shot = f"/pipeline/host-data/ise_pxgrid_no_popup_{pod_id}.png"
                 try:
                     await page.screenshot(path=_shot, full_page=True)
                 except Exception as _se:
@@ -2765,7 +2765,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # account selection dialog directly in the ISE node edit page.
             log("OAuth auth done — waiting for ISE to show Select an Account dialog")
             await page.wait_for_timeout(3000)
-            await page.screenshot(path="/pipeline/host-data/ise_after_oauth.png", full_page=False)
+            await page.screenshot(path=f"/pipeline/host-data/ise_after_oauth_{pod_id}.png", full_page=False)
 
             # Wait up to 20s for "Select an Account" to appear in ISE
             _acct_appeared = False
@@ -2777,7 +2777,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                     break
                 await page.wait_for_timeout(3000)
 
-            await page.screenshot(path="/pipeline/host-data/ise_account_dialog.png", full_page=False)
+            await page.screenshot(path=f"/pipeline/host-data/ise_account_dialog_{pod_id}.png", full_page=False)
 
             if _acct_appeared:
                 # Select PseudoCo-{org_number} radio button
@@ -2805,7 +2805,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                 await page.wait_for_timeout(1000)
 
                 # Click "Register ISE"
-                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_before_register_ise.png"), full_page=False)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_before_register_ise_{pod_id}.png"), full_page=False)
                 try:
                     _reg_ise_btn = page.locator('button:has-text("Register ISE")').first
                     await _reg_ise_btn.wait_for(state="visible", timeout=8000)
@@ -2837,12 +2837,12 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             for _p in _all_posts_seen:
                 log(f"  POST-seen: {_p}")
 
-            await page.screenshot(path="/pipeline/host-data/ise_after_register_ise.png", full_page=False)
+            await page.screenshot(path=f"/pipeline/host-data/ise_after_register_ise_{pod_id}.png", full_page=False)
 
             # Check for ISE error dialog — only fail on specific ISE error phrases, not generic "error"
             _pt_err = (await page.inner_text("body")).lower()
             if "bad request" in _pt_err or "validation failed" in _pt_err:
-                await page.screenshot(path="/pipeline/host-data/ise_register_ise_error.png", full_page=False)
+                await page.screenshot(path=f"/pipeline/host-data/ise_register_ise_error_{pod_id}.png", full_page=False)
                 log("Bad Request / Validation failed dialog detected — dismissing")
                 # Dismiss the error dialog by clicking OK so ISE is in a clean state
                 try:
@@ -3030,7 +3030,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
 
             # Timed out. Report what the panel actually said -- the old message
             # pointed at a screenshot that could be months old.
-            _shot = "/pipeline/host-data/ise_pxgrid_register_final.png"
+            _shot = f"/pipeline/host-data/ise_pxgrid_register_final_{pod_id}.png"
             try:
                 await page.screenshot(path=_shot, full_page=True)
             except Exception:
@@ -3042,7 +3042,7 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
 
         except Exception as e:
             try:
-                await page.screenshot(path=str(Path(__file__).parent / "data" / "ise_pxgrid_register_err.png"), full_page=True)
+                await page.screenshot(path=str(Path(__file__).parent / "data" / f"ise_pxgrid_register_err_{pod_id}.png"), full_page=True)
             except Exception:
                 pass
             return False, f"pxGrid Cloud registration error: {e}"
@@ -3275,7 +3275,7 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                         continue
 
                 if not _fmc_nav_ok:
-                    await page.screenshot(path="/pipeline/host-data/ise_cdfmc_no_fmc.png", full_page=True)
+                    await page.screenshot(path=f"/pipeline/host-data/ise_cdfmc_no_fmc_{pod_id}.png", full_page=True)
                     return True, f"{_SKIP_PREFIX} FMC not found in catalog (ISE error/no internet) — cdFMC integration skipped"
 
             await page.wait_for_timeout(2000)
@@ -3350,7 +3350,7 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                         continue
                 log("Waiting 5s for ISE to fully settle post-deactivate...")
                 await page.wait_for_timeout(5000)
-                await page.screenshot(path="/pipeline/host-data/ise_cdfmc_post_deactivate.png", full_page=True)
+                await page.screenshot(path=f"/pipeline/host-data/ise_cdfmc_post_deactivate_{pod_id}.png", full_page=True)
                 log("Post-deactivate screenshot: ise_cdfmc_post_deactivate.png")
 
             # Check if pxGrid Cloud not yet enabled
@@ -3388,7 +3388,7 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                 pass
             # Screenshot + page text dump for debugging
             try:
-                await page.screenshot(path="/pipeline/host-data/ise_cdfmc_pre_activate.png", full_page=True)
+                await page.screenshot(path=f"/pipeline/host-data/ise_cdfmc_pre_activate_{pod_id}.png", full_page=True)
                 log("Screenshot: /pipeline/host-data/ise_cdfmc_pre_activate.png")
             except Exception:
                 pass
@@ -3586,7 +3586,7 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
                 except Exception:
                     continue
             if not _scc_clicked:
-                await page.screenshot(path="/pipeline/host-data/ise_scc_link_fail.png")
+                await page.screenshot(path=f"/pipeline/host-data/ise_scc_link_fail_{pod_id}.png")
                 return False, "Could not find Cisco Security Cloud link in Activated integrations — check ise_scc_link_fail.png"
             await page.wait_for_timeout(2000)
 
@@ -3605,7 +3605,7 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1000)
             await _ise_dismiss_session_info(page)  # dismiss again after scroll
-            await page.screenshot(path="/pipeline/host-data/ise_scc_deactivate_pre.png", full_page=True)
+            await page.screenshot(path=f"/pipeline/host-data/ise_scc_deactivate_pre_{pod_id}.png", full_page=True)
 
             # ── Detect current Application status ─────────────────────────────
             # If already Inactive (from a prior run) → skip Deactivate entirely.
@@ -3673,7 +3673,7 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
                         deactivate_found = True
                         log(f"JS Deactivate fallback: {_js_da}")
                     else:
-                        await page.screenshot(path="/pipeline/host-data/ise_deactivate_fail.png", full_page=True)
+                        await page.screenshot(path=f"/pipeline/host-data/ise_deactivate_fail_{pod_id}.png", full_page=True)
                         return False, "Deactivate button not found — check ise_deactivate_fail.png"
 
                 # Confirm dialog — ISE shows "Deactivate App" button in modal
@@ -3753,7 +3753,7 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
             # Let ISE fully settle into Inactive before we interact with the form
             log("Waiting 5s for ISE to fully settle post-deactivate...")
             await page.wait_for_timeout(5000)
-            await page.screenshot(path="/pipeline/host-data/ise_scc_post_deactivate.png", full_page=True)
+            await page.screenshot(path=f"/pipeline/host-data/ise_scc_post_deactivate_{pod_id}.png", full_page=True)
             log("Post-deactivate screenshot: ise_scc_post_deactivate.png")
 
             # ── Verify / ensure "Existing instances" is selected ──────────────
@@ -3806,7 +3806,7 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
                 log(f"Existing instances selection result: {_ex_result}")
                 await page.wait_for_timeout(1500)
 
-            await page.screenshot(path="/pipeline/host-data/ise_scc_existing_selected.png", full_page=True)
+            await page.screenshot(path=f"/pipeline/host-data/ise_scc_existing_selected_{pod_id}.png", full_page=True)
             log("Existing instances screenshot: ise_scc_existing_selected.png")
 
             # ── Wait for instance dropdown to auto-populate ───────────────────
@@ -3935,13 +3935,13 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
                     reactivated = True
                     await page.wait_for_timeout(3000)
                 else:
-                    await page.screenshot(path="/pipeline/host-data/ise_reactivate_fail.png", full_page=True)
+                    await page.screenshot(path=f"/pipeline/host-data/ise_reactivate_fail_{pod_id}.png", full_page=True)
                     return False, absent_message(
                         "Activate button (re-activate)",
                         diag=await describe_page_async(page),
                         extra="check ise_reactivate_fail.png")
 
-            await page.screenshot(path="/pipeline/host-data/ise_scc_post_activate.png", full_page=True)
+            await page.screenshot(path=f"/pipeline/host-data/ise_scc_post_activate_{pod_id}.png", full_page=True)
             log("Post-activate screenshot: ise_scc_post_activate.png")
 
             # ── Check for OTP (only if New instance path was taken) ───────────
@@ -3992,7 +3992,7 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
                     break
 
             if not _confirmed_active:
-                await page.screenshot(path="/pipeline/host-data/ise_active_timeout.png", full_page=True)
+                await page.screenshot(path=f"/pipeline/host-data/ise_active_timeout_{pod_id}.png", full_page=True)
                 log("WARNING: Deactivate button never appeared in 3 min — check ise_active_timeout.png")
 
             if new_otp:
@@ -4090,7 +4090,7 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
                                    "'manage your ise registration'",
                                    diag=await describe_page_async(page)))
 
-            await page.screenshot(path="/pipeline/host-data/ise_scc_config_tab.png", full_page=False)
+            await page.screenshot(path=f"/pipeline/host-data/ise_scc_config_tab_{pod_id}.png", full_page=False)
 
             # Is the integration already Active, in which case there is nothing
             # to create?
@@ -4175,7 +4175,7 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
                 except Exception:
                     continue
             if not _activated:
-                await page.screenshot(path="/pipeline/host-data/ise_activate_fail.png", full_page=True)
+                await page.screenshot(path=f"/pipeline/host-data/ise_activate_fail_{pod_id}.png", full_page=True)
                 return False, absent_message(
                     "Activate button", diag=await describe_page_async(page),
                     extra="check ise_activate_fail.png")
@@ -4196,7 +4196,7 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
             else:
                 log("WARNING: 'Fetching OTP...' still present after 20s — attempting OTP read anyway")
             await _ise_dismiss_session_info(page)
-            await page.screenshot(path="/pipeline/host-data/ise_scc_pre_otp.png", full_page=False)
+            await page.screenshot(path=f"/pipeline/host-data/ise_scc_pre_otp_{pod_id}.png", full_page=False)
 
             otp_token = await _read_otp_from_page(page, log)
             if not otp_token:
