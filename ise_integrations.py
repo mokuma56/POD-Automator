@@ -2530,17 +2530,83 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # click, but never let this diagnostic block the click itself —
             # only the popup-open result decides success or failure.
             if not _pre.get("pxCloud_deviceName"):
+                # Dijit set('value', ...) was tried here first and is exactly
+                # the method the INITIAL fill above deliberately avoids — its
+                # own comment says "JS set() / fill() silently fails on Dijit
+                # TextBox widgets in newer ISE" — and re-reading a second
+                # after set() showed it empty again every time (2026-09-21).
+                # It was never actually load-bearing: the network intercept's
+                # '"name":""' patch is what carried POD-2/4/5/7/9 whenever
+                # ISE's own click handler still fired a real request. POD-9
+                # (2026-09-21, later same day) showed that assumption isn't
+                # universal — no popup AND an empty activation-url fetch,
+                # meaning ISE's handler never fired any request at all that
+                # time, so there was nothing for the intercept to patch.
+                # Re-try with the SAME physical-click + press_sequentially
+                # method proven for the initial fill instead of the method
+                # already known not to stick. Verify by re-reading after each
+                # attempt so the log shows whether it actually took — but
+                # still never gate the click on the outcome, since bailing
+                # here before is what regressed POD-2/7/9 onto a worse,
+                # 100%-reproducible failure.
                 log("pxCloud_deviceName reads empty before Register — "
-                    "re-asserting via Dijit set('value', ...) immediately "
-                    "before the click (the network intercept below also "
-                    "patches the POST body if this does not stick either)")
-                try:
-                    await page.evaluate(
-                        "(name) => { const w = dijit.byId('pxCloud_deviceName'); "
-                        "if (w && typeof w.set === 'function') w.set('value', name); }",
-                        deployment_name)
-                except Exception as _se3:
-                    log(f"Dijit set('value') on pxCloud_deviceName failed: {_se3}")
+                    "re-filling with the physical-click+type method instead "
+                    "of Dijit set(), which is known not to stick on this widget")
+                _refill_ok = False
+                for _refill_try in range(3):
+                    try:
+                        _rc = await page.evaluate("""() => {
+                            if (typeof dijit !== 'undefined' && dijit.byId) {
+                                const w = dijit.byId('pxCloud_deviceName');
+                                if (w && w.domNode) {
+                                    const inp = w.domNode.querySelector('input') || w.domNode;
+                                    inp.scrollIntoView({behavior: 'instant', block: 'center'});
+                                    const r = inp.getBoundingClientRect();
+                                    if (r.width > 0) return {x: r.left + r.width/2, y: r.top + r.height/2};
+                                }
+                            }
+                            return null;
+                        }""")
+                    except Exception as _rce:
+                        log(f"re-fill attempt {_refill_try + 1}/3: coordinate lookup failed: {_rce}")
+                        break
+                    if not _rc:
+                        log(f"re-fill attempt {_refill_try + 1}/3: could not locate the name input")
+                        break
+                    await page.mouse.click(_rc["x"], _rc["y"])
+                    await page.wait_for_timeout(400)
+                    await page.keyboard.press("Control+a")
+                    await page.keyboard.press("Meta+a")
+                    await page.wait_for_timeout(200)
+                    await page.keyboard.press("Backspace")
+                    await page.wait_for_timeout(200)
+                    await page.keyboard.type(deployment_name, delay=60)
+                    await page.wait_for_timeout(500)
+                    await page.mouse.click(_rc["x"], _rc["y"] + 40)  # blur
+                    await page.wait_for_timeout(500)
+                    try:
+                        _check = await page.evaluate(
+                            "() => { const w = dijit.byId('pxCloud_deviceName'); "
+                            "return w && typeof w.get === 'function' ? String(w.get('value')) : ''; }")
+                    except Exception as _cke:
+                        _check = f"read failed: {_cke}"
+                    log(f"re-fill attempt {_refill_try + 1}/3: pxCloud_deviceName now reads {_check!r}")
+                    if _check and "read failed" not in str(_check):
+                        _refill_ok = True
+                        break
+                if not _refill_ok:
+                    # Belt-and-suspenders: fall back to the old Dijit set() in
+                    # case this run's widget rejects physical typing instead.
+                    try:
+                        await page.evaluate(
+                            "(name) => { const w = dijit.byId('pxCloud_deviceName'); "
+                            "if (w && typeof w.set === 'function') w.set('value', name); }",
+                            deployment_name)
+                    except Exception as _se3:
+                        log(f"Dijit set('value') on pxCloud_deviceName failed: {_se3}")
+                    log("pxCloud_deviceName still would not hold a value after 3 physical "
+                        "re-fill attempts and a Dijit set() fallback — proceeding to click "
+                        "anyway; the network intercept's POST-body patch is the last resort")
 
             # Set up popup listener then click Register
             _popup_err = ""
