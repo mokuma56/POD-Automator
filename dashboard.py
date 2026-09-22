@@ -106,7 +106,29 @@ def _set_global_config(conn, key, value):
         (key, value),
     )
 
+def _ensure_wal_mode():
+    # journal_mode is a property of the FILE (see _db()'s comment on why it
+    # is not set per-connection), so the one-time PRAGMA from 2026-09-01 that
+    # fixed "database disk image is malformed" under concurrent writers does
+    # NOT survive a dump-and-reload recovery — sqlite3 <dump.sql always
+    # creates the new file in the default 'delete' mode. That silent
+    # regression is exactly what let the same corruption recur on
+    # 2026-09-17 and again on 2026-09-21/22 (POD-12/pipeline_steps, fixed by
+    # dump+reload that same night). Assert it back on every dashboard start
+    # instead of relying on a manual PRAGMA nobody remembers to redo.
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+        if mode.lower() != "wal":
+            conn.execute("PRAGMA journal_mode=WAL;")
+            mode2 = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+            print(f"[db] journal_mode was {mode!r} — set to {mode2!r}", flush=True)
+    finally:
+        conn.close()
+
+
 def _migrate():
+    _ensure_wal_mode()
     conn = _db()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pods (
