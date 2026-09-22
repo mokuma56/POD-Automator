@@ -3220,10 +3220,18 @@ def _scc_token(key_id: str, key_secret: str) -> str:
     return r.json()["access_token"]
 
 
-def _scc_org_number_from_pod() -> str:
-    """Extract org number from scc_org stored in DB for the current POD."""
-    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
-    pod_id  = os.environ.get("POD_ID", "")
+def _scc_org_number_from_pod(pod_id: str = "", db_path: str = "") -> str:
+    """Extract org number from scc_org stored in DB for the current POD.
+
+    pod_id/db_path are optional explicit overrides. Callers running inside a
+    Docker container (one pod_id per process) can rely on the os.environ
+    fallback below safely; a caller running inside dashboard.py's own
+    multi-threaded Flask process cannot — os.environ is process-global, so
+    two concurrent requests for different PODs can race on it. Always pass
+    these explicitly from a caller that isn't itself a single-POD container.
+    """
+    db_path = db_path or os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    pod_id  = pod_id or os.environ.get("POD_ID", "")
     try:
         import sqlite3 as _sq
         c = _sq.connect(db_path)
@@ -3267,7 +3275,7 @@ def phase_duo_ext_dir_setup() -> tuple[bool, str]:
     return duo_push_authproxy_config(POD_ID, DB_PATH)
 
 
-def phase_scc_reset_check():
+def phase_scc_reset_check(pod_id: str = "", db_path: str = ""):
     """
     Automated SCC reset verification (6 of 13 checklist items).
     Reads scc_keys_<org>.json, authenticates, and checks/resets:
@@ -3281,13 +3289,20 @@ def phase_scc_reset_check():
     logging_settings and ravpn_profiles moved to manual checklist
     (require browser session auth — no public API equivalent).
 
+    pod_id/db_path are optional explicit overrides — pass them from any
+    caller that runs inside dashboard.py's multi-threaded Flask process,
+    where os.environ is shared across concurrent requests for different
+    PODs and cannot be trusted alone (see _scc_org_number_from_pod).
+    The os.environ fallback below is for the in-container pipeline path,
+    where each process only ever has one pod_id.
+
     Persists each item to scc_checklist table.
     Returns (ok, result_string).
     """
     import sqlite3 as _sq
 
-    db_path = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
-    pod_id  = os.environ.get("POD_ID", "")
+    db_path = db_path or os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
+    pod_id  = pod_id or os.environ.get("POD_ID", "")
 
     # SCC API calls require public internet (api.sse.cisco.com).
     # When running inside a Docker container (VPN network), DNS for public hosts
@@ -3341,7 +3356,7 @@ def phase_scc_reset_check():
         except Exception as e:
             print(f"     scc_checklist DB write failed: {e}")
 
-    org_num = _scc_org_number_from_pod()
+    org_num = _scc_org_number_from_pod(pod_id=pod_id, db_path=db_path)
     if not org_num:
         msg = "Could not determine SCC org number from pod_number — run detect_pod_number first"
         for k in ALL_KEYS:

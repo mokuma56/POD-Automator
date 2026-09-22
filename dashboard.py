@@ -1919,13 +1919,18 @@ def api_scc_recheck(pod_id):
     log(pod_id, "[scc_reset_check] Starting SCC API checks...")
 
     def _check():
+        _db_path = str(Path(__file__).parent / "data" / "pod_state.db")
         _os.environ["POD_ID"] = pod_id
-        _os.environ["DB_PATH"] = str(Path(__file__).parent / "data" / "pod_state.db")
+        _os.environ["DB_PATH"] = _db_path
         _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
         try:
             import onboard_router as _or
             importlib.reload(_or)
-            ok, result = _or.phase_scc_reset_check()
+            # Pass explicitly rather than relying on the os.environ side effect
+            # above — this Flask process is multi-threaded, so a concurrent
+            # request for a different POD can overwrite os.environ["POD_ID"]
+            # mid-flight and this call would silently read the wrong POD.
+            ok, result = _or.phase_scc_reset_check(pod_id=pod_id, db_path=_db_path)
             log(pod_id, f"[scc_reset_check] {'OK' if ok else 'FAILED'}: {result}")
             c2 = _db()
             c2.execute(
@@ -1993,7 +1998,11 @@ def api_scc_run_check_sync(pod_id):
     try:
         import onboard_router
         importlib.reload(onboard_router)
-        api_ok, api_result = onboard_router.phase_scc_reset_check()
+        # Pass explicitly, not just via the os.environ side effect above —
+        # this Flask process is multi-threaded and os.environ is shared
+        # across concurrent requests for different PODs.
+        api_ok, api_result = onboard_router.phase_scc_reset_check(
+            pod_id=pod_id, db_path=db_path)
         log(pod_id, f"[scc-reset] API checks done: {api_result}")
     except Exception as e:
         api_ok, api_result = False, str(e)
@@ -6381,12 +6390,16 @@ def api_scc_manual_reset(pod_id):
             import sys, os as _os, importlib
             log(pod_id, "[scc-reset] Phase 1: running API-based checks (6 items)...")
             sys.path.insert(0, str(Path(__file__).parent))
+            _db_path = str(Path(__file__).parent / "data" / "pod_state.db")
             _os.environ["POD_ID"] = pod_id
-            _os.environ["DB_PATH"] = str(Path(__file__).parent / "data" / "pod_state.db")
+            _os.environ["DB_PATH"] = _db_path
             _os.environ["SCC_KEYS_DIR"] = str(Path(__file__).parent / "data" / "scc_keys")
             import onboard_router
             importlib.reload(onboard_router)
-            ok, result = onboard_router.phase_scc_reset_check()
+            # Pass explicitly — this Flask process is multi-threaded and
+            # os.environ is shared across concurrent requests for other PODs.
+            ok, result = onboard_router.phase_scc_reset_check(
+                pod_id=pod_id, db_path=_db_path)
             log(pod_id, f"[scc-reset] API checks done: {result}")
         except Exception as _e:
             log(pod_id, f"[scc-reset] API checks error: {_e}")
@@ -6489,7 +6502,12 @@ def api_scc_reset_all():
                 _os.environ["DB_PATH"] = db_path
                 import onboard_router
                 importlib.reload(onboard_router)
-                ok1, res1 = onboard_router.phase_scc_reset_check()
+                # Pass explicitly — even though this loop itself is
+                # sequential, os.environ is shared with any OTHER concurrent
+                # request (e.g. the pipeline's own scc_reset_check step)
+                # touching a different POD at the same time.
+                ok1, res1 = onboard_router.phase_scc_reset_check(
+                    pod_id=pod_id, db_path=db_path)
                 log(pod_id, f"[scc-reset-all] {pod_id} Phase 1: {res1}")
             except Exception as _e1:
                 log(pod_id, f"[scc-reset-all] {pod_id} Phase 1 error: {_e1}")
