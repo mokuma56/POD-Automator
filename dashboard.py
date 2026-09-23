@@ -6820,6 +6820,60 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                         f"starting {_ours!r}). It may belong to an earlier session on "
                         f"this reused org. Verify it targets this POD's ISE, or delete "
                         f"it in cdFMC and re-run so a fresh instance is created.")
+                # An ACTIVE instance belonging to ANOTHER tenant is the one state
+                # the check above is blind to — it filters rows by this POD's
+                # tenant, so a foreign one is simply not seen and we fall through
+                # to a create that can never succeed. cdFMC redeems the OTP
+                # against whatever instance is currently active, so an OTP minted
+                # by this POD's ISE is refused the instant Create is clicked:
+                # "OTP was issued for a different application and cannot be
+                # redeemed for the requested parent application."
+                #
+                # POD-14 / org 531 on 2026-09-23 sat on SEC-NET-CL26-0006
+                # (tenant SEC-NET-CL26-06, activated against a SEC-NET-CL26 ISE).
+                # Two full runs went ISE login -> New instance -> Activate -> OTP
+                # -> four create methods -> 30s wait -> fail, and then told the
+                # operator to "delete it manually in cdFMC and re-run" — which is
+                # impossible as written: cdFMC renders the active row's delete
+                # control disabled (verified in the DOM, row-0-delete-icon
+                # disabled=true), and there is no deactivate control, only
+                # "make this other row active". Say what is actually true.
+                try:
+                    _foreign = _fmc_tab.evaluate("""() => {
+                        const NL = String.fromCharCode(10);
+                        const rows = Array.from(document.querySelectorAll(
+                            'div.ReactVirtualized__Table__row'));
+                        for (const r of rows) {
+                            const b = r.querySelector('[data-testid$="-active-icon"]');
+                            const active = !!(b && b.querySelector('[data-testid="icon-success"]'));
+                            if (!active) continue;
+                            const del = r.querySelector('[data-testid$="-delete-icon"]');
+                            const txt = (r.innerText || '');
+                            return {name: txt.split(NL)[0].trim(),
+                                    detail: txt.split(NL).join(' | ').slice(0, 110),
+                                    deletable: !!(del && !del.disabled)};
+                        }
+                        return null;
+                    }""")
+                except Exception as _fe:
+                    log_fn(f"[cdfmc-nav] foreign-active check failed: {_fe}")
+                    _foreign = None
+                if _foreign:
+                    log_fn(f"[cdfmc-nav] ACTIVE instance is not {_tenant}'s: {_foreign}")
+                    return False, (
+                        f"cdFMC for this org is bound to another tenant's pxGrid "
+                        f"account: {_foreign.get('name')!r} is the active instance "
+                        f"({_foreign.get('detail', '')}) but this POD is {_tenant}. "
+                        f"cdFMC redeems the OTP against whichever instance is active, "
+                        f"so no OTP from {_tenant}'s ISE can be accepted here. Its "
+                        f"delete control is "
+                        f"{'enabled' if _foreign.get('deletable') else 'DISABLED while it is active'}"
+                        f", and cdFMC offers no deactivate — so this cannot be cleared "
+                        f"from the instance list alone. Clear the binding in cdFMC "
+                        f"(Integrations -> Identity Sources -> Service Type) or use an "
+                        f"org whose cdFMC is not already registered to another lab, "
+                        f"then re-run.")
+
                 log_fn(f"[cdfmc-nav] no active instance for {_tenant} — creating one")
 
             # Only instances WE created are ours to delete. cdFMC is shared.
