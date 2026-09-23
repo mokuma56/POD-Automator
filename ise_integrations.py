@@ -1336,6 +1336,98 @@ async def _ise_reopen_node(page, log) -> bool:
     return False
 
 
+async def _ise_select_new_instance(page, log) -> bool:
+    """Select 'New instance' on an ISE Integration Catalog page, and VERIFY it.
+
+    ISE renders these as Dijit widgets: the real <input type="radio"> is
+    hidden, so `input[type=radio]` is never .is_visible() and the old selector
+    loop matched nothing. Its fallback — get_by_text("New instance").click() —
+    wrapped every failure in `except Exception: pass`, so the step sailed on
+    with "Existing instances" still selected. ISE then reissued an OTP bound to
+    the EXISTING cdFMC instance, and cdFMC refused it with "OTP was issued for
+    a different application and cannot be redeemed for the requested parent
+    application" — an error that names cdFMC for something nothing on the cdFMC
+    side caused. POD-14 on 2026-09-23 burned several runs on that, because the
+    only evidence was the ABSENCE of a log line ("Checked New instance radio"
+    never printed), which is the hardest kind of failure to notice.
+
+    Returns False rather than continuing, because minting an OTP against the
+    wrong choice wastes it and reports the wrong system as broken.
+    """
+    _JS_RADIOS = """() => Array.from(document.querySelectorAll(
+        '[role="radio"], input[type="radio"], .dijitRadio'))
+        .map((e, i) => ({i: i,
+            aria: e.getAttribute('aria-checked'),
+            checked: e.checked === true,
+            txt: ((e.closest('label') || e.parentElement || e).textContent || '')
+                   .trim().slice(0, 50)}))"""
+    _SEL = '[role="radio"], input[type="radio"], .dijitRadio'
+
+    def _pick(rows):
+        for r in rows or []:
+            if "new instance" in (r.get("txt") or "").lower():
+                return r
+        return None
+
+    def _is_on(r):
+        return bool(r) and (r.get("checked") is True or r.get("aria") == "true")
+
+    try:
+        rows = await page.evaluate(_JS_RADIOS)
+    except Exception as e:
+        log(f"could not inventory radio widgets: {e}")
+        return False
+    log(f"radio widgets: {rows}")
+    target = _pick(rows)
+    if target is None:
+        log("no radio widget whose label mentions 'New instance'")
+        return False
+    if _is_on(target):
+        log("New instance already selected")
+        return True
+
+    # Physical mouse click: Dijit ignores synthetic clicks on the hidden input.
+    try:
+        loc = page.locator(_SEL).nth(target["i"])
+        await loc.scroll_into_view_if_needed(timeout=5000)
+        _box = await loc.bounding_box()
+        if _box:
+            await page.mouse.click(_box["x"] + _box["width"] / 2,
+                                   _box["y"] + _box["height"] / 2)
+            await page.wait_for_timeout(1200)
+    except Exception as e:
+        log(f"physical click on New instance failed: {e}")
+
+    target = _pick(await page.evaluate(_JS_RADIOS)) or target
+    if _is_on(target):
+        log("New instance selected via physical click — verified")
+        return True
+
+    try:
+        _r = await page.evaluate("""() => {
+            const els = Array.from(document.querySelectorAll(
+                '[role="radio"], input[type="radio"], .dijitRadio'));
+            const el = els.find(e => (((e.closest('label') || e.parentElement || e)
+                       .textContent) || '').toLowerCase().includes('new instance'));
+            if (!el) return 'not found';
+            el.click();
+            const inp = el.querySelector ? el.querySelector('input[type=radio]') : null;
+            if (inp) inp.click();
+            return 'clicked';
+        }""")
+        log(f"DOM click fallback: {_r}")
+        await page.wait_for_timeout(1200)
+    except Exception as e:
+        log(f"DOM click fallback failed: {e}")
+
+    target = _pick(await page.evaluate(_JS_RADIOS)) or target
+    if _is_on(target):
+        log("New instance selected via DOM click — verified")
+        return True
+    log(f"New instance did NOT take — widget still reads: {target}")
+    return False
+
+
 async def _ise_wait_pxgrid_region(page, log, timeout_s: int = 90) -> bool:
     """Wait for the region dropdown to finish loading.
 
@@ -3212,24 +3304,56 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                 # Available integrations order: [0]=FMC, [1]=OfficeSpace, [2]=pxGrid Demo...
                 # nth(1) was previously hardcoded here — WRONG (hits OfficeSpace).
                 _fmc_clicked = False
-                for _fmc_label in ["Firewall Management Center", "FMC", "Cisco Secure Firewall"]:
+                # Identify each tile by the text of the SMALLEST ancestor that
+                # owns exactly one "More details" button.
+                #
+                # The previous selector was
+                #     page.locator(':has(button[data-label="More details"])')
+                #         .filter(has_text=<label>)
+                # with no tag prefix, so it matched every ANCESTOR containing a
+                # More-details button — <body> included, and <body>'s text
+                # contains every label in the catalog. .first was therefore the
+                # outermost match, and ITS first button was just the first tile on
+                # the page. On POD-14 that is DNASpaces: the step opened DNASpaces,
+                # activated it, took the OTP ISE issued FOR DNASpaces, and handed
+                # it to cdFMC — which answered, literally and correctly, "OTP was
+                # issued for a different application". It logged "Clicked FMC
+                # 'More details'" on every one of those runs. 2026-09-23.
+                try:
+                    _tiles = await page.evaluate("""() => {
+                        const btns = Array.from(document.querySelectorAll(
+                            'button[data-label="More details"]'));
+                        const tileOf = (b) => {
+                            let el = b;
+                            while (el && el.parentElement) {
+                                const p = el.parentElement;
+                                if (p.querySelectorAll(
+                                        'button[data-label="More details"]').length > 1) return el;
+                                el = p;
+                            }
+                            return el;
+                        };
+                        return btns.map((b, i) => ({i: i,
+                            text: ((tileOf(b) || b).innerText || '').trim().slice(0, 70)}));
+                    }""")
+                except Exception as _te:
+                    log(f"could not inventory catalog tiles: {_te}")
+                    _tiles = []
+                log(f"catalog tiles: {_tiles}")
+                for _fmc_label in ["Firewall Management Center", "Cisco Secure Firewall", "FMC"]:
+                    _hit = next((t for t in _tiles
+                                 if _fmc_label.lower() in (t.get("text") or "").lower()), None)
+                    if _hit is None:
+                        continue
                     try:
-                        # Find a container that has both the label text AND a More details button
-                        _containers = page.locator(
-                            ':has(button[data-label="More details"])'
-                        ).filter(has_text=_fmc_label)
-                        _cc = await _containers.count()
-                        if _cc > 0:
-                            _fmc_btn = _containers.first.locator(
-                                'button[data-label="More details"]'
-                            ).first
-                            await _fmc_btn.click(timeout=10000, force=True)
-                            log(f"Clicked FMC 'More details' via title {_fmc_label!r}")
-                            _fmc_nav_ok = True
-                            _fmc_clicked = True
-                            break
+                        await more_btns.nth(_hit["i"]).click(timeout=10000, force=True)
+                        log(f"Clicked 'More details' on tile {_hit['i']} matching "
+                            f"{_fmc_label!r}: {_hit.get('text')!r}")
+                        _fmc_nav_ok = True
+                        _fmc_clicked = True
+                        break
                     except Exception as _fe:
-                        log(f"FMC tile search ({_fmc_label!r}): {_fe}")
+                        log(f"click on tile {_hit['i']} failed: {_fe}")
                         continue
 
                 if not _fmc_clicked:
@@ -3305,6 +3429,29 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
                     return True, f"{_SKIP_PREFIX} FMC not found in catalog (ISE error/no internet) — cdFMC integration skipped"
 
             await page.wait_for_timeout(2000)
+
+            # Confirm we actually landed on FMC before touching anything.
+            # Opening the wrong integration card is SILENT: every later step
+            # succeeds on its own terms, ISE issues a perfectly good OTP for
+            # whatever app is open, and the only system that objects is cdFMC —
+            # by which point the error names cdFMC for an ISE-side mis-click.
+            # POD-14 spent 2026-09-23 chasing that as a cdFMC/tenant problem
+            # while the page was sitting on DNASpaces.
+            try:
+                _open_app = (await page.inner_text("body"))[:400].lower()
+            except Exception:
+                _open_app = ""
+            if not any(k in _open_app for k in
+                       ("firewall management center", "secure firewall", "fmc")):
+                await page.screenshot(
+                    path=f"/pipeline/host-data/ise_wrong_integration_{pod_id}.png",
+                    full_page=True)
+                return False, (
+                    "Opened the wrong ISE integration card — expected Firewall "
+                    "Management Center. Refusing to continue: activating the wrong "
+                    "app yields an OTP that cdFMC rejects as 'issued for a different "
+                    f"application'. Page header reads {_open_app[:90]!r}. See "
+                    f"ise_wrong_integration_{pod_id}.png")
 
             # Click "Configuration" tab — and verify it actually switched.
             log("Clicking Configuration tab")
@@ -3390,19 +3537,17 @@ async def _phase_ise_cdfmc_integrate_async(pod_id: str, creds: dict, session_pat
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1000)
             log("Selecting New instance")
-            for ni_sel in ['input[type="radio"][value*="new" i]', 'label:has-text("New instance") input']:
-                try:
-                    rb = page.locator(ni_sel).first
-                    if await rb.is_visible(timeout=3000):
-                        await rb.check()
-                        break
-                except Exception:
-                    continue
-            else:
-                try:
-                    await page.get_by_text("New instance").click(timeout=5000)
-                except Exception:
-                    pass
+            if not await _ise_select_new_instance(page, log):
+                await page.screenshot(
+                    path=f"/pipeline/host-data/ise_new_instance_fail_{pod_id}.png",
+                    full_page=True)
+                return False, (
+                    "Could not select 'New instance' on the ISE FMC integration "
+                    "page. Refusing to request an OTP: ISE would bind it to the "
+                    "EXISTING cdFMC instance and cdFMC would then reject it as "
+                    "'OTP was issued for a different application', which blames "
+                    "cdFMC for an ISE-side selection that never took. See "
+                    f"ise_new_instance_fail_{pod_id}.png")
 
             log("Clicking Activate")
             # Re-check for internet error banner (appears after New instance selection)
@@ -4164,21 +4309,17 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1000)
             log("Selecting New instance")
-            for ni_sel in ['input[type="radio"][value*="new" i]', 'label:has-text("New instance") input']:
-                try:
-                    rb = page.locator(ni_sel).first
-                    if await rb.is_visible(timeout=3000):
-                        await rb.check()
-                        log("Checked New instance radio")
-                        break
-                except Exception:
-                    continue
-            else:
-                try:
-                    await page.get_by_text("New instance").click(timeout=5000)
-                    log("Clicked New instance text")
-                except Exception:
-                    pass
+            if not await _ise_select_new_instance(page, log):
+                await page.screenshot(
+                    path=f"/pipeline/host-data/ise_new_instance_fail_{pod_id}.png",
+                    full_page=True)
+                return False, (
+                    "Could not select 'New instance' on the ISE FMC integration "
+                    "page. Refusing to request an OTP: ISE would bind it to the "
+                    "EXISTING cdFMC instance and cdFMC would then reject it as "
+                    "'OTP was issued for a different application', which blames "
+                    "cdFMC for an ISE-side selection that never took. See "
+                    f"ise_new_instance_fail_{pod_id}.png")
             await page.wait_for_timeout(500)
 
             log("Clicking Activate")

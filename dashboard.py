@@ -6766,6 +6766,12 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             # tell OUR instance from one left by an earlier session on this
             # reused org. (It is also used further down by _purge_instances.)
             OURS_PREFIX = "ISE-FMC-POD-"
+            # Set when this tenant already has an active instance we did not
+            # create. It can only be deleted AFTER ours is created and activated,
+            # so it is carried down to the post-save cleanup rather than acted on
+            # here. Only ever a row matching this POD's own tenant, so widening
+            # the purge by this one name cannot reach another lab's instance.
+            _stale_active = None
 
             if _tenant:
                 try:
@@ -6811,75 +6817,28 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                                f"instance {_existing!r} — nothing to do")
                         return True, (f"cdFMC pxGrid already integrated: instance "
                                       f"{_existing!r} active for {_tenant}")
-                    log_fn(f"[cdfmc-nav] {_tenant} has an active pxGrid instance "
-                           f"{_existing!r} that this POD did not create — cannot "
-                           f"confirm it points at this POD's ISE")
-                    return True, (
-                        f"WARN: cdFMC pxGrid instance {_existing!r} is active for "
-                        f"{_tenant} but was not created by this POD (expected a name "
-                        f"starting {_ours!r}). It may belong to an earlier session on "
-                        f"this reused org. Verify it targets this POD's ISE, or delete "
-                        f"it in cdFMC and re-run so a fresh instance is created.")
-                # An ACTIVE instance belonging to ANOTHER tenant is the one state
-                # the check above is blind to — it filters rows by this POD's
-                # tenant, so a foreign one is simply not seen and we fall through
-                # to a create that can never succeed. cdFMC redeems the OTP
-                # against whatever instance is currently active, so an OTP minted
-                # by this POD's ISE is refused the instant Create is clicked:
-                # "OTP was issued for a different application and cannot be
-                # redeemed for the requested parent application."
-                #
-                # POD-14 / org 531 on 2026-09-23 sat on SEC-NET-CL26-0006
-                # (tenant SEC-NET-CL26-06, activated against a SEC-NET-CL26 ISE).
-                # Two full runs went ISE login -> New instance -> Activate -> OTP
-                # -> four create methods -> 30s wait -> fail, and then told the
-                # operator to "delete it manually in cdFMC and re-run" — which is
-                # impossible as written: cdFMC renders the active row's delete
-                # control disabled (verified in the DOM, row-0-delete-icon
-                # disabled=true), and there is no deactivate control, only
-                # "make this other row active". Say what is actually true.
-                try:
-                    _foreign = _fmc_tab.evaluate("""() => {
-                        const NL = String.fromCharCode(10);
-                        const rows = Array.from(document.querySelectorAll(
-                            'div.ReactVirtualized__Table__row'));
-                        for (const r of rows) {
-                            const b = r.querySelector('[data-testid$="-active-icon"]');
-                            const active = !!(b && b.querySelector('[data-testid="icon-success"]'));
-                            if (!active) continue;
-                            const del = r.querySelector('[data-testid$="-delete-icon"]');
-                            const txt = (r.innerText || '');
-                            return {name: txt.split(NL)[0].trim(),
-                                    detail: txt.split(NL).join(' | ').slice(0, 110),
-                                    deletable: !!(del && !del.disabled)};
-                        }
-                        return null;
-                    }""")
-                except Exception as _fe:
-                    log_fn(f"[cdfmc-nav] foreign-active check failed: {_fe}")
-                    _foreign = None
-                if _foreign:
-                    log_fn(f"[cdfmc-nav] ACTIVE instance is not {_tenant}'s: {_foreign}")
-                    return False, (
-                        f"cdFMC for this org is bound to another tenant's pxGrid "
-                        f"account: {_foreign.get('name')!r} is the active instance "
-                        f"({_foreign.get('detail', '')}) but this POD is {_tenant}. "
-                        f"cdFMC redeems the OTP against whichever instance is active, "
-                        f"so no OTP from {_tenant}'s ISE can be accepted here. Its "
-                        f"delete control is "
-                        f"{'enabled' if _foreign.get('deletable') else 'DISABLED while it is active'}"
-                        f", and cdFMC offers no deactivate — so this cannot be cleared "
-                        f"from the instance list alone. Clear the binding in cdFMC "
-                        f"(Integrations -> Identity Sources -> Service Type) or use an "
-                        f"org whose cdFMC is not already registered to another lab, "
-                        f"then re-run.")
-
+                    # A stale active instance is NOT a reason to stop. cdFMC's
+                    # order of operations is create -> activate -> save, and only
+                    # THEN delete the old one: it refuses to delete an instance
+                    # while that instance is the active one (its delete control
+                    # renders disabled), so ours has to exist and be activated
+                    # before the stale one can go anywhere.
+                    #
+                    # Returning here instead left the POD pointed at whatever an
+                    # earlier session had registered, reported amber forever, and
+                    # told the operator to "delete it and re-run" — advice cdFMC
+                    # will not let them follow. Fall through and create ours.
+                    log_fn(f"[cdfmc-nav] {_tenant} has a stale active pxGrid "
+                           f"instance {_existing!r} that this POD did not create "
+                           f"— creating ours and activating it (the stale one can "
+                           f"only be removed once it is no longer active)")
+                    _stale_active = _existing
                 log_fn(f"[cdfmc-nav] no active instance for {_tenant} — creating one")
 
             # Only instances WE created are ours to delete. cdFMC is shared.
             # (OURS_PREFIX is defined above, before the active-instance check.)
 
-            def _purge_instances(keep_name, why):
+            def _purge_instances(keep_name, why, also=None):
                 """Delete OUR stale pxGrid Application Instances except `keep_name`.
 
                 Runs BEFORE creating as well as after saving. cdFMC binds an OTP
@@ -6924,7 +6883,15 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                             # OWNERSHIP GATE — before anything else, and before
                             # the ACTIVE check, so a foreign instance is never a
                             # deletion candidate regardless of its state.
-                            if OURS_PREFIX not in _row_txt:
+                            #
+                            # `also` widens this by EXACT NAME only, and the sole
+                            # caller passes the stale instance that was active for
+                            # THIS POD's tenant. That row was matched by tenant, so
+                            # it cannot be another lab's — the 2026-09-01 blast
+                            # radius (ONE-CISCO-LAB-JL, SEC-NET-CL04,
+                            # SEC-NET-CL26-04) stays impossible.
+                            _row_name = _row_txt.split("\n")[0].strip()
+                            if OURS_PREFIX not in _row_txt and _row_name not in (also or ()):
                                 if not _foreign_logged.get(_row_txt[:40]):
                                     _foreign_logged[_row_txt[:40]] = True
                                     log_fn(f"[cdfmc-nav] leaving alone (not ours, "
@@ -7352,7 +7319,11 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
 
             # ── 10. Delete anything superseded by the instance we just saved ──
             try:
-                _purge_instances(instance_name, "Cleaning up superseded instances...")
+                # Ours is created and active by now, so the stale instance that
+                # was active on arrival is finally deletable — cdFMC only frees
+                # the delete control once a row stops being the active one.
+                _purge_instances(instance_name, "Cleaning up superseded instances...",
+                                 also=({_stale_active} if _stale_active else None))
             except Exception as _pe:
                 log_fn(f"[cdfmc-nav] superseded-instance cleanup skipped (non-fatal): {_pe}")
 
