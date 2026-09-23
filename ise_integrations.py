@@ -1287,18 +1287,33 @@ async def _ise_reopen_node(page, log) -> bool:
     # A standalone probe doing the identical sequence with a 20s click and longer
     # settles succeeded first time, so the deployment grid on this box is simply
     # slower to become clickable than 12s allows. Give it room, wait for the row
-    # to be actionable rather than merely present, and grow the budget per retry.
-    for _try in range(3):
+    # to be actionable rather than merely present.
+    _url = (f"{ISE_URL}/admin/#administration/administration_system"
+            f"/administration_system_deployment")
+    for _try in range(2):
         try:
-            await page.goto(
-                f"{ISE_URL}/admin/#administration/administration_system"
-                f"/administration_system_deployment",
-                wait_until="domcontentloaded", timeout=60000)
+            # goto() AND reload(), not goto() alone. The ISE admin UI is a Dojo
+            # single-page app and clicking a node row does not change the URL
+            # hash, so by the time the connect poll calls this the URL already
+            # IS _url — and a goto() that differs from the current URL only in
+            # its #fragment is a same-document navigation, i.e. a silent no-op.
+            # The DOM stayed on the node EDIT FORM, which has no deployment
+            # grid, so the row selector ran out its full timeout and then so did
+            # the click, every try. Measured on POD-14 2026-09-23: 309s burned
+            # per call (30s grid wait + 20/30/40s clicks across 3 tries), called
+            # 3x per registration — ~16 of that run's ~21 minutes, all of it
+            # after the registration itself had already succeeded at 2m47s.
+            # It also made the poll re-read a stale DOM and report ISE's
+            # transient "could not connect to pxGrid" as the live state, which
+            # is the same false negative the fresh-context fallback below was
+            # added to paper over. reload() re-renders unconditionally.
+            await page.goto(_url, wait_until="domcontentloaded", timeout=60000)
+            await page.reload(wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(6000)
             await _ise_dismiss_session_info(page)
             await _ise_dismiss_modal(page)
             try:
-                await page.wait_for_selector('table tbody tr, .dijitGrid', timeout=30000)
+                await page.wait_for_selector('table tbody tr, .dijitGrid', timeout=15000)
             except Exception:
                 await page.wait_for_timeout(4000)
             await _ise_dismiss_modal(page)
@@ -1308,16 +1323,16 @@ async def _ise_reopen_node(page, log) -> bool:
             # the row before it wires the handler, and clicking in that window is
             # what times out.
             try:
-                await node.wait_for(state="visible", timeout=20000 + _try * 10000)
+                await node.wait_for(state="visible", timeout=15000)
             except Exception:
                 pass
-            await node.click(timeout=20000 + _try * 10000)
+            await node.click(timeout=20000 + _try * 6000)
             await page.wait_for_timeout(8000)
             await _ise_dismiss_modal(page)
             return True
         except Exception as e:
-            log(f"re-open node attempt {_try + 1}/3 failed: {str(e).splitlines()[0][:110]}")
-            await page.wait_for_timeout(3000 + _try * 3000)
+            log(f"re-open node attempt {_try + 1}/2 failed: {str(e).splitlines()[0][:110]}")
+            await page.wait_for_timeout(3000)
     return False
 
 
@@ -2884,7 +2899,14 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
             # succeeded and only this check was wrong.
             _refreshed = True   # the panel was just loaded by the register flow
             _consec_reopen_fail = 0
-            for _attempt in range(60):  # 60 × 10s = 10 min
+            # Bound this by the CLOCK, not by a poll count. "60 × 10s = 10 min"
+            # only held while an iteration cost nothing but its sleep; each
+            # refresh costs real seconds on top, so the stated budget has to be
+            # measured rather than inferred from the count.
+            _deadline = time.monotonic() + 600   # 10 minutes
+            _attempt = -1
+            while time.monotonic() < _deadline:
+                _attempt += 1
                 await page.wait_for_timeout(10000)
                 _panel = await _pxgrid_panel(page)
                 if _pxgrid_is_registered(_panel):
@@ -2906,14 +2928,18 @@ async def _phase_ise_pxgrid_register_async(pod_id: str, creds: dict, log) -> tup
                                   f"(account {_panel.get('account')}, "
                                   f"name {_panel.get('name')}, region {_panel.get('region')})")
 
-                log(f"Poll {_attempt + 1}/60: status={_panel.get('status')!r} "
+                log(f"Poll {_attempt + 1}: status={_panel.get('status')!r} "
                     f"deregister={_panel.get('deregister')} "
                     f"(panel refreshed: {_refreshed})")
 
                 # Re-navigate periodically: the panel is populated when the node
-                # edit page loads, so a stale page can sit on pre-registration
-                # content indefinitely.
-                if _attempt % 6 == 5:
+                # edit page loads and never updates in place, so re-reading the
+                # same DOM cannot produce a new answer — only the refresh can.
+                # Every 3rd poll rather than every 6th: that halves how long a
+                # connection sits undetected. Measured against POD-14's ISE on
+                # 2026-09-23, a refresh now costs ~37s and returns the true
+                # panel, so a cycle is ~67s — versus 309s to learn nothing.
+                if _attempt % 3 == 2:
                     _refreshed = await _ise_reopen_node(page, log)
                     if _refreshed:
                         log("Re-opened node edit page to refresh the pxGrid panel")
