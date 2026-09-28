@@ -2053,6 +2053,35 @@ def api_scc_run_check_sync(pod_id):
     return jsonify({"ok": overall_ok, "result": combined})
 
 
+@app.route("/api/hostdb/<op>", methods=["POST"])
+def api_hostdb(op):
+    """Run a named db_ops operation for a container, on this process's DB.
+
+    Host-writes-only: containers never open pod_state.db themselves (WAL
+    across the Docker Desktop bind mount wedged this process's connections).
+    They call hostdb.call(op, ...), which POSTs here. Only ops registered in
+    db_ops.OPS can run — no SQL crosses the wire.
+    """
+    import db_ops
+    if op not in db_ops.OPS:
+        return jsonify({"ok": False, "error": f"unknown op {op!r}"}), 404
+    params = request.get_json(silent=True)
+    if not isinstance(params, dict):
+        return jsonify({"ok": False, "error": "body must be a JSON object"}), 400
+    try:
+        conn = _db()
+    except sqlite3.Error as e:
+        return jsonify({"ok": False, "error": f"host DB unavailable: {e}"}), 503
+    try:
+        return jsonify({"ok": True, "result": db_ops.run(op, conn, **params)})
+    except (TypeError, ValueError) as e:
+        return jsonify({"ok": False, "error": f"{op}: {e}"}), 400
+    except sqlite3.Error as e:
+        return jsonify({"ok": False, "error": f"{op}: {type(e).__name__}: {e}"}), 500
+    finally:
+        conn.close()
+
+
 @app.route("/api/duo-saml-setup/<pod_id>", methods=["POST"])
 def api_duo_saml_setup(pod_id):
     """Run duo_saml_full_setup in a background thread.

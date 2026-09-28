@@ -30,13 +30,13 @@ Rollback steps (in reverse order):
 
 import time
 import logging
-import sqlite3
-import datetime
 import os
 import re
 import requests
 import urllib3
 import paramiko
+
+import hostdb  # every pod_state.db access goes through the host — see db_ops.py
 
 urllib3.disable_warnings()
 logger = logging.getLogger(__name__)
@@ -51,56 +51,26 @@ DB_PATH = os.environ.get("DB_PATH", os.path.expanduser("~/sw_projects/pod_automa
 
 def ensure_sda_table():
     try:
-        c = sqlite3.connect(DB_PATH, timeout=10)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS sda_steps (
-                pod_id       TEXT NOT NULL,
-                mode         TEXT NOT NULL DEFAULT 'deploy',
-                step_name    TEXT NOT NULL,
-                status       TEXT NOT NULL DEFAULT 'pending',
-                started_at   TEXT,
-                completed_at TEXT,
-                result       TEXT,
-                PRIMARY KEY (pod_id, mode, step_name)
-            )
-        """)
-        c.commit()
-        c.close()
-    except Exception as e:
+        hostdb.call("sda_ensure_table", db_path=DB_PATH)
+    except hostdb.HostDBError as e:
         print(f"Warning: could not create sda_steps table: {e}")
 
 
 def _set_step(mode, step_name, status, result=None, _retries=5, _retry_delay=2):
     """Upsert a step row. Sets started_at on first RUNNING, completed_at on OK/FAILED.
 
-    Retries up to _retries times on transient SQLite errors (locked / disk I/O)
-    so that a momentary volume-mount hiccup cannot silently leave a step stuck
-    at 'running' forever.
+    Runs on the host (containers never open pod_state.db — see db_ops.py).
+    Retries up to _retries times, on top of hostdb's own retry through a
+    dashboard restart, so a momentary outage cannot silently leave a step
+    stuck at 'running' forever.
     """
     last_err = None
     for attempt in range(1, _retries + 1):
         try:
-            c = sqlite3.connect(DB_PATH, timeout=10)
-            now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            row = c.execute(
-                "SELECT started_at FROM sda_steps WHERE pod_id=? AND mode=? AND step_name=?",
-                (POD_ID, mode, step_name)
-            ).fetchone()
-            started = (row[0] if row else None) or (now if status == "running" else None)
-            completed = now if status in ("completed", "failed") else None
-            c.execute("""
-                INSERT INTO sda_steps (pod_id, mode, step_name, status, started_at, completed_at, result)
-                VALUES (?,?,?,?,?,?,?)
-                ON CONFLICT(pod_id, mode, step_name) DO UPDATE SET
-                    status=excluded.status,
-                    started_at=COALESCE(excluded.started_at, started_at),
-                    completed_at=excluded.completed_at,
-                    result=excluded.result
-            """, (POD_ID, mode, step_name, status, started, completed, result))
-            c.commit()
-            c.close()
+            hostdb.call("sda_step_set", db_path=DB_PATH, pod_id=POD_ID, mode=mode,
+                        step_name=step_name, status=status, result=result)
             return  # success
-        except Exception as e:
+        except hostdb.HostDBError as e:
             last_err = e
             if attempt < _retries:
                 print(f"Warning: _set_step attempt {attempt}/{_retries} failed ({e}), retrying in {_retry_delay}s...")
@@ -2400,15 +2370,8 @@ def run_deploy(from_step=None, log_fn=print, pod_id=None, db_path=None):
 
     # Reset any stale 'running' rows from a previous crashed run
     try:
-        c = sqlite3.connect(DB_PATH, timeout=10)
-        c.execute(
-            "UPDATE sda_steps SET status='pending', completed_at=NULL "
-            "WHERE pod_id=? AND mode='deploy' AND status='running'",
-            (POD_ID,)
-        )
-        c.commit()
-        c.close()
-    except Exception as e:
+        hostdb.call("sda_reset_running", db_path=DB_PATH, pod_id=POD_ID, mode="deploy")
+    except hostdb.HostDBError as e:
         log_fn(f"Warning: could not clear stale running steps: {e}")
 
     started = from_step is None
@@ -2457,29 +2420,17 @@ def run_rollback(log_fn=print, pod_id=None, db_path=None, resume=True):
     # This ensures a stuck step is never permanently frozen — the next invocation
     # of run_rollback will re-run it rather than skip (completed) or loop (running).
     try:
-        c = sqlite3.connect(DB_PATH, timeout=10)
-        c.execute(
-            "UPDATE sda_steps SET status='pending', completed_at=NULL "
-            "WHERE pod_id=? AND mode='rollback' AND status='running'",
-            (POD_ID,)
-        )
-        c.commit()
-        c.close()
-    except Exception as e:
+        hostdb.call("sda_reset_running", db_path=DB_PATH, pod_id=POD_ID, mode="rollback")
+    except hostdb.HostDBError as e:
         log_fn(f"Warning: could not reset stale running steps: {e}")
 
     # Build set of already-completed step names from DB
     completed_in_db = set()
     if resume:
         try:
-            c = sqlite3.connect(DB_PATH, timeout=10)
-            rows = c.execute(
-                "SELECT step_name FROM sda_steps WHERE pod_id=? AND mode='rollback' AND status='completed'",
-                (POD_ID,)
-            ).fetchall()
-            c.close()
-            completed_in_db = {r[0] for r in rows}
-        except Exception as e:
+            completed_in_db = set(hostdb.call("sda_completed", db_path=DB_PATH,
+                                              pod_id=POD_ID, mode="rollback") or [])
+        except hostdb.HostDBError as e:
             log_fn(f"Warning: could not read completed steps: {e}")
 
     errors = []

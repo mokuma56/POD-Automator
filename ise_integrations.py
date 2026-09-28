@@ -25,10 +25,10 @@ import asyncio
 import datetime
 import json
 import re
-import sqlite3
 import time
-from contextlib import closing
 from pathlib import Path
+
+import hostdb  # every pod_state.db access goes through the host — see db_ops.py
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -88,107 +88,38 @@ async def _rendered_body(page) -> str:
     return txt if len(txt) > 400 else ""
 
 
-def _db_connect(db_path: str, retries: int = 8, delay: float = 0.4) -> sqlite3.Connection:
-    """Connect to SQLite with retry for transient VirtioFS/bind-mount I/O errors.
-    macOS Docker bind-mounts can return EIO (disk I/O error) during concurrent
-    host+container access; retrying after a short back-off resolves it reliably.
-    synchronous=OFF skips fsync() calls that fail on macOS VirtioFS bind-mounts.
-    """
-    last_err: Exception | None = None
-    for attempt in range(retries):
-        try:
-            conn = sqlite3.connect(db_path, timeout=30)
-            # WAL, matching dashboard.py's _db(). These MUST agree: flipping a
-            # WAL database back to DELETE needs an exclusive lock, so with the
-            # dashboard connected this raised "database is locked" and took the
-            # whole dashboard down at import time.
-            # Was synchronous=OFF. In WAL that risks a corrupt file on an OS
-            # crash or power loss, and this database was already corrupted once
-            # on 2026-09-01 by concurrent writers. NORMAL is the standard WAL
-            # setting: safe against corruption, at worst losing the last commits.
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=15000")
-            return conn
-        except sqlite3.OperationalError as e:
-            if ("disk I/O error" in str(e) or "unable to open database file" in str(e)) and attempt < retries - 1:
-                time.sleep(delay * (attempt + 1))
-                last_err = e
-                continue
-            raise
-    raise last_err  # type: ignore[misc]
-
 # ── DB helpers ─────────────────────────────────────────────────────────────────
+#
+# This card runs in a container, and containers never open pod_state.db:
+# WAL across the Docker Desktop bind mount wedged the dashboard's own
+# connections ("disk I/O error" on every request while a CLI integrity_check
+# said ok). Every read and write below is a named op run by the dashboard —
+# see db_ops.py. _db_connect(), with its EIO retry loop, existed only to paper
+# over that bind-mount behaviour and is gone with it.
 
 def ise_ensure_table(db_path: str) -> None:
     """Create ise_steps table; add pxGrid Cloud columns to org_credentials if missing."""
-    conn = _db_connect(db_path)
-    try:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS ise_steps (
-                pod_id        TEXT,
-                step_name     TEXT,
-                status        TEXT DEFAULT 'pending',
-                result        TEXT DEFAULT '',
-                started_at    TEXT,
-                completed_at  TEXT,
-                PRIMARY KEY (pod_id, step_name)
-            )
-        """)
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(org_credentials)").fetchall()]
-        for col in ["pxgrid_cloud_email", "pxgrid_cloud_password", "pxgrid_cloud_account"]:
-            if col not in cols:
-                conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {col} TEXT DEFAULT ''")
-        conn.commit()
-    finally:
-        conn.close()
+    hostdb.call("ise_ensure_table", db_path=db_path)
 
 
 def _ise_step_set(pod_id: str, step: str, status: str, result: str, db_path: str) -> None:
-    """Upsert a single row in ise_steps."""
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    for attempt in range(8):
-        conn = _db_connect(db_path)
-        try:
-            conn.execute("""
-                INSERT INTO ise_steps (pod_id, step_name, status, result, started_at, completed_at)
-                VALUES (?,?,?,?,?,?)
-                ON CONFLICT(pod_id, step_name) DO UPDATE SET
-                    status=excluded.status, result=excluded.result,
-                    started_at=COALESCE(excluded.started_at, started_at),
-                    completed_at=excluded.completed_at
-            """, (
-                pod_id, step, status, result,
-                now if status == "running" else None,
-                now if status in ("completed", "failed", "skipped") else None,
-            ))
-            conn.commit()
-            return
-        except sqlite3.OperationalError as e:
-            _retryable = ("disk I/O error", "unable to open database file", "database is locked")
-            if any(r in str(e) for r in _retryable) and attempt < 7:
-                conn.close()
-                time.sleep(0.4 * (attempt + 1))
-                continue
-            raise
-        finally:
-            conn.close()
+    """Upsert a single row in ise_steps.
+
+    Raises hostdb.HostDBError if the host cannot record it — hostdb.call has
+    already retried through a dashboard restart by then.
+    """
+    hostdb.call("ise_step_set", db_path=db_path, pod_id=pod_id, step=step,
+                status=status, result=result)
+
+
+def _ise_step_get(pod_id: str, step: str, db_path: str) -> dict | None:
+    """{status, result, started_at} for one ise_steps row, or None."""
+    return hostdb.call("ise_step_get", db_path=db_path, pod_id=pod_id, step=step)
 
 
 def _load_creds(pod_id: str, db_path: str) -> dict | None:
     """Load org_credentials for the POD's SCC org. Returns dict or None if not found."""
-    with closing(_db_connect(db_path)) as c:
-        c.row_factory = sqlite3.Row
-        pod = c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
-        if not pod:
-            return None
-        scc_org = pod["scc_org"] or ""
-        m = re.search(r"pseudoco-(\d+)", scc_org)
-        if not m:
-            return None
-        oc = c.execute("SELECT * FROM org_credentials WHERE org_number=?", (m.group(1),)).fetchone()
-        result = dict(oc) if oc else {}
-        result["scc_org"] = scc_org  # always inject so steps can navigate directly
-        return result
+    return hostdb.call("org_creds_for_pod", db_path=db_path, pod_id=pod_id)
 
 
 # ── ISE REST API helper ────────────────────────────────────────────────────────
@@ -4604,15 +4535,12 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
         if i < from_step:
             continue
 
-        # Skip steps already completed or skipped — no need to re-run
-        # Use _db_connect (with retry) so transient I/O errors don't cause
-        # completed steps to silently re-run.
+        # Skip steps already completed or skipped — no need to re-run.
+        # Read through the host (hostdb retries through a dashboard restart),
+        # so a transient failure doesn't cause completed steps to silently re-run.
         try:
-            with closing(_db_connect(db_path)) as _skip_db:
-                _row = _skip_db.execute(
-                    "SELECT status, result FROM ise_steps WHERE pod_id=? AND step_name=?",
-                    (pod_id, step)
-                ).fetchone()
+            _r = _ise_step_get(pod_id, step, db_path)
+            _row = (_r["status"], _r["result"]) if _r else None
             _prev_status = _row[0] if _row else ""
             _prev_result = (_row[1] or "") if _row else ""
             _was_soft_fail = _prev_result.startswith("[soft-fail]")
@@ -4695,10 +4623,8 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
         # isolation, so log what the row really says — next time this happens it
         # is diagnosable instead of gone with the run.
         try:
-            with closing(_db_connect(db_path)) as _vdb:
-                _vr = _vdb.execute(
-                    "SELECT status, started_at FROM ise_steps WHERE pod_id=? AND step_name=?",
-                    (pod_id, step)).fetchone()
+            _v = _ise_step_get(pod_id, step, db_path)
+            _vr = (_v["status"], _v["started_at"]) if _v else None
             if not _vr or _vr[0] != "running":
                 _log(f"[warn] {step} did not take the 'running' mark — row reads "
                      f"{_vr[0] if _vr else 'MISSING'!r}; the card will look idle")
@@ -4807,7 +4733,6 @@ async def _scc_open_session_async(ctx, idac_url: str, log, db_path: str = ""):
     # Both card versions are live during the migration ("View" then "Login"),
     # so the candidate list and its verification are shared with the sync twin.
     import re as _re
-    import sqlite3 as _sq
 
     from duo_automation import (IDAC_NON_SCC_SECTIONS, IDAC_SCC_SECTIONS,
                                 _JS_IDAC_BTNS, _JS_IDAC_CLICK, _UUID_RE,
@@ -4848,11 +4773,9 @@ async def _scc_open_session_async(ctx, idac_url: str, log, db_path: str = ""):
 
     known = set()
     try:
-        with _sq.connect(db_path or _scc_default_db_path()) as conn:
-            known = {(r[0] or "").strip().lower() for r in conn.execute(
-                "SELECT scc_org_uuid FROM org_credentials "
-                "WHERE scc_org_uuid IS NOT NULL AND scc_org_uuid != ''")}
-    except _sq.Error as e:
+        known = set(hostdb.call("known_scc_org_uuids",
+                                db_path=db_path or _scc_default_db_path()) or [])
+    except hostdb.HostDBError as e:
         log(f"could not read known org uuids ({e}) — not guessing an enterprise id")
 
     attempts = []
@@ -5115,11 +5038,9 @@ def ise_teardown(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
     # Clear the card's step rows so the next run starts genuinely fresh.
     if ok:
         try:
-            with closing(_db_connect(db_path)) as c:
-                c.execute("DELETE FROM ise_steps WHERE pod_id=?", (pod_id,))
-                c.commit()
+            hostdb.call("ise_steps_clear", db_path=db_path, pod_id=pod_id)
             _log("Cleared ise_steps rows")
-        except sqlite3.Error as e:
+        except hostdb.HostDBError as e:
             _log(f"[warn] could not clear ise_steps: {e}")
 
     return ok, msg + " | cdFMC pxGrid instance must still be removed by hand"

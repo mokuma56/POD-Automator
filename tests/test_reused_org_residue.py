@@ -120,17 +120,40 @@ def test_the_site_prefix_is_captured_not_discarded():
         os.path.join(_ROOT, "onboard_router.py")).read()
 
 
-def test_persist_accepts_and_stores_the_site():
+def _persist_body():
     src = open(os.path.join(_ROOT, "onboard_router.py")).read()
-    assert "def _persist(pod_number, source, site=\"\")" in src
-    assert "pod_site=?" in src
+    i = src.index("def _persist(pod_number, source")
+    return src[i:i + 1600]
+
+
+def _pods_db(with_site):
+    import sqlite3
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE pods (pod_id TEXT, pod_number TEXT, updated_at TEXT"
+              + (", pod_site TEXT" if with_site else "") + ")")
+    c.execute("INSERT INTO pods (pod_id) VALUES ('POD-8')")
+    return c
+
+
+def test_persist_accepts_and_stores_the_site():
+    """_persist now writes through the host (host-writes-only, db_ops.pod_update);
+    it must still send the site, and the op must store it."""
+    import db_ops
+    body = _persist_body()
+    assert "def _persist(pod_number, source, site=\"\")" in body
+    assert '"pod_site": site' in body
+    c = _pods_db(with_site=True)
+    db_ops.run("pod_update", c, pod_id="POD-8",
+               fields={"pod_number": "13", "pod_site": "sjc"})
+    assert c.execute("SELECT pod_number, pod_site FROM pods").fetchone() == ("13", "sjc")
 
 
 def test_a_db_without_pod_site_still_records_the_number():
     """The column is a migration; an older DB must not lose the POD number
-    over a failed UPDATE."""
-    src = open(os.path.join(_ROOT, "onboard_router.py")).read()
-    i = src.index("def _persist(pod_number, source")
-    body = src[i:i + 1600]
-    assert "except sqlite3.OperationalError:" in body
-    assert body.count("UPDATE pods SET pod_number=?") >= 1
+    over a failed UPDATE. The fallback moved from _persist into db_ops.pod_update,
+    which drops columns the DB does not have."""
+    import db_ops
+    c = _pods_db(with_site=False)
+    db_ops.run("pod_update", c, pod_id="POD-8",
+               fields={"pod_number": "13", "pod_site": "sjc"})
+    assert c.execute("SELECT pod_number FROM pods").fetchone() == ("13",)
