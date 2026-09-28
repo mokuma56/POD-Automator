@@ -9111,6 +9111,81 @@ def sa_sso_already_configured(t, sa_org: str, ent: str) -> bool:
     return "DuoSSO" in (_scc_text(t) or "").split("SSO authentication")[-1]
 
 
+def _saml_entity_host(xml: str) -> str:
+    """Lower-cased host of the entityID in SAML metadata; '' if there is none.
+
+    For Duo's IdP metadata this is the org's SSO host (sso-<hash>.demo.sso...),
+    which is what tells one Duo org apart from another — every org on the lab
+    deployment shares api-demodemo, so the API host cannot.
+    """
+    m = re.search(r'entityID\s*=\s*"([^"]+)"', xml or "")
+    return urllib.parse.urlparse(m.group(1)).netloc.lower() if m else ""
+
+
+def _sa_sp_metadata_xml() -> str:
+    """Secure Access's Service Provider metadata, built from its constants.
+
+    Used when Secure Access already holds an SSO configuration, so its wizard
+    (the normal source of this file) cannot be walked. entity/ACS are the same
+    for every org, and they are all duo_upload_sp_metadata() reads.
+    """
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" '
+        f'entityID="{SA_SP_ENTITY_ID}">\n'
+        '  <md:SPSSODescriptor protocolSupportEnumeration='
+        '"urn:oasis:names:tc:SAML:2.0:protocol">\n'
+        '    <md:AssertionConsumerService '
+        'Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" '
+        f'Location="{SA_SP_ACS_URL}" index="0"/>\n'
+        '  </md:SPSSODescriptor>\n'
+        '</md:EntityDescriptor>\n'
+    )
+
+
+def sa_sso_idp_host(t, sa_org: str, ent: str, name: str = "DuoSSO",
+                    log=None) -> str:
+    """Host of the Duo SSO endpoint Secure Access's SSO configuration sends
+    users to, or '' when it cannot be determined.
+
+    Secure Access does not show the IdP entity on the card ("Entity Id
+    Disabled"), so ask the configuration itself: Test Configuration opens the
+    IdP's login page, and its host names the Duo org. Nothing is typed into it.
+
+    Why this exists (POD-8, 2026-09-28): Secure Access kept an SSO
+    configuration from a Duo org that dCloud had since replaced. "Is SSO
+    configured?" said yes, so sso_saml skipped, and every login went to the
+    dead org — where the password came back "Invalid credentials" without the
+    auth proxy ever seeing a request.
+    """
+    _log = log or (lambda s: print(f"     [sa-sso] {s}"))
+    if not _sa_config_page(t, sa_org, ent):
+        _log("IdP check: configuration page never rendered")
+        return ""
+    if not _sa_expand_row(t, name):
+        _log(f"IdP check: could not expand the {name} row")
+        return ""
+    hit = t.evaluate(_LEAF_HIT, "^test configuration$")
+    if not hit:
+        _log("IdP check: no Test Configuration control on the expanded row")
+        return ""
+    with t.context.expect_page(timeout=30_000) as info:
+        t.mouse.click(hit["x"], hit["y"])
+    popup = info.value
+    try:
+        popup.wait_for_load_state("load", timeout=30_000)
+        # The popup can pass through Secure Access's own redirect first.
+        for _ in range(10):
+            host = urllib.parse.urlparse(popup.url).netloc.lower()
+            if host.endswith("duosecurity.com"):
+                return host
+            popup.wait_for_timeout(2_000)
+        _log(f"IdP check: popup never reached Duo ({popup.url[:90]})")
+        return ""
+    finally:
+        popup.close()
+
+
 def _sa_wizard_open(t, sa_org: str, ent: str, log=None) -> str:
     """Open Connect -> Configuration management -> SSO authentication wizard.
 
@@ -9268,6 +9343,11 @@ def duo_setup_saml_sso(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
          the IdP metadata XML.
       3. Secure Access wizard again -> upload the IdP XML and click Done.
 
+    When Secure Access already holds a configuration, the Duo side still runs
+    (it is idempotent) and the configuration is kept only if it points at the
+    current Duo org's SSO host; one left over from a replaced org is deleted
+    and recreated.
+
     Every stage is verified against re-read state, not against the click.
     """
     import re as _re
@@ -9304,16 +9384,26 @@ def duo_setup_saml_sso(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
     sp_path, idp_path = f"{tmp}/sa_sp.xml", f"{tmp}/duo_idp.xml"
 
     # ── pass 1: Secure Access -> Service Provider XML ──
+    # An existing configuration is NOT proof of a working one: it may belong
+    # to a Duo org dCloud has since replaced (POD-8, 2026-09-28). Record which
+    # Duo org it points at; pass 2 learns the current org, pass 3 compares.
+    # Returning early here also skipped the whole Duo side, which is how
+    # POD-8's app sat on "Disable for all users" with an empty entity_id.
+    sa_configured, sa_idp = False, ""
     with _spw() as pw:
         br = pw.chromium.launch(headless=True, args=["--no-sandbox"])
         try:
             ctx = br.new_context(ignore_https_errors=True, accept_downloads=True,
                                  viewport={"width": 1600, "height": 1200})
             t, ent = _scc_open_session(ctx, idac, log=_log)
-            if sa_sso_already_configured(t, sa_org, ent):
-                _log("SSO authentication already configured — nothing to do")
-                return True, "SSO authentication already configured in Secure Access"
-            sa_download_sp_metadata(t, sa_org, ent, sp_path, log=_log)
+            sa_configured = sa_sso_already_configured(t, sa_org, ent)
+            if sa_configured:
+                sa_idp = sa_sso_idp_host(t, sa_org, ent, log=_log)
+                _log(f"SSO authentication already configured — IdP {sa_idp or 'unknown'}")
+                with open(sp_path, "w") as fh:
+                    fh.write(_sa_sp_metadata_xml())
+            else:
+                sa_download_sp_metadata(t, sa_org, ent, sp_path, log=_log)
         except Exception as e:
             return False, f"could not obtain the Service Provider XML: {type(e).__name__}: {e}"
         finally:
@@ -9328,9 +9418,14 @@ def duo_setup_saml_sso(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
         page.goto(app_url, wait_until="load", timeout=45_000)
         page.wait_for_timeout(9_000)
 
-        ok, msg = duo_upload_sp_metadata(page, sp_path, log=_log)
-        if not ok:
-            return False, msg
+        if (sa_configured
+                and _duo_read_field(page, "entity_id") == SA_SP_ENTITY_ID
+                and _duo_read_field(page, "acs_url") == SA_SP_ACS_URL):
+            _log("SP metadata: already applied")
+        else:
+            ok, msg = duo_upload_sp_metadata(page, sp_path, log=_log)
+            if not ok:
+                return False, msg
         ok, msg = duo_enable_for_all_users(page, log=_log)
         if not ok:
             return False, msg
@@ -9353,13 +9448,42 @@ def duo_setup_saml_sso(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
             _log(f"browser cleanup: {type(e).__name__}")
 
     # ── pass 3: Secure Access -> consume the IdP XML ──
+    with open(idp_path) as fh:
+        duo_idp = _saml_entity_host(fh.read())
+    if sa_configured:
+        if sa_idp and sa_idp == duo_idp:
+            return True, (f"SSO authentication already configured in Secure Access "
+                          f"(IdP {duo_idp} matches the Duo app) | {attr_msg}")
+        if not sa_idp:
+            # Unknown is not "stale": deleting a configuration on a probe
+            # glitch would break a working POD. sso_test checks end to end.
+            _log("WARN: could not read Secure Access's IdP host — leaving the "
+                 "existing SSO configuration in place")
+            return True, (f"SSO authentication already configured in Secure Access "
+                          f"(IdP host unverified) | {attr_msg}")
+        _log(f"Secure Access SSO points at {sa_idp}, but the Duo app is on "
+             f"{duo_idp} — replacing the stale configuration")
+
     with _spw() as pw2:
         br2 = pw2.chromium.launch(headless=True, args=["--no-sandbox"])
         try:
             ctx2 = br2.new_context(ignore_https_errors=True, accept_downloads=True,
                                    viewport={"width": 1600, "height": 1200})
             t2, ent2 = _scc_open_session(ctx2, idac, log=_log)
+            if sa_configured:
+                ok, msg = sa_delete_sso_config(t2, sa_org, ent2, log=_log)
+                if not ok:
+                    return False, f"could not remove the stale SSO configuration: {msg}"
             ok, msg = sa_upload_idp_metadata(t2, sa_org, ent2, idp_path, log=_log)
+            if ok:
+                # Prove the new configuration reaches the current Duo org,
+                # rather than trusting that the wizard's Done took.
+                now = sa_sso_idp_host(t2, sa_org, ent2, log=_log)
+                if now and now != duo_idp:
+                    return False, (f"SSO configuration recreated but still points at "
+                                   f"{now}, not the Duo app's {duo_idp}")
+                if sa_configured:
+                    msg = f"replaced stale SSO configuration ({sa_idp} -> {duo_idp}); {msg}"
         except Exception as e:
             return False, f"could not upload the IdP XML: {type(e).__name__}: {e}"
         finally:
@@ -10033,6 +10157,31 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
         return False, f"AD1 step failed: {type(e).__name__}: {e}"
 
 
+def _pick_sso_test_user(duo_users: list, sa_usernames: list) -> str:
+    """Choose the address to log in with for the SSO test.
+
+    Order of trust:
+      1. kit's email as the CURRENT Duo org has it (synced from this POD's AD);
+      2. a Secure Access kit@ address that the Duo org also knows;
+      3. the first Secure Access kit@, then any user — the old behaviour, kept
+         only for when Duo's user list is unavailable.
+    """
+    def _email(u):
+        return (u.get("email") or "").strip()
+
+    for u in duo_users or []:
+        if (u.get("username") or "").strip().lower() == "kit" and _email(u):
+            return _email(u)
+    duo_emails = {_email(u).lower() for u in duo_users or []} - {""}
+    sa_kits = [u for u in sa_usernames or [] if u.lower().startswith("kit@")]
+    for u in sa_kits:
+        if u.lower() in duo_emails:
+            return u
+    if sa_kits:
+        return sa_kits[0]
+    return (sa_usernames or [""])[0]
+
+
 def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
                        password: str = "", log=None) -> tuple[bool, str]:
     """Run Secure Access's own "Test Configuration" and assert it succeeds.
@@ -10083,16 +10232,27 @@ def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
 
     # Default to kit, the user the lab guide tests with. The UPN is
     # pod-specific (kit@rtp17.corp.pseudoco.com), so read it rather than
-    # assuming a domain.
+    # assuming a domain. Prefer the current Duo org's own record: Secure
+    # Access can still hold users provisioned from an org dCloud has since
+    # replaced (POD-8 carried kit@rtp14 beside the real kit@sjc14), and the
+    # first "kit@" there was the dead one.
     if not username:
+        duo_users = []
+        d_ikey, d_skey, d_host = ((oc.get(k) or "").strip()
+                                  for k in ("duo_ikey", "duo_skey", "duo_host"))
+        if d_ikey and d_skey and d_host:
+            try:
+                duo_users = _paginate(d_ikey, d_skey, d_host, "/admin/v1/users")
+            except (requests.RequestException, RuntimeError, ValueError) as e:
+                _log(f"could not list Duo users ({type(e).__name__}: {e}) — "
+                     "falling back to Secure Access's list")
         try:
             r = requests.get("https://api.sse.cisco.com/identity/v2/scim/Users",
                              headers={"Authorization": f"Bearer {scim_tok}"}, timeout=20)
             users = [u.get("userName", "") for u in r.json().get("Resources", [])]
-            username = next((u for u in users if u.lower().startswith("kit@")),
-                            users[0] if users else "")
-        except Exception as e:
+        except (requests.RequestException, ValueError) as e:
             return False, f"could not read a test user from Secure Access: {e}"
+        username = _pick_sso_test_user(duo_users, users)
     if not username:
         return False, "no provisioned users in Secure Access to test with"
     _log(f"testing as {username}")
