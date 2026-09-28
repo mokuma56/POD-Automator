@@ -6754,21 +6754,43 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             # ── 3. Open authenticated cdFMC tab via Platform Settings HBR-BUTTON ──
             # Wait for the control to actually exist. The 15s above is a fixed
             # wait, and this SPA can still be rendering skeletons well past it.
+            #
+            # Re-polling one render is not enough: on POD-10 and POD-7
+            # (2026-09-28, several PODs' cards running at once) the page sat on
+            # its grey skeleton for the whole 90s this used to wait, while a
+            # plain re-run moments later rendered at once. A fresh navigation
+            # gets past a render that never completes — the same finding as
+            # _sa_config_page's one-reload retry — so poll, reload, poll again.
+            # 3 rounds x ~45s stays well inside the card's 10-min wait for us.
             _btn_seen = False
-            for _probe in range(18):          # up to ~90s
-                try:
-                    if page.evaluate(_JS_FIND_HBR, "Platform Settings"):
-                        _btn_seen = True
-                        break
-                except Exception:
-                    pass
-                page.wait_for_timeout(5000)
+            _waited = 0
+            for _round in range(3):
+                if _round:
+                    log_fn(f"[cdfmc-nav] Platform Settings not rendered after ~{_waited}s — "
+                           f"reloading the FMC app page (round {_round + 1}/3)")
+                    try:
+                        page.goto(_fmc_url, wait_until="domcontentloaded", timeout=60000)
+                    except Exception as _re:
+                        log_fn(f"[cdfmc-nav] reload exception: {_re}")
+                    page.wait_for_timeout(10000)
+                    _waited += 10
+                for _probe in range(9):       # ~45s per round
+                    try:
+                        if page.evaluate(_JS_FIND_HBR, "Platform Settings"):
+                            _btn_seen = True
+                            break
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(5000)
+                    _waited += 5
+                if _btn_seen:
+                    break
             if not _btn_seen:
                 page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_no_button_{pod_id}.png"))
                 return False, ("Platform Settings control never rendered on the SCC FMC "
-                               "app page — the page was still loading, so there was "
-                               "nothing to click")
-            log_fn(f"[cdfmc-nav] Platform Settings control present after ~{_probe * 5}s")
+                               f"app page after ~{_waited}s and 2 reloads — the page was "
+                               "still loading, so there was nothing to click")
+            log_fn(f"[cdfmc-nav] Platform Settings control present after ~{_waited}s")
 
             log_fn("[cdfmc-nav] Opening cdFMC tab via Platform Settings (expect_popup)...")
             try:
