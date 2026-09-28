@@ -199,8 +199,59 @@ SDWAN_STEPS = {
     "copy_bootstrap", "controller_mode_enable", "verify_online",
 }
 
+def _sdwan_live_online(sess):
+    """(online, detail) from vManage right now, not from the DB flag.
+
+    pods.sdwan_online survives a dCloud reset of the POD, so trusting it alone
+    skipped every SD-WAN step on a freshly reset POD-6 (2026-09-28) whose
+    router was back in autonomous mode — the switches then failed
+    connectivity and 5/13 routes were missing. Online means this router's
+    UUID is listed as reachable with the system-ip this pipeline assigns.
+    """
+    r = sess.get(f"{onboard_router.VMANAGE}/dataservice/device", timeout=20)
+    r.raise_for_status()
+    for d in r.json().get("data", []):
+        if d.get("uuid") == onboard_router.UUID:
+            reach = str(d.get("reachability", "")).lower()
+            sip = d.get("system-ip", "")
+            ok = reach == "reachable" and sip == onboard_router.SYSTEM_IP
+            return ok, f"{onboard_router.UUID} reachability={reach} system-ip={sip}"
+    return False, f"{onboard_router.UUID} not listed in vManage"
+
+
+def _clear_sdwan_flag():
+    import sqlite3 as _sq
+    try:
+        c = _sq.connect(DB_PATH)
+        c.execute("UPDATE pods SET sdwan_online='', updated_at=datetime('now') "
+                  "WHERE pod_id=?", (pod_id,))
+        c.commit(); c.close()
+    except _sq.Error as e:
+        print(f"  Warning: could not clear sdwan_online: {e}")
+
+
+# The session is needed even when the SD-WAN steps are skipped:
+# redeploy_config_group runs regardless and uses it. Creating it only in the
+# not-online branch left `s` undefined there ("name 's' is not defined").
+s = None
 if _sdwan_online:
-    print("  SD-WAN already online — skipping router onboarding steps")
+    import requests as _rq
+    try:
+        s = onboard_router.vmanage_session()
+        _live, _detail = _sdwan_live_online(s)
+    except (_rq.RequestException, ValueError) as e:
+        # vManage unreachable: cannot verify, so keep the old behaviour.
+        _live, _detail = True, f"could not verify with vManage ({type(e).__name__}: {e})"
+    if _live:
+        print(f"  SD-WAN already online ({_detail}) — skipping router onboarding steps")
+    else:
+        print(f"  sdwan_online=yes in the DB but vManage disagrees ({_detail}) — "
+              "running the SD-WAN steps")
+        live_log(f"[sdwan] stale sdwan_online flag ({_detail}) — running SD-WAN steps")
+        _sdwan_online = False
+        _clear_sdwan_flag()
+        # Steps marked completed by the previous run are stale for the same reason.
+        _completed_steps -= SDWAN_STEPS
 else:
     s = onboard_router.vmanage_session()
 
