@@ -2041,6 +2041,7 @@ def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
     except _sq_rs.Error as e:
         _log(f"could not clear stale Duo credentials: {e}")
         return "unavailable"
+    _PASSKEY_LOGIN_DEAD.pop(org_num, None)
 
     why = ("the iDAC URL changed" if stored
            else "no iDAC URL had been recorded for this org")
@@ -2832,6 +2833,7 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
                     "updated_at=datetime('now') WHERE org_number=?",
                     (email, password, admin_host, _json.dumps(creds), hwm, idac, org_num),
                 )
+            _PASSKEY_LOGIN_DEAD.pop(org_num, None)
             _log("passkey + admin credentials persisted")
 
             page2 = ctx.new_page()
@@ -5268,6 +5270,22 @@ def duo_admin_totp_code(pod_id: str, db_path: str) -> str:
     return _totp_generate(secret)
 
 
+# A pipeline run calls duo_passkey_login from ~11 independent sites (bootstrap,
+# ad_sync, saml_scim_config, sso_saml, ...), each starting its own fresh
+# [50, 5_000, 250_000] guess sequence from the same stored high-water mark. If
+# the stored passkey credential doesn't belong to the currently-live tenant at
+# all (session-scope couldn't prove rotation and left a previous session's
+# credential in place — see duo_refresh_session_scope), every offset is
+# doomed: it's not a signCount drift, it's the wrong key. Guessing anyway
+# turns one dead credential into 9+ real failed logins per run, which is
+# enough on its own to trip Duo's account lockout (POD-2, 2026-09-28 — three
+# call sites each burned all three offsets before the lockout banner finally
+# stopped the fourth). Cache the verdict per org for the life of this process
+# so the second call site fails fast instead of repeating attempts already
+# proven futile; cleared whenever a fresh credential is actually persisted.
+_PASSKEY_LOGIN_DEAD: dict = {}
+
+
 def duo_passkey_login(pod_id: str, db_path: str, log=None):
     """Open an authenticated Duo admin session using the stored passkey.
 
@@ -5287,6 +5305,12 @@ def duo_passkey_login(pod_id: str, db_path: str, log=None):
         org_num = _re.search(r"pseudoco-(\d+)", (pod["scc_org"] or "")).group(1)
         oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
                                (org_num,)).fetchone())
+
+    if org_num in _PASSKEY_LOGIN_DEAD:
+        raise RuntimeError(
+            f"org {org_num}: skipping passkey login — already proven unusable "
+            f"earlier this run ({_PASSKEY_LOGIN_DEAD[org_num]}). Not retrying "
+            f"to avoid piling more failed logins onto a possible lockout.")
 
     creds = _json.loads(oc.get("duo_passkey_cred") or "[]")
     if not creds:
@@ -5332,6 +5356,7 @@ def duo_passkey_login(pod_id: str, db_path: str, log=None):
         browser.close()
         pw.stop()
         if locked:
+            _PASSKEY_LOGIN_DEAD[org_num] = "Duo showed the account-lockout banner"
             raise RuntimeError(
                 f"Duo admin account {oc['duo_admin_email']} is rate-limited/locked by "
                 f"Duo (\"exceeded the number of attempts\") — signCount retries won't "
@@ -5340,6 +5365,7 @@ def duo_passkey_login(pod_id: str, db_path: str, log=None):
         if i + 1 < len(attempts):
             _log(f"passkey rejected at signCount {base} — retrying "
                  f"{attempts[i + 1]} above the stored mark")
+    _PASSKEY_LOGIN_DEAD[org_num] = f"exhausted offsets {attempts} above {stored_hwm}"
     raise RuntimeError(
         f"passkey login failed at signCount offsets {attempts} above {stored_hwm} — "
         f"Duo's counter may be further ahead, or the credential was removed")
