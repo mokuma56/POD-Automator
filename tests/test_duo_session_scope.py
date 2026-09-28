@@ -37,7 +37,7 @@ STALE_DUO = {
     "duo_admin_password": "oldpw",
     "duo_admin_host": "admin-old1234.duosecurity.com",
     "duo_passkey_cred": '[{"rpId": "admin-old1234.duosecurity.com"}]',
-    "duo_passkey_hwm": "7",
+    "duo_passkey_hwm": 7,
     "duo_admin_totp_secret": "OLDTOTPSECRET",
     "duo_saml_app_ikey": "DIOLDSAMLAPPOLDSAMLA",
     "authproxy_ikey": "DIOLDPROXYOLDPROXYOL",
@@ -70,9 +70,18 @@ def _make_db(tmp_path, *, stored_url):
     db = tmp_path / "pod_state.db"
     cols = sorted(set(STALE_DUO) | set(STABLE) | {"idac_url"})
     conn = sqlite3.connect(db)
+    # duo_passkey_hwm is INTEGER in the real schema (data/pod_state.db), every
+    # other session-scoped column is TEXT. Mirroring that mixed typing here is
+    # what exposed the 2026-09-27 bug: (prev[c] or "").strip() crashed with
+    # "'int' object has no attribute 'strip'" on this one column, on every
+    # single call that reached it in production — an all-TEXT synthetic schema
+    # here would never have caught it.
+    coldefs = ", ".join(
+        f"{c} INTEGER DEFAULT 0" if c == "duo_passkey_hwm" else f"{c} TEXT DEFAULT ''"
+        for c in cols)
     conn.execute(
         "CREATE TABLE org_credentials (org_number TEXT PRIMARY KEY, "
-        "updated_at TEXT, " + ", ".join(f"{c} TEXT DEFAULT ''" for c in cols) + ")")
+        "updated_at TEXT, " + coldefs + ")")
     conn.execute("CREATE TABLE pods (pod_id TEXT PRIMARY KEY, scc_org TEXT)")
     conn.execute("INSERT INTO pods VALUES ('POD-5', 'cisco-pseudoco-518--x.app.us.cdo.cisco.com')")
     values = {**STALE_DUO, **STABLE, "idac_url": stored_url}
@@ -113,7 +122,8 @@ def test_new_session_clears_stale_duo_credentials(tmp_path, fake_session):
 
     row = _row(db)
     for col in STALE_DUO:
-        assert row[col] == "", f"{col} still holds the previous session's value"
+        expected = 0 if col == "duo_passkey_hwm" else ""
+        assert row[col] == expected, f"{col} still holds the previous session's value"
     assert row["idac_url"] == NEW_URL
 
 
@@ -178,7 +188,8 @@ def test_no_stored_url_also_clears(tmp_path, fake_session):
     row = _row(db)
     assert row["idac_url"] == NEW_URL
     for col in STALE_DUO:
-        assert row[col] == "", f"{col} survived with no matching iDAC URL"
+        expected = 0 if col == "duo_passkey_hwm" else ""
+        assert row[col] == expected, f"{col} survived with no matching iDAC URL"
     for col, expected in STABLE.items():
         assert row[col] == expected, f"{col} was cleared but its org is stable"
 
