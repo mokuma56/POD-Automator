@@ -1134,6 +1134,31 @@ def _load_saved_admin_cookies_for_org(duo_host: str) -> dict:
         return {}
 
 
+def _stale_sa_scim_users(sa_users: list, duo_users: list) -> list:
+    """Secure Access SCIM users the CURRENT Duo org does not know about.
+
+    Duo's connector names a user by email, or by username when there is no
+    email, so a user belongs to this org when its userName matches either.
+    Refuses to judge (returns []) unless the Duo list is non-empty AND at least
+    one Secure Access user already matches it — without proof the current org
+    is provisioning, an empty or failed read would otherwise wipe everyone.
+    """
+    current = set()
+    for u in duo_users or []:
+        for k in ("email", "username"):
+            v = (u.get(k) or "").strip().lower()
+            if v:
+                current.add(v)
+    if not current:
+        return []
+    known = [u for u in sa_users or []
+             if (u.get("userName") or "").strip().lower() in current]
+    if not known:
+        return []
+    return [u for u in sa_users
+            if (u.get("userName") or "").strip().lower() not in current and u.get("id")]
+
+
 def _push_duo_users_to_sa_scim(
     duo_ikey: str,
     duo_skey: str,
@@ -12004,6 +12029,49 @@ def duo_run_card(
         except Exception as e:
             return False, f"SA SCIM verify failed: {e}"
 
+    def step_scim_push_and_prune():
+        """step_scim_push, then drop users a previous Duo org provisioned.
+
+        Secure Access's org survives a dCloud reset but the Duo org does not,
+        so the old org's users stay in Secure Access beside the new ones
+        (POD-8: kit@rtp14 next to kit@sjc14; POD-6: 16 users for 8). The
+        leftovers are not harmless — sso_test picked the stale kit and failed
+        "Invalid credentials". Pruning is best-effort and never fails the step.
+        """
+        ok, msg = step_scim_push()
+        if not ok or not scim_tok:
+            return ok, msg
+        try:
+            duo_users = _paginate(duo_ikey, duo_skey, duo_host, "/admin/v1/users")
+            r = requests.get(SA_SCIM_URL + "/Users",
+                             headers={"Authorization": f"Bearer {scim_tok}"},
+                             params={"count": 500}, timeout=20)
+            r.raise_for_status()
+            sa_users = r.json().get("Resources", [])
+        except (requests.RequestException, RuntimeError, ValueError) as e:
+            _log(f"stale-user prune skipped ({type(e).__name__}: {e})")
+            return ok, msg
+        stale = _stale_sa_scim_users(sa_users, duo_users)
+        removed = []
+        for u in stale:
+            try:
+                d = requests.delete(f"{SA_SCIM_URL}/Users/{u['id']}",
+                                    headers={"Authorization": f"Bearer {scim_tok}"},
+                                    timeout=20)
+            except requests.RequestException as e:
+                _log(f"could not remove stale SA user {u.get('userName')}: {e}")
+                continue
+            if d.status_code in (200, 204, 404):
+                removed.append(u.get("userName", ""))
+            else:
+                _log(f"could not remove stale SA user {u.get('userName')}: "
+                     f"HTTP {d.status_code}")
+        if removed:
+            _log(f"removed {len(removed)} SA user(s) left by a previous Duo org: "
+                 f"{', '.join(removed)}")
+            msg += f" | removed {len(removed)} stale user(s) from a previous Duo org"
+        return ok, msg
+
     def step_sso_saml():
         """Lab guide section 4 — the SAML trust between Duo and Secure Access.
 
@@ -12306,7 +12374,7 @@ def duo_run_card(
         "ad_sync":          step_ad_sync,
         "saml_scim_config": step_saml_scim_config,
         "authproxy_enroll": step_authproxy_enroll,
-        "scim_push":        step_scim_push,
+        "scim_push":        step_scim_push_and_prune,
         "sso_saml":         step_sso_saml,
         "sso_authsource":   step_sso_authsource,
         "mfa_policy":       step_mfa_policy,

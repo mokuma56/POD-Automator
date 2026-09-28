@@ -79,3 +79,45 @@ def test_old_behaviour_when_duo_list_unavailable():
 def test_kit_without_email_is_skipped():
     duo = [{"username": "kit", "email": ""}]
     assert _pick_sso_test_user(duo, POD8_SA) == "kit@rtp14.corp.pseudoco.com"
+
+
+# ── pruning a previous Duo org's users out of Secure Access ────────────────
+from duo_automation import _stale_sa_scim_users  # noqa: E402
+
+# POD-8's Secure Access list: old org first (rtp14 + @corp names), new org second
+# (sjc14 + bare usernames for the users Duo holds without an email).
+POD8_SA_USERS = [
+    {"id": "1", "userName": "kit@rtp14.corp.pseudoco.com"},
+    {"id": "2", "userName": "lin@corp.pseudoco.com"},
+    {"id": "3", "userName": "kit@sjc14.corp.pseudoco.com"},
+    {"id": "4", "userName": "lin"},
+]
+POD8_DUO = [
+    {"username": "kit", "email": "kit@sjc14.corp.pseudoco.com"},
+    {"username": "lin", "email": ""},
+]
+
+
+def test_prunes_exactly_the_previous_orgs_users():
+    stale = _stale_sa_scim_users(POD8_SA_USERS, POD8_DUO)
+    assert sorted(u["userName"] for u in stale) == [
+        "kit@rtp14.corp.pseudoco.com", "lin@corp.pseudoco.com"]
+
+
+def test_never_prunes_without_a_duo_list():
+    """A failed or empty Duo read proves nothing — it must not wipe Secure Access."""
+    assert _stale_sa_scim_users(POD8_SA_USERS, []) == []
+
+
+def test_never_prunes_when_nothing_matches_the_current_org():
+    """If no Secure Access user belongs to the current org, the connector has not
+    run yet (or matching is broken) — deleting everything would be the result."""
+    duo = [{"username": "someone", "email": "someone@elsewhere.com"}]
+    assert _stale_sa_scim_users(POD8_SA_USERS, duo) == []
+
+
+def test_match_ignores_case():
+    sa = [{"id": "1", "userName": "Kit@SJC14.corp.pseudoco.com"},
+          {"id": "2", "userName": "kit@rtp14.corp.pseudoco.com"}]
+    stale = _stale_sa_scim_users(sa, POD8_DUO)
+    assert [u["id"] for u in stale] == ["2"]
