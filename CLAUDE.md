@@ -70,6 +70,19 @@ If a fix requires touching one, STOP and ask first.
 
 ## Hard-won gotchas
 
+### pod_state.db — host-writes-only
+Only the dashboard process opens `data/pod_state.db`. Code running in a container
+(pipeline, ISE card, fabric cards) calls `hostdb.call("<op>", ...)`, which POSTs to
+`/api/hostdb/<op>`; the dashboard runs the named op from `db_ops.OPS` on its own
+connection. WAL across the Docker Desktop bind mount otherwise wedges the dashboard
+("disk I/O error" on every request while a CLI `integrity_check` says `ok`).
+- A new access pattern = a new op in `db_ops.py` (parameterised; no SQL over HTTP),
+  plus a test in `tests/test_hostdb.py`.
+- Importing `hostdb` inside a container arms a tripwire: `sqlite3.connect` refuses
+  `pod_state.db`. A failure naming `hostdb.call` means a direct open slipped in.
+- `hostdb.call` on the host runs the op directly, so the same call works in both
+  contexts. Container modules must not import `sqlite3` at all (pinned by a test).
+
 ### Licensing
 - Correct API: `POST /dataservice/v1/licensing/assign-licenses` with `C8K_MEDIUM_WAN_A`
   (WAN Advantage). The old `msla/assignLicenses` + `C8K_SMALL_WAN_A` returns HTTP 200

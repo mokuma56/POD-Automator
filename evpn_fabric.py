@@ -34,7 +34,8 @@ import os
 import sys
 import time
 import paramiko
-import sqlite3
+
+import hostdb  # every pod_state.db access goes through the host — see db_ops.py
 
 # ── Switch definitions ────────────────────────────────────────────────────────
 SWITCHES = {
@@ -707,40 +708,23 @@ def _send_raw(ip, commands, timeout=30):
 def _persist_fabric_step(step_name, status, result=""):
     if not POD_ID:
         return
-    # Retry up to 3 times — SQLite "database is locked" can silently drop
-    # the completed/failed write if the dashboard is writing simultaneously,
-    # leaving the step stuck in 'running' forever.
-    for attempt in range(3):
-        try:
-            c = sqlite3.connect(DB_PATH, timeout=15)
-            c.execute("""
-                INSERT OR REPLACE INTO fabric_steps
-                    (pod_id, step_name, status, started_at, completed_at, result)
-                VALUES (?, ?, ?,
-                    COALESCE((SELECT started_at FROM fabric_steps WHERE pod_id=? AND step_name=?), datetime('now')),
-                    CASE WHEN ? IN ('completed','failed','skipped') THEN datetime('now') ELSE NULL END,
-                    ?)
-            """, (POD_ID, step_name, status, POD_ID, step_name, status, result))
-            c.commit()
-            c.close()
-            return
-        except Exception as e:
-            print(f"[fabric] WARNING: _persist_fabric_step({step_name}, {status}) attempt {attempt+1} failed: {e}")
-            if attempt < 2:
-                import time; time.sleep(0.5)
+    # Via the host (containers never open pod_state.db — see db_ops.py).
+    # hostdb.call retries through a dashboard restart, which is what the old
+    # 3x "database is locked" retry here was guarding: a dropped
+    # completed/failed write leaves the step stuck in 'running' forever.
+    try:
+        hostdb.call("fabric_step_set", db_path=DB_PATH, pod_id=POD_ID,
+                    step_name=step_name, status=status, result=result)
+    except hostdb.HostDBError as e:
+        print(f"[fabric] WARNING: _persist_fabric_step({step_name}, {status}) failed: {e}")
 
 
 def _load_completed_fabric_steps():
     if not POD_ID:
         return set()
     try:
-        c = sqlite3.connect(DB_PATH)
-        rows = c.execute(
-            "SELECT step_name FROM fabric_steps WHERE pod_id=? AND status='completed'", (POD_ID,)
-        ).fetchall()
-        c.close()
-        return {r[0] for r in rows}
-    except Exception:
+        return set(hostdb.call("fabric_completed", db_path=DB_PATH, pod_id=POD_ID) or [])
+    except hostdb.HostDBError:
         return set()
 
 
@@ -932,21 +916,8 @@ FABRIC_STEP_LABELS = {k: k.replace("_", " ").title() for k, _ in FABRIC_STEPS}
 
 def ensure_fabric_table():
     try:
-        c = sqlite3.connect(DB_PATH)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS fabric_steps (
-                pod_id       TEXT NOT NULL,
-                step_name    TEXT NOT NULL,
-                status       TEXT NOT NULL DEFAULT 'pending',
-                started_at   TEXT,
-                completed_at TEXT,
-                result       TEXT,
-                PRIMARY KEY (pod_id, step_name)
-            )
-        """)
-        c.commit()
-        c.close()
-    except Exception as e:
+        hostdb.call("fabric_ensure_table", db_path=DB_PATH)
+    except hostdb.HostDBError as e:
         print(f"Warning: could not create fabric_steps table: {e}")
 
 

@@ -10,6 +10,7 @@ import os, sys, time, subprocess, json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import onboard_router
+import hostdb   # all DB access goes through the host — see db_ops.py
 
 # KB auto-draft on failure (best-effort — never blocks the pipeline)
 try:
@@ -38,13 +39,9 @@ onboard_router.CG_ID = os.getenv("CG_ID", "ae290e0f-7bc4-40f7-9bfa-23b1e7b2a71a"
 # dashboard Live Logs panel, not just in 'docker logs'.
 def _pre_log(msg):
     try:
-        import sqlite3 as _sq3
-        _pid = os.environ.get("POD_ID", "UNKNOWN")
-        _db  = "/pipeline/host-data/pod_state.db"
-        _c   = _sq3.connect(_db, timeout=5)
-        _c.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (_pid, msg))
-        _c.commit(); _c.close()
-    except Exception:
+        hostdb.call("log_append", db_path="/pipeline/host-data/pod_state.db",
+                    pod_id=os.environ.get("POD_ID", "UNKNOWN"), line=msg)
+    except hostdb.HostDBError:
         pass
     print(msg)   # keep stdout copy for 'docker logs'
 
@@ -130,42 +127,26 @@ DB_PATH = "/pipeline/host-data/pod_state.db"
 
 # ── Pipeline helpers ─────────────────────────────────────────────
 def live_log(msg):
-    """Write a log line to the pipeline_logs table."""
+    """Write a log line to the pipeline_logs table (via the host)."""
     try:
-        import sqlite3 as _sq
-        c = _sq.connect(DB_PATH)
-        c.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
-        c.commit(); c.close()
-    except Exception:
+        hostdb.call("log_append", db_path=DB_PATH, pod_id=pod_id, line=msg)
+    except hostdb.HostDBError:
         pass
 
 def report_step(step_name, status, result=""):
-    """Write a step status update to pipeline_steps table."""
+    """Write a step status update to pipeline_steps table (via the host)."""
     try:
-        import sqlite3 as _sq
-        c = _sq.connect(DB_PATH)
-        c.execute("""
-            INSERT OR REPLACE INTO pipeline_steps
-                (pod_id, step_name, status, started_at, completed_at, result)
-            VALUES (?, ?, ?,
-                COALESCE((SELECT started_at FROM pipeline_steps WHERE pod_id=? AND step_name=?), datetime('now')),
-                CASE WHEN ? IN ('completed','failed','skipped') THEN datetime('now') ELSE NULL END,
-                ?)
-        """, (pod_id, step_name, status, pod_id, step_name, status, result))
-        c.execute("UPDATE pods SET updated_at=datetime('now') WHERE pod_id=?", (pod_id,))
-        c.commit(); c.close()
-    except Exception as e:
+        hostdb.call("pipeline_step_set", db_path=DB_PATH, pod_id=pod_id,
+                    step_name=step_name, status=status, result=result)
+    except hostdb.HostDBError as e:
         print(f"  Warning: report_step failed: {e}")
 
 # Write serial to dashboard DB now that pod_id and DB_PATH are defined
 try:
-    import sqlite3 as _sqlite3
-    _c = _sqlite3.connect(DB_PATH)
-    _c.execute("UPDATE pods SET router_serial=?, updated_at=datetime('now') WHERE pod_id=?",
-               (SERIAL, pod_id))
-    _c.commit(); _c.close()
+    hostdb.call("pod_update", db_path=DB_PATH, pod_id=pod_id,
+                fields={"router_serial": SERIAL})
     print(f"  Serial {SERIAL} written to DB for {pod_id}")
-except Exception as _e:
+except hostdb.HostDBError as _e:
     print(f"  Warning: could not write serial to DB: {_e}")
 
 print(f"\nOnboarding {onboard_router.UUID} for {pod_id}\n{'='*40}")
@@ -173,20 +154,9 @@ print(f"\nOnboarding {onboard_router.UUID} for {pod_id}\n{'='*40}")
 # ── Load existing step state and pod flags from DB ───────────────
 def _load_state():
     try:
-        import sqlite3 as _sq
-        c = _sq.connect(DB_PATH)
-        rows = c.execute(
-            "SELECT step_name, status FROM pipeline_steps WHERE pod_id=?", (pod_id,)
-        ).fetchall()
-        pod_row = c.execute(
-            "SELECT sdwan_online FROM pods WHERE pod_id=?", (pod_id,)
-        ).fetchone()
-        c.close()
-        completed = {r[0] for r in rows if r[1] == "completed"}
-        sdwan_online = (pod_row["sdwan_online"] if pod_row and isinstance(pod_row, dict)
-                        else (pod_row[0] if pod_row else "")) == "yes"
-        return completed, sdwan_online
-    except Exception as e:
+        st = hostdb.call("pipeline_state", db_path=DB_PATH, pod_id=pod_id)
+        return set(st["completed"]), bool(st["sdwan_online"])
+    except (hostdb.HostDBError, KeyError, TypeError) as e:
         print(f"  Warning: could not load state: {e}")
         return set(), False
 
@@ -220,13 +190,10 @@ def _sdwan_live_online(sess):
 
 
 def _clear_sdwan_flag():
-    import sqlite3 as _sq
     try:
-        c = _sq.connect(DB_PATH)
-        c.execute("UPDATE pods SET sdwan_online='', updated_at=datetime('now') "
-                  "WHERE pod_id=?", (pod_id,))
-        c.commit(); c.close()
-    except _sq.Error as e:
+        hostdb.call("pod_update", db_path=DB_PATH, pod_id=pod_id,
+                    fields={"sdwan_online": ""})
+    except hostdb.HostDBError as e:
         print(f"  Warning: could not clear sdwan_online: {e}")
 
 
@@ -340,50 +307,33 @@ for step_name, func in steps:
         # an early exit before the final status=ready write at the bottom.
         if step_name == "controller_mode_enable":
             try:
-                subprocess.run([sys.executable, "-c", f"""
-import sqlite3
-conn = sqlite3.connect('{DB_PATH}')
-conn.execute("UPDATE pods SET sdwan_online='yes', updated_at=datetime('now') WHERE pod_id=?", ('{pod_id}',))
-conn.commit()
-conn.close()
-"""], timeout=5)
+                hostdb.call("pod_update", db_path=DB_PATH, pod_id=pod_id,
+                            fields={"sdwan_online": "yes"})
                 print("  Dashboard: sdwan_online=yes")
-            except Exception:
-                pass
+            except hostdb.HostDBError as _se:
+                print(f"  Warning: could not set sdwan_online: {_se}")
         # Extract and persist scc_org from cdfmc_check result
         if step_name == "cdfmc_check" and isinstance(result, str) and "scc_org=" in result:
             import re as _re
             m = _re.search(r"scc_org=([^\s|]+)", result)
             if m:
                 _scc = m.group(1)
-                # Write it HERE, in-process, with a retry — and never swallow a
-                # failure. This used to shell out to a 5s subprocess wrapped in
-                # `except Exception: pass`. On 2026-08-31 two PODs ran at once,
-                # the write lost a SQLite race, and the exception vanished: the
-                # org WAS discovered ("scc_org=cisco-pseudoco-524...") but never
-                # stored, so scc_reset_check skipped, Duo failed with "Cannot
-                # determine org number from scc_org=''", and ISE never ran — all
-                # for a reason none of them named.
-                import sqlite3 as _sq_org   # not imported at module level here
-                _saved = False
-                _last = None
-                for _try in range(5):
-                    try:
-                        _c = _sq_org.connect(DB_PATH, timeout=20)
-                        _c.execute("UPDATE pods SET scc_org=?, updated_at=datetime('now') "
-                                   "WHERE pod_id=?", (_scc, pod_id))
-                        _c.commit()
-                        _c.close()
-                        _saved = True
-                        break
-                    except Exception as _pe:
-                        _last = _pe
-                        time.sleep(1 + _try)
-                if _saved:
+                # Write it HERE and never swallow a failure. This used to shell
+                # out to a 5s subprocess wrapped in `except Exception: pass`. On
+                # 2026-08-31 two PODs ran at once, the write lost a SQLite race,
+                # and the exception vanished: the org WAS discovered
+                # ("scc_org=cisco-pseudoco-524...") but never stored, so
+                # scc_reset_check skipped, Duo failed with "Cannot determine org
+                # number from scc_org=''", and ISE never ran — all for a reason
+                # none of them named. The host now serialises writes, and
+                # hostdb.call retries while the dashboard is restarting.
+                try:
+                    hostdb.call("pod_update", db_path=DB_PATH, pod_id=pod_id,
+                                fields={"scc_org": _scc})
                     live_log(f"  scc_org stored: {_scc}")
-                else:
+                except hostdb.HostDBError as _pe:
                     # Loud, because everything downstream needs this value.
-                    live_log(f"  ✗ COULD NOT STORE scc_org={_scc} after 5 tries: {_last} "
+                    live_log(f"  ✗ COULD NOT STORE scc_org={_scc}: {_pe} "
                              f"— SCC reset, Duo and ISE will all fail until this is set")
     except Exception as e:
         log_line = f"✗ {step_name} FAILED: {str(e)[:200]}"
@@ -401,15 +351,10 @@ conn.close()
 
 # Mark SD-WAN online and POD fully ready in dashboard
 try:
-    subprocess.run([sys.executable, "-c", f"""
-import sqlite3
-conn = sqlite3.connect('{DB_PATH}')
-conn.execute("UPDATE pods SET sdwan_online='yes', status='ready', notes='POD READY', updated_at=datetime('now') WHERE pod_id=?", ('{pod_id}',))
-conn.commit()
-conn.close()
-"""], timeout=5)
+    hostdb.call("pod_update", db_path=DB_PATH, pod_id=pod_id,
+                fields={"sdwan_online": "yes", "status": "ready", "notes": "POD READY"})
     print("  Dashboard: sdwan_online=yes, status=ready, notes=POD READY")
-except Exception as e:
+except hostdb.HostDBError as e:
     print(f"  Warning: could not update dashboard DB: {e}")
 
 print(f"\n{'='*40}")

@@ -2456,7 +2456,7 @@ def phase_detect_pod_number():
     Soft-fail: returns (False, reason) if both methods fail, so the pipeline
     continues without blocking.
     """
-    import re, sqlite3
+    import re
 
     DB_PATH = os.environ.get("DB_PATH", "/pipeline/host-data/pod_state.db")
     POD_ID  = os.environ.get("POD_ID", "")
@@ -2470,13 +2470,12 @@ def phase_detect_pod_number():
         # (dcloud-rtp-anyconnect.cisco.com / dcloud-sjc-anyconnect.cisco.com),
         # so derive it from there instead of depending on AD email parsing.
         try:
-            conn = sqlite3.connect(DB_PATH)
-            row = conn.execute(
-                "SELECT vpn_host FROM pods WHERE pod_id=?", (POD_ID,)
-            ).fetchone()
-            conn.close()
-            if row and row[0]:
-                m = re.search(r"dcloud-([a-z]+)-", row[0], re.I)
+            import hostdb
+            row = hostdb.call("pod_get", db_path=DB_PATH, pod_id=POD_ID,
+                              fields=["vpn_host"])
+            vpn_host = (row or {}).get("vpn_host") or ""
+            if vpn_host:
+                m = re.search(r"dcloud-([a-z]+)-", vpn_host, re.I)
                 if m:
                     return m.group(1).lower()
         except Exception:
@@ -2492,24 +2491,12 @@ def phase_detect_pod_number():
         # indistinguishable by the label the dashboard shows. Keeping the site
         # makes "rtp13" and "sjc13" tell them apart.
         try:
-            conn = sqlite3.connect(DB_PATH)
-            conn.row_factory = sqlite3.Row
+            import hostdb
             if POD_ID:
-                try:
-                    conn.execute(
-                        "UPDATE pods SET pod_number=?, pod_site=?, "
-                        "updated_at=datetime('now') WHERE pod_id=?",
-                        (pod_number, site, POD_ID),
-                    )
-                except sqlite3.OperationalError:
-                    # Older DB without pod_site — the number is still worth
-                    # recording, so do not lose it over the new column.
-                    conn.execute(
-                        "UPDATE pods SET pod_number=?, updated_at=datetime('now') "
-                        "WHERE pod_id=?", (pod_number, POD_ID),
-                    )
-                conn.commit()
-            conn.close()
+                # pod_update drops columns an older DB lacks (pod_site), so the
+                # number is still recorded there — same as the old fallback.
+                hostdb.call("pod_update", db_path=DB_PATH, pod_id=POD_ID,
+                            fields={"pod_number": pod_number, "pod_site": site})
         except Exception as db_err:
             return True, f"POD# {pod_number} (via {source}) — WARNING: DB write failed: {db_err}"
         _label = f"{site}{pod_number}" if site else pod_number
