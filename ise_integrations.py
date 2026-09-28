@@ -3728,7 +3728,10 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
                     // Use body text scan — Inactive must be checked before Active
                     // (Inactive contains the substring Active).
                     // \\b word-boundary ensures 'Active' won't match inside 'Activate'.
+                    // 'Activation Unresponsive' (POD-6, 2026-09-28) matches none of
+                    // the others — 'Activation' is not \\bActive\\b — so name it.
                     const t = document.body.innerText || '';
+                    if (/Activation\\s+Unresponsive/i.test(t)) return 'Unresponsive';
                     if (/\\bInactive\\b/.test(t)) return 'Inactive';
                     if (/\\bConnected\\b/.test(t)) return 'Connected';
                     if (/\\bActive\\b/.test(t)) return 'Active';
@@ -3739,10 +3742,41 @@ async def _phase_ise_scc_deactivate_reactivate_async(pod_id: str, creds: dict, s
                 await page.wait_for_timeout(3500)
             log(f"Application status detected: {_status_text!r}")
 
-            _already_inactive = _status_text == 'Inactive'
+            # 'Activation Unresponsive' offers Activate on "Existing instances"
+            # and no Deactivate — the same page the Inactive path already drives.
+            _already_inactive = _status_text in ('Inactive', 'Unresponsive')
+
+            # Decide from the controls too, not the status text alone. POD-6,
+            # 2026-09-28: the status read as unrecognised, the step assumed
+            # Active, looked for a Deactivate button the page never offers in
+            # that state, and soft-failed "Deactivate button not found" — on an
+            # integration that then went Active by itself (26 SGTs in step 5).
+            # Only skip Deactivate when the page positively offers Activate and
+            # not Deactivate; while Deactivate is there it is still clicked, so
+            # the required deactivate+reactivate cycle is never skipped.
+            if not _already_inactive:
+                for _ctl_try in range(4):                # up to ~10s for late paint
+                    _ctl = await page.evaluate("""() => {
+                        const vis = e => !!(e.offsetParent || e.getClientRects().length);
+                        const txt = e => (e.innerText || '').trim();
+                        const els = Array.from(document.querySelectorAll('button, a, span'));
+                        return {
+                            deactivate: els.some(e => vis(e) && txt(e) === 'Deactivate'),
+                            activate:   els.some(e => vis(e) && /^activate$/i.test(txt(e))),
+                        };
+                    }""")
+                    if _ctl.get("deactivate"):
+                        break
+                    if _ctl.get("activate"):
+                        log(f"No Deactivate control, but Activate is offered (status "
+                            f"{_status_text!r}) — treating the instance as not active")
+                        _already_inactive = True
+                        break
+                    await page.wait_for_timeout(2500)
 
             if _already_inactive:
-                log("Instance already Inactive — skipping Deactivate, going straight to Activate")
+                log(f"Instance not active ({_status_text!r}) — skipping Deactivate, "
+                    f"going straight to Activate")
             else:
                 # ── Deactivate (Active → Inactive) ────────────────────────────
                 log("Instance is Active — clicking Deactivate")
