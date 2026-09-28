@@ -1940,6 +1940,59 @@ DUO_SESSION_SCOPED_COLUMNS = (
 )
 
 
+def _idac_duo_email_from_blocks(blocks: list) -> str:
+    """The Duo admin email from the iDAC page's leaf text blocks, or ''.
+
+    Same anchoring as _pw_activate_duo_admin: the page lists several accounts
+    and "Email" appears under each (ThousandEyes first), so read only between
+    the "Cisco Duo" heading and the per-user emails that follow it.
+    """
+    blocks = [str(b).strip() for b in blocks or [] if str(b).strip()]
+    try:
+        start = next(i for i, t in enumerate(blocks) if re.fullmatch(r"(?i)cisco duo", t))
+    except StopIteration:
+        return ""
+    end = next((i for i in range(start + 1, len(blocks))
+                if re.fullmatch(r"(?i)(iot|prod|main)\s+user\s+email", blocks[i])),
+               len(blocks))
+    for i in range(start, end - 1):
+        if re.fullmatch(r"(?i)email", blocks[i]) and "@" in blocks[i + 1]:
+            return blocks[i + 1]
+    return ""
+
+
+def idac_duo_admin_email(idac_url: str, log=None) -> str:
+    """Read (never activate) the Duo admin email the iDAC card lists; '' if unknown.
+
+    Only loads the page. Activation is one-shot, so nothing here clicks.
+    """
+    _log = log or (lambda m: print(f"  [duo-session] {m}"))
+    from playwright.sync_api import sync_playwright, Error as _PwError
+    try:
+        with sync_playwright() as p:
+            br = p.chromium.launch(headless=True)
+            try:
+                page = br.new_page()
+                page.goto(idac_url, wait_until="load", timeout=30_000)
+                email = ""
+                for _ in range(4):          # adaptive cards render after load
+                    page.wait_for_timeout(3_000)
+                    email = _idac_duo_email_from_blocks(page.evaluate(
+                        """() => Array.from(document.querySelectorAll('.ac-textBlock, p, div'))
+                               .filter(e => e.children.length === 0)
+                               .map(e => e.textContent.trim())"""))
+                    if email:
+                        break
+            finally:
+                br.close()
+    except _PwError as e:
+        _log(f"could not read the Duo admin from the iDAC card: {e}")
+        return ""
+    if not email:
+        _log("no Duo admin email found on the iDAC card")
+    return email
+
+
 def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
                               log=None) -> str:
     """Detect a new dCloud session and drop the Duo credentials it invalidated.
@@ -1973,9 +2026,10 @@ def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
         with _sq_rs.connect(db_path) as conn:
             conn.row_factory = _sq_rs.Row
             row = conn.execute(
-                "SELECT idac_url FROM org_credentials WHERE org_number=?",
-                (org_num,)).fetchone()
+                "SELECT idac_url, duo_admin_email FROM org_credentials "
+                "WHERE org_number=?", (org_num,)).fetchone()
         stored = ((row["idac_url"] if row else "") or "").strip()
+        stored_admin = ((row["duo_admin_email"] if row else "") or "").strip()
     except _sq_rs.Error as e:
         _log(f"could not read the stored iDAC URL: {e}")
         return "unavailable"
@@ -1990,8 +2044,23 @@ def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
              "credentials alone (cannot prove the session rotated)")
         return "unavailable"
 
+    why = ""
     if live == stored:
-        return "unchanged"
+        # A matching URL is NOT proof the Duo org is unchanged. POD-2 and
+        # POD-6 (2026-09-28) kept their iDAC URL across a dCloud reset while
+        # the card listed a NEW, never-activated Duo admin — so this returned
+        # "unchanged", the card drove the previous org, and on POD-2 walked
+        # straight into that org's locked admin. The admin on the card is the
+        # direct signal. Compare only when both are known: a card that cannot
+        # be read is "unknown", and clearing on it is how admins get locked
+        # out (same-session clear, 2026-08-31 — see below).
+        if not stored_admin:
+            return "unchanged"
+        live_admin = idac_duo_admin_email(live, log=_log)
+        if not live_admin or live_admin.lower() == stored_admin.lower():
+            return "unchanged"
+        why = (f"the iDAC card now lists Duo admin {live_admin}, not the stored "
+               f"{stored_admin}")
 
     # Anything other than an exact match means these Duo values cannot be shown
     # to belong to THIS session — and dCloud builds a new Duo org every session,
@@ -2043,8 +2112,8 @@ def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
         return "unavailable"
     _PASSKEY_LOGIN_DEAD.pop(org_num, None)
 
-    why = ("the iDAC URL changed" if stored
-           else "no iDAC URL had been recorded for this org")
+    why = why or ("the iDAC URL changed" if stored
+                  else "no iDAC URL had been recorded for this org")
     if had:
         _log(f"NEW SESSION for org {org_num} — {why}, so dCloud has built a new "
              f"Duo org. Cleared {len(had)} stale Duo credential(s) "

@@ -106,11 +106,69 @@ def _row(db_path):
 
 @pytest.fixture
 def fake_session(monkeypatch):
-    """Control what the jump host's session log appears to contain."""
-    def _set(url):
+    """Control what the jump host's session log and the iDAC card appear to say.
+
+    The card defaults to listing the SAME admin as the stored row, so tests
+    that are only about the URL keep their meaning (and never open a browser).
+    """
+    def _set(url, card_admin=STALE_DUO["duo_admin_email"]):
         monkeypatch.setattr(da, "read_idac_url_from_session",
                             lambda pod_id, log=None: url)
+        monkeypatch.setattr(da, "idac_duo_admin_email",
+                            lambda idac_url, log=None: card_admin)
     return _set
+
+
+def test_same_url_but_new_admin_on_the_card_clears(tmp_path, fake_session):
+    """POD-2 / POD-6, 2026-09-28: the iDAC URL survived a dCloud reset while the
+    card listed a new, never-activated Duo admin. Returning "unchanged" drove
+    the previous org and hit POD-2's locked admin."""
+    db = _make_db(tmp_path, stored_url=OLD_URL)
+    fake_session(OLD_URL, card_admin="x-arch-duo-sjc059e41@corp.pseudoco.com")
+
+    assert da.duo_refresh_session_scope("POD-5", db, "518", log=lambda m: None) == "rotated"
+
+    row = _row(db)
+    for col in STALE_DUO:
+        expected = 0 if col == "duo_passkey_hwm" else ""
+        assert row[col] == expected, f"{col} still holds the previous org's value"
+    for col, expected in STABLE.items():
+        assert row[col] == expected
+
+
+def test_same_url_and_unreadable_card_changes_nothing(tmp_path, fake_session):
+    """Unknown is not "different": clearing an activated admin in the same
+    session is what locked two admins out on 2026-08-31."""
+    db = _make_db(tmp_path, stored_url=OLD_URL)
+    fake_session(OLD_URL, card_admin="")
+
+    assert da.duo_refresh_session_scope("POD-5", db, "518", log=lambda m: None) == "unchanged"
+    assert _row(db)["duo_admin_email"] == STALE_DUO["duo_admin_email"]
+
+
+def test_admin_comparison_ignores_case(tmp_path, fake_session):
+    db = _make_db(tmp_path, stored_url=OLD_URL)
+    fake_session(OLD_URL, card_admin=STALE_DUO["duo_admin_email"].upper())
+
+    assert da.duo_refresh_session_scope("POD-5", db, "518", log=lambda m: None) == "unchanged"
+
+
+# Leaf text blocks as POD-2's iDAC page rendered them, 2026-09-28.
+POD2_BLOCKS = ["ThousandEyes", "Login details", "Email", "te@corp.pseudoco.com",
+               "Cisco Duo", "Login details", "Email",
+               "x-arch-duo-sjc059e41@corp.pseudoco.com", "Suggested Password", "pw",
+               "IOT User Email", "lee@sjc16.corp.pseudoco.com",
+               "PROD User Email", "kit@sjc16.corp.pseudoco.com", "Activate Account"]
+
+
+def test_card_email_is_the_duo_admin_not_thousandeyes_or_a_user():
+    assert da._idac_duo_email_from_blocks(POD2_BLOCKS) == \
+        "x-arch-duo-sjc059e41@corp.pseudoco.com"
+
+
+def test_card_without_a_duo_section_reads_as_unknown():
+    assert da._idac_duo_email_from_blocks(["ThousandEyes", "Email", "te@x.com"]) == ""
+    assert da._idac_duo_email_from_blocks([]) == ""
 
 
 def test_new_session_clears_stale_duo_credentials(tmp_path, fake_session):
