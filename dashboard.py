@@ -362,14 +362,25 @@ _ensure_ise_table()
 
 # ---- Log helpers ----
 def log(pod_id, msg):
+    conn = None
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=5)
         conn.row_factory = sqlite3.Row
         conn.execute("INSERT INTO pipeline_logs (pod_id, log_line) VALUES (?, ?)", (pod_id, msg))
         conn.commit()
-        conn.close()
     except Exception:
         pass  # never crash the _run() thread over a log write
+    finally:
+        # A write that fails partway (e.g. the recurring disk I/O wedge) must
+        # not leak this connection's file descriptor — log() is called from
+        # every automation thread, often dozens of times a minute, and a
+        # leaked fd per failed write is what ran the dashboard process out of
+        # file descriptors on 2026-09-27.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def clear_logs(pod_id):
     conn = _db()
@@ -3790,9 +3801,19 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                     # Row has a "..." kebab as the last button — no text content, target by position
                     # NOTE: tr.is_visible() returns False in Playwright even for visible rows;
                     #       check the button directly instead.
+                    # The row's Module Name is NOT reliably "ISE-POD-*" — a pre-existing
+                    # or differently-created integration can be named anything (seen live
+                    # on 2026-09-27: "PseudoCo-510-SCC"), which made this locator match
+                    # zero rows and silently fall through to Add Integration instead of
+                    # deleting. Match on the Integration TYPE column instead, which this
+                    # code already confirmed says ISE via `_is_bad` / the "ise" in
+                    # _page_text check above — that text is stable regardless of naming.
                     try:
-                        _row = page.locator('tr').filter(has_text='ISE-POD')
-                        _kebab = _row.locator('button').last
+                        _row = page.locator('tr').filter(
+                            has_text='Identity Service Engine')
+                        if _row.count() == 0:
+                            _row = page.locator('tr').filter(has_text='ISE')
+                        _kebab = _row.first.locator('button').last
                         if not _kebab.is_visible(timeout=3000):
                             raise Exception("kebab button not visible")
                         _kebab.click(timeout=5000)
@@ -3936,6 +3957,7 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             # On this page the sidebar has NO "Connect" nav item (we're in Platform
             # Management context, not Secure Access), so the selector is unambiguous.
             page.wait_for_timeout(2000)
+            _connect_clicked = False
             try:
                 _pre_inputs = page.evaluate("""() =>
                     Array.from(document.querySelectorAll('input, textarea'))
@@ -3944,11 +3966,24 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                     .map(i => i.placeholder || i.type)""")
                 if not _pre_inputs:
                     log_fn("[scc-nav] No form inputs yet — on ISE detail page, clicking Connect")
+                    # Cisco has renamed this control before (the iDAC card's SCC
+                    # opener went through "View"/"Login" churn too — see
+                    # IDAC_SCC_SECTIONS) — try a broad set of labels rather than
+                    # betting on one, and never silently fall through to filling
+                    # a form that was never opened.
                     for _conn_sel in [
                         'button:has-text("Connect")',
                         'button:has-text("Integrate")',
+                        'button:has-text("Get Started")',
+                        'button:has-text("Set Up")',
+                        'button:has-text("Setup")',
+                        'button:has-text("Configure")',
+                        'button:has-text("Add")',
                         'a:has-text("Connect")',
                         'a:has-text("Integrate")',
+                        'a:has-text("Get Started")',
+                        'a:has-text("Set Up")',
+                        'a:has-text("Configure")',
                     ]:
                         try:
                             btn = page.locator(_conn_sel).first
@@ -3957,6 +3992,7 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                                 page.wait_for_load_state("domcontentloaded", timeout=10000)
                                 page.wait_for_timeout(3000)
                                 log_fn(f"[scc-nav] Clicked Connect on detail page via {_conn_sel!r}")
+                                _connect_clicked = True
                                 try:
                                     page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_integrate_{pod_id}.png"))
                                 except Exception:
@@ -3973,6 +4009,33 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
                                 break
                         except Exception:
                             continue
+
+                    # Re-check for the real form now — a click that didn't
+                    # match one of the labels above must not be mistaken for
+                    # one that did. Proceeding to fill on a page that still has
+                    # no form fields produced a misleading "could not click
+                    # Save" failure instead of the real "no form ever opened"
+                    # cause (2026-09-27, POD-4).
+                    _post_inputs = page.evaluate("""() =>
+                        Array.from(document.querySelectorAll('input, textarea'))
+                        .filter(i => i.placeholder !== "Type 'Ctrl' + '/' to search"
+                                   && i.type !== 'hidden')
+                        .map(i => i.placeholder || i.type)""")
+                    if not _post_inputs:
+                        _diag = page.evaluate("""() =>
+                            Array.from(document.querySelectorAll('button, a'))
+                            .filter(x => x.getClientRects().length)
+                            .map(x => (x.innerText || '').trim())
+                            .filter(Boolean).slice(0, 20)""")
+                        try:
+                            page.screenshot(path=str(DATA_DIR / "data" / f"scc_no_connect_{pod_id}.png"))
+                        except Exception:
+                            pass
+                        return False, (
+                            "ISE -> SCC integration: no integration form ever opened "
+                            f"(connect button clicked: {_connect_clicked}) — check "
+                            f"scc_no_connect_{pod_id}.png; controls seen on the "
+                            f"detail page: {_diag}")
             except Exception as _pie:
                 log_fn(f"[scc-nav] pre-input check error: {_pie}")
 

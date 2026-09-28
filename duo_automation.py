@@ -2022,11 +2022,22 @@ def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
             prev = conn.execute(
                 f"SELECT {', '.join(clear)} FROM org_credentials WHERE org_number=?",
                 (org_num,)).fetchone()
-            had = [c for c in clear if prev and (prev[c] or "").strip()]
+            # duo_passkey_hwm is INTEGER (the others are TEXT), so
+            # (prev[c] or "").strip() raised "'int' object has no attribute
+            # 'strip'" on every call that reached this line — silently
+            # aborting the whole rotation-clear before it ever ran. Every pod
+            # hit it on every run (see pipeline_logs: "session-scope check
+            # did not complete"), so stale cross-session admin/passkey/TOTP
+            # state was never actually cleared here — individual steps' own
+            # validity probes were the only thing ever catching it, one
+            # column at a time, well after the fact (POD-1's stale TOTP
+            # secret, POD-8's stale duo_admin_email, 2026-09-27/28).
+            had = [c for c in clear if prev and str(prev[c] or "").strip()]
             conn.execute(
                 f"UPDATE org_credentials SET idac_url=?, updated_at=datetime('now'), "
                 f"{', '.join(c + '=?' for c in clear)} WHERE org_number=?",
-                [live] + [""] * len(clear) + [org_num])
+                [live] + [(0 if c == "duo_passkey_hwm" else "") for c in clear]
+                + [org_num])
     except _sq_rs.Error as e:
         _log(f"could not clear stale Duo credentials: {e}")
         return "unavailable"
@@ -2511,8 +2522,8 @@ def _pw_duo_admin_login_passkey(page, admin_host: str, email: str, password: str
             page.wait_for_timeout(9_000)
 
     if "/login" in page.url:
-        body = page.evaluate("() => document.body.innerText.slice(0, 200)")
-        _log(f"login failed: {body.strip()[:140]!r}")
+        body = page.evaluate("() => document.body.innerText.slice(0, 400)")
+        _log(f"login failed: {body.strip()[:300]!r}")
         return False
     _log(f"logged in -> {page.url[:70]}")
     return True
@@ -3850,8 +3861,21 @@ def _scc_open_session(ctx, idac_url: str, log=None, db_path: str = ""):
         return h.endswith("security.cisco.com") and not h.startswith("sign-on")
 
     cands = []
-    for _i in range(12):
+    # 24 x 2.5s = 60s (widened from 12/30s on 2026-09-27, then proven NOT the
+    # cause — it still failed at 60s). The real cause, found via the
+    # "controls seen" diagnostic below: the iDAC page only had the first two
+    # cards' buttons in the DOM at all (AWS's "Send Request" + footer links) —
+    # Webex/SCC/Duo were simply never mounted. A manual walkthrough of the
+    # same live URL confirmed those cards only appear after scrolling several
+    # screens down, so this page lazy-mounts cards near the viewport rather
+    # than rendering the whole thing up front. The retry loop was re-querying
+    # the same unscrolled viewport every 2.5s forever, which is why widening
+    # the timeout alone changed nothing. Scroll progressively each iteration
+    # so cards further down actually get a chance to mount.
+    for _i in range(24):
         try:
+            pg.evaluate("window.scrollBy(0, 600)")
+            pg.wait_for_timeout(300)
             _btns = pg.evaluate(_JS_IDAC_BTNS, list(IDAC_SCC_SECTIONS)
                                 + list(IDAC_NON_SCC_SECTIONS)) or []
             cands = _idac_scc_candidates(_btns)
@@ -3863,11 +3887,22 @@ def _scc_open_session(ctx, idac_url: str, log=None, db_path: str = ""):
             pass
         pg.wait_for_timeout(2_500)
     if not cands:
+        # Leave a trace of what WAS on the card, so a real layout change is
+        # distinguishable from "just slow" on the next occurrence — a bare
+        # RuntimeError here previously left no way to tell them apart.
+        try:
+            _seen = pg.evaluate("""() =>
+                Array.from(document.querySelectorAll('button, a'))
+                .filter(x => x.getClientRects().length && (x.innerText || '').trim())
+                .map(x => (x.innerText || '').trim().slice(0, 30))
+                .slice(0, 20)""")
+        except Exception:
+            _seen = []
         raise RuntimeError(
             "iDAC card offered no control that could open Security Cloud "
-            "Control after 30s — the adaptive card did not render, or its "
+            "Control after 60s — the adaptive card did not render, or its "
             "layout changed again (URL may be stale or dCloud slow); "
-            "NOT minting a new one")
+            f"NOT minting a new one; controls seen: {_seen}")
 
     _log("iDAC SCC candidates: "
          + ", ".join(f"{c['label']!r}"
@@ -4051,7 +4086,15 @@ def sa_generate_scim_token_ui(pod_id: str, db_path: str, log=None) -> tuple[bool
         oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
                                (org_num,)).fetchone() or {})
 
-    idac = (oc.get("idac_url") or "").strip()
+    # Prefer the LIVE session's iDAC URL over the stored one, same as every
+    # other caller of _scc_open_session — org_credentials.idac_url is a cache
+    # that goes stale across dCloud session resets/rotations. This function
+    # was the one holdout still reading it directly, and it opened a session
+    # so reduced (ThousandEyes/AWS only, no SCC/Duo/Webex cards) that the iDAC
+    # candidate search below always failed — misdiagnosed at first as a
+    # rendering timing/lazy-load issue before the actual URL was compared
+    # against a fresh read (2026-09-27).
+    idac = read_idac_url_from_session(pod_id, log=_log) or (oc.get("idac_url") or "").strip()
     sa_org = (oc.get("sa_org_id") or "").strip()
     if not idac:
         return False, "no stored idac_url — cannot open an SCC session"
@@ -5277,8 +5320,23 @@ def duo_passkey_login(pod_id: str, db_path: str, log=None):
                     "UPDATE org_credentials SET duo_passkey_hwm=? WHERE org_number=?",
                     (hwm, org_num))
             return pw, browser, ctx, page
+        # A "You've exceeded the number of attempts" page is Duo rate-limiting
+        # or locking the account, not rejecting this specific signCount — every
+        # offset will show the same page. Escalating anyway just adds more
+        # failed logins on top of the lockout, so stop after the first.
+        locked = False
+        try:
+            locked = "exceeded the number" in page.evaluate("() => document.body.innerText")
+        except Exception:
+            pass
         browser.close()
         pw.stop()
+        if locked:
+            raise RuntimeError(
+                f"Duo admin account {oc['duo_admin_email']} is rate-limited/locked by "
+                f"Duo (\"exceeded the number of attempts\") — signCount retries won't "
+                f"help and only prolong the lockout. Wait for a cooldown before "
+                f"retrying, or re-enroll the passkey.")
         if i + 1 < len(attempts):
             _log(f"passkey rejected at signCount {base} — retrying "
                  f"{attempts[i + 1]} above the stored mark")
@@ -9205,7 +9263,9 @@ def duo_setup_saml_sso(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
         oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
                                (m.group(1),)).fetchone() or {})
 
-    idac = (oc.get("idac_url") or "").strip()
+    # See sa_generate_scim_token_ui for why the live session's URL is
+    # preferred over the stored one (2026-09-27 fix).
+    idac = read_idac_url_from_session(pod_id, log=_log) or (oc.get("idac_url") or "").strip()
     sa_org = (oc.get("sa_org_id") or "").strip()
     app_ikey = (oc.get("duo_saml_app_ikey") or "").strip()
     if not (idac and sa_org):
@@ -9987,7 +10047,9 @@ def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
         oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
                                (m.group(1),)).fetchone() or {})
 
-    idac = (oc.get("idac_url") or "").strip()
+    # See sa_generate_scim_token_ui for why the live session's URL is
+    # preferred over the stored one (2026-09-27 fix).
+    idac = read_idac_url_from_session(pod_id, log=_log) or (oc.get("idac_url") or "").strip()
     sa_org = (oc.get("sa_org_id") or "").strip()
     scim_tok = (oc.get("sa_scim_token") or "").strip()
     if not (idac and sa_org):
@@ -10336,7 +10398,9 @@ def sa_teardown_identity(pod_id: str, db_path: str, log=None) -> tuple[bool, str
         oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
                                (m.group(1),)).fetchone() or {})
 
-    idac = (oc.get("idac_url") or "").strip()
+    # See sa_generate_scim_token_ui for why the live session's URL is
+    # preferred over the stored one (2026-09-27 fix).
+    idac = read_idac_url_from_session(pod_id, log=_log) or (oc.get("idac_url") or "").strip()
     sa_org = (oc.get("sa_org_id") or "").strip()
     if not (idac and sa_org):
         return False, "idac_url / sa_org_id missing from org_credentials"
@@ -11464,6 +11528,22 @@ def duo_run_card(
                     "SELECT duo_admin_totp_secret FROM org_credentials WHERE org_number=?",
                     (org_num,)).fetchone()
             has_totp = bool((srow["duo_admin_totp_secret"] or "").strip()) if srow else False
+            # A stored secret is not evidence Duo still has the matching
+            # token — a reused org can carry one left by an earlier session
+            # (verify caught this on POD-1/org 502 after bootstrap read
+            # "already provisioned" and skipped, 2026-09-27). Confirm against
+            # Duo itself rather than trusting the column, same check verify
+            # already does.
+            if has_totp:
+                try:
+                    _toks = _duo_request(duo_ikey, duo_skey, duo_host, "GET",
+                                         "/admin/v1/tokens").get("response", [])
+                    _want = f"POD{org_num}-PROCTOR"
+                    has_totp = any(str(t.get("serial", "")).startswith(_want)
+                                   for t in _toks)
+                except Exception as _tke:
+                    _log(f"could not confirm stored TOTP token against Duo "
+                         f"({type(_tke).__name__}) — assuming it is still valid")
             if not has_totp:
                 tok_ok, tok_msg = duo_provision_admin_totp(pod_id, db_path, log=_log)
                 parts.append(f"totp: {tok_msg}" if tok_ok else f"totp FAILED: {tok_msg}")
