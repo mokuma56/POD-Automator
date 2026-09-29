@@ -437,7 +437,11 @@ def _sh(cmd, timeout=6):
 
 def _mac_memory():
     """Physical memory in MB: (total, used). macOS has no /proc, and psutil is
-    not installed, so read hw.memsize and derive used from vm_stat pages."""
+    not installed, so read hw.memsize and derive used from vm_stat pages.
+    On Linux, /proc/meminfo (used = total - MemAvailable)."""
+    _mi = _linux_meminfo()
+    if _mi:
+        return _mi[0], _mi[0] - _mi[1]
     total_b = 0
     try:
         total_b = int(_sh("/usr/sbin/sysctl -n hw.memsize") or 0)
@@ -9529,8 +9533,29 @@ SCC_RESET_MAX_CONCURRENT = 3
 _scc_reset_slots = threading.Semaphore(SCC_RESET_MAX_CONCURRENT)
 
 
-def _host_mem_free_pct():
-    """macOS's own free-memory percentage, or None if it cannot be read."""
+def _linux_meminfo(path="/proc/meminfo"):
+    """(total_mb, available_mb) from /proc/meminfo, or None off Linux."""
+    try:
+        with open(path) as fh:
+            kb = {l.split(":")[0]: int(l.split()[1]) for l in fh if l.split()[1:2]}
+    except (OSError, ValueError, IndexError):
+        return None
+    if not kb.get("MemTotal") or "MemAvailable" not in kb:
+        return None
+    return kb["MemTotal"] // 1024, kb["MemAvailable"] // 1024
+
+
+def _host_mem_free_pct(_meminfo=None):
+    """Free-memory percentage of this host, or None if it cannot be read.
+
+    macOS: the kernel's own figure (kern.memorystatus_level, what
+    memory_pressure prints). Linux: MemAvailable / MemTotal — without this the
+    gate never engaged on the Linux automator (sysctl has no such key there).
+    """
+    mi = _meminfo if _meminfo is not None else _linux_meminfo()
+    if mi:
+        total, avail = mi
+        return int(avail * 100 / total) if total else None
     try:
         r = subprocess.run(["sysctl", "-n", "kern.memorystatus_level"],
                            capture_output=True, text=True, timeout=5)

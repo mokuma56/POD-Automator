@@ -40,6 +40,46 @@ def in_container() -> bool:
     return os.path.exists("/.dockerenv")
 
 
+def _default_gateway(route_file="/proc/net/route") -> str:
+    """IPv4 default gateway of a non-tunnel interface, from /proc/net/route; ''.
+
+    The per-POD VPN adds only specific routes to tun0 (198.18/15, 172.16/12 …),
+    so the default route stays on eth0 — the POD's own Docker bridge, whose
+    gateway address is the host itself on a Linux Docker host.
+    """
+    try:
+        with open(route_file) as fh:
+            rows = fh.read().splitlines()[1:]
+    except OSError:
+        return ""
+    for row in rows:
+        f = row.split()
+        if len(f) >= 3 and f[1] == "00000000" and not f[0].startswith(("tun", "wg", "ppp")):
+            gw = int(f[2], 16)
+            if gw:
+                return ".".join(str((gw >> (8 * i)) & 0xFF) for i in range(4))
+    return ""
+
+
+def dashboard_url(_release=None, _route_file="/proc/net/route") -> str:
+    """Where a container reaches the host dashboard.
+
+    DASHBOARD_URL wins. Otherwise: Docker Desktop (Mac) runs containers in a
+    VM whose kernel release says "linuxkit"; there the host is only reachable at
+    Docker Desktop's gateway 192.168.65.254. On a Linux Docker host there is no
+    VM, and the container's default gateway IS the host.
+    """
+    env = os.environ.get("DASHBOARD_URL", "").strip()
+    if env:
+        return env.rstrip("/")
+    import platform
+    release = _release if _release is not None else platform.release()
+    if "linuxkit" in release.lower():
+        return DEFAULT_DASHBOARD_URL
+    gw = _default_gateway(_route_file)
+    return f"http://{gw}:5050" if gw else DEFAULT_DASHBOARD_URL
+
+
 def call(op: str, db_path: str = "", **params):
     """Run *op* with *params*; return its result or raise HostDBError."""
     if in_container():
@@ -63,7 +103,7 @@ def _call_local(op: str, db_path: str, params: dict):
 def _call_http(op: str, params: dict, _sleep=time.sleep, _urlopen=None):
     """POST the op to the host. Retries only while the host is unreachable or
     answering 5xx; a 4xx is a bug in the call and is raised immediately."""
-    url = f"{os.environ.get('DASHBOARD_URL', DEFAULT_DASHBOARD_URL)}/api/hostdb/{op}"
+    url = f"{dashboard_url()}/api/hostdb/{op}"
     body = json.dumps(params).encode()
     opener = _urlopen or urllib.request.urlopen
     last = None
