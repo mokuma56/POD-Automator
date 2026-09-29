@@ -3296,7 +3296,8 @@ def phase_scc_reset_check(pod_id: str = "", db_path: str = ""):
     # is blocked by the tunnel. Delegate to the dashboard host process instead.
     if os.path.exists("/.dockerenv"):
         import urllib.request, json as _json
-        dashboard_url = os.environ.get("DASHBOARD_URL", "http://192.168.65.254:5050")
+        import hostdb as _hdb
+        dashboard_url = _hdb.dashboard_url()   # Docker Desktop or Linux host
         try:
             req = urllib.request.Request(
                 f"{dashboard_url}/api/scc/run-check-sync/{pod_id}",
@@ -3678,7 +3679,8 @@ def phase_duo_saml_setup() -> tuple[bool, str]:
     # Full SAML setup via browser (iDAC preferred)
     if os.path.exists("/.dockerenv"):
         import urllib.request, json as _json
-        dashboard_url = os.environ.get("DASHBOARD_URL", "http://192.168.65.254:5050")
+        import hostdb as _hdb
+        dashboard_url = _hdb.dashboard_url()   # Docker Desktop or Linux host
         try:
             req = urllib.request.Request(
                 f"{dashboard_url}/api/duo-saml-setup-sync/{pod_id}",
