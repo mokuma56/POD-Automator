@@ -90,8 +90,23 @@ def test_cdfmc_wait_fits_inside_the_cards_budget():
     block = _cdfmc_wait_block()
     rounds = int(re.search(r"for _round in range\((\d+)\)", block).group(1))
     probes = int(re.search(r"for _probe in range\((\d+)\)", block).group(1))
-    total = rounds * probes * 5 + (rounds - 1) * 10
-    assert total <= 4 * 60, f"Platform Settings wait is {total}s"
+    fresh_signin_s = 90          # new browser + iDAC SCC sign-in + 15s settle
+    total = rounds * probes * 5 + 10 + fresh_signin_s
+    assert total <= 5 * 60, f"Platform Settings wait is {total}s"
     after = _ISE[_ISE.index("cdFMC OTP written to shared volume"):]
     budget = int(re.search(r"_deadline = _t\.time\(\) \+ (\d+)", after).group(1))
     assert total < budget / 2, f"{total}s of a {budget}s card budget"
+
+
+def test_cdfmc_last_round_starts_a_fresh_session():
+    """POD-14, 2026-09-29: two reloads in the same session stayed on the
+    skeleton; a new browser + sign-in (a re-run) rendered at once."""
+    block = _cdfmc_wait_block()
+    last = block[block.index("elif _round == 2:"):block.index("for _probe in range(")]
+    i_close = last.index("browser.close()")
+    i_launch = last.index("browser = p.chromium.launch(")
+    i_signin = last.index("_host_scc_open(browser")
+    i_goto = last.index("page.goto(_fmc_url")
+    assert i_close < i_launch < i_signin < i_goto
+    # The URL is rebuilt from the NEW session's enterprise id.
+    assert last.index("_fmc_url = ") < i_goto
