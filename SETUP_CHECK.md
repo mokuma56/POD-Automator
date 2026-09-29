@@ -200,8 +200,7 @@ or use the dashboard's pre-check (`POST /api/preflight/POD-N`).
 
 | # | Check | Result | Notes |
 |---|---|---|---|
-| 1 | All required commits present | | list any missing |
-| 1 | "Discard a stored Admin API app…" present | | |
+| 1 | On the target commit (or newer), all 10 subjects found | | list any missing |
 | 2 | `uv sync` done / image rebuilt / dashboard restarted | | dates |
 | 2 | Old healthcheck job absent | | |
 | 3.1 | Tests: 1 failed (the known one), rest pass | | counts |
