@@ -93,3 +93,36 @@ def test_supervised_restart_does_not_launch_a_second_dashboard():
     restart = SCRIPT[SCRIPT.index("SUPERVISED=0"):]
     assert "INVOCATION_ID" in restart and "XPC_SERVICE_NAME" in restart
     assert restart.index('if [ "$SUPERVISED" = "0" ]') < restart.index("nohup uv run")
+
+
+def _decide(tmp_path, local_ahead: bool, diverged: bool = False):
+    """Run update.sh's up-to-date decision against a real two-branch repo."""
+    g = lambda *a: subprocess.run(["git", "-C", str(tmp_path), *a], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+    g("init", "-q", "-b", "main"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+    g("commit", "-q", "--allow-empty", "-m", "base"); base = g("rev-parse", "HEAD")
+    g("commit", "-q", "--allow-empty", "-m", "newer"); newer = g("rev-parse", "HEAD")
+    if diverged:
+        g("reset", "-q", "--hard", base); g("commit", "-q", "--allow-empty", "-m", "other")
+        local, remote = g("rev-parse", "HEAD"), newer
+    else:
+        local, remote = (newer, base) if local_ahead else (base, newer)
+        g("reset", "-q", "--hard", local)
+    snippet = _section('if [ "$LOCAL" = "$REMOTE" ]', "log \"Update available")
+    r = subprocess.run(["bash", "-c", f'log(){{ echo "[update] $*"; }}; LOCAL={local}; REMOTE={remote}\n'
+                        + snippet + "echo PROCEED"], cwd=tmp_path, capture_output=True, text=True)
+    return r.stdout
+
+
+def test_a_copy_ahead_of_github_is_not_updated_backwards(tmp_path):
+    out = _decide(tmp_path, local_ahead=True)
+    assert "DONE:no-restart" in out and "PROCEED" not in out
+
+
+def test_github_ahead_is_an_update(tmp_path):
+    assert "PROCEED" in _decide(tmp_path, local_ahead=False)
+
+
+def test_diverged_is_refused(tmp_path):
+    out = _decide(tmp_path, local_ahead=False, diverged=True)
+    assert "ERROR:" in out and "PROCEED" not in out

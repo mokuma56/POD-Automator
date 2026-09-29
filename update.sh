@@ -54,6 +54,19 @@ if [ "$LOCAL" = "$REMOTE" ]; then
     exit 0
 fi
 
+# Only a remote that is AHEAD is an update. "Different" is not enough: a copy
+# deployed ahead of GitHub (2026-09-29, Linux host) was "updated" backwards —
+# nothing pulled, image rebuilt, dashboard restarted for no reason.
+if git merge-base --is-ancestor "$REMOTE" "$LOCAL"; then
+    log "Local $(git rev-parse --short HEAD) is ahead of origin/main $(git rev-parse --short "$REMOTE") — nothing to pull"
+    echo "DONE:no-restart"
+    exit 0
+fi
+if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
+    echo "ERROR:Local $(git rev-parse --short HEAD) and origin/main $(git rev-parse --short "$REMOTE") have diverged — resolve by hand (git log --oneline --graph HEAD origin/main)"
+    exit 1
+fi
+
 log "Update available: $(git rev-parse --short HEAD) → $(git rev-parse --short origin/main)"
 
 # ── 3. Show what changed ─────────────────────────────────────────────────────
