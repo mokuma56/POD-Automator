@@ -1964,6 +1964,26 @@ DUO_SESSION_SCOPED_COLUMNS = (
     "authproxy_enroll_blob", "authproxy_blob_saved_at", "authproxy_sso_cfg",
 )
 
+# What activation + passkey enrolment just produced for the NEW admin. Kept when
+# an old org's Admin API app is discarded (bootstrap), because activation is
+# one-shot and these are the only way back in.
+_ADMIN_LOGIN_COLUMNS = frozenset({
+    "duo_admin_email", "duo_admin_password", "duo_admin_host",
+    "duo_passkey_cred", "duo_passkey_hwm",
+})
+
+
+def _admin_in_api_org(admins: list, email: str) -> bool:
+    """Does this Admin API org list *email* among its admins (case-insensitive)?
+
+    The test for "these API credentials belong to the org whose admin we just
+    activated". An empty list is "no" — an old org's API app answered POD-27's
+    admin listing with 0 admins.
+    """
+    want = (email or "").strip().lower()
+    return bool(want) and any((a.get("email") or "").strip().lower() == want
+                              for a in admins or [])
+
 
 def _idac_duo_email_from_blocks(blocks: list) -> str:
     """The Duo admin email from the iDAC page's leaf text blocks, or ''.
@@ -2937,17 +2957,46 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
             hwm = _pw_read_signcount(cdp3, auth3, base)
 
             if _reuse_api_creds:
-                # The existing Admin API app (verified reachable above) is
-                # still good — only the admin/passkey side was missing, and
-                # creating a second app here would leave the org with two API
-                # apps for no reason. Just bank the fresh signCount.
+                # "Reachable" is not "this org". POD-27, 2026-09-29: org 504's
+                # row carried Admin API creds from a PREVIOUS session's Duo org
+                # (no admin email to compare, so the session check passed) and
+                # that org still answered — so the card activated the new admin
+                # in the new org, then ran every API step against the OLD one
+                # (org_setup: "admins=0, users=8"; June users from another lab;
+                # TOTP "admin not found"). Keep the app only if its org actually
+                # contains the admin we just activated.
+                _admins, _why = [], ""
+                try:
+                    _admins = _duo_request(oc["duo_ikey"], oc["duo_skey"], oc["duo_host"],
+                                           "GET", "/admin/v1/admins").get("response", [])
+                except Exception as _ae:
+                    _why = f"could not list its admins ({str(_ae)[:60]})"
+                if _admin_in_api_org(_admins, email):
+                    # The existing Admin API app is still good — only the
+                    # admin/passkey side was missing, and creating a second
+                    # app here would leave the org with two API apps for no
+                    # reason. Just bank the fresh signCount.
+                    with _sq.connect(db_path) as conn:
+                        conn.execute(
+                            "UPDATE org_credentials SET duo_passkey_hwm=? "
+                            "WHERE org_number=?", (hwm, org_num))
+                    return True, (f"org {org_num}: admin activated + passkey "
+                                  f"enrolled (admin={email}) — kept existing "
+                                  f"Admin API app ikey={oc['duo_ikey']}")
+                _why = _why or (f"its org has {len(_admins)} admin(s) and not {email}")
+                _log(f"org {org_num}: stored Admin API app {oc['duo_ikey']} "
+                     f"({oc['duo_host']}) belongs to a previous Duo org — {_why}. "
+                     f"Clearing that org's API/auth-proxy details and creating a "
+                     f"new Admin API app in this org")
+                _stale = [c for c in DUO_SESSION_SCOPED_COLUMNS
+                          if c not in _ADMIN_LOGIN_COLUMNS]
                 with _sq.connect(db_path) as conn:
+                    _have = {r[1] for r in conn.execute("PRAGMA table_info(org_credentials)")}
+                    _stale = [c for c in _stale if c in _have]
                     conn.execute(
-                        "UPDATE org_credentials SET duo_passkey_hwm=? "
-                        "WHERE org_number=?", (hwm, org_num))
-                return True, (f"org {org_num}: admin activated + passkey "
-                              f"enrolled (admin={email}) — kept existing "
-                              f"Admin API app ikey={oc['duo_ikey']}")
+                        f"UPDATE org_credentials SET "
+                        f"{', '.join(c + '=?' for c in _stale)} WHERE org_number=?",
+                        [(0 if c == 'duo_passkey_hwm' else '') for c in _stale] + [org_num])
 
             api = _pw_create_admin_api_app(page2, admin_host, log=_log)
 
@@ -10315,6 +10364,51 @@ def _pick_sso_test_user(duo_users: list, sa_usernames: list) -> str:
     return (sa_usernames or [""])[0]
 
 
+def _kit_email_from_ad_verify(result: str) -> str:
+    """kit's address from the pipeline's ad_verify result, or ''.
+
+    ad_verify reads AD1 directly and records e.g.
+    "All updated | Kit=kit@rtp10.corp.pseudoco.com [OK] | Lee=...".
+    """
+    m = re.search(r"\bKit=([\w.+-]+@[\w.-]+)", result or "")
+    return m.group(1) if m else ""
+
+
+def _pod_ad_kit_email(pod_id: str, db_path: str, log=None) -> str:
+    """kit's email as THIS POD's Active Directory has it, or '' if unknown.
+
+    From the pipeline's ad_verify result when there is one (free), otherwise
+    straight from AD1 over WinRM — Duo-only PODs never ran the pipeline.
+    """
+    import sqlite3 as _sq
+    _log = log or (lambda m: None)
+    try:
+        with _sq.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT result FROM pipeline_steps WHERE pod_id=? AND step_name='ad_verify'",
+                (pod_id,)).fetchone()
+        email = _kit_email_from_ad_verify(row[0] if row else "")
+        if email:
+            return email
+    except _sq.Error as e:
+        _log(f"could not read ad_verify for {pod_id}: {e}")
+    s = None
+    try:
+        s = _winrm_connect_for_pod(pod_id, log=lambda m: None)
+        r = s.run_ps("(Get-ADUser kit -Properties mail).mail")
+        out = (r.std_out or b"").decode(errors="replace").strip()
+        return out if "@" in out else ""
+    except Exception as e:   # WinRM has many failure types; unknown is fine here
+        _log(f"could not read kit's AD address ({type(e).__name__}: {e})")
+        return ""
+    finally:
+        if s is not None and hasattr(s, "close"):
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
 def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
                        password: str = "", log=None) -> tuple[bool, str]:
     """Run Secure Access's own "Test Configuration" and assert it succeeds.
@@ -10386,6 +10480,17 @@ def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
         except (requests.RequestException, ValueError) as e:
             return False, f"could not read a test user from Secure Access: {e}"
         username = _pick_sso_test_user(duo_users, users)
+        # AD is what the proxy authenticates against, so it has the final say.
+        # POD-27, 2026-09-29: the Duo org held another lab's kit@sjc02 while
+        # POD-27's AD has kit@rtp10 — testing the Duo-side address could only
+        # ever fail "Invalid credentials".
+        ad_kit = _pod_ad_kit_email(pod_id, db_path, log=_log)
+        if ad_kit and ad_kit.lower() != (username or "").lower():
+            if username:
+                _log(f"Duo/Secure Access offer {username} but this POD's AD has "
+                     f"{ad_kit} — testing the AD address (the other is left over "
+                     f"from another lab)")
+            username = ad_kit
     if not username:
         return False, "no provisioned users in Secure Access to test with"
     _log(f"testing as {username}")
