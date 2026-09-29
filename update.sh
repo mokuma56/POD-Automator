@@ -20,6 +20,24 @@ if ! git rev-parse --is-inside-work-tree &>/dev/null; then
     exit 1
 fi
 
+# ── 1b. Refuse while a run is in flight ─────────────────────────────────────
+# Updating restarts the dashboard, which kills every in-flight Duo card and ISE
+# host step (the old 15-minute auto-pull cron on the Linux host did exactly
+# that). Read-only query; the host may read the DB.
+DB="$SCRIPT_DIR/data/pod_state.db"
+if command -v sqlite3 >/dev/null 2>&1 && [ -f "$DB" ]; then
+    BUSY=$(sqlite3 -readonly "$DB" "SELECT group_concat(pod_id||':'||step_name, ', ') FROM (
+        SELECT pod_id, step_name FROM duo_steps WHERE status='running'
+        UNION ALL SELECT pod_id, step_name FROM ise_steps WHERE status='running'
+        UNION ALL SELECT pod_id, step_name FROM pipeline_steps WHERE status='running');" 2>/dev/null || true)
+    if [ -n "$BUSY" ]; then
+        echo "ERROR:Runs in progress ($BUSY) — updating restarts the dashboard and would kill them. Try again when they finish."
+        exit 1
+    fi
+else
+    log "WARNING: sqlite3 not found — cannot check for running steps"
+fi
+
 # ── 2. Fetch without merging so we can compare ───────────────────────────────
 log "Fetching from origin..."
 if ! git fetch origin main 2>&1; then
@@ -56,22 +74,25 @@ else
     log "Dependencies unchanged — skipping uv sync"
 fi
 
-# ── 6. Rebuild Docker image if pipeline code changed ─────────────────────────
-DOCKER_FILES="onboard_router.py onboard.py docker/Dockerfile docker/vpn-entrypoint.sh"
+# ── 6. Rebuild Docker image if any code baked into it changed ────────────────
+# Read the file list from docker/Dockerfile's COPY lines, so it cannot drift
+# from what the image really contains (a hardcoded list missed
+# ise_integrations.py, duo_automation.py, hostdb.py, db_ops.py … and left the
+# image stale). data/ is bind-mounted at run time, so it does not count.
+IMAGE_FILES=$(awk '/^COPY /{for(i=2;i<NF;i++) print $i}' docker/Dockerfile | sed 's#/$##' | grep -vx "data")
 NEED_DOCKER=0
-for f in $DOCKER_FILES; do
-    if echo "$CHANGED" | grep -q "^${f}$"; then
-        NEED_DOCKER=1
-        break
-    fi
-done
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if echo "$CHANGED" | grep -q "^${f}\(/\|$\)"; then NEED_DOCKER=1; log "  image input changed: $f"; fi
+done <<< "$IMAGE_FILES
+docker/Dockerfile"
 
 if [ "$NEED_DOCKER" = "1" ]; then
-    log "Pipeline code changed — rebuilding Docker image (this takes 2-4 minutes)..."
-    docker compose -f docker/docker-compose.yml build 2>&1 | while IFS= read -r line; do log "$line"; done
+    log "Image code changed — rebuilding Docker image (this takes 2-4 minutes)..."
+    docker compose -f docker-compose.yml build 2>&1 | while IFS= read -r line; do log "$line"; done
     log "Docker image rebuilt successfully"
 else
-    log "No pipeline code changes — Docker rebuild not needed"
+    log "No image code changes — Docker rebuild not needed"
 fi
 
 # ── 7. Sync shared Knowledge Base articles ───────────────────────────────────
@@ -82,21 +103,20 @@ uv run python3 kb_sync.py pull 2>&1 | while IFS= read -r line; do log "$line"; d
 log "Update complete. Restarting dashboard in 3 seconds..."
 echo "DONE:restart"
 
-# Detach restart so the SSE response can flush before the process dies
+# Detach restart so the SSE response can flush before the process dies.
+# Under a service manager (systemd sets INVOCATION_ID; a launchd agent sets
+# XPC_SERVICE_NAME) only stop the dashboard — the manager relaunches it.
+# Relaunching it ourselves as well started a second copy outside the manager.
+SUPERVISED=0
+if [ -n "${INVOCATION_ID:-}" ] || { [ -n "${XPC_SERVICE_NAME:-}" ] && [ "${XPC_SERVICE_NAME}" != "0" ]; } \
+   || pgrep -f "run_dashboard.sh" >/dev/null 2>&1; then
+    SUPERVISED=1
+fi
 (
     sleep 3
-    # If launched via run_dashboard.sh the wrapper auto-restarts after kill.
-    # If launched directly, we restart it ourselves.
-    WRAPPER_PID=$(pgrep -f "run_dashboard.sh" | head -1 || true)
-    DASH_PID=$(pgrep -f "python.*dashboard.py" | head -1 || true)
-
-    if [ -n "$DASH_PID" ]; then
-        kill "$DASH_PID" 2>/dev/null || true
-    fi
-
-    # If no wrapper is running, relaunch dashboard directly
-    if [ -z "$WRAPPER_PID" ] && [ -n "$DASH_PID" ]; then
-        sleep 1
+    pkill -f "python3 dashboard.py" 2>/dev/null || true
+    if [ "$SUPERVISED" = "0" ]; then
+        sleep 2
         nohup uv run python3 "$SCRIPT_DIR/dashboard.py" >> "$SCRIPT_DIR/data/dashboard.log" 2>&1 &
     fi
 ) &
