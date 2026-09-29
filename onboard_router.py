@@ -3304,7 +3304,10 @@ def phase_scc_reset_check(pod_id: str = "", db_path: str = ""):
                 headers={"Content-Type": "application/json"},
                 data=b"{}",
             )
-            with urllib.request.urlopen(req, timeout=600) as resp:
+            # 1500s, not 600: the host now queues browser resets
+            # (SCC_RESET_MAX_CONCURRENT in dashboard.py, ~3.5-4 min each), so
+            # a POD finishing alongside others can wait a few rounds first.
+            with urllib.request.urlopen(req, timeout=1500) as resp:
                 data = _json.loads(resp.read())
             return data.get("ok", False), data.get("result", "no result from host")
         except Exception as e:

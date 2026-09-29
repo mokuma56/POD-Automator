@@ -1,6 +1,7 @@
 """POD Dashboard — upload events CSV, start pipelines, monitor live progress."""
 
 import sqlite3, json, threading, csv, io, os, time, sys, subprocess, re
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request, make_response
@@ -2022,8 +2023,20 @@ def api_scc_run_check_sync(pod_id):
     # Phase 2 — 7 browser-based items (runs synchronously so step stays "running"
     # until all 13 items are persisted)
     try:
-        log(pod_id, "[scc-reset] Starting browser reset (7 manual items)...")
-        browser_ok, browser_result = _scc_auto_reset_manual(pod_id, lambda m: log(pod_id, m))
+        # A host browser for ~3.5-4 min. Uncapped, seven pipelines finishing
+        # together opened seven at once on top of any Duo cards. Queue instead;
+        # the pipeline container waits up to 25 min for this request.
+        if not _scc_reset_slots.acquire(blocking=False):
+            log(pod_id, f"[scc-reset] queued for a browser slot "
+                        f"({SCC_RESET_MAX_CONCURRENT} SCC resets run at once)")
+            _scc_reset_slots.acquire()
+        try:
+            _wait_for_host_memory(lambda m: log(pod_id, f"[scc-reset] {m}"),
+                                  "the SCC browser reset")
+            log(pod_id, "[scc-reset] Starting browser reset (7 manual items)...")
+            browser_ok, browser_result = _scc_auto_reset_manual(pod_id, lambda m: log(pod_id, m))
+        finally:
+            _scc_reset_slots.release()
         log(pod_id, f"[scc-reset] Browser reset done: {browser_result}")
     except Exception as e:
         browser_ok, browser_result = False, str(e)
@@ -2945,7 +2958,10 @@ def api_duo_run(pod_id):
         def _log_fn(msg):
             log(pod_id, f"[duo] {msg}")
         try:
-            ok, result = _da_run.duo_run_card(pod_id, db_path, from_step=from_step, log=_log_fn)
+            # Same slot + memory admission as run-pod-full: this path used to
+            # bypass DUO_MAX_CONCURRENT entirely.
+            with _duo_slot(_log_fn):
+                ok, result = _da_run.duo_run_card(pod_id, db_path, from_step=from_step, log=_log_fn)
             log(pod_id, f"[duo] {'OK' if ok else 'FAILED'}: {result}")
         except Exception as e:
             log(pod_id, f"[duo] exception: {e}")
@@ -6421,12 +6437,83 @@ _scc_reset_all_state = {        # track global SCC reset-all progress
 }
 
 
+def _dispatch_host_job(slots, pod_id, name, job, queued_logged, log_prefix, what,
+                       inflight):
+    """Start job() in its own thread when a worker slot is free.
+
+    Returns True if started (caller then removes the trigger file), False if
+    every worker is busy or this POD already has a job in flight — the trigger
+    file stays on disk, so the request stays queued and is picked up on a later
+    pass, still subject to its age limit. Each watcher used to run its host
+    half inline, one POD at a time, so every POD behind the first waited in
+    line (2026-09-28: POD-5 waited 12 min for step 5; step 2 queues risked the
+    5-min drop). One job per POD at a time, so a re-run cannot race itself.
+    """
+    with _host_jobs_lock:
+        if pod_id in inflight:
+            return False
+        if not slots.acquire(blocking=False):
+            if pod_id not in queued_logged:
+                queued_logged.add(pod_id)
+                log(pod_id, f"{log_prefix} queued — all {what} workers busy")
+            return False
+        inflight.add(pod_id)
+        queued_logged.discard(pod_id)
+
+    def _run():
+        try:
+            job()
+        except Exception as _e:
+            try:
+                log(pod_id, f"{log_prefix} worker error: {_e}")
+            except Exception:
+                pass
+        finally:
+            with _host_jobs_lock:
+                inflight.discard(pod_id)
+            slots.release()
+
+    threading.Thread(target=_run, daemon=True, name=f"{name}-{pod_id}").start()
+    return True
+
+
+_host_jobs_lock = threading.Lock()
+
+
+# ISE step 2 host half: ~1.5-2 min per POD (2026-09-28). The card waits 600s
+# for our result, so a request may queue up to SCC_OTP_MAX_AGE_S; it used to be
+# dropped silently at 300s — earlier than the card itself gives up.
+SCC_NAV_WORKERS = 2
+SCC_OTP_MAX_AGE_S = 540
+_scc_nav_slots = threading.Semaphore(SCC_NAV_WORKERS)
+_scc_nav_inflight = set()
+
+
+def _scc_nav_job(_pod_id, _otp):
+    log(_pod_id, f"[scc-nav] Watcher picked up OTP for {_pod_id} — running host SCC nav")
+    # No longer gated on the session file existing: _host_scc_open
+    # mints a fresh session from the org's iDAC URL and only falls
+    # back to this file. Refusing here was what turned a missing
+    # 12-hour session into "No SCC session file for POD-xx" on
+    # three of the five ISE steps.
+    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
+    _ok, _msg = _host_scc_integrate(_pod_id, _otp, str(_session_path),
+                                    lambda m: log(_pod_id, m))
+    _res = {"ok": _ok, "message": _msg}
+    log(_pod_id, f"[scc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+    # Write result for container to pick up
+    _result_path = DATA_DIR / "data" / f"ise_scc_result_{_pod_id}.json"
+    _result_path.write_text(json.dumps(_res))
+
+
 def _scc_otp_watcher():
     """Background thread: watch for ise_scc_otp_*.json files written by Docker container.
     When found, run SCC Playwright nav on host (outside VPN), write result file.
     Uses shared volume /pipeline/host-data/ = data/ on host.
+    Up to SCC_NAV_WORKERS PODs are handled at once.
     """
     import glob as _glob
+    _queued = set()
     while True:
         try:
             for _otp_file in _glob.glob(str(DATA_DIR / "data" / "ise_scc_otp_*.json")):
@@ -6437,26 +6524,20 @@ def _scc_otp_watcher():
                     _ts = _data.get("ts", 0)
                     if not _pod_id or not _otp:
                         continue
-                    # Ignore stale files older than 5 min
-                    if time.time() - _ts > 300:
+                    _age = time.time() - _ts
+                    if _age > SCC_OTP_MAX_AGE_S:
                         Path(_otp_file).unlink(missing_ok=True)
+                        _queued.discard(_pod_id)
+                        log(_pod_id, f"[scc-nav] dropped an OTP request that waited "
+                                     f"{int(_age)}s (limit {SCC_OTP_MAX_AGE_S}s) — "
+                                     f"re-run ISE step 2")
                         continue
-                    # Remove signal file immediately so we don't process twice
-                    Path(_otp_file).unlink(missing_ok=True)
-                    log(_pod_id, f"[scc-nav] Watcher picked up OTP for {_pod_id} — running host SCC nav")
-                    # No longer gated on the session file existing: _host_scc_open
-                    # mints a fresh session from the org's iDAC URL and only falls
-                    # back to this file. Refusing here was what turned a missing
-                    # 12-hour session into "No SCC session file for POD-xx" on
-                    # three of the five ISE steps.
-                    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
-                    _ok, _msg = _host_scc_integrate(_pod_id, _otp, str(_session_path),
-                                                    lambda m: log(_pod_id, m))
-                    _res = {"ok": _ok, "message": _msg}
-                    log(_pod_id, f"[scc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
-                    # Write result for container to pick up
-                    _result_path = DATA_DIR / "data" / f"ise_scc_result_{_pod_id}.json"
-                    _result_path.write_text(json.dumps(_res))
+                    if _dispatch_host_job(_scc_nav_slots, _pod_id, "scc-nav",
+                                          lambda p=_pod_id, o=_otp: _scc_nav_job(p, o),
+                                          _queued, "[scc-nav]", "SCC nav",
+                                          _scc_nav_inflight):
+                        # Remove signal file so we don't process twice
+                        Path(_otp_file).unlink(missing_ok=True)
                 except Exception as _e:
                     try:
                         log("SCC_WATCHER", f"[scc-nav] watcher error processing {_otp_file}: {_e}")
@@ -6788,8 +6869,9 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             if not _btn_seen:
                 page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_no_button_{pod_id}.png"))
                 return False, ("Platform Settings control never rendered on the SCC FMC "
-                               f"app page after ~{_waited}s and 2 reloads — the page was "
-                               "still loading, so there was nothing to click")
+                               f"app page after ~{_waited}s, a reload and a fresh browser "
+                               "sign-in — the page was still loading, so there was "
+                               "nothing to click")
             log_fn(f"[cdfmc-nav] Platform Settings control present after ~{_waited}s")
 
             log_fn("[cdfmc-nav] Opening cdFMC tab via Platform Settings (expect_popup)...")
@@ -7459,11 +7541,47 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                 pass
 
 
+# ISE step 4 host half: ~1.5-3 min per POD (2026-09-28; up to ~2.5 min more if
+# the FMC page needs its reloads). The card waits 600s for our result.
+CDFMC_NAV_WORKERS = 2
+CDFMC_OTP_MAX_AGE_S = 600
+_cdfmc_nav_slots = threading.Semaphore(CDFMC_NAV_WORKERS)
+_cdfmc_nav_inflight = set()
+
+
+def _cdfmc_nav_job(_pod_id, _otp, _iname):
+    log(_pod_id, f"[cdfmc-nav] Watcher picked up OTP for {_pod_id}")
+    # Not gated on the file: _host_scc_open mints a fresh
+    # iDAC session and only falls back to it.
+    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
+    _ok, _msg = _host_cdfmc_integrate(
+        _pod_id, _otp, _iname, str(_session_path),
+        lambda m: log(_pod_id, m),
+    )
+    _res = {"ok": _ok, "message": _msg}
+    log(_pod_id, f"[cdfmc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+    # Absolute + atomic. DATA_DIR is Path(__file__).parent, which is
+    # RELATIVE when the dashboard is started as `python3 dashboard.py`,
+    # so every write here depended on the process CWD. Write via a
+    # temp file + os.replace so the container can never observe a
+    # half-written file, then confirm it landed -- on 2026-08-31 the
+    # nav reported OK at 15:34:48 and the container still timed out at
+    # 15:38:15 having never seen a result, with no traceback anywhere.
+    _result_path = (DATA_DIR / "data").resolve() / f"ise_cdfmc_result_{_pod_id}.json"
+    _tmp = _result_path.with_suffix(".json.tmp")
+    _tmp.write_text(json.dumps(_res))
+    os.replace(str(_tmp), str(_result_path))
+    log(_pod_id, f"[cdfmc-nav] result written to {_result_path} "
+                 f"(exists={_result_path.exists()})")
+
+
 def _cdfmc_otp_watcher():
     """Background thread: watch for ise_cdfmc_otp_*.json written by Docker step 4.
     Runs _host_cdfmc_integrate on the host (outside Docker VPN) and writes result file.
+    Up to CDFMC_NAV_WORKERS PODs are handled at once.
     """
     import glob as _glob
+    _queued = set()
     while True:
         try:
             for _otp_file in _glob.glob(str(DATA_DIR / "data" / "ise_cdfmc_otp_*.json")):
@@ -7475,33 +7593,19 @@ def _cdfmc_otp_watcher():
                     _ts          = _data.get("ts", 0)
                     if not _pod_id or not _otp:
                         continue
-                    if time.time() - _ts > 600:  # 10 min stale
+                    _age = time.time() - _ts
+                    if _age > CDFMC_OTP_MAX_AGE_S:
                         Path(_otp_file).unlink(missing_ok=True)
+                        _queued.discard(_pod_id)
+                        log(_pod_id, f"[cdfmc-nav] dropped an OTP request that waited "
+                                     f"{int(_age)}s (limit {CDFMC_OTP_MAX_AGE_S}s) — "
+                                     f"re-run ISE step 4")
                         continue
-                    Path(_otp_file).unlink(missing_ok=True)
-                    log(_pod_id, f"[cdfmc-nav] Watcher picked up OTP for {_pod_id}")
-                    # Not gated on the file: _host_scc_open mints a fresh
-                    # iDAC session and only falls back to it.
-                    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
-                    _ok, _msg = _host_cdfmc_integrate(
-                        _pod_id, _otp, _iname, str(_session_path),
-                        lambda m: log(_pod_id, m),
-                    )
-                    _res = {"ok": _ok, "message": _msg}
-                    log(_pod_id, f"[cdfmc-nav] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
-                    # Absolute + atomic. DATA_DIR is Path(__file__).parent, which is
-                    # RELATIVE when the dashboard is started as `python3 dashboard.py`,
-                    # so every write here depended on the process CWD. Write via a
-                    # temp file + os.replace so the container can never observe a
-                    # half-written file, then confirm it landed -- on 2026-08-31 the
-                    # nav reported OK at 15:34:48 and the container still timed out at
-                    # 15:38:15 having never seen a result, with no traceback anywhere.
-                    _result_path = (DATA_DIR / "data").resolve() / f"ise_cdfmc_result_{_pod_id}.json"
-                    _tmp = _result_path.with_suffix(".json.tmp")
-                    _tmp.write_text(json.dumps(_res))
-                    os.replace(str(_tmp), str(_result_path))
-                    log(_pod_id, f"[cdfmc-nav] result written to {_result_path} "
-                                 f"(exists={_result_path.exists()})")
+                    if _dispatch_host_job(_cdfmc_nav_slots, _pod_id, "cdfmc-nav",
+                                          lambda p=_pod_id, o=_otp, n=_iname: _cdfmc_nav_job(p, o, n),
+                                          _queued, "[cdfmc-nav]", "cdFMC nav",
+                                          _cdfmc_nav_inflight):
+                        Path(_otp_file).unlink(missing_ok=True)
                 except Exception as _e:
                     try:
                         log("CDFMC_WATCHER", f"[cdfmc-nav] watcher error: {_e}")
@@ -7523,6 +7627,12 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
 
     Checks every 5 min up to 20 min total (4 checks). Logs elapsed time.
     If skip_wait=True, checks immediately with no propagation wait (for recheck button).
+
+    A browser is open only DURING a check (~30-60s): each check opens its own
+    SCC session and closes it again. It used to hold one Chromium for the whole
+    up-to-20-min wait, idle almost all of it (2026-09-28: 5.5-11 min per POD) —
+    ~0.5 GB of host memory per waiting POD, which is what made running PODs in
+    parallel here expensive.
     """
     import re as _re, time as _t
     from playwright.sync_api import sync_playwright
@@ -7530,114 +7640,161 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
     MAX_WAIT    = 20 * 60   # 20 min total
     INTERVAL    = 5  * 60   # check every 5 min
 
-    # The SGT URL needs the enterprise id. That used to be dug out of a stored
-    # session file's localStorage, which meant this step could not run at all
-    # without a fresh scc_session_<POD>.json. It now comes from the session we
-    # open below, so the URL is built once that session exists.
-    sgt_url = ""
-
-    def _navigate_and_count(page) -> tuple:
-        """Go to SGT page, return (ok, count).  ok=None means session expired."""
-        page.goto(sgt_url, wait_until="domcontentloaded", timeout=60000)
+    def _check_once(tag: str) -> tuple:
+        """One check in a fresh browser. Returns (ok, count); ok=None means the
+        SCC session could not be established. Raises on anything else."""
+        browser = page = None
         try:
-            page.wait_for_load_state("networkidle", timeout=15000)
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                ctx, page, _eid = _host_scc_open(browser, pod_id, log_fn, session_path)
+                # The SGT URL needs the enterprise id, which comes from the
+                # session just opened (no stored scc_session file needed).
+                sgt_url = (
+                    f"https://security.cisco.com/secure-access/org/{sa_org_id}"
+                    f"/resources/securitygrouptags"
+                    + (f"?enterpriseId={_eid}" if _eid else "")
+                )
+                log_fn(f"[sgt-verify] SGT URL: {sgt_url}")
+                page.goto(sgt_url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(3000)
+                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_{tag}_{pod_id}.png"))
+                if "sign-on" in page.url.lower():
+                    return None, 0
+                body = page.inner_text("body")
+                m = _re.search(r'(\d+)\s+total', body, _re.IGNORECASE)
+                count = int(m.group(1)) if m else 0
+                if count == 0:
+                    try:
+                        count = page.locator("table tbody tr").count()
+                    except Exception:
+                        pass
+                return count > 0, count
         except Exception:
-            pass
-        page.wait_for_timeout(3000)
-        if "sign-on" in page.url.lower():
-            return None, 0
-        body = page.inner_text("body")
-        m = _re.search(r'(\d+)\s+total', body, _re.IGNORECASE)
-        count = int(m.group(1)) if m else 0
-        if count == 0:
-            try:
-                count = page.locator("table tbody tr").count()
-            except Exception:
-                pass
-        return count > 0, count
+            if page:
+                try:
+                    page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_error_{pod_id}.png"))
+                except Exception:
+                    pass
+            raise
+        finally:
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
-    browser = None
-    page    = None
+    _no_session = ("SCC session could not be established — check that this POD's "
+                   "org has an idac_url set in Org Credentials")
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx, page, _eid = _host_scc_open(browser, pod_id, log_fn, session_path)
-            sgt_url = (
-                f"https://security.cisco.com/secure-access/org/{sa_org_id}"
-                f"/resources/securitygrouptags"
-                + (f"?enterpriseId={_eid}" if _eid else "")
-            )
-            log_fn(f"[sgt-verify] SGT URL: {sgt_url}")
+        if skip_wait:
+            # ── Immediate recheck — no propagation wait ───────────────────────
+            log_fn("[sgt-verify] Immediate recheck — querying SGTs now...")
+            ok, count = _check_once("recheck")
+            if ok is None:
+                return False, _no_session
+            if ok:
+                log_fn(f"[sgt-verify] ✓ Found {count} SGTs")
+                return True, f"SGT verify passed: {count} Security Group Tags found in Secure Access"
+            return True, f"WARN: No SGTs found — ISE→SCC integration may not be active yet"
 
-            if skip_wait:
-                # ── Immediate recheck — no propagation wait ───────────────────
-                log_fn("[sgt-verify] Immediate recheck — querying SGTs now...")
-                ok, count = _navigate_and_count(page)
-                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_recheck_{pod_id}.png"))
-                if ok is None:
-                    return False, "SCC session could not be established — check that this POD's org has an idac_url set in Org Credentials"
-                if ok:
-                    log_fn(f"[sgt-verify] ✓ Found {count} SGTs")
-                    return True, f"SGT verify passed: {count} Security Group Tags found in Secure Access"
-                return True, f"WARN: No SGTs found — ISE→SCC integration may not be active yet"
-
-            # ── Check every 5 min up to 20 min ───────────────────────────────
-            log_fn(f"[sgt-verify] Checking every 5 min up to 20 min (4 checks)...")
-            start = _t.time()
-            for check_num in range(1, 5):   # checks at 5, 10, 15, 20 min
-                next_check_at = check_num * INTERVAL
-                # Wait with elapsed logging every 60s
-                while True:
-                    elapsed = _t.time() - start
-                    if elapsed >= next_check_at:
-                        break
-                    e_mins, e_secs = divmod(int(elapsed), 60)
-                    log_fn(f"[sgt-verify] Elapsed {e_mins:02d}:{e_secs:02d} — next check at {check_num*5} min...")
-                    wake = min(_t.time() + 60, start + next_check_at)
-                    while _t.time() < wake:
-                        _t.sleep(2)
-
+        # ── Check every 5 min up to 20 min ───────────────────────────────────
+        log_fn(f"[sgt-verify] Checking every 5 min up to 20 min (4 checks)...")
+        start = _t.time()
+        for check_num in range(1, 5):   # checks at 5, 10, 15, 20 min
+            next_check_at = check_num * INTERVAL
+            # Wait with elapsed logging every 60s — no browser open meanwhile.
+            while True:
                 elapsed = _t.time() - start
+                if elapsed >= next_check_at:
+                    break
                 e_mins, e_secs = divmod(int(elapsed), 60)
-                log_fn(f"[sgt-verify] Check {check_num}/4 at {e_mins:02d}:{e_secs:02d} elapsed...")
-                ok, count = _navigate_and_count(page)
-                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_check{check_num}_{pod_id}.png"))
+                log_fn(f"[sgt-verify] Elapsed {e_mins:02d}:{e_secs:02d} — next check at {check_num*5} min...")
+                wake = min(_t.time() + 60, start + next_check_at)
+                while _t.time() < wake:
+                    _t.sleep(2)
 
-                if ok is None:
-                    return False, "SCC session could not be established — check that this POD's org has an idac_url set in Org Credentials"
-                if ok:
-                    log_fn(f"[sgt-verify] ✓ Found {count} SGTs at check {check_num} ({e_mins:02d}:{e_secs:02d} elapsed)")
-                    return True, f"SGT verify passed: {count} Security Group Tags found after {e_mins}m{e_secs:02d}s"
+            elapsed = _t.time() - start
+            e_mins, e_secs = divmod(int(elapsed), 60)
+            log_fn(f"[sgt-verify] Check {check_num}/4 at {e_mins:02d}:{e_secs:02d} elapsed...")
+            ok, count = _check_once(f"check{check_num}")
 
-                log_fn(f"[sgt-verify] No SGTs yet (count={count}) — next check in 5 min...")
+            if ok is None:
+                return False, _no_session
+            if ok:
+                log_fn(f"[sgt-verify] ✓ Found {count} SGTs at check {check_num} ({e_mins:02d}:{e_secs:02d} elapsed)")
+                return True, f"SGT verify passed: {count} Security Group Tags found after {e_mins}m{e_secs:02d}s"
 
-            log_fn(f"[sgt-verify] ⚠ WARN: No SGTs after 20 min — check ISE → cdFMC integration")
-            return True, (
-                f"WARN: No SGTs in Secure Access after 20 min — "
-                f"check ISE→cdFMC integration (screenshot: sgt_verify_check4_{pod_id}.png)"
-            )
+            log_fn(f"[sgt-verify] No SGTs yet (count={count}) — next check in 5 min...")
+
+        log_fn(f"[sgt-verify] ⚠ WARN: No SGTs after 20 min — check ISE → cdFMC integration")
+        return True, (
+            f"WARN: No SGTs in Secure Access after 20 min — "
+            f"check ISE→cdFMC integration (screenshot: sgt_verify_check4_{pod_id}.png)"
+        )
 
     except Exception as _e:
         log_fn(f"[sgt-verify] Exception: {_e}")
-        if page:
-            try:
-                page.screenshot(path=str(DATA_DIR / "data" / f"sgt_verify_error_{pod_id}.png"))
-            except Exception:
-                pass
         return False, f"SGT verify exception: {_e}"
-    finally:
-        if browser:
-            try:
-                browser.close()
-            except Exception:
-                pass
+
+
+# ISE step 5 host half. Mostly waiting (checks at 5/10/15/20 min) with no
+# browser open between checks, so several PODs can run at once cheaply. It
+# used to be one POD at a time: POD-5 queued 12 min on 2026-09-28, and the card
+# only waits 45 min in total (the trigger itself is dropped after 40).
+SGT_VERIFY_WORKERS = 6
+SGT_TRIGGER_MAX_AGE_S = 2400
+_sgt_slots = threading.Semaphore(SGT_VERIFY_WORKERS)
+_sgt_inflight = set()
+
+
+def _sgt_verify_job(_pod_id, _sa_org):
+    log(_pod_id, f"[sgt-verify] Watcher picked up SGT trigger for {_pod_id}")
+    # Mark step as running immediately so dashboard shows progress
+    _ensure_ise_table()
+    _dbc = _db()
+    _dbc.execute(
+        "INSERT INTO ise_steps (pod_id, step_name, status, result, started_at) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(pod_id,step_name) DO UPDATE SET "
+        "status=excluded.status, result=excluded.result, started_at=excluded.started_at",
+        (_pod_id, "ise_sgt_verify", "running",
+         "SGT verify in progress — waiting up to 20 min for SGTs to propagate...",
+         datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+    )
+    _dbc.commit(); _dbc.close()
+    # Not gated on the file: _host_scc_open mints a fresh
+    # iDAC session and only falls back to it.
+    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
+    _ok, _msg = _host_sgt_verify(
+        _pod_id, _sa_org, str(_session_path),
+        lambda m: log(_pod_id, m),
+    )
+    _res = {"ok": _ok, "message": _msg}
+    log(_pod_id, f"[sgt-verify] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
+    # Update final status in ise_steps
+    _dbc2 = _db()
+    _dbc2.execute(
+        "UPDATE ise_steps SET status=?, result=?, completed_at=? "
+        "WHERE pod_id=? AND step_name='ise_sgt_verify'",
+        ("completed" if _res["ok"] else "failed", _res["message"],
+         datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), _pod_id)
+    )
+    _dbc2.commit(); _dbc2.close()
+    _result_path = DATA_DIR / "data" / f"ise_sgt_result_{_pod_id}.json"
+    Path(_result_path).write_text(json.dumps(_res))
 
 
 def _sgt_verify_watcher():
     """Background thread: watch for ise_sgt_trigger_{pod_id}.json written by Docker step 5.
     Calls _host_sgt_verify (with countdown + Playwright) and writes ise_sgt_result_{pod_id}.json.
+    Up to SGT_VERIFY_WORKERS PODs are verified at once.
     """
     import glob as _glob
+    _queued = set()
     while True:
         try:
             for _trig_file in _glob.glob(str(DATA_DIR / "data" / "ise_sgt_trigger_*.json")):
@@ -7648,43 +7805,18 @@ def _sgt_verify_watcher():
                     _ts      = _data.get("ts", 0)
                     if not _pod_id or not _sa_org:
                         continue
-                    if time.time() - _ts > 2400:   # 40 min stale guard
+                    _age = time.time() - _ts
+                    if _age > SGT_TRIGGER_MAX_AGE_S:   # 40 min stale guard
                         Path(_trig_file).unlink(missing_ok=True)
+                        _queued.discard(_pod_id)
+                        log(_pod_id, f"[sgt-verify] dropped an SGT trigger that waited "
+                                     f"{int(_age)}s (limit {SGT_TRIGGER_MAX_AGE_S}s)")
                         continue
-                    Path(_trig_file).unlink(missing_ok=True)
-                    log(_pod_id, f"[sgt-verify] Watcher picked up SGT trigger for {_pod_id}")
-                    # Mark step as running immediately so dashboard shows progress
-                    _ensure_ise_table()
-                    _dbc = _db()
-                    _dbc.execute(
-                        "INSERT INTO ise_steps (pod_id, step_name, status, result, started_at) "
-                        "VALUES (?,?,?,?,?) ON CONFLICT(pod_id,step_name) DO UPDATE SET "
-                        "status=excluded.status, result=excluded.result, started_at=excluded.started_at",
-                        (_pod_id, "ise_sgt_verify", "running",
-                         "SGT verify in progress — waiting up to 20 min for SGTs to propagate...",
-                         datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
-                    )
-                    _dbc.commit(); _dbc.close()
-                    # Not gated on the file: _host_scc_open mints a fresh
-                    # iDAC session and only falls back to it.
-                    _session_path = DATA_DIR / "data" / f"scc_session_{_pod_id}.json"
-                    _ok, _msg = _host_sgt_verify(
-                        _pod_id, _sa_org, str(_session_path),
-                        lambda m: log(_pod_id, m),
-                    )
-                    _res = {"ok": _ok, "message": _msg}
-                    log(_pod_id, f"[sgt-verify] {'OK' if _res['ok'] else 'FAIL'}: {_res['message']}")
-                    # Update final status in ise_steps
-                    _dbc2 = _db()
-                    _dbc2.execute(
-                        "UPDATE ise_steps SET status=?, result=?, completed_at=? "
-                        "WHERE pod_id=? AND step_name='ise_sgt_verify'",
-                        ("completed" if _res["ok"] else "failed", _res["message"],
-                         datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), _pod_id)
-                    )
-                    _dbc2.commit(); _dbc2.close()
-                    _result_path = DATA_DIR / "data" / f"ise_sgt_result_{_pod_id}.json"
-                    Path(_result_path).write_text(json.dumps(_res))
+                    if _dispatch_host_job(_sgt_slots, _pod_id, "sgt-verify",
+                                          lambda p=_pod_id, o=_sa_org: _sgt_verify_job(p, o),
+                                          _queued, "[sgt-verify]", "SGT verify",
+                                          _sgt_inflight):
+                        Path(_trig_file).unlink(missing_ok=True)
                 except Exception as _e:
                     try:
                         log("SGT_WATCHER", f"[sgt-verify] watcher error: {_e}")
@@ -9338,14 +9470,88 @@ def run_pod(pod_id):
 # host-side Playwright do not compete for the same RAM:
 #
 #   pipeline  -> containers, ~280MB each measured, bounded by Docker's cap
-#   Duo       -> host Chromium, ~432MB measured for one browser+page, so budget
-#                ~700MB per POD once the SCC tab and virtual authenticator are
-#                open. Bounded by DUO_MAX_CONCURRENT below.
+#   Duo       -> host Chromium: ~1 GB peak per card MEASURED (0.9-1.4 GB alone,
+#                4.5-5.1 GB for five at once; the ~700MB first estimated was
+#                low). Bounded by DUO_MAX_CONCURRENT + the memory gate below.
 #
 # 30 PODs serialised on Duo would take ~12.5 hours, which is why this is a
 # semaphore and not a lock.
 DUO_MAX_CONCURRENT = 5
 _duo_slots = threading.Semaphore(DUO_MAX_CONCURRENT)
+
+# ── Host-browser admission (2026-09-28 re-measure) ────────────────────────────
+# Measured, not estimated: one Duo card peaks at ~0.9-1.4 GB of host Chromium
+# and five at once peaked at 4.5-5.1 GB (failure_events "peak host Chromium
+# RSS", Sep 1-21) — ~1 GB per card, not the ~700MB assumed above. On this Mac
+# (24 GB; Docker Desktop's VM holds 7.75 GB; desktop apps ~3-4 GB; wired ~3 GB)
+# that leaves roughly 8 GB for host Chromium, shared by Duo cards, SCC resets
+# (~3.5-4 min each) and the ISE host halves (steps 2, 4, 5 — one browser each).
+#
+# Fixed caps bound the worst case; this gate adapts to what else the Mac is
+# doing: a new host-browser run waits while the kernel reports less than
+# HOST_MEM_FREE_MIN_PCT free (kern.memorystatus_level, the figure
+# memory_pressure prints). It holds its slot while it waits, so the caps still
+# bound the total.
+HOST_MEM_FREE_MIN_PCT = 20
+SCC_RESET_MAX_CONCURRENT = 3
+_scc_reset_slots = threading.Semaphore(SCC_RESET_MAX_CONCURRENT)
+
+
+def _host_mem_free_pct():
+    """macOS's own free-memory percentage, or None if it cannot be read."""
+    try:
+        r = subprocess.run(["sysctl", "-n", "kern.memorystatus_level"],
+                           capture_output=True, text=True, timeout=5)
+        return int(r.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _wait_for_host_memory(log_fn, what, _read=None, _sleep=None, poll_s=15):
+    """Block until the host has room for another browser run.
+
+    Unknown memory never blocks (a check that cannot run is not a failed
+    check — same rule as _preflight_gate). Returns seconds waited.
+    """
+    read = _read or _host_mem_free_pct
+    sleep = _sleep or time.sleep
+    waited = 0
+    while True:
+        pct = read()
+        if pct is None or pct >= HOST_MEM_FREE_MIN_PCT:
+            if waited:
+                log_fn(f"host memory back to {pct}% free — starting {what} "
+                       f"after waiting {waited}s")
+            return waited
+        if waited % 60 == 0:
+            log_fn(f"waiting for host memory before starting {what}: {pct}% free "
+                   f"(needs {HOST_MEM_FREE_MIN_PCT}%)")
+        sleep(poll_s)
+        waited += poll_s
+
+
+@contextmanager
+def _duo_slot(log_fn):
+    """Hold one Duo slot (and enough host memory) for the length of a Duo card.
+
+    EVERY Duo start must come through here. /api/duo/run — the Duo card's own
+    Run button — used to call duo_run_card directly, so DUO_MAX_CONCURRENT only
+    ever bounded runs started by run-pod-full, and five-plus cards launched from
+    their cards ran unbounded.
+    """
+    global _duo_slots_held
+    if not _duo_slots.acquire(blocking=False):
+        log_fn(f"queued for a Duo slot ({DUO_MAX_CONCURRENT} run at once)")
+        _duo_slots.acquire()
+    with _duo_slots_lock:
+        _duo_slots_held += 1
+    try:
+        _wait_for_host_memory(log_fn, "the Duo card")
+        yield
+    finally:
+        with _duo_slots_lock:
+            _duo_slots_held = max(0, _duo_slots_held - 1)
+        _duo_slots.release()
 
 # How many Duo slots are actually held, tracked explicitly.
 #
@@ -9561,43 +9767,35 @@ def _run_full_automation(pod_id: str, addons: list, skip_preflight: bool = False
 
     if "duo" in addons:
         # Host-side Playwright: hold a slot for the whole card.
-        waiting = not _duo_slots.acquire(blocking=False)
-        if waiting:
-            _log(f"queued for a Duo slot ({DUO_MAX_CONCURRENT} run at once)")
-            _duo_slots.acquire()
-        global _duo_slots_held
-        with _duo_slots_lock:
-            _duo_slots_held += 1
-        # Sample the peak DURING the card, not before it. Reading RSS on the way
-        # in reports 0 MB, because Playwright has not launched yet — useless for
-        # sizing DUO_MAX_CONCURRENT, which is the whole reason for measuring.
-        _peak = {"mb": 0.0}
-        _stop_sampling = threading.Event()
+        with _duo_slot(_log):
+            # Sample the peak DURING the card, not before it. Reading RSS on the
+            # way in reports 0 MB, because Playwright has not launched yet —
+            # useless for sizing DUO_MAX_CONCURRENT, which is the whole reason
+            # for measuring.
+            _peak = {"mb": 0.0}
+            _stop_sampling = threading.Event()
 
-        def _sample():
-            while not _stop_sampling.wait(15):
+            def _sample():
+                while not _stop_sampling.wait(15):
+                    _peak["mb"] = max(_peak["mb"], _peak_rss_mb())
+
+            _sampler = threading.Thread(target=_sample, daemon=True)
+            _sampler.start()
+            try:
+                _log("Duo card starting")
+                import duo_automation as _da
+                d_ok, d_msg = _da.duo_run_card(
+                    pod_id, str(DB_PATH), from_step=0,
+                    log=lambda m: log(pod_id, f"[duo] {m}"))
+                _log(f"Duo {'OK' if d_ok else 'FAILED'}: {d_msg}")
+            except Exception as e:
+                _log(f"Duo exception: {e}")
+            finally:
+                _stop_sampling.set()
                 _peak["mb"] = max(_peak["mb"], _peak_rss_mb())
-
-        _sampler = threading.Thread(target=_sample, daemon=True)
-        _sampler.start()
-        try:
-            _log("Duo card starting")
-            import duo_automation as _da
-            d_ok, d_msg = _da.duo_run_card(
-                pod_id, str(DB_PATH), from_step=0,
-                log=lambda m: log(pod_id, f"[duo] {m}"))
-            _log(f"Duo {'OK' if d_ok else 'FAILED'}: {d_msg}")
-        except Exception as e:
-            _log(f"Duo exception: {e}")
-        finally:
-            _stop_sampling.set()
-            _peak["mb"] = max(_peak["mb"], _peak_rss_mb())
-            _log(f"peak host Chromium RSS during Duo: {_peak['mb']:.0f} MB "
-                 f"(all Chromium on this host, so with N concurrent this is the "
-                 f"combined figure)")
-            with _duo_slots_lock:
-                _duo_slots_held = max(0, _duo_slots_held - 1)
-            _duo_slots.release()
+                _log(f"peak host Chromium RSS during Duo: {_peak['mb']:.0f} MB "
+                     f"(all Chromium on this host, so with N concurrent this is "
+                     f"the combined figure)")
 
     if "ise" in addons:
         # Partly container-side, but NOT free of host browsers: steps 2, 4 and 5
