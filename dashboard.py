@@ -6842,19 +6842,51 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             # plain re-run moments later rendered at once. A fresh navigation
             # gets past a render that never completes — the same finding as
             # _sa_config_page's one-reload retry — so poll, reload, poll again.
-            # 3 rounds x ~45s stays well inside the card's 10-min wait for us.
+            #
+            # And a reload is not always enough either: POD-14 (org 530,
+            # 2026-09-29) stayed on the skeleton through two reloads in the SAME
+            # browser/sign-in, then a re-run minutes later — new browser, new
+            # iDAC sign-in — rendered and finished in ~2 min. The stuck state
+            # follows the session, so the last round starts a fresh one.
+            # Rounds: poll | reload + poll | new browser + sign-in + poll.
+            # ~3.5-4 min worst case, inside the card's 10-min wait for us.
             _btn_seen = False
             _waited = 0
             for _round in range(3):
-                if _round:
+                if _round == 1:
                     log_fn(f"[cdfmc-nav] Platform Settings not rendered after ~{_waited}s — "
-                           f"reloading the FMC app page (round {_round + 1}/3)")
+                           f"reloading the FMC app page (round 2/3)")
                     try:
                         page.goto(_fmc_url, wait_until="domcontentloaded", timeout=60000)
                     except Exception as _re:
                         log_fn(f"[cdfmc-nav] reload exception: {_re}")
                     page.wait_for_timeout(10000)
                     _waited += 10
+                elif _round == 2:
+                    log_fn(f"[cdfmc-nav] Platform Settings not rendered after ~{_waited}s "
+                           f"and a reload — starting a fresh browser and SCC sign-in "
+                           f"(round 3/3)")
+                    try:
+                        page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_stuck_session_{pod_id}.png"))
+                    except Exception:
+                        pass
+                    _t_fresh = time.time()
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    # Reassigned, so the finally below closes the NEW browser.
+                    browser = p.chromium.launch(headless=True,
+                        args=["--disable-popup-blocking", "--no-sandbox", "--disable-dev-shm-usage"])
+                    ctx, page, _eid = _host_scc_open(browser, pod_id, log_fn, session_path)
+                    _fmc_url = (f"https://security.cisco.com/firewalls/applications/FMC/?enterpriseId={_eid}"
+                                if _eid else "https://security.cisco.com/firewalls/applications/FMC/")
+                    try:
+                        page.goto(_fmc_url, wait_until="domcontentloaded", timeout=60000)
+                    except Exception as _re:
+                        log_fn(f"[cdfmc-nav] fresh-session goto exception: {_re}")
+                    page.wait_for_timeout(15000)
+                    _waited += int(time.time() - _t_fresh)
                 for _probe in range(9):       # ~45s per round
                     try:
                         if page.evaluate(_JS_FIND_HBR, "Platform Settings"):
