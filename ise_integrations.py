@@ -4812,30 +4812,67 @@ async def _scc_open_session_async(ctx, idac_url: str, log, db_path: str = ""):
     except hostdb.HostDBError as e:
         log(f"could not read known org uuids ({e}) — not guessing an enterprise id")
 
+    def _is_signon(u):
+        h = _host(u)
+        return h.startswith("sign-on") and h.endswith("security.cisco.com")
+
+    async def _settle(tab, probes):
+        for _ in range(probes):
+            if "enterpriseId=" in tab.url or _is_scc(tab.url):
+                return
+            await tab.wait_for_timeout(5_000)
+
+    async def _close(tab):
+        try:
+            await tab.close()
+        except Exception:
+            pass
+
     attempts = []
     for _c in cands:
         _label, _sect = _c.get("label"), _c.get("section") or "no section"
-        try:
-            async with ctx.expect_page(timeout=45_000) as info:
-                await pg.evaluate(_JS_IDAC_CLICK, _c["i"])
-            tab = await info.value
-            await tab.wait_for_load_state("load", timeout=30_000)
-        except Exception as e:
-            attempts.append(f"{_label!r} in {_sect}: no tab opened ({str(e)[:60]})")
-            continue
-
-        for _ in range(18):
-            if "enterpriseId=" in tab.url or _is_scc(tab.url):
+        # Same as the sync twin (duo_automation._scc_open_session): a tab still
+        # on Cisco's sign-on page is the right button with a slow SAML
+        # auto-login (POD-19, 2026-09-28), so it gets 60s more and one fresh
+        # click before being written off; any other host is skipped at once.
+        tab = None
+        for _try in range(2):
+            try:
+                async with ctx.expect_page(timeout=45_000) as info:
+                    await pg.evaluate(_JS_IDAC_CLICK, _c["i"])
+                tab = await info.value
+                await tab.wait_for_load_state("load", timeout=30_000)
+            except Exception as e:
+                attempts.append(f"{_label!r} in {_sect}: no tab opened ({str(e)[:60]})")
+                tab = None
                 break
-            await tab.wait_for_timeout(5_000)
 
-        if not _is_scc(tab.url):
+            await _settle(tab, 18)
+            if not _is_scc(tab.url) and _is_signon(tab.url):
+                log(f"{_label!r} in {_sect} is still on Cisco sign-on after 90s — "
+                    f"giving the SAML sign-in 60s more")
+                await _settle(tab, 12)
+            if _is_scc(tab.url):
+                break
+
+            if _is_signon(tab.url):
+                await _close(tab)
+                tab = None
+                if _try == 0:
+                    log(f"{_label!r} in {_sect}: Cisco sign-on stalled — clicking it "
+                        f"once more for a fresh sign-in")
+                    await pg.wait_for_timeout(3_000)
+                    continue
+                attempts.append(f"{_label!r} in {_sect}: stalled on Cisco sign-on "
+                                f"(sign-on.security.cisco.com) on both tries")
+                break
+
             attempts.append(f"{_label!r} in {_sect}: landed on {tab.url[:70]}")
             log(f"{_label!r} in {_sect} opened {_host(tab.url)} — not SCC, trying next")
-            try:
-                await tab.close()
-            except Exception:
-                pass
+            await _close(tab)
+            tab = None
+            break
+        if tab is None:
             continue
 
         # The id comes off the live page and is accepted only when it matches a
