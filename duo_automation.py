@@ -4005,36 +4005,78 @@ def _scc_open_session(ctx, idac_url: str, log=None, db_path: str = ""):
                      + (f" in {c['section']!r}" if c.get("section") else " (no section)")
                      for c in cands[:4]))
 
+    def _is_signon(u):
+        h = _host(u)
+        return h.startswith("sign-on") and h.endswith("security.cisco.com")
+
+    def _settle(t, probes):
+        """Poll up to probes x 5s for the tab to land on SCC."""
+        for _ in range(probes):
+            if "enterpriseId=" in t.url or _is_scc(t.url):
+                return
+            t.wait_for_timeout(5_000)
+
+    def _close(t):
+        try:
+            t.close()
+        except Exception:
+            pass
+
     attempts = []
     for _c in cands:
         _label, _sect = _c.get("label"), _c.get("section") or "no section"
-        try:
-            with ctx.expect_page(timeout=45_000) as info:
-                if not pg.evaluate(_JS_IDAC_CLICK, _c["i"]):
-                    _log(f"iDAC {_label!r} vanished between enumerate and click")
-            t = info.value
-            t.wait_for_load_state("load", timeout=30_000)
-        except Exception as e:
-            attempts.append(f"{_label!r} in {_sect}: no tab opened ({str(e)[:60]})")
-            continue
-
-        # Settle on SCC itself. The old test was "enterpriseId= in the URL",
-        # which SCC no longer emits, so it spun 90s on a working session.
-        for _ in range(18):
-            if "enterpriseId=" in t.url or _is_scc(t.url):
+        # A tab still sitting on Cisco's sign-on page is the RIGHT button with
+        # a slow SAML auto-login, not a wrong button: POD-19, 2026-09-28, sat
+        # on sign-on.security.cisco.com/sso/saml2/... for the full 90s at
+        # sso_test, was written off as "not SCC", and — the other 'View' being
+        # Meraki — failed the step; the same button had signed in three times
+        # earlier in that run, and a re-run got in within 11s. So a sign-on
+        # stall gets 60s more, then ONE fresh click of the same button. A tab
+        # that opened anything else (Meraki) is still skipped at once.
+        t = None
+        for _try in range(2):
+            try:
+                with ctx.expect_page(timeout=45_000) as info:
+                    if not pg.evaluate(_JS_IDAC_CLICK, _c["i"]):
+                        _log(f"iDAC {_label!r} vanished between enumerate and click")
+                t = info.value
+                t.wait_for_load_state("load", timeout=30_000)
+            except Exception as e:
+                attempts.append(f"{_label!r} in {_sect}: no tab opened ({str(e)[:60]})")
+                t = None
                 break
-            t.wait_for_timeout(5_000)
 
-        if not _is_scc(t.url):
+            # Settle on SCC itself. The old test was "enterpriseId= in the URL",
+            # which SCC no longer emits, so it spun 90s on a working session.
+            _settle(t, 18)
+            if not _is_scc(t.url) and _is_signon(t.url):
+                _log(f"{_label!r} in {_sect} is still on Cisco sign-on after 90s — "
+                     f"giving the SAML sign-in 60s more")
+                _settle(t, 12)
+            if _is_scc(t.url):
+                break
+
+            if _is_signon(t.url):
+                _close(t)
+                t = None
+                if _try == 0:
+                    _log(f"{_label!r} in {_sect}: Cisco sign-on stalled — clicking it "
+                         f"once more for a fresh sign-in")
+                    pg.wait_for_timeout(3_000)
+                    continue
+                attempts.append(f"{_label!r} in {_sect}: stalled on Cisco sign-on "
+                                f"(sign-on.security.cisco.com) on both tries")
+                break
+
             # Say WHERE it landed. Without the URL this read as a slow or
             # blocked SCC login for a whole run, when in fact the click had
             # opened the Meraki dashboard and waiting could never have helped.
             attempts.append(f"{_label!r} in {_sect}: landed on {t.url[:70]}")
             _log(f"{_label!r} in {_sect} opened {_host(t.url)} — not SCC, trying next")
-            try:
-                t.close()
-            except Exception:
-                pass
+            _close(t)
+            t = None
+            break
+        if t is None:
             continue
 
         # Poll for the id. The loop above exits as soon as the HOST is right,
@@ -4053,10 +4095,7 @@ def _scc_open_session(ctx, idac_url: str, log=None, db_path: str = ""):
         if not ent:
             attempts.append(f"{_label!r} in {_sect}: on SCC at {t.url[:60]} but "
                             "no enterprise id")
-            try:
-                t.close()
-            except Exception:
-                pass
+            _close(t)
             continue
 
         _log(f"SCC session established via {_label!r} in {_sect} "
