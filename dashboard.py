@@ -8492,114 +8492,203 @@ def api_ssh_terminal(pod_id, ip):
     return jsonify({"status": "ok"})
 
 
-@app.route("/api/upload-event", methods=["POST"])
-def upload_event():
-    if "file" not in request.files:
-        return jsonify({"error": "No file"}), 400
-    f = request.files["file"]
-    if not f.filename.endswith(".csv"):
-        return jsonify({"error": "Must be .csv"}), 400
+# dCloud session IDs encode the datacenter in their first digit, and each
+# datacenter has its own AnyConnect headend. The raw EventsDetails export has
+# no VPN host column, so it is derived from the session ID.
+VPN_HOST_BY_SESSION_PREFIX = {
+    "1": "dcloud-rtp-anyconnect.cisco.com",
+    "4": "dcloud-sjc-anyconnect.cisco.com",
+}
+DEFAULT_ROUTER_IP = "198.18.133.25"  # all PODs share the same router IP, isolated by per-POD VPN
 
-    content = f.stream.read().decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(content))
-    if not reader.fieldnames:
-        return jsonify({"error": "Empty CSV"}), 400
 
-    raw_rows = list(reader)
-    cleaned_rows = []
-    for r in raw_rows:
-        cleaned_rows.append({k.strip(): v for k, v in r.items()})
+def _vpn_host_for_session(session_id):
+    """RTP for session IDs starting with 1, SJC for 4, '' when unknown."""
+    return VPN_HOST_BY_SESSION_PREFIX.get((session_id or "").strip()[:1], "")
 
-    rows = cleaned_rows
-    created = 0
 
-    # Detect column mapping from header names (case-insensitive)
-    def _col(header, *aliases):
+def _parse_event_rows(fieldnames, rows, start_pod=1):
+    """Turn event-CSV rows into POD records.
+
+    Accepts both the hand-built format (with a "POD Number" column) and the raw
+    dCloud EventsDetails export, which has no POD column: those rows are
+    numbered start_pod, start_pod+1, ... in session-ID order. The internal
+    pod_id is only a slot; detect_pod_number fills the real number from AD.
+    A missing vpn host is derived from the session ID.
+
+    Returns (records, warnings)."""
+    headers = [h.strip() for h in (fieldnames or []) if h]
+    rows = [{(k or "").strip(): (v or "").strip() for k, v in r.items()} for r in rows]
+
+    def _col(*aliases):
         for a in aliases:
-            for h in (reader.fieldnames or []):
-                if h.strip().lower() == a.lower():
-                    return h.strip()
+            for h in headers:
+                if h.lower() == a.lower():
+                    return h
         return None
 
     vpn_host_col = _col("vpn_host", "vpn host", "vpn-host", "vpn_server", "vpnh")
     vpn_user_col = _col("vpn_user", "username", "vpn username", "vpn-user", "user")
     vpn_pass_col = _col("vpn_pass", "password", "vpn password", "vpn-password", "pass")
-    session_col = _col("session_id", "session id", "session", "session_id", "sessionid")
-    router_ip_col = _col("router_ip", "router ip", "router-ip", "router_ip", "device ip", "device_ip")
+    session_col = _col("session_id", "session id", "session", "sessionid")
+    router_ip_col = _col("router_ip", "router ip", "router-ip", "device ip", "device_ip")
     assigned_col = _col("assigned_to", "assigned", "cco id", "cco_id", "attendee", "student")
+    pod_col = _col("POD Number", "pod_number", "POD", "Pod", "Session Number")
 
-    for row in rows:
-        pod_num = None
-        for key in ["POD Number", "POD Number", "pod_number", "POD", "Pod", "Session Number"]:
-            if key in row and row[key].strip():
-                pod_num = row[key].strip()
-                break
-        if not pod_num:
-            continue
+    def _get(row, col):
+        return row.get(col, "") if col else ""
 
-        pod_id = f"POD-{pod_num}"
+    warnings = []
+    if pod_col:
+        numbered = [(_get(r, pod_col), r) for r in rows if _get(r, pod_col)]
+    else:
+        # Raw export: one row per session. Skip blank/trailing rows.
+        sessions = [r for r in rows if _get(r, session_col)]
+        sessions.sort(key=lambda r: (len(_get(r, session_col)), _get(r, session_col)))
+        numbered = [(str(start_pod + i), r) for i, r in enumerate(sessions)]
 
-        # Extract device info by scanning columns
-        device_data = {}
-        router_serial = ""
-        for col in row:
-            val = row[col].strip()
+    records = []
+    for pod_num, row in numbered:
+        device_data, router_serial = {}, ""
+        for col, val in row.items():
             if not val:
                 continue
-            cl = col.lower().strip()
-            if "serial" in cl or "chassis" in cl or "sn" == cl:
+            cl = col.lower()
+            if "serial" in cl or "chassis" in cl or cl == "sn":
                 device_data[col] = val
                 if not router_serial:
                     router_serial = val
                 if "C8231" in val or "ISR" in val or "C8000" in val:
                     router_serial = val
 
-        vpn_host = row.get(vpn_host_col, "").strip() if vpn_host_col else ""
-        vpn_user = row.get(vpn_user_col, "").strip() if vpn_user_col else ""
-        vpn_pass = row.get(vpn_pass_col, "").strip() if vpn_pass_col else ""
-        session_id = row.get(session_col, "").strip() if session_col else ""
-        assigned_to = (row.get(assigned_col, "").strip() if assigned_col else "")
+        session_id = _get(row, session_col)
+        vpn_host = _get(row, vpn_host_col) or _vpn_host_for_session(session_id)
+        if not vpn_host:
+            warnings.append(f"POD-{pod_num}: no VPN host — session ID "
+                            f"'{session_id}' does not start with 1 (RTP) or 4 (SJC)")
+        records.append({
+            "pod_id": f"POD-{pod_num}",
+            "session_id": session_id,
+            "vpn_host": vpn_host,
+            "vpn_user": _get(row, vpn_user_col),
+            "vpn_pass": _get(row, vpn_pass_col),
+            "router_ip": _get(row, router_ip_col) or DEFAULT_ROUTER_IP,
+            "router_serial": router_serial,
+            "device_data": device_data,
+            "assigned_to": _get(row, assigned_col),
+        })
+    return records, warnings
 
-        router_ip = row.get(router_ip_col, "") if router_ip_col else ""
-        if not router_ip:
-            router_ip = "198.18.133.25"  # all PODs share the same router IP, isolated by per-POD VPN
 
-        conn = _db()
-        existing = conn.execute("SELECT pod_id FROM pods WHERE pod_id = ?", (pod_id,)).fetchone()
-        if existing:
-            # Only overwrite assigned_to if CSV provides a non-blank value
-            if assigned_to:
-                conn.execute("""UPDATE pods SET status='pending', device_data=?, router_serial=?,
-                    vpn_host=?, vpn_user=?, vpn_pass=?, router_ip=?, session_id=?, assigned_to=?,
-                    notes='Imported from event CSV', updated_at=datetime('now')
-                    WHERE pod_id=?""",
-                    (json.dumps(device_data), router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, assigned_to, pod_id))
-            else:
-                conn.execute("""UPDATE pods SET status='pending', device_data=?, router_serial=?,
-                    vpn_host=?, vpn_user=?, vpn_pass=?, router_ip=?, session_id=?,
-                    notes='Imported from event CSV', updated_at=datetime('now')
-                    WHERE pod_id=?""",
-                    (json.dumps(device_data), router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, pod_id))
+def _upsert_pod(conn, rec, note):
+    """Load one POD record onto its pod_id and reset that POD to 'pending'."""
+    pod_id = rec["pod_id"]
+    vals = (json.dumps(rec.get("device_data") or {}), rec.get("router_serial", ""),
+            rec["vpn_host"], rec["vpn_user"], rec["vpn_pass"],
+            rec.get("router_ip") or DEFAULT_ROUTER_IP, rec["session_id"])
+    assigned_to = rec.get("assigned_to", "")
+    existing = conn.execute("SELECT pod_id FROM pods WHERE pod_id = ?", (pod_id,)).fetchone()
+    if existing:
+        # Only overwrite assigned_to if a non-blank value was provided
+        if assigned_to:
+            conn.execute("""UPDATE pods SET status='pending', device_data=?, router_serial=?,
+                vpn_host=?, vpn_user=?, vpn_pass=?, router_ip=?, session_id=?, assigned_to=?,
+                notes=?, updated_at=datetime('now')
+                WHERE pod_id=?""", vals + (assigned_to, note, pod_id))
         else:
-            conn.execute("""INSERT INTO pods
-                (pod_id, status, device_data, router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, assigned_to, notes)
-                VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 'Imported from event CSV')""",
-                (pod_id, json.dumps(device_data), router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, assigned_to))
-        # Clear EVERY pod_id-keyed table, not just pipeline_steps. Importing a
-        # CSV row loads a new session onto this pod_id and resets the POD to
-        # 'pending', but the Duo and ISE card rows used to survive it — so a
-        # freshly loaded POD inherited the previous session's card state and
-        # showed a failed ISE step it had never run. Card state belongs to the
-        # session that produced it, exactly like the pipeline steps beside it.
-        #
-        # failure_events is deliberately NOT in this list: it is append-only and
-        # outliving the run that produced it is the whole point of it.
-        _delete_all_pod_data(conn, pod_id)
-        conn.commit()
-        conn.close()
-        created += 1
+            conn.execute("""UPDATE pods SET status='pending', device_data=?, router_serial=?,
+                vpn_host=?, vpn_user=?, vpn_pass=?, router_ip=?, session_id=?,
+                notes=?, updated_at=datetime('now')
+                WHERE pod_id=?""", vals + (note, pod_id))
+    else:
+        conn.execute("""INSERT INTO pods
+            (pod_id, status, device_data, router_serial, vpn_host, vpn_user, vpn_pass, router_ip, session_id, assigned_to, notes)
+            VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (pod_id,) + vals + (assigned_to, note))
+    # Clear EVERY pod_id-keyed table, not just pipeline_steps. Loading a new
+    # session onto this pod_id resets the POD to 'pending', but the Duo and ISE
+    # card rows used to survive it — so a freshly loaded POD inherited the
+    # previous session's card state and showed a failed ISE step it had never
+    # run. Card state belongs to the session that produced it, exactly like the
+    # pipeline steps beside it.
+    #
+    # failure_events is deliberately NOT in this list: it is append-only and
+    # outliving the run that produced it is the whole point of it.
+    _delete_all_pod_data(conn, pod_id)
 
-    return jsonify({"status": "ok", "pods_created": created, "columns": reader.fieldnames})
+
+@app.route("/api/upload-event", methods=["POST"])
+def upload_event():
+    if "file" not in request.files:
+        return jsonify({"error": "No file"}), 400
+    f = request.files["file"]
+    if not f.filename.lower().endswith(".csv"):
+        return jsonify({"error": "Must be .csv"}), 400
+    try:
+        start_pod = int(request.form.get("start_pod") or 1)
+    except ValueError:
+        return jsonify({"error": "Start POD # must be a number"}), 400
+    if start_pod < 1:
+        return jsonify({"error": "Start POD # must be 1 or higher"}), 400
+
+    content = f.stream.read().decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(content))
+    if not reader.fieldnames:
+        return jsonify({"error": "Empty CSV"}), 400
+
+    records, warnings = _parse_event_rows(reader.fieldnames, list(reader), start_pod)
+    conn = _db()
+    try:
+        for rec in records:
+            _upsert_pod(conn, rec, "Imported from event CSV")
+        conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({"status": "ok", "pods_created": len(records),
+                    "pods": [{"pod_id": r["pod_id"], "session_id": r["session_id"],
+                              "vpn_host": r["vpn_host"]} for r in records],
+                    "warnings": warnings,
+                    "columns": [h.strip() for h in reader.fieldnames]})
+
+
+@app.route("/api/add-pod", methods=["POST"])
+def add_single_pod():
+    """Add (or reload) one POD from the dashboard form — for one-offs outside an event."""
+    data = request.get_json(silent=True) or {}
+    pod_num = str(data.get("pod_number", "")).strip()
+    if not pod_num.isdigit() or int(pod_num) < 1:
+        return jsonify({"error": "POD # must be a positive number"}), 400
+    session_id = str(data.get("session_id", "")).strip()
+    vpn_user = str(data.get("vpn_user", "")).strip()
+    vpn_pass = str(data.get("vpn_pass", "")).strip()
+    missing = [n for n, v in (("Session ID", session_id), ("Username", vpn_user),
+                              ("Password", vpn_pass)) if not v]
+    if missing:
+        return jsonify({"error": "Required: " + ", ".join(missing)}), 400
+    vpn_host = str(data.get("vpn_host", "")).strip() or _vpn_host_for_session(session_id)
+    if not vpn_host:
+        return jsonify({"error": f"Session ID '{session_id}' does not start with 1 (RTP) "
+                                 f"or 4 (SJC) — enter the VPN host"}), 400
+    router_serial = str(data.get("router_serial", "")).strip()
+    rec = {
+        "pod_id": f"POD-{int(pod_num)}",
+        "session_id": session_id,
+        "vpn_host": vpn_host,
+        "vpn_user": vpn_user,
+        "vpn_pass": vpn_pass,
+        "router_ip": DEFAULT_ROUTER_IP,
+        "router_serial": router_serial,
+        "device_data": {"router_serial": router_serial} if router_serial else {},
+        "assigned_to": str(data.get("assigned_to", "")).strip(),
+    }
+    conn = _db()
+    try:
+        _upsert_pod(conn, rec, "Added manually")
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"status": "ok", "pod_id": rec["pod_id"], "vpn_host": vpn_host})
 
 
 # ---------------------------------------------------------------------------
@@ -10437,6 +10526,27 @@ DASHBOARD_HTML = """
         <div class="hint">EventsDetails.csv from dCloud</div>
         <input type="file" id="file-input" accept=".csv" onchange="handleFile(this.files[0])">
       </div>
+      <div style="display:flex;gap:6px;align-items:center;margin-top:6px;font-size:11px;color:#8899aa;">
+        <label for="start-pod-input" title="Raw dCloud exports have no POD column: sessions are numbered from here in session-ID order. Session IDs starting with 1 get the RTP VPN, 4 the SJC VPN.">Start at POD #</label>
+        <input id="start-pod-input" type="number" min="1" value="1" style="width:56px;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
+        <button onclick="toggleAddPodForm()" style="margin-left:auto;padding:4px 8px;background:#0d1e30;border:1px solid #02c8ff;color:#02c8ff;border-radius:4px;cursor:pointer;font-size:11px;">+ Add Single POD</button>
+      </div>
+      <div id="add-pod-form" style="display:none;margin-top:8px;border-top:1px solid #1a3a5a;padding-top:8px;">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+          <input id="ap-pod" type="number" min="1" placeholder="POD # *" style="background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
+          <input id="ap-session" type="text" placeholder="Session ID *" oninput="apUpdateVpnHint()" style="background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
+          <input id="ap-user" type="text" placeholder="VPN Username *" autocomplete="off" style="background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
+          <input id="ap-pass" type="text" placeholder="VPN Password *" autocomplete="off" style="background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
+          <input id="ap-host" type="text" placeholder="VPN host (auto from Session ID)" style="grid-column:1 / span 2;background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
+          <input id="ap-serial" type="text" placeholder="Router serial (optional)" style="background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
+          <input id="ap-assigned" type="text" placeholder="Assigned to (optional)" style="background:#0a1625;border:1px solid #1a3a5a;color:#e0e8f0;border-radius:4px;padding:4px 6px;font-size:11px;">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;margin-top:6px;">
+          <span id="ap-vpn-hint" style="font-size:10px;color:#667788;flex:1;"></span>
+          <button onclick="toggleAddPodForm()" style="padding:4px 10px;background:#0d1e30;border:1px solid #445566;color:#c9d1d9;border-radius:4px;cursor:pointer;font-size:11px;">Cancel</button>
+          <button onclick="submitAddPod()" style="padding:4px 10px;background:#0d1e30;border:1px solid #00e68a;color:#00e68a;border-radius:4px;cursor:pointer;font-size:11px;">Add POD</button>
+        </div>
+      </div>
       <div class="upload-result" id="upload-result"></div>
     </div>
 
@@ -10808,15 +10918,62 @@ async function handleFile(file) {
 
   const fd = new FormData();
   fd.append('file', file);
+  fd.append('start_pod', document.getElementById('start-pod-input').value || '1');
   const r = await fetch('/api/upload-event', { method: 'POST', body: fd });
   const data = await r.json();
+  document.getElementById('file-input').value = '';  // allow re-selecting the same file
 
   if (data.error) {
-    result.innerHTML = '<span style="color:#ff4757">Error: ' + data.error + '</span>';
+    result.innerHTML = '<span style="color:#ff4757">Error: ' + escHtml(data.error) + '</span>';
   } else {
-    result.innerHTML = '<span style="color:#00e68a">Imported ' + data.pods_created + ' PODs. Columns: ' + (data.columns || []).join(', ') + '</span>';
+    const site = h => /-rtp-/.test(h) ? 'RTP' : /-sjc-/.test(h) ? 'SJC' : '?';
+    const list = (data.pods || []).map(p => escHtml(p.pod_id) + ' ' + escHtml(p.session_id) + ' ' + site(p.vpn_host)).join(', ');
+    const warn = (data.warnings || []).map(w => '<br><span style="color:#ffa502">' + escHtml(w) + '</span>').join('');
+    result.innerHTML = '<span style="color:#00e68a">Imported ' + data.pods_created + ' PODs' + (list ? ': ' + list : '') + '</span>' + warn;
     load();
   }
+}
+
+function _apSite(sessionId) {
+  const c = (sessionId || '').trim().charAt(0);
+  return c === '1' ? 'rtp' : c === '4' ? 'sjc' : '';
+}
+
+function apUpdateVpnHint() {
+  const site = _apSite(document.getElementById('ap-session').value);
+  const host = document.getElementById('ap-host');
+  host.placeholder = site ? 'dcloud-' + site + '-anyconnect.cisco.com (auto)' : 'VPN host (auto from Session ID)';
+  document.getElementById('ap-vpn-hint').textContent = site ? 'VPN: ' + site.toUpperCase() : '';
+}
+
+function toggleAddPodForm() {
+  const f = document.getElementById('add-pod-form');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+  if (f.style.display === 'block') document.getElementById('ap-pod').focus();
+}
+
+async function submitAddPod() {
+  const v = id => document.getElementById(id).value.trim();
+  const body = {
+    pod_number: v('ap-pod'), session_id: v('ap-session'), vpn_user: v('ap-user'),
+    vpn_pass: v('ap-pass'), vpn_host: v('ap-host'), router_serial: v('ap-serial'),
+    assigned_to: v('ap-assigned'),
+  };
+  const podId = 'POD-' + parseInt(body.pod_number, 10);
+  if ((window._lastPods || []).some(p => p.pod_id === podId)
+      && !confirm(podId + ' already exists. Replace it? Its pipeline, Duo and ISE card state will be cleared.')) return;
+  const result = document.getElementById('upload-result');
+  const r = await fetch('/api/add-pod', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await r.json();
+  if (data.error) {
+    result.innerHTML = '<span style="color:#ff4757">Error: ' + escHtml(data.error) + '</span>';
+    return;
+  }
+  result.innerHTML = '<span style="color:#00e68a">Added ' + escHtml(data.pod_id) + ' (' + escHtml(data.vpn_host) + ')</span>';
+  ['ap-pod','ap-session','ap-user','ap-pass','ap-host','ap-serial','ap-assigned'].forEach(id => document.getElementById(id).value = '');
+  apUpdateVpnHint();
+  document.getElementById('add-pod-form').style.display = 'none';
+  load();
 }
 
 async function load() {

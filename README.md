@@ -257,6 +257,14 @@ Session Id,POD Number,vpn host,Username,Password
 
 Router IP is auto-derived as `198.18.133.{21 + pod_num}`.
 
+The **raw dCloud EventsDetails export** also works as-is, with no POD Number or vpn host
+column. Sessions are numbered from the card's **Start at POD #** box (default 1) in
+session-ID order, and the VPN host comes from the session ID's first digit: `1…` →
+`dcloud-rtp-anyconnect.cisco.com`, `4…` → `dcloud-sjc-anyconnect.cisco.com`.
+
+For a one-off POD outside an event, use **+ Add Single POD** on the same card instead of
+building a CSV.
+
 ---
 
 ## Infrastructure Reference
