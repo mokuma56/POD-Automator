@@ -53,6 +53,13 @@ def test_raw_export_numbered_in_session_order_with_derived_vpn():
     assert (recs[0]["vpn_user"], recs[0]["vpn_pass"]) == ("v2user1", "bbb222")
 
 
+def test_multi_user_cell_uses_first_user():
+    text = ("Session Id, Users, Username, Password \n"
+            "1360503, None, v3635user1; v3635user2; ... v3635user16, cb6450\n")
+    recs, _ = _parse(text)
+    assert (recs[0]["vpn_user"], recs[0]["vpn_pass"]) == ("v3635user1", "cb6450")
+
+
 def test_raw_export_start_pod_offset():
     recs, _ = _parse(RAW_EXPORT, start_pod=8)
     assert [r["pod_id"] for r in recs] == ["POD-8", "POD-9", "POD-10"]
