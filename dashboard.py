@@ -8570,7 +8570,9 @@ def _parse_event_rows(fieldnames, rows, start_pod=1):
             "pod_id": f"POD-{pod_num}",
             "session_id": session_id,
             "vpn_host": vpn_host,
-            "vpn_user": _get(row, vpn_user_col),
+            # Raw exports can list every session user in one cell
+            # ("v3635user1; v3635user2; ... v3635user16"); the VPN logs in as the first.
+            "vpn_user": _get(row, vpn_user_col).split(";")[0].strip(),
             "vpn_pass": _get(row, vpn_pass_col),
             "router_ip": _get(row, router_ip_col) or DEFAULT_ROUTER_IP,
             "router_serial": router_serial,
