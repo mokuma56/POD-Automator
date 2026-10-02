@@ -2388,7 +2388,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <text x="14" y="66" font-family="Arial" font-weight="700" font-size="32" fill="#FFFFFF" letter-spacing="2">CISCO</text>
       </svg>
     </div>
-    <div class="topbar-right">Integrated Security Architecture &nbsp;|&nbsp; Hands-On Lab<a href="/prep" class="prep-btn">&#9881; Prep</a></div>
+    <div class="topbar-right">Integrated Security Architecture &nbsp;|&nbsp; Hands-On Lab<a href="/prep" class="prep-btn" onclick="location.href = location.protocol + '//' + location.hostname + ':5050/'; return false;">&#9881; Prep</a></div>
   </div>
 
   <!-- ════════════════════════════════════════
