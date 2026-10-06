@@ -315,3 +315,91 @@ def sda_completed(conn, pod_id: str, mode: str) -> list:
     return sorted(r[0] for r in conn.execute(
         "SELECT step_name FROM sda_steps WHERE pod_id=? AND mode=? AND status='completed'",
         (pod_id, mode)))
+
+
+# ── Cloud Fabric card (cloud_fabric.py) ───────────────────────────────────────
+
+@op
+def cloudfabric_ensure_table(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cloudfabric_steps (
+            pod_id       TEXT NOT NULL,
+            mode         TEXT NOT NULL DEFAULT 'deploy',
+            step_name    TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            started_at   TEXT,
+            completed_at TEXT,
+            result       TEXT,
+            PRIMARY KEY (pod_id, mode, step_name)
+        )
+    """)
+    # Cloud IDs read off each switch by `show meraki connect`. Kept apart from
+    # the step rows so Clear/Rollback do not lose them: once a switch has been
+    # factory-reset into cloud config its out-of-band SSH is gone, and the
+    # Cloud ID is the only handle left to claim it again.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cloudfabric_devices (
+            pod_id     TEXT NOT NULL,
+            role       TEXT NOT NULL,
+            serial     TEXT NOT NULL,
+            updated_at TEXT,
+            PRIMARY KEY (pod_id, role)
+        )
+    """)
+
+
+@op
+def cloudfabric_step_set(conn, pod_id: str, mode: str, step_name: str, status: str,
+                         result=None) -> None:
+    """Sets started_at on first RUNNING, completed_at on completed/failed."""
+    now = _utcnow()
+    row = conn.execute(
+        "SELECT started_at FROM cloudfabric_steps WHERE pod_id=? AND mode=? AND step_name=?",
+        (pod_id, mode, step_name)).fetchone()
+    started = (row[0] if row else None) or (now if status == "running" else None)
+    completed = now if status in ("completed", "failed") else None
+    conn.execute("""
+        INSERT INTO cloudfabric_steps (pod_id, mode, step_name, status, started_at, completed_at, result)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(pod_id, mode, step_name) DO UPDATE SET
+            status=excluded.status,
+            started_at=COALESCE(excluded.started_at, started_at),
+            completed_at=excluded.completed_at,
+            result=excluded.result
+    """, (pod_id, mode, step_name, status, started, completed, result))
+
+
+@op
+def cloudfabric_reset_running(conn, pod_id: str, mode: str) -> int:
+    """Stale 'running' rows from a crashed run go back to pending."""
+    return conn.execute(
+        "UPDATE cloudfabric_steps SET status='pending', completed_at=NULL "
+        "WHERE pod_id=? AND mode=? AND status='running'", (pod_id, mode)).rowcount
+
+
+@op
+def cloudfabric_completed(conn, pod_id: str, mode: str) -> list:
+    return sorted(r[0] for r in conn.execute(
+        "SELECT step_name FROM cloudfabric_steps WHERE pod_id=? AND mode=? AND status='completed'",
+        (pod_id, mode)))
+
+
+@op
+def cloudfabric_clear_mode(conn, pod_id: str, mode: str) -> int:
+    """A finished rollback clears the deploy rows, so the next Deploy starts over."""
+    return conn.execute(
+        "DELETE FROM cloudfabric_steps WHERE pod_id=? AND mode=?", (pod_id, mode)).rowcount
+
+
+@op
+def cloudfabric_device_set(conn, pod_id: str, role: str, serial: str) -> None:
+    conn.execute("""
+        INSERT INTO cloudfabric_devices (pod_id, role, serial, updated_at) VALUES (?,?,?,?)
+        ON CONFLICT(pod_id, role) DO UPDATE SET serial=excluded.serial, updated_at=excluded.updated_at
+    """, (pod_id, role, serial, _utcnow()))
+
+
+@op
+def cloudfabric_devices(conn, pod_id: str) -> dict:
+    return {r[0]: r[1] for r in conn.execute(
+        "SELECT role, serial FROM cloudfabric_devices WHERE pod_id=?", (pod_id,))}

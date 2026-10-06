@@ -264,9 +264,37 @@ def test_route_refuses_unknown_ops_and_bad_calls(client):
                        content_type="application/json").status_code == 400
 
 
+
+def test_cloudfabric_steps_round_trip(db):
+    _run(db, "cloudfabric_ensure_table")
+    _run(db, "cloudfabric_step_set", pod_id="POD-6", mode="deploy", step_name="claim_devices",
+         status="running")
+    t0 = _q(db, "SELECT started_at FROM cloudfabric_steps")[0][0]
+    _run(db, "cloudfabric_step_set", pod_id="POD-6", mode="deploy", step_name="claim_devices",
+         status="completed", result="3/3 online")
+    assert _q(db, "SELECT started_at, status, result FROM cloudfabric_steps")[0] == (
+        t0, "completed", "3/3 online")
+    _run(db, "cloudfabric_step_set", pod_id="POD-6", mode="deploy", step_name="name_switches",
+         status="running")
+    assert _run(db, "cloudfabric_reset_running", pod_id="POD-6", mode="deploy") == 1
+    assert _run(db, "cloudfabric_completed", pod_id="POD-6", mode="deploy") == ["claim_devices"]
+    assert _run(db, "cloudfabric_clear_mode", pod_id="POD-6", mode="deploy") == 2
+
+
+def test_cloudfabric_cloud_ids_survive_step_clear(db):
+    """Clear/Rollback wipe step rows only: once a switch is in cloud config its
+    OOB SSH is gone and the recorded Cloud ID is the only way to re-claim it."""
+    _run(db, "cloudfabric_ensure_table")
+    _run(db, "cloudfabric_device_set", pod_id="POD-6", role="leaf1", serial="Q5VJ-JL9A-5MW7")
+    _run(db, "cloudfabric_device_set", pod_id="POD-6", role="leaf1", serial="Q5VJ-JL9A-0000")
+    _run(db, "cloudfabric_clear_mode", pod_id="POD-6", mode="deploy")
+    assert _run(db, "cloudfabric_devices", pod_id="POD-6") == {"leaf1": "Q5VJ-JL9A-0000"}
+    assert _run(db, "cloudfabric_devices", pod_id="POD-7") == {}
+
 # ── nothing that runs in a container opens the file itself ────────────────────
 
-CONTAINER_MODULES = ["onboard.py", "ise_integrations.py", "evpn_fabric.py", "sda_fabric.py"]
+CONTAINER_MODULES = ["onboard.py", "ise_integrations.py", "evpn_fabric.py", "sda_fabric.py",
+                     "cloud_fabric.py"]
 
 
 @pytest.mark.parametrize("name", CONTAINER_MODULES)

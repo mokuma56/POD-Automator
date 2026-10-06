@@ -40,6 +40,7 @@ def test_rebuild_list_is_every_file_the_image_copies():
                          cwd=ROOT, capture_output=True, text=True).stdout.split()
     for f in ("ise_integrations.py", "duo_automation.py", "hostdb.py", "db_ops.py",
               "onboard.py", "onboard_router.py", "evpn_fabric.py", "sda_fabric.py",
+              "cloud_fabric.py",
               "base_configs"):
         assert f in out, f
     assert "data" not in out, "data/ is bind-mounted; it must not force rebuilds"
