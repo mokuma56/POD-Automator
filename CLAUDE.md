@@ -44,6 +44,9 @@ Never write a credential into this file, a commit message, or a log line.
 - `ise_integrations.py` — 5 ISE steps (pxGrid, SCC, deactivate/reactivate, cdFMC, SGT verify)
 - `duo_automation.py` — Duo card steps, authproxy push via WinRM, SCIM
 - `sda_fabric.py` / `evpn_fabric.py` — fabric deploy pipelines
+- `cloud_fabric.py` — Cloud Fabric tab (Meraki-managed EVPN): public Meraki API for prep/underlay;
+  Dashboard session (iDAC Meraki tile) for Organization → Fabric and ISE admin-UI API for the
+  TrustSec↔Meraki sync — neither has a public API. Request shapes: `docs/cloud_fabric_api_capture.md`
 - `reset_switches.py` — raw `telnetlib` base-config push (Netmiko fails on blank C9300)
 - `generate_lab_cards.py` — reportlab PDF lab detail cards
 - `data/pod_state.db` — SQLite: `pods`, `pipeline_steps`, `pipeline_logs`, `upgrade_config`,

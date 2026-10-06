@@ -230,7 +230,10 @@ def _migrate():
                  "duo_saml_app_ikey", "sa_saml_profile_id",
                  "scc_password", "scc_email", "authproxy_cfg",
                  "sa_scim_token", "authproxy_enroll_blob",
-                 "authproxy_blob_saved_at"):
+                 "authproxy_blob_saved_at",
+                 # Optional per-POD Meraki API key for the ISE TrustSec<->Meraki
+                 # connection (cloud_fabric.py); falls back to MERAKI_API_KEY.
+                 "meraki_api_key"):
         try:
             conn.execute(f"ALTER TABLE org_credentials ADD COLUMN {_col} TEXT DEFAULT ''")
         except Exception:
@@ -2844,6 +2847,141 @@ def api_sda_clear(pod_id):
     c.execute("DELETE FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[sda/%'", (pod_id,))
     c.commit(); c.close()
     return jsonify({"status": "ok", "message": f"SDA state cleared for {pod_id}"})
+
+
+# ---------------------------------------------------------------------------
+# Cloud Fabric API routes (cloud_fabric.py — Meraki-managed EVPN fabric)
+# ---------------------------------------------------------------------------
+
+CLOUDFABRIC_SECRETS = ("MERAKI_API_KEY", "LAB_PASS")
+
+
+def _cloudfabric_secrets():
+    """The secrets cloud_fabric.py needs, from the environment or the gitignored .env.
+
+    Returns (env, missing). They reach the container by name only (`-e NAME`), so
+    the values never appear on a docker command line or in `ps`.
+    """
+    env = {k: os.environ.get(k, "") for k in CLOUDFABRIC_SECRETS}
+    dotenv = Path(__file__).resolve().parent / ".env"
+    if not all(env.values()) and dotenv.exists():
+        for line in dotenv.read_text().splitlines():
+            k, sep, v = line.strip().partition("=")
+            if sep and k in env and not env[k]:
+                env[k] = v.strip().strip('"').strip("'")
+    return env, [k for k, v in env.items() if not v]
+
+
+def _ensure_cloudfabric_table():
+    import cloud_fabric
+    cloud_fabric.DB_PATH = str(DATA_DIR / "data" / "pod_state.db")
+    cloud_fabric.ensure_table()
+
+
+@app.route("/api/cloudfabric/status/<pod_id>")
+def api_cloudfabric_status(pod_id):
+    _ensure_cloudfabric_table()
+    c = _db()
+    rows = c.execute(
+        "SELECT mode, step_name, status, result, started_at, completed_at "
+        "FROM cloudfabric_steps WHERE pod_id=?", (pod_id,)).fetchall()
+    devices = {r["role"]: r["serial"] for r in c.execute(
+        "SELECT role, serial FROM cloudfabric_devices WHERE pod_id=?", (pod_id,))}
+    c.close()
+    steps = {"deploy": {}, "rollback": {}}
+    for mode, step_name, status, result, started_at, completed_at in rows:
+        steps.setdefault(mode, {})[step_name] = {
+            "status": status or "pending", "result": result or "",
+            "started_at": started_at or "", "completed_at": completed_at or "",
+        }
+    _, missing = _cloudfabric_secrets()
+    return jsonify({"pod_id": pod_id, "deploy": steps["deploy"], "rollback": steps["rollback"],
+                    "devices": devices, "missing_secrets": missing})
+
+
+def _cloudfabric_launch(pod_id, mode, from_step=None):
+    """docker run cloud_fabric.py in the POD's VPN namespace, streaming its log."""
+    r = subprocess.run(
+        ["docker", "inspect", f"vpn-{pod_id}", "--format", "{{.State.Status}}"],
+        capture_output=True, text=True, timeout=5)
+    if r.returncode != 0 or r.stdout.strip() != "running":
+        return jsonify({"status": "error", "message": f"VPN container vpn-{pod_id} is not running"}), 400
+    secrets, missing = _cloudfabric_secrets()
+    if missing:
+        return jsonify({"status": "error",
+                        "message": "set " + ", ".join(missing) + " in the dashboard environment or .env"}), 400
+    _ensure_cloudfabric_table()
+    _warn_if_image_stale(pod_id)
+
+    args = ["cloud_fabric.py", mode] + (["--from", from_step] if from_step else [])
+
+    def _run():
+        cmd = ["docker", "run", "--rm",
+               "--network", f"container:vpn-{pod_id}",
+               "-e", f"POD_ID={pod_id}",
+               "-e", "DB_PATH=/pipeline/host-data/pod_state.db"]
+        for k in CLOUDFABRIC_SECRETS:
+            cmd += ["-e", k]                  # value comes from env= below, not argv
+        cmd += ["-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
+                "--entrypoint", "python3", "pod-automator:latest", "-u"] + args
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                env={**os.environ, **secrets})
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(pod_id, f"[cloudfabric/log] {line}")
+        proc.wait()
+        _clear_stuck_running(pod_id, "cloudfabric_steps", mode=mode)
+
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "ok", "message": f"Cloud Fabric {mode} started for {pod_id}"})
+
+
+@app.route("/api/cloudfabric/deploy/<pod_id>", methods=["POST"])
+def api_cloudfabric_deploy(pod_id):
+    """Resume the deploy from the first incomplete step, or rerun from `from_step`."""
+    data = request.get_json(silent=True) or {}
+    return _cloudfabric_launch(pod_id, "deploy", data.get("from_step") or None)
+
+
+@app.route("/api/cloudfabric/rollback/<pod_id>", methods=["POST"])
+def api_cloudfabric_rollback(pod_id):
+    return _cloudfabric_launch(pod_id, "rollback")
+
+
+@app.route("/api/cloudfabric/logs/<pod_id>")
+def api_cloudfabric_logs(pod_id):
+    """Incremental Cloud Fabric log lines for the live panel (same contract as /api/ise/logs)."""
+    try:
+        since = int(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        since = 0
+    try:
+        limit = min(int(request.args.get("limit", 400)), 2000)
+    except (TypeError, ValueError):
+        limit = 400
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT id, log_line, timestamp FROM pipeline_logs "
+            "WHERE pod_id=? AND id>? AND log_line LIKE '[cloudfabric/%' "
+            "ORDER BY id LIMIT ?", (pod_id, since, limit)).fetchall()
+        lines = [{"id": r[0], "log_line": r[1], "timestamp": r[2]} for r in rows]
+        return jsonify({"lines": lines, "last_id": lines[-1]["id"] if lines else since})
+    finally:
+        conn.close()
+
+
+@app.route("/api/cloudfabric/clear/<pod_id>", methods=["POST"])
+def api_cloudfabric_clear(pod_id):
+    """Clear step rows and log lines. Recorded Cloud IDs are kept on purpose."""
+    _ensure_cloudfabric_table()
+    c = _db()
+    c.execute("DELETE FROM cloudfabric_steps WHERE pod_id=?", (pod_id,))
+    c.execute("DELETE FROM pipeline_logs WHERE pod_id=? AND log_line LIKE '[cloudfabric/%'", (pod_id,))
+    c.commit(); c.close()
+    return jsonify({"status": "ok", "message": f"Cloud Fabric state cleared for {pod_id}"})
 
 
 # ── Duo Card API ──────────────────────────────────────────────────────────────
@@ -8940,7 +9078,7 @@ def api_vpn_connect(pod_id):
 
 SESSION_TABLES = ("pipeline_steps", "pipeline_logs", "scc_checklist",
                   "fabric_steps", "sda_steps", "duo_steps", "ise_steps",
-                  "preflight_results")
+                  "preflight_results", "cloudfabric_steps", "cloudfabric_devices")
 # failure_events is deliberately excluded: it is append-only history and
 # outliving the run that produced it is the whole point of it.
 
@@ -10732,6 +10870,7 @@ DASHBOARD_HTML = """
        <button class="tab-btn" onclick="switchTab(this, 'upgrade')">Upgrade</button>
        <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
        <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
+       <button class="tab-btn" onclick="switchTab(this, 'cloudfabric')">&#x2601; Cloud Fabric</button>
      </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
@@ -10774,6 +10913,26 @@ DASHBOARD_HTML = """
      <div class="tab-content" id="tab-sda">
        <div id="sda-grid" style="padding:16px;min-height:260px;">
          <div style="color:#667788;font-size:13px;">Select a POD to manage SDA Fabric</div>
+       </div>
+     </div>
+
+     <div class="tab-content" id="tab-cloudfabric">
+       <div id="cloudfabric-grid" style="padding:16px;min-height:260px;">
+         <div style="color:#667788;font-size:13px;">Select a POD to manage the Cloud Fabric</div>
+       </div>
+       <!-- Sibling of #cloudfabric-grid on purpose, as the Duo and ISE cards do it:
+            the grid's innerHTML is replaced on every poll, which would wipe the log. -->
+       <div id="cloudfabric-log-wrap" style="padding:0 16px 16px;display:none;">
+         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+           <span style="font-size:12px;font-weight:600;color:#cdd6e0;">Live log</span>
+           <span>
+             <label style="font-size:11px;color:#8899aa;cursor:pointer;">
+               <input type="checkbox" id="cloudfabric-log-follow" checked style="vertical-align:middle;"> follow
+             </label>
+             <button id="cloudfabric-log-clear" style="background:#1c2733;color:#cdd6e0;border:none;padding:2px 9px;border-radius:3px;cursor:pointer;font-size:11px;margin-left:8px;">Clear</button>
+           </span>
+         </div>
+         <pre id="cloudfabric-log" style="background:#0d1117;border:1px solid #1c2733;border-radius:6px;padding:10px 12px;margin:0;max-height:260px;overflow:auto;font-size:11px;line-height:1.5;color:#9fb0c0;white-space:pre-wrap;word-break:break-word;"></pre>
        </div>
      </div>
 
@@ -11012,6 +11171,7 @@ async function load() {
      else if (tabName === 'upgrade')   loadUpgrade(detailId);
      else if (tabName === 'fabric')    loadFabricStatus(detailId);
      else if (tabName === 'sda')       loadSdaStatus(detailId);
+     else if (tabName === 'cloudfabric') loadCloudFabricStatus(detailId);
      else if (tabName === 'duo')       loadDuoStatus(detailId);
      else if (tabName === 'ise')       loadIseStatus(detailId);
      else if (tabName === 'scc')       { if (!window._sccResetRunning) loadSccChecklist(detailId); }
@@ -12273,6 +12433,7 @@ async function showPipeline(podId) {
   if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
   if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
   if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
+  if (window._cfPoller)     { clearInterval(window._cfPoller);     window._cfPoller     = null; }
   if (window._duoPoller)    { clearInterval(window._duoPoller);    window._duoPoller    = null; }
   if (window._catcPoll)     { clearInterval(window._catcPoll);     window._catcPoll     = null; }
   if (window._switchRecheckPoller) { clearTimeout(window._switchRecheckPoller); window._switchRecheckPoller = null; }
@@ -12282,6 +12443,8 @@ async function showPipeline(podId) {
   // Clear the SDA grid so it doesn't flash old-POD data before loadSdaStatus fires
   const _sg = document.getElementById('sda-grid');
   if (_sg) { _sg.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>'; _sg._lastHtml = null; _sg._lastPodId = null; }
+  const _cg = document.getElementById('cloudfabric-grid');
+  if (_cg) { _cg.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>'; _cg._lastHtml = null; _cg._lastPodId = null; }
 
   const panel = document.getElementById('detail-panel');
   const podData = window._lastPods ? window._lastPods.find(p => p.pod_id === podId) : null;
@@ -13931,6 +14094,9 @@ function switchTab(btn, name) {
     if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
     if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
   }
+  if (name !== 'cloudfabric') {
+    if (window._cfPoller)     { clearInterval(window._cfPoller);     window._cfPoller     = null; }
+  }
   // Leaving SCC tab — clear the reset-running lock so global load() resumes normally
   if (name !== 'scc') {
     window._sccResetRunning = false;
@@ -13948,6 +14114,7 @@ function switchTab(btn, name) {
   if (name === 'scc')        { if (podId) loadSccChecklist(podId); }
   if (name === 'fabric')     { if (podId) loadFabricStatus(podId); }
   if (name === 'sda')        { if (podId) loadSdaStatus(podId); }
+  if (name === 'cloudfabric') { if (podId) loadCloudFabricStatus(podId); }
   if (name === 'baseconfig') { if (podId) loadBaseConfig(podId); }
 }
 
@@ -14591,6 +14758,230 @@ async function triggerSda(podId, action) {
 async function clearSda(podId) {
   await fetch('/api/sda/clear/' + podId, { method: 'POST' });
   loadSdaStatus(podId);
+}
+
+// ---------------------------------------------------------------------------
+// Cloud Fabric Tab (cloud_fabric.py — Meraki-managed EVPN fabric)
+// ---------------------------------------------------------------------------
+
+const CF_DEPLOY_STEPS = [
+  ["meraki_connect",        "Cloud-Manage Switches",  "service meraki connect (OOB SSH)", "A. Dashboard & ISE prep"],
+  ["claim_devices",         "Claim + Add to SITE_105", "Cloud configuration mode",        ""],
+  ["name_switches",         "Name Switches",           "Site_105-Border-Spine / Leaf1/2", ""],
+  ["mgmt_interfaces",       "Static Mgmt Interfaces",  "VLAN 1 .53 / .51 / .52",          ""],
+  ["ise_nads",              "ISE Network Devices",     "198.18.1.51-53 RADIUS",           ""],
+  ["ise_meraki_integration", "ISE ↔ Meraki Integration", "PseudoCo_Cloud_Networking, 3 SGTs", ""],
+  ["adaptive_groups_check", "ISE SGT Sync Check",      "Main 16 / Production 19 / IoT 18", ""],
+  ["vlan_profile",          "Named VLANs",             "10 / 101 / 102 + SGTs",           ""],
+  ["access_policy",         "Access Policy",           "PseudoCo_ISE (Hybrid, Multi-Auth)", ""],
+  ["access_ports",          "Workstation Ports",       "Leaf1+Leaf2 ports 1, 3",          ""],
+  ["underlay_links",        "Routed Underlay",         "4 x /31, OSPF area 0 P2P",        "B. Routed underlay"],
+  ["transit_interface",     "Shared-Services Transit", "Border VLAN 5 192.168.255.7/31",  ""],
+  ["static_route",          "Shared-Services Route",   "198.18.5.0/24 via .6",            ""],
+  ["verify_ospf",           "Verify OSPF",             "Leaf1 + Leaf2 FULL",              ""],
+  ["fabric_create",         "Create Fabric (Staged)",  "ASN 65535, roles, VRFs, border", "C. Fabric build & deploy (Dashboard session)"],
+  ["fabric_subnets",        "Fabric Subnets",          "10 / 101 / 102 anycast, both leaves", ""],
+  ["fabric_deploy",         "Deploy Fabric",           "Wait for Deployed / Success",     ""],
+  ["verify_fabric",         "Verify Fabric",           "3 VRFs, 6 subnets, eBGP 3/3",     ""],
+];
+const CF_ROLLBACK_STEPS = [
+  ["delete_fabric",   "Delete Fabric",       "PseudoCo_Cloud_Fabric"],
+  ["delete_ise_meraki", "Delete ISE Integration", "PseudoCo_Cloud_Networking"],
+  ["remove_devices",  "Remove from Network", "SITE_105"],
+  ["release_devices", "Unclaim from Org",    "Org inventory"],
+];
+const CF_ROLE_LABELS = { border_spine: "Border-Spine", leaf1: "Leaf1", leaf2: "Leaf2" };
+
+function _cfColor(st, runColor) {
+  return st === 'failed' ? '#ff4757' : st === 'running' ? runColor : st === 'completed' ? '#00e68a' : 'transparent';
+}
+
+function _cfCard(prefix, info, idx, total, label, target, runColor) {
+  const st  = info.status || 'pending';
+  const res = (info.result || '').substring(0, 200).split('\\n')[0];
+  const dur = formatDur(info.started_at, info.completed_at);
+  let h = '<div id="' + prefix + '" class="step-card" style="border-left:3px solid ' + _cfColor(st, runColor) + ';">';
+  h += '<div class="step-num">Step ' + idx + '/' + total + '</div>';
+  h += '<div class="step-name">' + label + '</div>';
+  h += '<div style="font-size:10px;color:#556677;margin-bottom:3px;">' + target + '</div>';
+  h += '<span class="cf-badge">' + pipelineBadge(st) + '</span>';
+  if (res) h += '<div class="step-result">' + escHtml(res) + '</div>';
+  if (dur) h += '<div class="step-dur">' + dur + '</div>';
+  return h + '</div>';
+}
+
+function _cfProgress(deploy) {
+  const keys    = CF_DEPLOY_STEPS.map(s => s[0]);
+  const done    = keys.filter(k => (deploy[k]||{}).status === 'completed').length;
+  const failed  = keys.some(k => (deploy[k]||{}).status === 'failed');
+  const running = keys.some(k => (deploy[k]||{}).status === 'running');
+  const total   = keys.length;
+  const pct     = Math.min(100, Math.round(done / total * 100));
+  const color   = failed ? '#ff4757' : running ? '#02c8ff' : done === total ? '#00e68a' : '#445566';
+  const label   = failed  ? 'Failed at step ' + (done + 1) + '/' + total
+                : running ? 'Running — ' + done + '/' + total
+                : done === total ? 'Complete! All ' + total + ' steps done'
+                : done === 0 ? 'Not started' : 'Paused — ' + done + '/' + total;
+  return { done, total, pct, color, label, failed };
+}
+
+function renderCloudFabricGrid(podId, data) {
+  const grid = document.getElementById('cloudfabric-grid');
+  if (!grid) return;
+  const deploy   = data.deploy   || {};
+  const rollback = data.rollback || {};
+  const devices  = data.devices  || {};
+  const p = _cfProgress(deploy);
+
+  let html = '';
+  if ((data.missing_secrets || []).length) {
+    html += '<div style="background:#3a1d1d;border:1px solid #ff4757;color:#ffb3ba;padding:8px 12px;border-radius:4px;font-size:12px;margin-bottom:10px;">'
+         + 'Set ' + escHtml(data.missing_secrets.join(', ')) + ' in the dashboard environment or .env before running.</div>';
+  }
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
+  html += '<span style="font-size:14px;font-weight:600;color:#cdd6e0;">Cloud Fabric — Deploy</span>';
+  html += '<div style="display:flex;gap:8px;">';
+  html += '<button id="cf-deploy-btn" style="background:#02c8ff;color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">&#9654; ' + (p.done > 0 && p.done < p.total ? 'Resume' : 'Run Deploy') + '</button>';
+  html += '<button id="cf-rollback-btn" style="background:#e74c3c;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;">&#8635; Rollback</button>';
+  html += '<button id="cf-clear-btn" style="background:#1a2d4a;color:#8899aa;border:1px solid #2a3d5a;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:12px;">&#10005; Clear</button>';
+  html += '</div></div>';
+
+  // Cloud IDs captured from `show meraki connect`
+  const ids = Object.keys(CF_ROLE_LABELS).filter(r => devices[r]);
+  html += '<div style="font-size:11px;color:#8899aa;margin-bottom:10px;">Cloud IDs: '
+       + (ids.length ? ids.map(r => CF_ROLE_LABELS[r] + ' <code style="color:#cdd6e0;">' + escHtml(devices[r]) + '</code>').join(' &middot; ')
+                     : '<span style="color:#556677;">not captured yet</span>') + '</div>';
+
+  html += '<div style="margin-bottom:14px;">';
+  html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8899aa;margin-bottom:4px;">';
+  html += '<span id="cf-deploy-label">' + p.label + '</span>';
+  html += '<span id="cf-deploy-pct">' + p.pct + '% (' + p.done + '/' + p.total + ')</span></div>';
+  html += '<div style="background:#0d1117;border-radius:4px;height:8px;overflow:hidden;">';
+  html += '<div id="cf-deploy-bar" style="height:100%;border-radius:4px;background:' + p.color + ';width:' + p.pct + '%;transition:width 0.4s;"></div>';
+  html += '</div></div>';
+
+  let open = false;
+  CF_DEPLOY_STEPS.forEach((s, i) => {
+    if (s[3]) {
+      if (open) html += '</div>';
+      html += '<div style="font-size:12px;font-weight:600;color:#8899aa;margin:6px 0;">' + s[3] + '</div>';
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-bottom:12px;">';
+      open = true;
+    }
+    html += _cfCard('cf-card-deploy-' + s[0], deploy[s[0]] || {}, i + 1, CF_DEPLOY_STEPS.length, s[1], s[2], '#02c8ff');
+  });
+  if (open) html += '</div>';
+  html += '<div style="margin-bottom:6px;"></div>';
+
+  html += '<div style="font-size:13px;font-weight:600;color:#cdd6e0;margin-bottom:8px;">Rollback</div>';
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;">';
+  CF_ROLLBACK_STEPS.forEach((s, i) => {
+    html += _cfCard('cf-card-rollback-' + s[0], rollback[s[0]] || {}, i + 1, CF_ROLLBACK_STEPS.length, s[1], s[2], '#e67e22');
+  });
+  html += '</div>';
+
+  // Before the unchanged-html early return: the log moves even when no card does.
+  pollCloudFabricLogs(podId);
+  wireCloudFabricLogControls();
+  if (grid._lastHtml === html && grid._lastPodId === podId) return;
+  grid._lastHtml = html;
+  grid._lastPodId = podId;
+  grid.innerHTML = html;
+
+  setTimeout(() => {
+    const d = document.getElementById('cf-deploy-btn');
+    const r = document.getElementById('cf-rollback-btn');
+    const c = document.getElementById('cf-clear-btn');
+    if (d) d.onclick = () => triggerCloudFabric(podId, 'deploy');
+    if (r) r.onclick = () => { if (confirm('Roll back the Cloud Fabric for ' + podId + '? The fabric is deleted, then the three switches are removed from SITE_105 and unclaimed from the org.')) triggerCloudFabric(podId, 'rollback'); };
+    if (c) c.onclick = () => clearCloudFabric(podId);
+  }, 0);
+}
+
+// ── Cloud Fabric live log panel ── mirrors the ISE card: incremental by id.
+async function pollCloudFabricLogs(podId) {
+  const wrap = document.getElementById('cloudfabric-log-wrap');
+  const pre  = document.getElementById('cloudfabric-log');
+  if (!wrap || !pre) return;
+  if (window._cfLogPod !== podId) {         // POD switched — start clean
+    window._cfLogPod = podId;
+    window._cfLogSince = 0;
+    pre.textContent = '';
+  }
+  try {
+    const r = await fetch('/api/cloudfabric/logs/' + podId + '?since=' + (window._cfLogSince || 0));
+    if (!r.ok) return;
+    const d = await r.json();
+    wrap.style.display = 'block';
+    if (d.lines && d.lines.length) {
+      const follow = document.getElementById('cloudfabric-log-follow');
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+      d.lines.forEach(l => {
+        const t = (l.timestamp || '').substring(11, 19);
+        const line = (l.log_line || '').replace('[cloudfabric/log] ', '');
+        pre.textContent += (t ? t + '  ' : '') + line + String.fromCharCode(10);
+      });
+      window._cfLogSince = d.last_id;
+      if (!follow || (follow.checked && atBottom)) pre.scrollTop = pre.scrollHeight;
+    }
+  } catch (e) { /* transient fetch error — next tick retries */ }
+}
+
+function wireCloudFabricLogControls() {
+  const clr = document.getElementById('cloudfabric-log-clear');
+  if (clr && !clr._wired) {
+    clr._wired = true;
+    clr.onclick = () => {
+      const pre = document.getElementById('cloudfabric-log');
+      if (pre) pre.textContent = '';
+    };
+  }
+}
+
+function _cfAnyRunning(data) {
+  return [...Object.values(data.deploy || {}), ...Object.values(data.rollback || {})].some(s => (s || {}).status === 'running');
+}
+
+async function loadCloudFabricStatus(podId) {
+  if (window._cfPoller) { clearInterval(window._cfPoller); window._cfPoller = null; }
+  const grid = document.getElementById('cloudfabric-grid');
+  if (!podId) { if (grid) grid.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+  const data = await fetch('/api/cloudfabric/status/' + podId).then(r => r.json());
+  renderCloudFabricGrid(podId, data);
+  if (_cfAnyRunning(data)) _cfStartPoller(podId);
+}
+
+function _cfStartPoller(podId) {
+  if (window._cfPoller) clearInterval(window._cfPoller);
+  // claim_devices waits up to 20 min for the factory-reset switches, and
+  // meraki_connect / verify_ospf up to 10 each — keep polling for an hour.
+  let polls = 0;
+  window._cfPoller = setInterval(async () => {
+    polls++;
+    const data = await fetch('/api/cloudfabric/status/' + podId).then(r => r.json());
+    if (!_cfAnyRunning(data) || polls > 1200) {
+      clearInterval(window._cfPoller);
+      window._cfPoller = null;
+    }
+    renderCloudFabricGrid(podId, data);
+  }, 3000);
+}
+
+async function triggerCloudFabric(podId, action) {
+  const grid = document.getElementById('cloudfabric-grid');
+  if (grid) grid._lastHtml = null;
+  const r = await fetch('/api/cloudfabric/' + action + '/' + podId, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { alert(j.message || ('Cloud Fabric ' + action + ' failed to start')); return; }
+  _cfStartPoller(podId);
+}
+
+async function clearCloudFabric(podId) {
+  await fetch('/api/cloudfabric/clear/' + podId, { method: 'POST' });
+  const pre = document.getElementById('cloudfabric-log');
+  if (pre) pre.textContent = '';
+  window._cfLogSince = 0;
+  loadCloudFabricStatus(podId);
 }
 
 // ── Duo Card JS ───────────────────────────────────────────────────────────────
@@ -15361,6 +15752,7 @@ function closeDetail() {
   if (window._sdaCatcPoll)  { clearInterval(window._sdaCatcPoll);  window._sdaCatcPoll  = null; }
   if (window._sdaPoller)    { clearInterval(window._sdaPoller);    window._sdaPoller    = null; }
   if (window._fabricPoller) { clearInterval(window._fabricPoller); window._fabricPoller = null; }
+  if (window._cfPoller)     { clearInterval(window._cfPoller);     window._cfPoller     = null; }
   const ct = document.getElementById('catc-tile-container');
   if (ct) { ct._initialized = false; ct._podId = null; }
   const sct = document.getElementById('sda-catc-tile-container');
