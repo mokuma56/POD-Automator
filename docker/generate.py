@@ -364,7 +364,20 @@ def action_generate(pods, out_dir):
 
 # ── Main ─────────────────────────────────────────────────────
 
+def _load_lab_secrets():
+    """MERAKI_API_KEY / LAB_PASS from the gitignored .env into this process, so
+    `docker compose up` can interpolate them into the pipeline container."""
+    env = PROJECT_ROOT / ".env"
+    if not env.exists():
+        return
+    for line in env.read_text().splitlines():
+        k, sep, v = line.strip().partition("=")
+        if sep and k in ("MERAKI_API_KEY", "LAB_PASS") and not os.environ.get(k):
+            os.environ[k] = v.strip().strip('"').strip("'")
+
+
 def main():
+    _load_lab_secrets()
     parser = argparse.ArgumentParser(
         description="POD Automator — parallel SD-WAN onboarding"
     )

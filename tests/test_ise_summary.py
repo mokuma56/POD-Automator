@@ -18,7 +18,7 @@ from ise_integrations import ISE_STEPS, SOFT_FAIL_STEPS, _summarise_outcomes  # 
 def test_all_completed_is_success():
     ok, msg = _summarise_outcomes([(s, "completed", "done") for s in ISE_STEPS])
     assert ok is True
-    assert msg == "5/5 completed"
+    assert msg == f"{len(ISE_STEPS)}/{len(ISE_STEPS)} completed"
 
 
 def test_deliberate_self_skip_is_success():
@@ -83,5 +83,7 @@ def test_soft_fail_steps_are_the_internet_dependent_ones():
         "ise_cdfmc_integrate",
         "ise_scc_deactivate_reactivate",
         "ise_sgt_verify",
+        # Meraki cloud (api.meraki.com) via the lab's internet, like the three above
+        "ise_meraki_integration",
     }
     assert all(s in ISE_STEPS for s in SOFT_FAIL_STEPS)

@@ -45,6 +45,9 @@ ISE_STEPS = [
     "ise_scc_integrate",
     "ise_scc_deactivate_reactivate",
     "ise_cdfmc_integrate",
+    # Meraki sync before the SGT verify, so the card's last check runs after
+    # every integration that pushes SGTs out of ISE is in place.
+    "ise_meraki_integration",
     "ise_sgt_verify",
 ]
 
@@ -54,6 +57,7 @@ ISE_STEP_LABELS = {
     "ise_cdfmc_integrate":          "ISE \u2192 cdFMC (SGTs)",
     "ise_scc_deactivate_reactivate":"ISE\u2192SCC Deactivate + Reactivate",
     "ise_sgt_verify":               "Secure Access SGT Verify",
+    "ise_meraki_integration":       "ISE \u2192 Meraki (TrustSec SGT sync)",
 }
 
 def _sanitize(s: str) -> str:
@@ -4422,6 +4426,21 @@ async def _phase_ise_scc_integrate_async(pod_id: str, creds: dict, session_path:
             await browser.close()
 
 
+# ── ISE → Meraki (TrustSec) ───────────────────────────────────────────────────
+
+def _phase_ise_meraki_integration(log) -> tuple[bool, str]:
+    """Guide part A step 6, run from the ISE card so the session's ISE is wired to
+    the POD's Meraki org whatever fabric lab follows. Shared with the Cloud
+    Fabric tab (cloud_fabric.step_ise_meraki_integration): whichever runs second
+    finds the connection and reports SKIP: already integrated."""
+    import cloud_fabric
+    ok, msg = cloud_fabric.step_ise_meraki_integration(log)
+    cloud_fabric.close_session()
+    if ok and msg.startswith("already integrated"):
+        return True, f"{_SKIP_PREFIX}{msg}"
+    return ok, msg
+
+
 # ── Main card runner ──────────────────────────────────────────────────────────
 
 # These three depend on lab internet access, which is outside our control, so a
@@ -4432,6 +4451,7 @@ SOFT_FAIL_STEPS = (
     "ise_cdfmc_integrate",
     "ise_scc_deactivate_reactivate",
     "ise_sgt_verify",
+    "ise_meraki_integration",
 )
 
 
@@ -4702,6 +4722,8 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
                 ok, msg = asyncio.run(_phase_ise_scc_deactivate_reactivate_async(pod_id, creds, session_path, _log))
             elif step == "ise_sgt_verify":
                 ok, msg = _phase_ise_sgt_verify(pod_id, creds, _log)
+            elif step == "ise_meraki_integration":
+                ok, msg = _phase_ise_meraki_integration(_log)
             else:
                 ok, msg = False, f"Unknown step: {step}"
         except Exception as e:

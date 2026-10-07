@@ -2872,6 +2872,12 @@ def _cloudfabric_secrets():
     return env, [k for k, v in env.items() if not v]
 
 
+# Load them into this process once, so every `docker compose up` of a pipeline
+# container inherits them (compose-template.yml interpolates ${MERAKI_API_KEY}
+# and ${LAB_PASS} — the core pipeline's meraki_cleanup step needs both).
+os.environ.update({k: v for k, v in _cloudfabric_secrets()[0].items() if v and not os.environ.get(k)})
+
+
 def _ensure_cloudfabric_table():
     import cloud_fabric
     cloud_fabric.DB_PATH = str(DATA_DIR / "data" / "pod_state.db")
@@ -3337,6 +3343,9 @@ def api_ise_run(pod_id):
             "--network", f"container:vpn-{pod_id}",
             "-e", f"POD_ID={pod_id}",
             "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            # by name: values come from this process (loaded from .env at
+            # startup), for the ise_meraki_integration step
+            "-e", "MERAKI_API_KEY", "-e", "LAB_PASS",
             "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
             "--entrypoint", "python3",
             "pod-automator:latest", "-u", "-c",
@@ -3459,6 +3468,9 @@ def api_ise_reactivate(pod_id):
             "--network", f"container:vpn-{pod_id}",
             "-e", f"POD_ID={pod_id}",
             "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            # by name: values come from this process (loaded from .env at
+            # startup), for the ise_meraki_integration step
+            "-e", "MERAKI_API_KEY", "-e", "LAB_PASS",
             "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
             "--entrypoint", "python3",
             "pod-automator:latest", "-u", "-c",
@@ -9862,13 +9874,14 @@ PIPELINE_STEP_NAMES = [
     "controller_mode_enable", "verify_online", "redeploy_config_group",
     "verify_border_spine", "verify_leaf1", "verify_leaf2", "connectivity_test",
     "route_verification", "cdfmc_check", "ad_verify", "scc_reset_check",
+    "meraki_cleanup",
 ]
 
 PIPELINE_SOFT_FAIL = {
     "detect_pod_number", "controller_mode_enable", "verify_online",
     "redeploy_config_group", "verify_border_spine", "verify_leaf1",
     "verify_leaf2", "connectivity_test", "route_verification",
-    "cdfmc_check", "ad_verify", "scc_reset_check",
+    "cdfmc_check", "ad_verify", "scc_reset_check", "meraki_cleanup",
 }
 
 
@@ -10094,6 +10107,9 @@ def _run_full_automation(pod_id: str, addons: list, skip_preflight: bool = False
             "--network", f"container:vpn-{pod_id}",
             "-e", f"POD_ID={pod_id}",
             "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            # by name: values come from this process (loaded from .env at
+            # startup), for the ise_meraki_integration step
+            "-e", "MERAKI_API_KEY", "-e", "LAB_PASS",
             "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
             "--entrypoint", "python3",
             "pod-automator:latest", "-u", "-c",
@@ -11070,6 +11086,7 @@ const PIPELINE_ORDER = [
   "cdfmc_check",
   "ad_verify",
   "scc_reset_check",
+  "meraki_cleanup",
 ];
 
 async function handleFile(file) {
@@ -11696,7 +11713,7 @@ function badge(val, yesLabel) {
 const SOFT_FAIL_STEPS = new Set([
   'detect_pod_number','controller_mode_enable','verify_online','redeploy_config_group',
   'verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test',
-  'route_verification','cdfmc_check','ad_verify','scc_reset_check',
+  'route_verification','cdfmc_check','ad_verify','scc_reset_check','meraki_cleanup',
 ]);
 
 function pipelineBadge(val, result, name) {
@@ -16594,13 +16611,14 @@ const _origSwitchTab = typeof switchTab === 'function' ? switchTab : null;
 
 // ── ISE Integration Card JS ────────────────────────────────────────────────
 
-const ISE_STEPS = ['ise_pxgrid_register', 'ise_scc_integrate', 'ise_scc_deactivate_reactivate', 'ise_cdfmc_integrate', 'ise_sgt_verify'];
+const ISE_STEPS = ['ise_pxgrid_register', 'ise_scc_integrate', 'ise_scc_deactivate_reactivate', 'ise_cdfmc_integrate', 'ise_meraki_integration', 'ise_sgt_verify'];
 const ISE_STEP_LABELS = {
   ise_pxgrid_register:            'pxGrid Cloud Register',
   ise_scc_integrate:              'ISE \u2192 Secure Access (SGTs)',
   ise_cdfmc_integrate:            'ISE \u2192 cdFMC (SGTs)',
   ise_scc_deactivate_reactivate:  'ISE\u2192SCC Deactivate + Reactivate',
   ise_sgt_verify:                 'Secure Access SGT Verify',
+  ise_meraki_integration:         'ISE \u2192 Meraki (TrustSec SGT sync)',
 };
 
 async function loadIseStatus(podId) {

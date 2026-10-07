@@ -50,6 +50,11 @@ services:
       DB_PATH: /pipeline/host-data/pod_state.db
       SCC_KEYS_DIR: /pipeline/host-data/scc_keys
       BOOTSTRAP_PATH: /pipeline/data/bootstrap/ciscosdwan.cfg
+      # Interpolated by `docker compose` from the launching process's environment
+      # (the dashboard loads them from .env), so the values never land in a
+      # generated compose file. Used by the meraki_cleanup step.
+      MERAKI_API_KEY: ${MERAKI_API_KEY:-}
+      LAB_PASS: ${LAB_PASS:-}
     volumes:
       - {{pod_id}}-bootstrap:/pipeline/data/bootstrap
       - {{host_data}}:/pipeline/host-data

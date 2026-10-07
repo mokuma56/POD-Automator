@@ -578,7 +578,7 @@ def step_ise_meraki_integration(log_fn=print):
     try:
         have = _ise_connection(s)
         if have and any(o.get("id") == _org_id() for o in have.get("organizations") or []):
-            return True, f"{ISE_MERAKI_CONNECTION} already connected to org {_org_id()}"
+            return True, f"already integrated — {ISE_MERAKI_CONNECTION} connected to org {_org_id()}"
         if have:
             return False, (f"{ISE_MERAKI_CONNECTION} exists but is not linked to org {_org_id()} "
                            f"— delete it (rollback) and rerun")
@@ -1194,6 +1194,131 @@ ROLLBACK_STEPS = [
     ("remove_devices",  step_remove_devices),
     ("release_devices", step_release_devices),
 ]
+
+
+# ── Core-pipeline cleanup: leave the Meraki org as the lab starts it ──────────
+#
+# Runs on EVERY POD after scc_reset_check (onboard.py). It discovers what exists
+# rather than trusting what this tab recorded, so it also removes a previous
+# student's work. Kept: the org VRFs Main/PROD/IOT, OSPF area 0 and SITE_105
+# itself — the guide expects those. Removed: everything the lab builds.
+
+LAB_ACLS = ("DENY_ICMP",)
+LAB_GROUPS = {g for _, _, g, _ in NAMED_VLANS}        # Main / Production / IoT
+
+
+def lab_switches(net_devices: list, recorded: set) -> list:
+    """The Site_105 C9300s in SITE_105: recorded Cloud IDs, or the guide's names."""
+    names = {sw["name"] for sw in SWITCHES.values()}
+    return [d for d in net_devices
+            if d.get("serial") in recorded
+            or (str(d.get("model", "")).startswith("C9") and d.get("name") in names)]
+
+
+def lab_vlan_names(vlan_names: list) -> list:
+    """The VLAN profile's named VLANs with the lab's Main/PROD/IOT taken out."""
+    ours = {n for n, *_ in NAMED_VLANS}
+    ids = {str(i) for _, i, *_ in NAMED_VLANS}
+    return [v for v in vlan_names if v.get("name") not in ours and str(v.get("vlanId")) not in ids]
+
+
+def _cleanup_fabric(log_fn):
+    creds = hostdb.call("org_creds_for_pod", db_path=DB_PATH, pod_id=POD_ID) or {}
+    if not (creds.get("idac_url") or "").strip():
+        raise RuntimeError("no idac_url for this org — cannot open a Dashboard session")
+    return step_delete_fabric(log_fn)[1]
+
+
+def _cleanup_switches(log_fn):
+    net = _network_id()
+    recorded = set(_devices().values())
+    found = lab_switches(meraki("GET", f"/networks/{net}/devices") or [], recorded)
+    for d in found:
+        meraki("POST", f"/networks/{net}/devices/remove", {"serial": d["serial"]})
+        log_fn(f"    removed {d.get('name') or d['serial']} from {NETWORK_NAME}")
+    serials = {d["serial"] for d in found} | recorded
+    inv = _inventory(serials) if serials else {}
+    if inv:
+        meraki("POST", f"/organizations/{_org_id()}/inventory/release", {"serials": sorted(inv)})
+    return f"{len(found)} removed, {len(inv)} unclaimed"
+
+
+def _cleanup_switching(log_fn):
+    net = _network_id()
+    done = []
+    pols = meraki("GET", f"/networks/{net}/switch/accessPolicies") or []
+    for p in pols:
+        if p.get("name") == ACCESS_POLICY:
+            meraki("DELETE", f"/networks/{net}/switch/accessPolicies/{p['accessPolicyNumber']}")
+            done.append(f"access policy {ACCESS_POLICY}")
+    for prof in meraki("GET", f"/networks/{net}/vlanProfiles") or []:
+        keep = lab_vlan_names(prof.get("vlanNames", []))
+        if len(keep) != len(prof.get("vlanNames", [])):
+            meraki("PUT", f"/networks/{net}/vlanProfiles/{prof['iname']}", {
+                "name": prof["name"], "activeVlans": prof.get("activeVlans") or "all",
+                "vlanNames": keep, "vlanGroups": prof.get("vlanGroups", [])})
+            done.append(f"named VLANs in {prof['name']}")
+    if (meraki("GET", f"/networks/{net}/settings") or {}).get("namedVlans", {}).get("enabled"):
+        meraki("PUT", f"/networks/{net}/settings", {"namedVlans": {"enabled": False}})
+        done.append("named VLANs for RADIUS off")
+    return ", ".join(done) or "nothing to reset"
+
+
+def _cleanup_adaptive_policy(log_fn):
+    """ISE-synced policy, ACL and SGTs. Runs after the ISE connection is gone, or
+    ISE would push them straight back on its next sync."""
+    org = _org_id()
+    base = f"/organizations/{org}/adaptivePolicy"
+    done = []
+    for p in meraki("GET", f"{base}/policies") or []:
+        if {p["sourceGroup"]["name"], p["destinationGroup"]["name"]} & LAB_GROUPS:
+            meraki("DELETE", f"{base}/policies/{p['adaptivePolicyId']}")
+            done.append(f"policy {p['sourceGroup']['name']}→{p['destinationGroup']['name']}")
+    for a in meraki("GET", f"{base}/acls") or []:
+        if a["name"] in LAB_ACLS:
+            meraki("DELETE", f"{base}/acls/{a['aclId']}")
+            done.append(f"ACL {a['name']}")
+    for g in meraki("GET", f"{base}/groups") or []:
+        if g["name"] in LAB_GROUPS and not g.get("isDefaultGroup"):
+            meraki("DELETE", f"{base}/groups/{g['groupId']}")
+            done.append(f"group {g['name']} ({g['sgt']})")
+    return ", ".join(done) or "nothing synced"
+
+
+# Order matters: the fabric holds BGP on the switches (removal fails while it
+# exists); the ISE connection must go before its SGTs or ISE re-syncs them; the
+# VLAN profile references the groups, so it is reset before they are deleted.
+CLEANUP_PARTS = [
+    ("fabric",           _cleanup_fabric),
+    ("ISE integration",  lambda log_fn: step_delete_ise_meraki(log_fn)[1]),
+    ("switches",         _cleanup_switches),
+    ("switching config", _cleanup_switching),
+    ("adaptive policy",  _cleanup_adaptive_policy),
+]
+
+
+def meraki_cleanup(log_fn=print):
+    """Core-pipeline step: (ok, summary). Each part is independent — one failing
+    is reported but does not stop the rest."""
+    results, failed = [], []
+    try:
+        for name, fn in CLEANUP_PARTS:
+            try:
+                msg = fn(log_fn)
+                log_fn(f"  ✓ {name}: {msg}")
+                results.append(f"{name}: {msg}")
+            except STEP_ERRORS as e:
+                log_fn(f"  ✗ {name}: {type(e).__name__}: {e}")
+                failed.append(f"{name}: {str(e)[:120]}")
+    finally:
+        close_session()
+    if POD_ID:   # the Cloud Fabric card no longer describes this org
+        ensure_table()
+        for mode in ("deploy", "rollback"):
+            hostdb.call("cloudfabric_clear_mode", db_path=DB_PATH, pod_id=POD_ID, mode=mode)
+    if failed:
+        return False, "partial — " + "; ".join(failed)
+    return True, "; ".join(results)
 
 
 # ── Runners ───────────────────────────────────────────────────────────────────
