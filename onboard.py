@@ -222,6 +222,13 @@ if _sdwan_online:
 else:
     s = onboard_router.vmanage_session()
 
+def _meraki_cleanup():
+    """Leave the POD's Meraki org as the Cloud Fabric lab starts it (every POD:
+    which fabric lab a student runs is not known up front). See cloud_fabric.py."""
+    import cloud_fabric
+    return cloud_fabric.meraki_cleanup(log_fn=lambda m: live_log(f"[meraki-cleanup] {m.strip()}"))
+
+
 steps = [
     ("detect_pod_number",  onboard_router.phase_detect_pod_number),
     ("verify_router",      lambda: True),
@@ -244,6 +251,7 @@ steps = [
      ("cdfmc_check",        onboard_router.phase_cdfmc_check),
      ("ad_verify",          onboard_router.phase_ad_verify),
      ("scc_reset_check",    onboard_router.phase_scc_reset_check),
+     ("meraki_cleanup",     lambda: _meraki_cleanup()),
 ]
 
 SOFT_FAIL_STEPS = {
@@ -259,6 +267,7 @@ SOFT_FAIL_STEPS = {
     "cdfmc_check",
     "ad_verify",
     "scc_reset_check",
+    "meraki_cleanup",
 }
 
 for step_name, func in steps:

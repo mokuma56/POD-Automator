@@ -131,3 +131,28 @@ def test_ise_summary_matches_the_wizard_contract():
     assert body["sgtIds"] == {"selectedIds": ["s1", "s2", "s3"]}
     assert body["sgaclIds"] == {"selectedIds": []} and body["egressPolicyIds"] == {"selectedIds": []}
     assert body["settings"] == {"syncInterval": 12}
+
+
+def test_cleanup_only_picks_the_lab_switches():
+    devs = [{"serial": "S1", "model": "C9300-24U", "name": "Site_105-Border-Spine"},
+            {"serial": "S2", "model": "C9300-48UB", "name": "Site_105-Leaf1"},
+            {"serial": "S3", "model": "MX68", "name": "Site_105-Leaf2"},       # wrong model
+            {"serial": "S4", "model": "C9300-48UB", "name": "Lobby-Switch"},   # not the lab's
+            {"serial": "S5", "model": "C9300-48UB", "name": ""}]               # recorded only
+    picked = {d["serial"] for d in cf.lab_switches(devs, recorded={"S5"})}
+    assert picked == {"S1", "S2", "S5"}
+
+
+def test_cleanup_keeps_non_lab_named_vlans():
+    names = [{"name": "default", "vlanId": "1"}, {"name": "Main", "vlanId": "10"},
+             {"name": "PROD", "vlanId": "101"}, {"name": "IOT", "vlanId": "102"},
+             {"name": "Voice", "vlanId": "200"}]
+    assert cf.lab_vlan_names(names) == [{"name": "default", "vlanId": "1"},
+                                        {"name": "Voice", "vlanId": "200"}]
+
+
+def test_cleanup_order_frees_dependencies_first():
+    order = [n for n, _ in cf.CLEANUP_PARTS]
+    assert order.index("fabric") < order.index("switches")          # BGP blocks removal
+    assert order.index("ISE integration") < order.index("adaptive policy")   # else ISE re-syncs
+    assert order.index("switching config") < order.index("adaptive policy")  # VLAN profile refs groups
