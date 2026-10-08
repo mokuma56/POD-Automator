@@ -14796,7 +14796,8 @@ const CF_DEPLOY_STEPS = [
   ["transit_interface",     "Shared-Services Transit", "Border VLAN 5 192.168.255.7/31",  ""],
   ["static_route",          "Shared-Services Route",   "198.18.5.0/24 via .6",            ""],
   ["verify_ospf",           "Verify OSPF",             "Leaf1 + Leaf2 FULL",              ""],
-  ["fabric_create",         "Create Fabric (Staged)",  "ASN 65535, roles, VRFs, border", "C. Fabric build & deploy (Dashboard session)"],
+  ["fabric_vrfs",           "Fabric VRFs",             "Main / PROD / IOT (create if missing)", "C. Fabric build & deploy (Dashboard session)"],
+  ["fabric_create",         "Create Fabric (Staged)",  "ASN 65535, roles, VRFs, border", ""],
   ["fabric_subnets",        "Fabric Subnets",          "10 / 101 / 102 anycast, both leaves", ""],
   ["fabric_deploy",         "Deploy Fabric",           "Wait for Deployed / Success",     ""],
   ["verify_fabric",         "Verify Fabric",           "3 VRFs, 6 subnets, eBGP 3/3",     ""],
@@ -14806,6 +14807,7 @@ const CF_ROLLBACK_STEPS = [
   ["delete_ise_meraki", "Delete ISE Integration", "PseudoCo_Cloud_Networking"],
   ["remove_devices",  "Remove from Network", "SITE_105"],
   ["release_devices", "Unclaim from Org",    "Org inventory"],
+  ["delete_vrfs",     "Delete VRFs",         "Main / PROD / IOT"],
 ];
 const CF_ROLE_LABELS = { border_spine: "Border-Spine", leaf1: "Leaf1", leaf2: "Leaf2" };
 
