@@ -156,3 +156,10 @@ def test_cleanup_order_frees_dependencies_first():
     assert order.index("fabric") < order.index("switches")          # BGP blocks removal
     assert order.index("ISE integration") < order.index("adaptive policy")   # else ISE re-syncs
     assert order.index("switching config") < order.index("adaptive policy")  # VLAN profile refs groups
+    assert order.index("VRFs") > order.index("switches") > order.index("fabric")  # VRFs in use until then
+
+
+def test_vrfs_are_created_before_the_fabric_and_deleted_last():
+    deploy = [n for n, _ in cf.DEPLOY_STEPS]
+    assert deploy.index("fabric_vrfs") == deploy.index("fabric_create") - 1
+    assert [n for n, _ in cf.ROLLBACK_STEPS][-1] == "delete_vrfs"

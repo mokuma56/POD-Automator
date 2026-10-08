@@ -968,6 +968,30 @@ def _org_vrf_ids(log_fn) -> dict:
     return {n: have[n] for n in FABRIC_VRFS}
 
 
+def step_fabric_vrfs(log_fn=print):
+    """The org VRFs Main/PROD/IOT the fabric's border interfaces and subnets use.
+    Rollback and the core-pipeline cleanup delete them, so the build creates them."""
+    path = f"/organizations/{_org_id()}/routing/vrfs"
+    before = {v["name"] for v in (meraki("GET", path) or {}).get("items", [])}
+    ids = _org_vrf_ids(log_fn)
+    made = [n for n in FABRIC_VRFS if n not in before]
+    return True, (("created " + ", ".join(made)) if made else "already present") + \
+        " — " + ", ".join(f"{n}={ids[n]}" for n in FABRIC_VRFS)
+
+
+def delete_lab_vrfs(log_fn=print) -> str:
+    """Delete the org VRFs Main/PROD/IOT. Only once nothing uses them: the fabric
+    and the switches' VRF interfaces must already be gone."""
+    path = f"/organizations/{_org_id()}/routing/vrfs"
+    gone = []
+    for v in (meraki("GET", path) or {}).get("items", []):
+        if v["name"] in FABRIC_VRFS:
+            meraki("DELETE", f"{path}/{v['vrfId']}")
+            log_fn(f"    deleted org VRF {v['name']}")
+            gone.append(v["name"])
+    return ("deleted " + ", ".join(gone)) if gone else "no lab VRFs present"
+
+
 def build_fabric_config(org_id: str, devices: dict, vrf_ids: dict, with_subnets: bool,
                         fabric_id: str = "") -> dict:
     """The decoded `config` blob Dashboard's fabric wizard sends.
@@ -1151,6 +1175,7 @@ DEPLOY_STEPS = [
     ("transit_interface",     step_transit_interface),
     ("static_route",          step_static_route),
     ("verify_ospf",           step_verify_ospf),
+    ("fabric_vrfs",           step_fabric_vrfs),
     ("fabric_create",         step_fabric_create),
     ("fabric_subnets",        step_fabric_subnets),
     ("fabric_deploy",         step_fabric_deploy),
@@ -1193,6 +1218,7 @@ ROLLBACK_STEPS = [
     ("delete_ise_meraki", step_delete_ise_meraki),
     ("remove_devices",  step_remove_devices),
     ("release_devices", step_release_devices),
+    ("delete_vrfs",     lambda log_fn=print: (True, delete_lab_vrfs(log_fn))),
 ]
 
 
@@ -1200,8 +1226,8 @@ ROLLBACK_STEPS = [
 #
 # Runs on EVERY POD after scc_reset_check (onboard.py). It discovers what exists
 # rather than trusting what this tab recorded, so it also removes a previous
-# student's work. Kept: the org VRFs Main/PROD/IOT, OSPF area 0 and SITE_105
-# itself — the guide expects those. Removed: everything the lab builds.
+# student's work. Kept: OSPF area 0 and SITE_105 itself. Removed: everything the
+# lab builds, including the org VRFs Main/PROD/IOT (fabric_vrfs recreates them).
 
 LAB_ACLS = ("DENY_ICMP",)
 LAB_GROUPS = {g for _, _, g, _ in NAMED_VLANS}        # Main / Production / IoT
@@ -1292,6 +1318,7 @@ CLEANUP_PARTS = [
     ("fabric",           _cleanup_fabric),
     ("ISE integration",  lambda log_fn: step_delete_ise_meraki(log_fn)[1]),
     ("switches",         _cleanup_switches),
+    ("VRFs",             delete_lab_vrfs),
     ("switching config", _cleanup_switching),
     ("adaptive policy",  _cleanup_adaptive_policy),
 ]
