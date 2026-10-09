@@ -1,9 +1,8 @@
 """cdFMC Application Instances: which row is the ACTIVE one.
 
-The success icon alone reported active for rows that were not: on POD-18
-(2026-10-09) a stale POD-4 row with a grey "Selected" tick and an enabled trash
-was skipped as "ACTIVE", never purged, and cdFMC rejected every new OTP with
-"api key is invalid". cdFMC disables the delete control on the active row only.
+The success icon alone was seen reporting active for a "Not Activated" row
+(2026-09-23). cdFMC disables the delete control on the active row only, so that
+decides when the row has one.
 
 Run: uv run --with pytest python3 -m pytest tests/ -q
 """
@@ -23,7 +22,6 @@ def sig(**kw):
 
 
 def test_enabled_delete_is_not_active_even_with_success_icon():
-    # the POD-18 stale row
     assert d._cdfmc_row_is_active(sig()) is False
 
 

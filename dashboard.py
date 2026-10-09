@@ -7096,13 +7096,13 @@ def api_scc_reset_all_status():
 # ── Host-side cdFMC pxGrid integration (step 4) ──────────────────────────────
 
 # What one Application Instances row says about being active, as raw signals.
-# The old test -- an `icon-success` inside the row's `-active-icon` -- is true
-# for rows that are NOT active (verified 2026-09-23 and again on POD-18 on
-# 2026-10-09: a stale POD-4 row with a grey "Selected" tick and an enabled
-# trash was skipped as "ACTIVE", so it was never purged and blocked every OTP).
-# cdFMC itself draws the line we need: it disables the delete control on the
-# active row and only there, which is why ours must be activated before a stale
-# active one can go. _cdfmc_row_is_active() decides from these signals.
+# The `icon-success` inside the row's `-active-icon` was seen reporting active
+# for a "Not Activated" row (2026-09-23). cdFMC disables the delete control on
+# the active row only, which is why ours must be activated before a stale
+# active one can go, so that decides here; every row's signals are logged.
+# Not the cause of the POD-18 "api key is invalid" failure (2026-10-09): there
+# the stale POD-4 row really was active (delete disabled), and both tests agree.
+# _cdfmc_row_is_active() decides from these signals.
 _CDFMC_ROW_SIGNALS_JS = """(r) => {
     const del = r.querySelector('[data-testid$="-delete-icon"]')
              || (r.querySelector('[data-testid="icon-trash"]') || {closest: () => null}).closest('button');
