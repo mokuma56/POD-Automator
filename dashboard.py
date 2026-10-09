@@ -2990,6 +2990,199 @@ def api_cloudfabric_clear(pod_id):
     return jsonify({"status": "ok", "message": f"Cloud Fabric state cleared for {pod_id}"})
 
 
+# ---------------------------------------------------------------------------
+# Fault Lab routes (fault_lab.py — reversible Meraki faults for demos)
+# ---------------------------------------------------------------------------
+# Runs in this process: Meraki is a cloud API, so no VPN namespace is needed.
+
+import fault_lab
+import hostdb as _hostdb
+fault_lab.DB_PATH = str(DB_PATH)
+
+_FAULTLAB_CLASS = {"busy": False, "results": []}   # last class-wide run, for the panel
+
+
+def _faultlab_log_for(pod_id):
+    return lambda msg: log(pod_id, msg)
+
+
+def _faultlab_recent_logs(pod_id=None, limit=40):
+    c = _db()
+    try:
+        sql = "SELECT pod_id, log_line, timestamp FROM pipeline_logs WHERE log_line LIKE '[faultlab]%'"
+        args = ()
+        if pod_id:
+            sql, args = sql + " AND pod_id=?", (pod_id,)
+        rows = c.execute(sql + " ORDER BY id DESC LIMIT ?", args + (limit,)).fetchall()
+    finally:
+        c.close()
+    return [{"pod_id": r["pod_id"], "line": r["log_line"], "at": r["timestamp"]} for r in reversed(rows)]
+
+
+def _faultlab_public(rec):
+    """A record for the browser: the target parsed, the snapshot left out."""
+    return {**{k: v for k, v in rec.items() if k != "snapshot"}, "target": json.loads(rec["target"])}
+
+
+def _faultlab_teardown(pod_id=None):
+    """Delete POD / Full Reset: revert faults while the org is still there.
+    Returns (steps, errors) in the shape both callers report."""
+    try:
+        done, errs = fault_lab.revert_all(pod_id, log_for=_faultlab_log_for)
+    except _hostdb.HostDBError as e:
+        return [], [f"fault lab: could not list injections: {str(e)[:120]}"]
+    steps = [f"fault lab: reverted {len(done)} injection(s)"] if done else []
+    return steps, [f"fault lab revert FAILED — {e}" for e in errs]
+
+
+def _faultlab_sweeper():
+    """Auto-revert: put back every injection whose TTL has passed."""
+    while True:
+        time.sleep(60)
+        try:
+            fault_lab.revert_all(expired_only=True, log_for=_faultlab_log_for)
+        except _hostdb.HostDBError as e:
+            print(f"[faultlab] sweeper: {e}", flush=True)
+
+
+threading.Thread(target=_faultlab_sweeper, daemon=True, name="faultlab-sweeper").start()
+
+
+@app.route("/api/faultlab/scenarios")
+def api_faultlab_scenarios():
+    return jsonify({"scenarios": fault_lab.scenario_catalog(),
+                    "default_ttl": fault_lab.DEFAULT_TTL_MINUTES})
+
+
+@app.route("/api/faultlab/targets/<pod_id>")
+def api_faultlab_targets(pod_id):
+    """Targets in the POD's org, live from Meraki: {"ssid": [...], "leaf": [...]}."""
+    try:
+        return jsonify({"pod_id": pod_id, "targets": fault_lab.targets_for_pod(pod_id)})
+    except fault_lab.FAULT_ERRORS as e:
+        return jsonify({"status": "error", "message": str(e)[:300]}), 400
+
+
+@app.route("/api/faultlab/status/<pod_id>")
+def api_faultlab_status(pod_id):
+    return jsonify({"pod_id": pod_id,
+                    "injections": [_faultlab_public(r) for r in _hostdb.call("faultlab_list", db_path=str(DB_PATH), pod_id=pod_id)],
+                    "logs": _faultlab_recent_logs(pod_id, 30)})
+
+
+@app.route("/api/faultlab/inject/<pod_id>", methods=["POST"])
+def api_faultlab_inject(pod_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        ttl = max(1, min(int(data.get("ttl_minutes") or fault_lab.DEFAULT_TTL_MINUTES), 480))
+        rec = fault_lab.inject(pod_id, data.get("scenario", ""), data.get("target") or {},
+                               ttl, log_fn=_faultlab_log_for(pod_id))
+    except fault_lab.FAULT_ERRORS as e:
+        log(pod_id, f"[faultlab] inject refused/failed: {str(e)[:200]}")
+        return jsonify({"status": "error", "message": str(e)[:300]}), 400
+    return jsonify({"status": "ok", "injection": _faultlab_public(rec)})
+
+
+@app.route("/api/faultlab/revert/<record_id>", methods=["POST"])
+def api_faultlab_revert(record_id):
+    rec = _hostdb.call("faultlab_get", db_path=str(DB_PATH), record_id=record_id)
+    if not rec:
+        return jsonify({"status": "error", "message": f"no injection {record_id}"}), 404
+    try:
+        fault_lab.revert(record_id, log_fn=_faultlab_log_for(rec["pod_id"]))
+    except fault_lab.FAULT_ERRORS as e:
+        return jsonify({"status": "error", "message": str(e)[:300]}), 400
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/faultlab/forget/<record_id>", methods=["POST"])
+def api_faultlab_forget(record_id):
+    """Drop a record without reverting — for a fault whose org no longer exists
+    (e.g. after a lab-session reset handed out new orgs)."""
+    rec = _hostdb.call("faultlab_get", db_path=str(DB_PATH), record_id=record_id)
+    if not rec:
+        return jsonify({"status": "error", "message": f"no injection {record_id}"}), 404
+    _hostdb.call("faultlab_delete", db_path=str(DB_PATH), record_id=record_id)
+    log(rec["pod_id"], f"[faultlab] forgot {rec['scenario']} on {rec['network_name']} "
+                       f"(id {record_id}) without reverting")
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/faultlab/class-status")
+def api_faultlab_class_status():
+    c = _db()
+    try:
+        pods = [{"pod_id": r["pod_id"], "pod_number": r["pod_number"] or ""}
+                for r in c.execute("SELECT pod_id, pod_number FROM pods ORDER BY pod_id")]
+    finally:
+        c.close()
+    return jsonify({"pods": pods, "busy": _FAULTLAB_CLASS["busy"],
+                    "results": _FAULTLAB_CLASS["results"],
+                    "injections": [_faultlab_public(r) for r in _hostdb.call("faultlab_list", db_path=str(DB_PATH))],
+                    "logs": _faultlab_recent_logs(None, 40)})
+
+
+@app.route("/api/faultlab/class-targets")
+def api_faultlab_class_targets():
+    """Every POD's targets, live from its Meraki org, for the class panel's per-POD pickers."""
+    c = _db()
+    try:
+        pods = [{"pod_id": r["pod_id"], "pod_number": r["pod_number"] or ""}
+                for r in c.execute("SELECT pod_id, pod_number FROM pods ORDER BY pod_id")]
+    finally:
+        c.close()
+    found = fault_lab.targets_for_pods([p["pod_id"] for p in pods])
+    return jsonify({"pods": [{**p, **found.get(p["pod_id"], {})} for p in pods]})
+
+
+@app.route("/api/faultlab/class-inject", methods=["POST"])
+def api_faultlab_class_inject():
+    """Inject one scenario on many PODs. Each item names its own targets, picked
+    from that POD's org exactly as the per-POD tab does:
+    {"scenario", "ttl_minutes", "items": [{"pod_id", "targets": [target, ...]}]}"""
+    data = request.get_json(silent=True) or {}
+    scenario = data.get("scenario", "")
+    items = [i for i in (data.get("items") or []) if i.get("pod_id") and i.get("targets")]
+    if scenario not in fault_lab.SCENARIOS or not items:
+        return jsonify({"status": "error", "message": "pick a scenario and at least one POD with a target"}), 400
+    if _FAULTLAB_CLASS["busy"]:
+        return jsonify({"status": "error", "message": "a class-wide run is already in progress"}), 409
+    ttl = max(1, min(int(data.get("ttl_minutes") or fault_lab.DEFAULT_TTL_MINUTES), 480))
+
+    def _run():
+        _FAULTLAB_CLASS.update(busy=True, results=[])
+        try:
+            for item in items:
+                pod_id, made, errors = item["pod_id"], 0, []
+                for target in item["targets"]:
+                    try:
+                        fault_lab.inject(pod_id, scenario, target, ttl, log_fn=_faultlab_log_for(pod_id))
+                        made += 1
+                    except fault_lab.FAULT_ERRORS as e:
+                        log(pod_id, f"[faultlab] class inject failed: {str(e)[:200]}")
+                        errors.append(str(e)[:200])
+                _FAULTLAB_CLASS["results"].append({
+                    "pod_id": pod_id, "ok": not errors,
+                    "message": "; ".join(errors) if errors else f"{made} target(s) faulted"})
+        finally:
+            _FAULTLAB_CLASS["busy"] = False
+
+    threading.Thread(target=_run, daemon=True, name="faultlab-class").start()
+    return jsonify({"status": "ok", "message": f"injecting {scenario} on {len(items)} POD(s)"})
+
+
+@app.route("/api/faultlab/class-revert", methods=["POST"])
+def api_faultlab_class_revert():
+    """Revert the selected PODs' faults, or every fault when no PODs are given."""
+    pod_ids = (request.get_json(silent=True) or {}).get("pod_ids") or [None]
+    done, errors = [], []
+    for pod_id in pod_ids:
+        d, e = fault_lab.revert_all(pod_id, log_for=_faultlab_log_for)
+        done += d
+        errors += e
+    return jsonify({"status": "error" if errors else "ok", "reverted": len(done), "errors": errors})
+
+
 # ── Duo Card API ──────────────────────────────────────────────────────────────
 
 @app.route("/api/duo/status/<pod_id>")
@@ -9343,6 +9536,12 @@ def delete_pod(pod_id):
         _errors.append(f"the Duo card is still running for {pod_id} — it will "
                        f"re-create duo_steps rows after this delete")
 
+    # Fault Lab faults are live Meraki config: put them back before the POD's
+    # org mapping disappears with its row. A failed revert keeps its record.
+    _fl_steps, _fl_errors = _faultlab_teardown(pod_id)
+    _steps.extend(_fl_steps)
+    _errors.extend(_fl_errors)
+
     # Compose down plus every container this POD can leave behind: the WinRM
     # proxies and card containers were previously missed.
     _steps.extend(_stop_pod_containers(pod_id))
@@ -10315,6 +10514,12 @@ def full_reset():
                        f"writes duo_steps rows in this process and will re-create "
                        f"them after the wipe")
 
+    # ── 1b. Fault Lab: revert every live Meraki fault while the pods table can
+    #        still map each POD to its org. Failed reverts keep their records.
+    _fl_steps, _fl_errors = _faultlab_teardown()
+    _steps.extend(_fl_steps)
+    _errors.extend(_fl_errors)
+
     # ── 2. Per-POD teardown, each with its own timeout ────────────────────────
     # Read the ids straight from the table. This used to go through
     # generate.read_db(), which is a VALIDATING loader for launching PODs: its
@@ -10929,6 +11134,7 @@ DASHBOARD_HTML = """
        <button class="tab-btn" onclick="switchTab(this, 'fabric')">EVPN Fabric</button>
        <button class="tab-btn" onclick="switchTab(this, 'sda')">SDA Fabric</button>
        <button class="tab-btn" onclick="switchTab(this, 'cloudfabric')">&#x2601; Cloud Fabric</button>
+       <button class="tab-btn" onclick="switchTab(this, 'faultlab')">&#x26A0; Fault Lab</button>
      </div>
     <div class="tab-content active" id="tab-steps">
       <div class="pipeline-grid" id="pipeline-grid"></div>
@@ -10991,6 +11197,12 @@ DASHBOARD_HTML = """
            </span>
          </div>
          <pre id="cloudfabric-log" style="background:#0d1117;border:1px solid #1c2733;border-radius:6px;padding:10px 12px;margin:0;max-height:260px;overflow:auto;font-size:11px;line-height:1.5;color:#9fb0c0;white-space:pre-wrap;word-break:break-word;"></pre>
+       </div>
+     </div>
+
+     <div class="tab-content" id="tab-faultlab">
+       <div id="faultlab-panel" style="padding:16px;min-height:260px;">
+         <div style="color:#667788;font-size:13px;">Select a POD to use the Fault Lab</div>
        </div>
      </div>
 
@@ -11060,6 +11272,16 @@ DASHBOARD_HTML = """
    </div>
 
 <!-- ── Standalone KB Modal (top-level, always accessible) ─────────────────── -->
+<div id="faultlab-class-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.80);z-index:10000;align-items:flex-start;justify-content:center;padding-top:40px;overflow-y:auto;">
+  <div style="background:#0d1117;border:1px solid #30363d;border-radius:10px;width:min(1240px,96vw);margin:0 auto 40px auto;position:relative;">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid #21262d;">
+      <span style="font-size:16px;font-weight:700;color:#ffa502;">&#9888; Fault Lab &mdash; Class Scenarios</span>
+      <button onclick="closeFaultLabClass()" style="background:none;border:none;color:#667788;font-size:20px;cursor:pointer;line-height:1;">&times;</button>
+    </div>
+    <div id="faultlab-class-body" style="padding:16px 20px 20px 20px;min-height:300px;"></div>
+  </div>
+</div>
+
 <div id="kb-standalone-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.80);z-index:10000;align-items:flex-start;justify-content:center;padding-top:48px;overflow-y:auto;">
   <div style="background:#0d1117;border:1px solid #30363d;border-radius:10px;width:min(820px,95vw);margin:0 auto 48px auto;position:relative;">
     <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid #21262d;">
@@ -11231,6 +11453,7 @@ async function load() {
      else if (tabName === 'fabric')    loadFabricStatus(detailId);
      else if (tabName === 'sda')       loadSdaStatus(detailId);
      else if (tabName === 'cloudfabric') loadCloudFabricStatus(detailId);
+     else if (tabName === 'faultlab')  loadFaultLab(detailId);
      else if (tabName === 'duo')       loadDuoStatus(detailId);
      else if (tabName === 'ise')       loadIseStatus(detailId);
      else if (tabName === 'scc')       { if (!window._sccResetRunning) loadSccChecklist(detailId); }
@@ -11722,7 +11945,12 @@ function renderStats(pods) {
     '<div class="stat-card yellow"><div class="num">' + running + '</div><div class="label">Running</div></div>' +
     '<div class="stat-card" style="border-left:3px solid #02c8ff"><div class="num">' + partial + '</div><div class="label">Partial</div></div>' +
     '<div class="stat-card red"><div class="num">' + pending + '</div><div class="label">Pending</div></div>' +
-    '<div class="stat-card"><div class="num">' + total + '</div><div class="label">Total</div></div>';
+    '<div class="stat-card"><div class="num">' + total + '</div><div class="label">Total</div></div>' +
+    // Fault Lab lives in this row on purpose: a section of its own pushed the
+    // dashboard past one screen. Clicking it opens the class panel overlay.
+    '<div class="stat-card" id="faultlab-tile" onclick="openFaultLabClass()" title="Active Fault Lab faults. Click to inject or revert faults across PODs" ' +
+      'style="border-left:3px solid #ffa502;cursor:pointer;"><div class="num" style="color:#ffa502;">' +
+      (window._flActiveCount || 0) + '</div><div class="label">&#9888; Fault Lab</div></div>';
 }
 
 // Dot colour for the DUO / ISE columns. Three states, not two: a card that has
@@ -12504,6 +12732,10 @@ async function showPipeline(podId) {
   if (_sg) { _sg.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>'; _sg._lastHtml = null; _sg._lastPodId = null; }
   const _cg = document.getElementById('cloudfabric-grid');
   if (_cg) { _cg.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>'; _cg._lastHtml = null; _cg._lastPodId = null; }
+  // Fault Lab: force a fresh shell (targets, selects) for the new POD
+  if (window._flPoller) { clearInterval(window._flPoller); window._flPoller = null; }
+  const _fp = document.getElementById('faultlab-panel');
+  if (_fp) { _fp._podId = null; _fp.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>'; }
 
   const panel = document.getElementById('detail-panel');
   const podData = window._lastPods ? window._lastPods.find(p => p.pod_id === podId) : null;
@@ -14156,6 +14388,9 @@ function switchTab(btn, name) {
   if (name !== 'cloudfabric') {
     if (window._cfPoller)     { clearInterval(window._cfPoller);     window._cfPoller     = null; }
   }
+  if (name !== 'faultlab') {
+    if (window._flPoller)     { clearInterval(window._flPoller);     window._flPoller     = null; }
+  }
   // Leaving SCC tab — clear the reset-running lock so global load() resumes normally
   if (name !== 'scc') {
     window._sccResetRunning = false;
@@ -14174,6 +14409,7 @@ function switchTab(btn, name) {
   if (name === 'fabric')     { if (podId) loadFabricStatus(podId); }
   if (name === 'sda')        { if (podId) loadSdaStatus(podId); }
   if (name === 'cloudfabric') { if (podId) loadCloudFabricStatus(podId); }
+  if (name === 'faultlab')   { if (podId) loadFaultLab(podId); }
   if (name === 'baseconfig') { if (podId) loadBaseConfig(podId); }
 }
 
@@ -15043,6 +15279,417 @@ async function clearCloudFabric(podId) {
   if (pre) pre.textContent = '';
   window._cfLogSince = 0;
   loadCloudFabricStatus(podId);
+}
+
+// ── Fault Lab JS ──────────────────────────────────────────────────────────────
+// Per-POD tab (#faultlab-panel) and the class-wide section (#faultlab-class-body).
+// Both render the same scenario cards (_flScenarioCard) from the same target
+// options (_flOptionsFor), so a new scenario or target kind shows up in both.
+// Handlers are attached after render; no inline onclick strings.
+
+let _flScenarios = null;          // [{name, label, target_kind, summary, symptoms}]
+let _flDefaultTtl = 30;
+const FL_STATUS_COLORS = { active: '#ffa502', injecting: '#02c8ff', reverting: '#02c8ff', revert_failed: '#ef4444' };
+const FL_INPUT_STYLE = 'background:#0d1117;border:1px solid #1c2733;color:#cdd6e0;border-radius:4px;padding:4px 6px;font-size:12px;';
+const FL_KIND_LABELS = { ssid: 'SSIDs', leaf: 'Leaf switches', dns_server: 'DNS server' };
+const FL_LOG_STYLE = 'background:#0d1117;border:1px solid #1c2733;border-radius:6px;padding:10px 12px;margin:0;max-height:220px;overflow:auto;font-size:11px;line-height:1.5;color:#9fb0c0;white-space:pre-wrap;word-break:break-word;';
+const FL_HEAD_STYLE = 'font-size:12px;font-weight:600;color:#cdd6e0;margin-bottom:6px;';
+
+// Re-read on every panel/tab open: a page left open across a dashboard restart
+// would otherwise keep showing the scenarios it first loaded.
+async function _flLoadScenarios() {
+  const j = await fetch('/api/faultlab/scenarios').then(r => r.json());
+  _flScenarios = j.scenarios || [];
+  _flDefaultTtl = j.default_ttl || 30;
+}
+
+function _flKinds() { return Array.from(new Set(_flScenarios.map(s => s.target_kind))); }
+
+function _flAttr(v) { return escHtml(String(v)).replace(/"/g, '&quot;'); }
+
+function _flBtn(label, color, attrs) {
+  return '<button ' + attrs + ' style="background:#0d1e30;border:1px solid ' + color + ';color:' + color +
+    ';padding:4px 11px;border-radius:4px;cursor:pointer;font-size:11px;">' + label + '</button>';
+}
+
+function _flRemaining(iso) {
+  const t = Date.parse(iso || '');
+  if (isNaN(t)) return '';
+  const mins = Math.round((t - Date.now()) / 60000);
+  return mins > 0 ? 'in ' + mins + ' min' : 'due now';
+}
+
+// The one place a POD's target list becomes picker options. `key` is the same
+// across PODs built from the same template (SSID slot, leaf role), which is what
+// the class panel's "set all" matches on.
+function _flOptionsFor(kind, targets) {
+  targets = targets || [];
+  if (kind === 'ssid') {
+    // "All SSIDs" first and selected by default: one fault per enabled SSID in the org.
+    const all = [], opts = [];
+    targets.forEach(n => n.ssids.forEach(s => {
+      const t = { network_id: n.network_id, ssid: s.number };
+      all.push(t);
+      opts.push({ key: 'ssid:' + s.name, targets: [t], text: s.name + ' (' + n.network_name + ')' });
+    }));
+    if (all.length) opts.unshift({ key: 'ssid:all', targets: all, text: 'All SSIDs (' + all.length + ')' });
+    return opts;
+  }
+  if (kind === 'dns_server') {
+    return targets.map(d => ({ key: 'dns_server:' + d.name, targets: [{ server: d.server }],
+      text: d.name + ' DNS (' + d.server + ') for wired hosts' }));
+  }
+  if (kind === 'leaf') {
+    const opts = targets.map(l => ({ key: 'leaf:' + (l.role || l.name.toLowerCase()),
+      targets: [{ serial: l.serial }],
+      text: l.name + ' (' + ((l.host_ports || []).length ? 'ports ' + l.host_ports.join(', ') : 'no host ports') + ')' }));
+    if (targets.length > 1) opts.unshift({ key: 'leaf:all', targets: targets.map(l => ({ serial: l.serial })),
+      text: 'All ' + targets.length + ' leaves (host ports only)' });
+    return opts;
+  }
+  return [];
+}
+
+function _flFillSelect(sel, opts, kind) {
+  sel._opts = opts;
+  sel.innerHTML = opts.length
+    ? opts.map((o, i) => '<option value="' + i + '">' + escHtml(o.text) + '</option>').join('')
+    : '<option value="">(no ' + (FL_KIND_LABELS[kind] || kind).toLowerCase() + ' found)</option>';
+}
+
+function _flSelected(sel) {
+  return (sel && sel._opts && sel.value !== '') ? sel._opts[+sel.value] : null;
+}
+
+function _flScenarioCard(sc, i, footHtml) {
+  return '<div style="background:#0d1117;border:1px solid #1c2733;border-radius:6px;padding:12px;">' +
+    '<div style="font-weight:600;color:#cdd6e0;font-size:13px;">' + escHtml(sc.label) + '</div>' +
+    '<div style="color:#9fb0c0;font-size:12px;margin:4px 0 8px;">' + escHtml(sc.summary) + '</div>' +
+    '<div style="color:#8899aa;font-size:11px;margin-bottom:10px;line-height:1.5;"><b>Expect:</b> ' + escHtml(sc.symptoms) + '</div>' +
+    footHtml + '</div>';
+}
+
+function _flCardGrid(cards) {
+  return '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:18px;">' + cards + '</div>';
+}
+
+function _flTtlInput(id) {
+  return '<label>Auto-revert after <input id="' + id + '" type="number" min="1" max="480" value="' + _flDefaultTtl +
+    '" style="' + FL_INPUT_STYLE + 'width:60px;"> min</label>';
+}
+
+function _flInjectionRows(list, showPod) {
+  if (!list.length) return '<div style="color:#667788;font-size:12px;">No active faults.</div>';
+  const th = '<th style="padding:4px 6px;font-weight:600;">';
+  let h = '<table style="width:100%;border-collapse:collapse;font-size:12px;"><tr style="color:#8899aa;text-align:left;">' +
+    (showPod ? th + 'POD</th>' : '') + th + 'Scenario</th>' + th + 'Target</th>' + th + 'Status</th>' +
+    th + 'Auto-revert</th><th></th></tr>';
+  list.forEach(r => {
+    const td = '<td style="padding:5px 6px;vertical-align:top;">';
+    h += '<tr style="border-top:1px solid #1c2733;color:#cdd6e0;">' +
+      (showPod ? td + escHtml(r.pod_id) + '</td>' : '') +
+      td + escHtml(r.scenario) + '</td>' +
+      td + escHtml(r.network_name || '') + '</td>' +
+      td + '<span style="color:' + (FL_STATUS_COLORS[r.status] || '#cdd6e0') + ';">' + escHtml(r.status) + '</span>' +
+        (r.last_error ? '<div style="color:#8899aa;font-size:11px;">' + escHtml(r.last_error) + '</div>' : '') + '</td>' +
+      td + (r.status === 'active' ? _flRemaining(r.expires_at) : '') + '</td>' +
+      '<td style="padding:5px 6px;text-align:right;white-space:nowrap;vertical-align:top;">' +
+        _flBtn('Revert', '#00e68a', 'data-fl-revert="' + _flAttr(r.id) + '"') +
+        (r.status === 'revert_failed' ? ' ' + _flBtn('Forget', '#8899aa', 'data-fl-forget="' + _flAttr(r.id) + '"') : '') +
+      '</td></tr>';
+  });
+  return h + '</table>';
+}
+
+function _flLogHtml(logs, showPod) {
+  if (!logs.length) return '<span style="color:#667788;">No Fault Lab activity yet.</span>';
+  return logs.map(l => escHtml((l.at || '') + '  ' + (showPod ? l.pod_id + '  ' : '') + l.line)).join('<br>');
+}
+
+async function _flRecordAction(action, id, refresh) {
+  if (action === 'forget' && !confirm('Forget this fault WITHOUT reverting it? Only do this when its Meraki org no longer exists, e.g. after a lab-session reset.')) return;
+  const r = await fetch('/api/faultlab/' + action + '/' + encodeURIComponent(id), { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) alert(j.message || (action + ' failed'));
+  refresh();
+}
+
+function _flWireRecordButtons(container, refresh) {
+  container.querySelectorAll('[data-fl-revert]').forEach(b => {
+    b.onclick = () => { b.disabled = true; b.textContent = 'Reverting...'; _flRecordAction('revert', b.dataset.flRevert, refresh); };
+  });
+  container.querySelectorAll('[data-fl-forget]').forEach(b => {
+    b.onclick = () => _flRecordAction('forget', b.dataset.flForget, refresh);
+  });
+}
+
+// ── Per-POD tab ──
+
+async function loadFaultLab(podId) {
+  if (window._flPoller) { clearInterval(window._flPoller); window._flPoller = null; }
+  const panel = document.getElementById('faultlab-panel');
+  if (!podId) { panel.innerHTML = '<div style="color:#667788;padding:20px;">No POD selected.</div>'; return; }
+  if (panel._podId !== podId) {
+    panel._podId = podId;
+    panel.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
+    await _flLoadScenarios();
+    if (panel._podId !== podId) return;
+    _flRenderPodShell(panel, podId);
+    _flLoadTargets(podId);
+  }
+  _flRefreshPod(podId);
+  window._flPoller = setInterval(() => _flRefreshPod(podId), 10000);
+}
+
+function _flRenderPodShell(panel, podId) {
+  let h = '<div style="font-size:12px;color:#8899aa;margin-bottom:12px;line-height:1.5;">' +
+    'Breaks real config in this POD&rsquo;s Meraki org so Dashboard shows a genuine problem to troubleshoot. ' +
+    'Every fault is reverted automatically after its timer, on Revert, or by Delete POD / Full Reset.</div>';
+  h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;font-size:12px;color:#cdd6e0;">' +
+    _flBtn('&#8635; Reload targets', '#02c8ff', 'id="fl-target-refresh" title="Reload SSIDs and leaf switches from Meraki"') +
+    _flTtlInput('fl-ttl') + '</div>';
+  h += '<div id="fl-target-error" style="color:#ef4444;font-size:12px;margin-bottom:8px;"></div>';
+  h += _flCardGrid(_flScenarios.map((sc, i) => _flScenarioCard(sc, i,
+    '<div style="display:flex;gap:8px;align-items:center;">' +
+      '<select data-fl-target="' + i + '" style="' + FL_INPUT_STYLE + 'flex:1;min-width:0;"><option value="">Loading...</option></select>' +
+      _flBtn('&#9888; Inject', '#ffa502', 'data-fl-inject="' + i + '"') + '</div>')).join(''));
+  h += '<div style="' + FL_HEAD_STYLE + '">Active faults</div><div id="fl-active" style="margin-bottom:16px;"></div>';
+  h += '<div style="' + FL_HEAD_STYLE + '">Activity</div><pre id="fl-log" style="' + FL_LOG_STYLE + '"></pre>';
+  panel.innerHTML = h;
+  document.getElementById('fl-target-refresh').onclick = () => _flLoadTargets(podId);
+  panel.querySelectorAll('[data-fl-inject]').forEach(b => {
+    b.onclick = () => _flInject(podId, +b.dataset.flInject, b);
+  });
+}
+
+async function _flLoadTargets(podId) {
+  const panel = document.getElementById('faultlab-panel'), err = document.getElementById('fl-target-error');
+  const sels = Array.from(panel.querySelectorAll('[data-fl-target]'));
+  sels.forEach(s => { s.innerHTML = '<option value="">Loading...</option>'; s._opts = []; });
+  err.textContent = '';
+  const r = await fetch('/api/faultlab/targets/' + podId);
+  const j = await r.json().catch(() => ({}));
+  if (panel._podId !== podId) return;   // POD changed meanwhile
+  if (!r.ok) {
+    sels.forEach(s => { s.innerHTML = '<option value="">(unavailable)</option>'; });
+    err.textContent = j.message || 'Could not load targets from Meraki';
+    return;
+  }
+  sels.forEach(s => {
+    const kind = _flScenarios[+s.dataset.flTarget].target_kind;
+    _flFillSelect(s, _flOptionsFor(kind, (j.targets || {})[kind]), kind);
+  });
+}
+
+async function _flInject(podId, i, btn) {
+  const sc = _flScenarios[i];
+  const opt = _flSelected(document.querySelector('#faultlab-panel [data-fl-target="' + i + '"]'));
+  if (!opt) { alert('Pick a target first.'); return; }
+  const ttl = parseInt(document.getElementById('fl-ttl').value, 10) || _flDefaultTtl;
+  if (!confirm('Inject ' + sc.label + ' on ' + opt.text + '? This changes live Meraki config; it auto-reverts in ' + ttl + ' min.')) return;
+  btn.disabled = true;
+  const errors = [];
+  for (const target of opt.targets) {     // "All leaves" = one fault per switch
+    const r = await fetch('/api/faultlab/inject/' + podId, { method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ scenario: sc.name, target: target, ttl_minutes: ttl }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) errors.push(j.message || 'Inject failed');
+  }
+  btn.disabled = false;
+  if (errors.length) alert(errors.join('; '));
+  _flRefreshPod(podId);
+}
+
+async function _flRefreshPod(podId) {
+  const panel = document.getElementById('faultlab-panel');
+  if (!panel || panel._podId !== podId) return;
+  const j = await fetch('/api/faultlab/status/' + podId).then(r => r.json()).catch(() => null);
+  if (!j || panel._podId !== podId) return;
+  const act = document.getElementById('fl-active'), pre = document.getElementById('fl-log');
+  if (act) { act.innerHTML = _flInjectionRows(j.injections || [], false); _flWireRecordButtons(act, () => _flRefreshPod(podId)); }
+  if (pre) { pre.innerHTML = _flLogHtml(j.logs || [], false); pre.scrollTop = pre.scrollHeight; }
+}
+
+// ── Class-wide section: the same cards, with one target column per kind ──
+
+// The class panel is an overlay opened from the summary tile, so it adds no height
+// to the dashboard (an in-page bar pushed it past one screen).
+function _flClassOpen() {
+  return document.getElementById('faultlab-class-modal').style.display === 'flex';
+}
+
+function openFaultLabClass() {
+  document.getElementById('faultlab-class-modal').style.display = 'flex';
+  if (window._flClassPoller) clearInterval(window._flClassPoller);
+  window._flClassPoller = setInterval(_flRefreshClass, 10000);
+  loadFaultLabClass();
+}
+
+function closeFaultLabClass() {
+  document.getElementById('faultlab-class-modal').style.display = 'none';
+  if (window._flClassPoller) { clearInterval(window._flClassPoller); window._flClassPoller = null; }
+}
+
+document.getElementById('faultlab-class-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeFaultLabClass();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && _flClassOpen()) closeFaultLabClass(); });
+
+// Keep the summary tile's count current while the overlay is closed.
+function _flSetActiveCount(n) {
+  window._flActiveCount = n;
+  const num = document.querySelector('#faultlab-tile .num');
+  if (num) num.textContent = n;
+}
+
+async function _flUpdateBadge() {
+  const j = await fetch('/api/faultlab/class-status').then(r => r.json()).catch(() => null);
+  if (j) _flSetActiveCount((j.injections || []).length);
+}
+_flUpdateBadge();
+setInterval(() => { if (!_flClassOpen()) _flUpdateBadge(); }, 30000);
+
+async function loadFaultLabClass() {
+  const body = document.getElementById('faultlab-class-body');
+  body.innerHTML = '<div style="color:#667788;font-size:13px;">Loading...</div>';
+  await _flLoadScenarios();
+  let h = '<div style="font-size:12px;color:#8899aa;margin-bottom:10px;line-height:1.5;">' +
+    'Inject a scenario on many PODs at once. Each POD&rsquo;s targets are read from its own Meraki org; ' +
+    'use the column header to set the same choice on every POD.</div>';
+  h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:12px;color:#cdd6e0;">' +
+    _flBtn('&#8635; Reload PODs &amp; targets', '#02c8ff', 'id="fl-class-reload" title="Re-read the POD list and every POD&rsquo;s Meraki org"') +
+    _flTtlInput('fl-class-ttl') + '</div>';
+  h += '<div id="fl-class-pods" style="margin-bottom:14px;"></div>';
+  h += _flCardGrid(_flScenarios.map((sc, i) => _flScenarioCard(sc, i,
+    '<div style="display:flex;gap:8px;align-items:center;justify-content:space-between;">' +
+      '<span style="color:#8899aa;font-size:11px;">Target: each POD&rsquo;s ' + escHtml(FL_KIND_LABELS[sc.target_kind] || sc.target_kind) + ' column</span>' +
+      _flBtn('&#9888; Inject on selected', '#ffa502', 'data-fl-class-inject="' + i + '"') + '</div>')).join(''));
+  h += '<div style="display:flex;gap:8px;margin-bottom:12px;">' +
+    _flBtn('Revert selected PODs', '#00e68a', 'id="fl-class-revert"') +
+    _flBtn('Revert ALL faults', '#ef4444', 'id="fl-class-revert-all"') + '</div>';
+  h += '<div id="fl-class-results" style="font-size:12px;margin-bottom:12px;"></div>';
+  h += '<div style="' + FL_HEAD_STYLE + '">Active faults (all PODs)</div><div id="fl-class-active" style="margin-bottom:16px;"></div>';
+  h += '<div style="' + FL_HEAD_STYLE + '">Activity</div><pre id="fl-class-log" style="' + FL_LOG_STYLE + '"></pre>';
+  body.innerHTML = h;
+  document.getElementById('fl-class-reload').onclick = _flLoadClassTargets;
+  body.querySelectorAll('[data-fl-class-inject]').forEach(b => { b.onclick = () => _flClassInject(+b.dataset.flClassInject); });
+  document.getElementById('fl-class-revert').onclick = () => _flClassRevert(false);
+  document.getElementById('fl-class-revert-all').onclick = () => _flClassRevert(true);
+  _flLoadClassTargets();
+  _flRefreshClass();
+}
+
+async function _flLoadClassTargets() {
+  const box = document.getElementById('fl-class-pods');
+  box.innerHTML = '<div style="color:#667788;font-size:12px;">Reading every POD&rsquo;s Meraki org...</div>';
+  const j = await fetch('/api/faultlab/class-targets').then(r => r.json()).catch(() => ({}));
+  const kinds = _flKinds();
+  const pods = (j.pods || []).map(p => ({ ...p,
+    label: p.pod_number ? 'POD-' + p.pod_number : p.pod_id,
+    opts: Object.fromEntries(kinds.map(k => [k, p.targets ? _flOptionsFor(k, p.targets[k]) : []])) }));
+  window._flClassPods = pods;
+  if (!pods.length) { box.innerHTML = '<div style="color:#667788;font-size:12px;">No PODs loaded.</div>'; return; }
+
+  const th = '<th style="padding:5px 6px;font-weight:600;text-align:left;">';
+  let h = '<table style="width:100%;border-collapse:collapse;font-size:12px;color:#cdd6e0;"><tr style="color:#8899aa;">' +
+    th + '<input type="checkbox" id="fl-class-all" title="Select all PODs"></th>' + th + 'POD (' + pods.length + ')</th>';
+  kinds.forEach(k => {
+    // "Set all" lists every option key seen on any POD, labelled from the first POD that has it.
+    const seen = {};
+    pods.forEach(p => p.opts[k].forEach(o => { if (!seen[o.key]) seen[o.key] = o.text; }));
+    h += th + escHtml(FL_KIND_LABELS[k] || k) + '<br><select data-fl-setall="' + _flAttr(k) + '" style="' + FL_INPUT_STYLE + 'margin-top:3px;max-width:260px;">' +
+      '<option value="">Set all to...</option>' +
+      Object.keys(seen).map(key => '<option value="' + _flAttr(key) + '">' + escHtml(seen[key]) + '</option>').join('') + '</select></th>';
+  });
+  h += '</tr>';
+  pods.forEach((p, i) => {
+    h += '<tr style="border-top:1px solid #1c2733;">' +
+      '<td style="padding:5px 6px;"><input type="checkbox" class="fl-class-pod" data-idx="' + i + '"' + (p.error ? ' disabled' : '') + '></td>' +
+      '<td style="padding:5px 6px;white-space:nowrap;">' + escHtml(p.label) + '</td>';
+    if (p.error) {
+      h += '<td colspan="' + kinds.length + '" style="padding:5px 6px;color:#ef4444;">' + escHtml(p.error) + '</td>';
+    } else {
+      kinds.forEach(k => {
+        h += '<td style="padding:5px 6px;"><select data-fl-pod="' + i + '" data-fl-kind="' + _flAttr(k) + '" style="' + FL_INPUT_STYLE + 'max-width:260px;"></select></td>';
+      });
+    }
+    h += '</tr>';
+  });
+  box.innerHTML = h + '</table>';
+  box.querySelectorAll('select[data-fl-pod]').forEach(s => {
+    _flFillSelect(s, pods[+s.dataset.flPod].opts[s.dataset.flKind], s.dataset.flKind);
+  });
+  document.getElementById('fl-class-all').onchange = e => {
+    box.querySelectorAll('.fl-class-pod:not([disabled])').forEach(c => { c.checked = e.target.checked; });
+  };
+  box.querySelectorAll('[data-fl-setall]').forEach(head => {
+    head.onchange = () => {
+      if (!head.value) return;
+      box.querySelectorAll('select[data-fl-kind="' + head.dataset.flSetall + '"]').forEach(s => {
+        const idx = (s._opts || []).findIndex(o => o.key === head.value);
+        if (idx >= 0) s.value = String(idx);
+      });
+    };
+  });
+}
+
+function _flSelectedPods() {
+  return Array.from(document.querySelectorAll('.fl-class-pod')).filter(c => c.checked)
+    .map(c => (window._flClassPods || [])[+c.dataset.idx]).filter(Boolean);
+}
+
+async function _flRefreshClass() {
+  if (!_flClassOpen()) return;
+  const j = await fetch('/api/faultlab/class-status').then(r => r.json()).catch(() => null);
+  if (j) _flRenderClassStatus(j);
+}
+
+function _flRenderClassStatus(j) {
+  const list = j.injections || [];
+  _flSetActiveCount(list.length);
+  document.querySelectorAll('[data-fl-class-inject]').forEach(b => {
+    b.disabled = !!j.busy;
+    b.innerHTML = j.busy ? 'Injecting...' : '&#9888; Inject on selected';
+  });
+  const res = document.getElementById('fl-class-results');
+  if (res) res.innerHTML = (j.results || []).map(r =>
+    '<div style="color:' + (r.ok ? '#00e68a' : '#ef4444') + ';">' + escHtml(r.pod_id + ': ' + r.message) + '</div>').join('');
+  const act = document.getElementById('fl-class-active');
+  if (act) { act.innerHTML = _flInjectionRows(list, true); _flWireRecordButtons(act, _flRefreshClass); }
+  const pre = document.getElementById('fl-class-log');
+  if (pre) { pre.innerHTML = _flLogHtml(j.logs || [], true); pre.scrollTop = pre.scrollHeight; }
+  if (j.busy) setTimeout(_flRefreshClass, 2000);
+}
+
+async function _flClassInject(i) {
+  const sc = _flScenarios[i];
+  const pods = _flSelectedPods();
+  if (!pods.length) { alert('Tick at least one POD.'); return; }
+  const items = [], missing = [];
+  pods.forEach(p => {
+    const opt = _flSelected(document.querySelector('select[data-fl-pod="' + (window._flClassPods || []).indexOf(p) + '"][data-fl-kind="' + sc.target_kind + '"]'));
+    if (opt) items.push({ pod_id: p.pod_id, targets: opt.targets }); else missing.push(p.label);
+  });
+  if (!items.length) { alert('None of the selected PODs has a ' + (FL_KIND_LABELS[sc.target_kind] || sc.target_kind) + ' target.'); return; }
+  const ttl = parseInt(document.getElementById('fl-class-ttl').value, 10) || _flDefaultTtl;
+  if (!confirm('Inject ' + sc.label + ' on ' + items.length + ' POD(s)' + (missing.length ? ' (skipping ' + missing.join(', ') + ': no target)' : '') +
+               '? This changes live Meraki config; it auto-reverts in ' + ttl + ' min.')) return;
+  const r = await fetch('/api/faultlab/class-inject', { method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ scenario: sc.name, items: items, ttl_minutes: ttl }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) alert(j.message || 'Class inject failed to start');
+  setTimeout(_flRefreshClass, 1000);
+}
+
+async function _flClassRevert(all) {
+  const pods = all ? [] : _flSelectedPods().map(p => p.pod_id);
+  if (!all && !pods.length) { alert('Tick the PODs to revert.'); return; }
+  if (!confirm(all ? 'Revert EVERY active fault on every POD?' : 'Revert all faults on ' + pods.length + ' POD(s)?')) return;
+  const r = await fetch('/api/faultlab/class-revert', { method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ pod_ids: pods }) });
+  const j = await r.json().catch(() => ({}));
+  if (j.errors && j.errors.length) alert('Some reverts failed: ' + j.errors.join('; '));
+  _flRefreshClass();
 }
 
 // ── Duo Card JS ───────────────────────────────────────────────────────────────

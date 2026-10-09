@@ -327,3 +327,21 @@ def test_image_ships_the_client():
     copy = next(l for l in (ROOT / "docker" / "Dockerfile").read_text().splitlines()
                 if l.startswith("COPY onboard.py"))
     assert "hostdb.py" in copy and "db_ops.py" in copy
+
+
+def test_faultlab_round_trip(db):
+    rec = dict(id="ab12cd34", pod_id="POD-6", scenario="dhcp_failure",
+               target='{"network_id": "L_1", "ssid": 1}', network_name="SITE_105",
+               snapshot='{"ipAssignmentMode": "NAT mode"}',
+               injected_at="2026-10-08T10:00:00Z", expires_at="2026-10-08T10:30:00Z")
+    assert _run(db, "faultlab_list") == []          # table is created on first use
+    _run(db, "faultlab_add", **rec)
+    assert _run(db, "faultlab_get", record_id="ab12cd34")["status"] == "injecting"
+    assert _run(db, "faultlab_set_status", record_id="ab12cd34", status="revert_failed",
+                last_error="404") == 1
+    found = _run(db, "faultlab_find", scenario="dhcp_failure", target=rec["target"])
+    assert (found["status"], found["last_error"]) == ("revert_failed", "404")
+    assert [r["id"] for r in _run(db, "faultlab_list", pod_id="POD-6")] == ["ab12cd34"]
+    assert _run(db, "faultlab_list", pod_id="POD-7") == []
+    assert _run(db, "faultlab_delete", record_id="ab12cd34") == 1
+    assert _run(db, "faultlab_get", record_id="ab12cd34") is None
