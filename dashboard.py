@@ -6902,6 +6902,47 @@ def api_scc_reset_all_status():
 
 # ── Host-side cdFMC pxGrid integration (step 4) ──────────────────────────────
 
+# What one Application Instances row says about being active, as raw signals.
+# The old test -- an `icon-success` inside the row's `-active-icon` -- is true
+# for rows that are NOT active (verified 2026-09-23 and again on POD-18 on
+# 2026-10-09: a stale POD-4 row with a grey "Selected" tick and an enabled
+# trash was skipped as "ACTIVE", so it was never purged and blocked every OTP).
+# cdFMC itself draws the line we need: it disables the delete control on the
+# active row and only there, which is why ours must be activated before a stale
+# active one can go. _cdfmc_row_is_active() decides from these signals.
+_CDFMC_ROW_SIGNALS_JS = """(r) => {
+    const del = r.querySelector('[data-testid$="-delete-icon"]')
+             || (r.querySelector('[data-testid="icon-trash"]') || {closest: () => null}).closest('button');
+    const b = r.querySelector('[data-testid$="-active-icon"]');
+    const dis = (e) => !!e && (e.disabled === true
+        || e.getAttribute('aria-disabled') === 'true'
+        || /disabled/i.test(String(e.getAttribute('class') || '')));
+    return {
+        name: (r.innerText || '').split(String.fromCharCode(10))[0].trim(),
+        text: (r.innerText || '').slice(0, 200),
+        has_delete: !!del,
+        delete_disabled: dis(del),
+        icon_success: !!(b && b.querySelector('[data-testid="icon-success"]')),
+        icon_html: b ? b.outerHTML.slice(0, 300) : '',
+    };
+}"""
+
+
+def _cdfmc_row_is_active(sig: dict) -> bool:
+    """Whether a cdFMC Application Instances row is the ACTIVE one.
+
+    The delete control is authoritative when present: cdFMC disables it on the
+    active row only. "Not Activated" in the row text is a definite no. The
+    success icon is used only when the row has no delete control at all, since
+    it alone has produced false positives.
+    """
+    if "not activated" in (sig.get("text") or "").lower():
+        return False
+    if sig.get("has_delete"):
+        return bool(sig.get("delete_disabled"))
+    return bool(sig.get("icon_success"))
+
+
 def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                           session_path: str, log_fn) -> tuple:
     """Run cdFMC pxGrid integration on the HOST (not Docker).
@@ -6914,7 +6955,7 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
     4. Click 'Create pxGrid Application Instance'
     5. Fill input[name='name'] and input[name='otp'], click Create → Save
     """
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, Error as PlaywrightError
 
     _JS_CLICK_HBR = """(label) => {
         function deepQueryAll(root) {
@@ -7156,20 +7197,22 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             _stale_active = None
 
             if _tenant:
+                _existing = None
                 try:
-                    _existing = _fmc_tab.evaluate("""(tenant) => {
-                        const rows = Array.from(document.querySelectorAll(
-                            'div.ReactVirtualized__Table__row'));
-                        for (const r of rows) {
-                            const txt = (r.innerText || '');
-                            if (!txt.includes(tenant)) continue;
-                            const b = r.querySelector('[data-testid$="-active-icon"]');
-                            const active = !!(b && b.querySelector('[data-testid="icon-success"]'));
-                            if (active) return txt.split(String.fromCharCode(10))[0].trim();
-                        }
-                        return null;
-                    }""", _tenant)
-                except Exception as _ee:
+                    _sigs = _fmc_tab.evaluate(
+                        "() => Array.from(document.querySelectorAll("
+                        "'div.ReactVirtualized__Table__row')).map("
+                        + _CDFMC_ROW_SIGNALS_JS + ")")
+                    for _sig in _sigs:
+                        if _tenant not in (_sig.get("text") or ""):
+                            continue
+                        _act = _cdfmc_row_is_active(_sig)
+                        log_fn(f"[cdfmc-nav] row {_sig.get('name')!r}: active={_act} "
+                               f"(delete={'disabled' if _sig.get('delete_disabled') else 'enabled' if _sig.get('has_delete') else 'absent'}, "
+                               f"icon_success={_sig.get('icon_success')}) icon={_sig.get('icon_html')!r}")
+                        if _act and not _existing:
+                            _existing = _sig.get("name")
+                except PlaywrightError as _ee:
                     log_fn(f"[cdfmc-nav] active-instance check failed: {_ee}")
                     _existing = None
                 if _existing:
@@ -7288,11 +7331,10 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
                             # there, and burned all 5 attempts on it. The genuinely
                             # stale row (SEC-NET-CL25-POD5) was never reached.
                             try:
-                                _is_active = _row.evaluate('''(r) => {
-                                    const b = r.querySelector('[data-testid$="-active-icon"]');
-                                    return !!(b && b.querySelector('[data-testid="icon-success"]'));
-                                }''')
-                            except Exception:
+                                _is_active = _cdfmc_row_is_active(
+                                    _row.evaluate(_CDFMC_ROW_SIGNALS_JS))
+                            except PlaywrightError as _ae:
+                                log_fn(f"[cdfmc-nav] row state read failed: {_ae}")
                                 _is_active = False
                             if _is_active:
                                 log_fn(f"[cdfmc-nav] skipping ACTIVE instance: "
