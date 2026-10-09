@@ -405,6 +405,87 @@ def cloudfabric_devices(conn, pod_id: str) -> dict:
         "SELECT role, serial FROM cloudfabric_devices WHERE pod_id=?", (pod_id,))}
 
 
+# ── Fault Lab (fault_lab.py) ──────────────────────────────────────────────────
+# One row per active injection, holding the original config to revert from.
+# Deliberately NOT a session table: Delete POD / Full Reset must revert these
+# first, and a row whose revert failed stays so the fault is never forgotten.
+
+FAULTLAB_FIELDS = ("id", "pod_id", "scenario", "target", "network_name", "snapshot",
+                   "status", "injected_at", "expires_at", "last_error")
+
+
+def _faultlab_table(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fault_injections (
+            id           TEXT PRIMARY KEY,
+            pod_id       TEXT NOT NULL,
+            scenario     TEXT NOT NULL,
+            target       TEXT NOT NULL,
+            network_name TEXT,
+            snapshot     TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'injecting',
+            injected_at  TEXT,
+            expires_at   TEXT,
+            last_error   TEXT DEFAULT ''
+        )
+    """)
+
+
+def _faultlab_row(row) -> dict:
+    return dict(zip(FAULTLAB_FIELDS, row))
+
+
+@op
+def faultlab_add(conn, id: str, pod_id: str, scenario: str, target: str, network_name: str,
+                 snapshot: str, injected_at: str, expires_at: str) -> None:
+    _faultlab_table(conn)
+    conn.execute("""
+        INSERT INTO fault_injections (id, pod_id, scenario, target, network_name, snapshot,
+                                      status, injected_at, expires_at)
+        VALUES (?,?,?,?,?,?,'injecting',?,?)
+    """, (id, pod_id, scenario, target, network_name, snapshot, injected_at, expires_at))
+
+
+@op
+def faultlab_set_status(conn, record_id: str, status: str, last_error: str = "") -> int:
+    _faultlab_table(conn)
+    return conn.execute("UPDATE fault_injections SET status=?, last_error=? WHERE id=?",
+                        (status, last_error, record_id)).rowcount
+
+
+@op
+def faultlab_get(conn, record_id: str) -> dict | None:
+    _faultlab_table(conn)
+    row = conn.execute(f"SELECT {', '.join(FAULTLAB_FIELDS)} FROM fault_injections WHERE id=?",
+                       (record_id,)).fetchone()
+    return _faultlab_row(row) if row else None
+
+
+@op
+def faultlab_find(conn, scenario: str, target: str) -> dict | None:
+    """Any record, in any state, for this scenario on this target: a revert_failed
+    row means the fault is still live, so it blocks a new injection too."""
+    _faultlab_table(conn)
+    row = conn.execute(f"SELECT {', '.join(FAULTLAB_FIELDS)} FROM fault_injections "
+                       "WHERE scenario=? AND target=?", (scenario, target)).fetchone()
+    return _faultlab_row(row) if row else None
+
+
+@op
+def faultlab_list(conn, pod_id: str | None = None) -> list:
+    _faultlab_table(conn)
+    sql = f"SELECT {', '.join(FAULTLAB_FIELDS)} FROM fault_injections"
+    args = ()
+    if pod_id:
+        sql, args = sql + " WHERE pod_id=?", (pod_id,)
+    return [_faultlab_row(r) for r in conn.execute(sql + " ORDER BY injected_at", args)]
+
+
+@op
+def faultlab_delete(conn, record_id: str) -> int:
+    _faultlab_table(conn)
+    return conn.execute("DELETE FROM fault_injections WHERE id=?", (record_id,)).rowcount
+
 
 @op
 def cloudfabric_org_creds(conn, pod_id: str) -> dict | None:
