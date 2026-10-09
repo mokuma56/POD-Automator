@@ -403,3 +403,25 @@ def cloudfabric_device_set(conn, pod_id: str, role: str, serial: str) -> None:
 def cloudfabric_devices(conn, pod_id: str) -> dict:
     return {r[0]: r[1] for r in conn.execute(
         "SELECT role, serial FROM cloudfabric_devices WHERE pod_id=?", (pod_id,))}
+
+
+
+@op
+def cloudfabric_org_creds(conn, pod_id: str) -> dict | None:
+    """org_credentials for a POD's Cloud Fabric work.
+
+    Normally the SCC org (org_creds_for_pod). A POD whose core pipeline has not
+    run yet has no scc_org; for those, an org number recorded for the Cloud
+    Fabric tab (cloudfabric_devices role "_org") links it without writing
+    pods.scc_org, which the SCC/cdFMC steps treat as discovered fact.
+    """
+    creds = org_creds_for_pod(conn, pod_id)
+    if creds:
+        return creds
+    row = conn.execute("SELECT serial FROM cloudfabric_devices WHERE pod_id=? AND role='_org'",
+                       (pod_id,)).fetchone()
+    if not row:
+        return None
+    cur = conn.execute("SELECT * FROM org_credentials WHERE org_number=?", (row[0],))
+    hit = cur.fetchone()
+    return dict(zip([d[0] for d in cur.description], hit)) if hit else None

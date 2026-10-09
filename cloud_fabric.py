@@ -40,6 +40,7 @@ import base64
 import json
 import os
 import re
+import ssl
 import sys
 import time
 
@@ -76,6 +77,9 @@ LEAVES = ("leaf1", "leaf2")
 
 MGMT_SUBNET  = "198.18.1.0/24"
 MGMT_GATEWAY = "198.18.1.1"
+# IOS XE 26.2.x rejects a V4 uplink without DNS ("Must have DNS server with a V4
+# uplink"); 26.1.x filled these same servers in itself (seen on POD-17).
+MGMT_DNS = ("208.67.222.222", "208.67.220.220")
 
 # (role, port, name, subnet, interface IP)
 UNDERLAY_LINKS = [
@@ -174,9 +178,15 @@ def meraki(method: str, path: str, body=None, params=None, ok=(200, 201, 202, 20
 _ctx = {}
 
 
+def _org_creds() -> dict | None:
+    """The POD's org_credentials row: from its scc_org, or the org linked for this
+    tab when the core pipeline has not run yet (db_ops.cloudfabric_org_creds)."""
+    return hostdb.call("cloudfabric_org_creds", db_path=DB_PATH, pod_id=POD_ID)
+
+
 def _org_id() -> str:
     if "org" not in _ctx:
-        creds = hostdb.call("org_creds_for_pod", db_path=DB_PATH, pod_id=POD_ID) or {}
+        creds = _org_creds() or {}
         org = str(creds.get("meraki_org_id") or "").strip()
         if not org:
             raise RuntimeError("org_credentials.meraki_org_id is empty for this POD's org "
@@ -258,11 +268,32 @@ def _ssh(ip: str, commands, config=False, timeout=30) -> str:
         client.close()
 
 
+# IOS XE renamed the command (2026-10-08, POD-18): `service cloud-mgmt connect` /
+# `show cloud-mgmt connect`. Older images only know the meraki form, so try the
+# new one first and fall back when the switch rejects it.
+CONNECT_CMDS = ("service cloud-mgmt connect", "service meraki connect")
+SHOW_CMDS = ("show cloud-mgmt connect", "show meraki connect")
+
+
+def _first_accepted(ip: str, cmds, config=False) -> tuple[str, str]:
+    """Run the first of `cmds` the switch accepts; returns (command, output)."""
+    last = None
+    for cmd in cmds:
+        try:
+            return cmd, _ssh(ip, [cmd], config=config)
+        except RuntimeError as e:          # "% Invalid input" → older/newer IOS XE
+            if "command rejected" not in str(e):
+                raise
+            last = e
+    raise last
+
+
 _CLOUD_ID_RE = re.compile(r"Cloud\s*ID\s*:?\s*([A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})", re.I)
 
 
 def parse_meraki_connect(output: str) -> dict:
-    """Pull the Cloud ID and registration state out of `show meraki connect`.
+    """Pull the Cloud ID and registration state out of `show cloud-mgmt connect`
+    (or the older `show meraki connect`).
 
     Registered means the guide's two checks: Fetch State "Config fetch
     succeeded" and the Meraki tunnel state(s) Up.
@@ -271,7 +302,8 @@ def parse_meraki_connect(output: str) -> dict:
     fetched = bool(re.search(r"Fetch\s+State\s*:\s*Config fetch succeeded", output, re.I))
     # "Meraki Tunnel Config" also has Primary:/Secondary: lines (the tunnel
     # servers), so read Up/Down only inside the "Meraki Tunnel State" section.
-    sec = re.search(r"Meraki Tunnel State(.*?)(?:\n\s*\n|\nMeraki |\Z)", output, re.I | re.S)
+    sec = re.search(r"(?:Meraki|Cloud[- ]?mgmt|Cloud) Tunnel State(.*?)"
+                    r"(?:\n\s*\n|\n(?:Meraki|Cloud[- ]?mgmt|Cloud) |\Z)", output, re.I | re.S)
     states = dict((k.lower(), v.lower()) for k, v in re.findall(
         r"^\s*(Primary|Secondary)\s*:\s*(\S+)", sec.group(1) if sec else "", re.I | re.M))
     tunnel_up = states.get("primary") == "up" and states.get("secondary", "up") == "up"
@@ -280,11 +312,116 @@ def parse_meraki_connect(output: str) -> dict:
             "registered": bool(m) and fetched and tunnel_up}
 
 
+# ── Topology from LLDP/CDP — works for any Site_105 hardware ──────────────────
+#
+# PODs carry C9300-48 (leaf uplinks on 47/48) or C9350-24 (uplinks on 23/24), so
+# roles and underlay ports come from the cabling, not from the guide's numbers.
+# Shape seen on both: the two leaves are joined by a double link (ports 10/11),
+# each leaf has one link to the Border-Spine, and the Border-Spine's lower port
+# goes to Leaf1.
+
+def _neighbor_serial(entry: dict, ident: dict) -> str | None:
+    """Which of our switches an lldpCdp port entry points at.
+    ident: serial → (mac hex without separators, Dashboard name)."""
+    blob = " ".join(str(v) for side in ("lldp", "cdp") for v in (entry.get(side) or {}).values()).lower()
+    blob_hex = re.sub(r"[^0-9a-f]", "", blob)
+    for serial, (mac_hex, name) in ident.items():
+        if (mac_hex and mac_hex in blob_hex) or (name and name.lower() in blob):
+            return serial
+    return None
+
+
+def _port_key(p: str):
+    return int(p) if str(p).isdigit() else 10_000
+
+
+def lab_links(lldp: dict, ident: dict) -> dict:
+    """{serial: {neighbor_serial: [local ports, lowest first]}} between our switches."""
+    out = {}
+    for serial, data in lldp.items():
+        for port, entry in (data.get("ports") or {}).items():
+            nb = _neighbor_serial(entry, ident)
+            if nb and nb != serial:
+                out.setdefault(serial, {}).setdefault(nb, []).append(str(port))
+    for links in out.values():
+        for ports in links.values():
+            ports.sort(key=_port_key)
+    return out
+
+
+def infer_roles(lldp: dict, ident: dict) -> dict:
+    """{role: serial} for three switches, from the cabling alone."""
+    links = lab_links(lldp, ident)
+    serials = list(ident)
+    if len(serials) != 3:
+        raise RuntimeError(f"expected 3 switches, found {len(serials)}")
+    # Leaves: the pair joined by more than one link.
+    pairs = [(a, b) for i, a in enumerate(serials) for b in serials[i + 1:]
+             if max(len(links.get(a, {}).get(b, [])), len(links.get(b, {}).get(a, []))) >= 2]
+    if len(pairs) != 1:
+        raise RuntimeError(f"cannot tell the leaves apart from LLDP (double-linked pairs: {pairs})")
+    leaves = set(pairs[0])
+    border = next(x for x in serials if x not in leaves)
+    to_leaf = links.get(border, {})
+    if not all(to_leaf.get(l) for l in leaves):
+        raise RuntimeError("Border-Spine does not see both leaves over LLDP")
+    leaf1, leaf2 = sorted(leaves, key=lambda l: _port_key(to_leaf[l][0]))
+    return {"border_spine": border, "leaf1": leaf1, "leaf2": leaf2}
+
+
+def underlay_ports(lldp: dict, ident: dict, roles: dict) -> dict:
+    """Ports for UNDERLAY_LINKS: {(role, peer_role): local port}."""
+    links = lab_links(lldp, ident)
+    b = roles["border_spine"]
+    out = {}
+    for leaf in LEAVES:
+        l = roles[leaf]
+        b_port = (links.get(b, {}).get(l) or [None])[0]
+        l_port = (links.get(l, {}).get(b) or [None])[0]
+        if not (b_port and l_port):
+            raise RuntimeError(f"no LLDP link between Border-Spine and {leaf}")
+        out[("border_spine", leaf)] = b_port
+        out[(leaf, "border_spine")] = l_port
+    return out
+
+
+def _site_switches() -> list:
+    return [d for d in (meraki("GET", f"/networks/{_network_id()}/devices") or [])
+            if str(d.get("model", "")).upper().startswith("C9")]
+
+
+def _lldp_and_ident(devices: list) -> tuple[dict, dict]:
+    ident = {d["serial"]: (re.sub(r"[^0-9a-f]", "", (d.get("mac") or "").lower()), d.get("name") or "")
+             for d in devices}
+    lldp = {d["serial"]: meraki("GET", f"/devices/{d['serial']}/lldpCdp") or {} for d in devices}
+    return lldp, ident
+
+
+def _adopt_cloud_switches(log_fn) -> str | None:
+    """Switches already cloud-managed in SITE_105 (no Cloud IDs recorded yet):
+    record them by role instead of converting. None when there is nothing to adopt."""
+    devs = _site_switches()
+    if len(devs) != 3:
+        return None
+    lldp, ident = _lldp_and_ident(devs)
+    roles = infer_roles(lldp, ident)
+    for role, serial in roles.items():
+        hostdb.call("cloudfabric_device_set", db_path=DB_PATH, pod_id=POD_ID, role=role, serial=serial)
+    models = {d["serial"]: d.get("model") for d in devs}
+    log_fn("  adopted from SITE_105 by LLDP: " +
+           ", ".join(f"{SWITCHES[r]['name']}={s} ({models[s]})" for r, s in roles.items()))
+    return ", ".join(f"{r}={s}" for r, s in roles.items())
+
+
 # ── Deploy steps — A. Dashboard & ISE prep ────────────────────────────────────
 
 def step_meraki_connect(log_fn=print):
-    """service meraki connect on each switch, wait for registration, record Cloud IDs."""
+    """service cloud-mgmt connect on each switch, wait for registration, record Cloud IDs."""
     known = _devices()
+    if not all(known.get(r) for r in SWITCHES):
+        adopted = _adopt_cloud_switches(log_fn)
+        if adopted:
+            return True, "already cloud-managed in " + NETWORK_NAME + " — adopted " + adopted
     if all(known.get(r) for r in SWITCHES):
         inv = _inventory(list(known.values()))
         if all(d.get("networkId") == _network_id() for d in inv.values()) and len(inv) == 3:
@@ -305,8 +442,8 @@ def step_meraki_connect(log_fn=print):
                           + ", ".join(f"{r}={known[r]}" for r in SWITCHES))
 
     for role, sw in SWITCHES.items():
-        log_fn(f"  {sw['name']} ({sw['oob']}): service meraki connect")
-        _ssh(sw["oob"], ["service meraki connect"], config=True)
+        cmd, _ = _first_accepted(sw["oob"], CONNECT_CMDS, config=True)
+        log_fn(f"  {sw['name']} ({sw['oob']}): {cmd}")
 
     pending = dict(SWITCHES)
     deadline = time.time() + 600
@@ -316,7 +453,7 @@ def step_meraki_connect(log_fn=print):
         for role in list(pending):
             sw = SWITCHES[role]
             try:
-                out = _ssh(sw["oob"], ["show meraki connect"])
+                _, out = _first_accepted(sw["oob"], SHOW_CMDS)
             except (paramiko.SSHException, OSError, EOFError) as e:  # SSH drops while it registers
                 log_fn(f"    {sw['name']}: ssh retry ({e})")
                 continue
@@ -333,7 +470,7 @@ def step_meraki_connect(log_fn=print):
     if pending:
         for role in pending:
             out = last.get(role, ({}, ""))[1]
-            log_fn(f"  {SWITCHES[role]['name']} last `show meraki connect`:\n{out[-1500:]}")
+            log_fn(f"  {SWITCHES[role]['name']} last `show cloud-mgmt connect`:\n{out[-1500:]}")
         return False, "not registered after 10 min: " + ", ".join(SWITCHES[r]["name"] for r in pending)
     ids = _devices()
     return True, ", ".join(f"{SWITCHES[r]['name']}={ids[r]}" for r in SWITCHES)
@@ -415,6 +552,7 @@ def step_mgmt_interfaces(log_fn=print):
             "name": sw["mgmt_name"], "mode": "vlan", "vlanId": 1,
             "subnet": MGMT_SUBNET, "interfaceIp": sw["mgmt_ip"],
             "defaultGateway": MGMT_GATEWAY, "uplinkV4": True,
+            "staticV4Dns1": MGMT_DNS[0], "staticV4Dns2": MGMT_DNS[1],
             "vrf": {"name": "Default"},
         }, log_fn)
     return True, "VLAN 1 .53/.51/.52 set as preferred uplink"
@@ -554,6 +692,62 @@ class IseUiSession:
         self._browser = self.page = None
 
 
+def meraki_leaf_cert() -> tuple[str, int, str]:
+    """(PEM, serial, notAfter 'YYYYMMDD') of the certificate api.meraki.com serves now."""
+    from cryptography import x509
+    pem = ssl.get_server_certificate((ISE_MERAKI_HOST, 443), timeout=20)
+    cert = x509.load_pem_x509_certificate(pem.encode())
+    after = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after
+    return pem, cert.serial_number, after.strftime("%Y%m%d")
+
+
+def ensure_meraki_leaf_trusted(log_fn) -> str:
+    """Pin the live api.meraki.com leaf in ISE's Trusted Certificates.
+
+    ISE 3.5's Meraki connector checks revocation on api.meraki.com and Google
+    Trust Services no longer publishes OCSP, so the handshake fails ("PKIX path
+    validation failed: Certificate does not specify OCSP responder" in
+    meraki-connector.log) and merakiOrganizations answers 500 "Please contact
+    Cisco support". A trusted leaf is a trust anchor, so no revocation check
+    runs. Google rotates the leaf ~every 90 days, which silently breaks the pin
+    — hence checking the LIVE serial on every run (POD-18, 2026-10-08: its ISE
+    held the previous leaf, expiring Oct 25, while Meraki served a newer one).
+    """
+    pem, serial, expires = meraki_leaf_cert()
+    s = requests.Session()
+    s.verify = False
+    s.auth = (ISE_USER, _lab_pass())
+    s.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+    base = f"https://{ISE_HOST}/api/v1/certs/trusted-certificate"
+    page, have = 1, []
+    while True:
+        r = s.get(base, params={"page": page, "size": 100}, timeout=60)
+        r.raise_for_status()
+        batch = r.json().get("response") or []
+        have += batch
+        if len(batch) < 100:
+            break
+        page += 1
+    if any(str(c.get("serialNumberDecimalFormat")) == str(serial) for c in have):
+        return f"api.meraki.com leaf already trusted (expires {expires})"
+    name = f"api.meraki.com-pinned-{expires}"
+    r = s.post(f"{base}/import", json={
+        "name": name, "data": pem,
+        # ISE 400s on punctuation here (a colon, apostrophe and commas failed on
+        # POD-18); keep it to plain words.
+        "description": "Pinned by pod automator for the Meraki connector",
+        "allowBasicConstraintCAFalse": True,   # it is a leaf, not a CA
+        "allowOutOfDateCert": False, "allowSHA1Certificates": False, "allowMultipleCNCert": False,
+        "trustForIseAuth": True, "trustForCiscoServicesAuth": True,   # = POD-17's working pin
+        "trustForClientAuth": False, "trustForCertificateBasedAdminAuth": False,
+        "validateCertificateExtensions": False}, timeout=60)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"ISE trusted-certificate import failed: {r.status_code} "
+                           f"{' '.join(r.text.split())[:300]}")
+    log_fn(f"  pinned api.meraki.com leaf in ISE as {name}")
+    return f"pinned {name}"
+
+
 def _ise_connection(s: IseUiSession) -> dict | None:
     return next((c for c in (s.call("GET", "/connections") or [])
                  if c.get("name") == ISE_MERAKI_CONNECTION), None)
@@ -584,8 +778,9 @@ def step_ise_meraki_integration(log_fn=print):
                            f"— delete it (rollback) and rerun")
         # The POD's own key when one is recorded, else the lab key the rest of
         # this module uses.
-        creds = hostdb.call("org_creds_for_pod", db_path=DB_PATH, pod_id=POD_ID) or {}
+        creds = _org_creds() or {}
         key = (creds.get("meraki_api_key") or "").strip() or os.environ.get("MERAKI_API_KEY", "")
+        log_fn("  " + ensure_meraki_leaf_trusted(log_fn))
         # merakiOrganizations answered a one-off 500 "Please contact Cisco support"
         # right after a connection delete, then 200 for the identical request.
         orgs = None
@@ -733,9 +928,33 @@ def _ensure_ospf_area0(log_fn):
     log_fn("  OSPF enabled with Area 0")
 
 
+def _underlay_links(log_fn) -> list:
+    """UNDERLAY_LINKS with each port taken from the real cabling (LLDP); the
+    guide's C9300-48 ports are only the fallback."""
+    try:
+        devs = [meraki("GET", f"/devices/{_serial(r)}") for r in SWITCHES]
+        lldp, ident = _lldp_and_ident(devs)
+        roles = {r: _serial(r) for r in SWITCHES}
+        ports = underlay_ports(lldp, ident, roles)
+    except (RuntimeError, KeyError) as e:
+        log_fn(f"    LLDP did not give the underlay ports ({e}) — using the guide's")
+        return UNDERLAY_LINKS
+    peer = {"border_spine": None, "leaf1": "border_spine", "leaf2": "border_spine"}
+    links = []
+    for role, port, name, subnet, ip in UNDERLAY_LINKS:
+        if role == "border_spine":
+            leaf = "leaf1" if name.endswith("Leaf1") else "leaf2"
+            links.append((role, ports[("border_spine", leaf)], name, subnet, ip))
+        else:
+            links.append((role, ports[(role, peer[role])], name, subnet, ip))
+    return links
+
+
 def step_underlay_links(log_fn=print):
     _ensure_ospf_area0(log_fn)
-    for role, port, name, subnet, ip in UNDERLAY_LINKS:
+    used = []
+    for role, port, name, subnet, ip in _underlay_links(log_fn):
+        used.append(f"{SWITCHES[role]['name'].replace('Site_105-', '')}:{port}")
         log_fn(f"  {SWITCHES[role]['name']} port {port}: {name} {ip}")
         _ensure_interface(_serial(role), {
             "name": name, "mode": "routed", "switchPortId": port,
@@ -743,7 +962,7 @@ def step_underlay_links(log_fn=print):
             "ospfSettings": {"area": "0", "networkType": "point-to-point"},
             "vrf": {"name": "Default"},
         }, log_fn)
-    return True, "4 routed /31 links, OSPF area 0 point-to-point"
+    return True, "4 routed /31 links (" + ", ".join(used) + "), OSPF area 0 point-to-point"
 
 
 def step_transit_interface(log_fn=print):
@@ -787,7 +1006,19 @@ def _ospf_neighbors(serial: str) -> list:
 def step_verify_ospf(log_fn=print):
     """Both leaves FULL on the Border-Spine (the guide's `show ip ospf neighbor`)."""
     serial = _serial("border_spine")
-    deadline = time.time() + 600
+    # The interfaces pushed in steps 4 and 10 send the switches back through a
+    # reconfigure ("Not running configured version", live tools "unable to
+    # authenticate", POD-18 2026-10-08). Asking for neighbors then is pointless:
+    # wait for all three to settle first, on the same test claim_devices uses.
+    settle = time.time() + 1800
+    while time.time() < settle:
+        state = {r: meraki("GET", f"/devices/{_serial(r)}") for r in SWITCHES}
+        busy = [SWITCHES[r]["name"] for r, d in state.items() if not switch_converted(d)]
+        if not busy:
+            break
+        log_fn(f"    waiting for switches to settle after config push: {', '.join(busy)}")
+        time.sleep(30)
+    deadline = time.time() + 900
     seen = []
     while time.time() < deadline:
         try:
@@ -803,7 +1034,7 @@ def step_verify_ospf(log_fn=print):
         if sum(1 for n in seen if str(n.get("state", "")).lower() == "full") >= 2:
             return True, f"2 FULL neighbors ({', '.join(sorted(full))})"
         time.sleep(30)
-    return False, "OSPF not FULL to both leaves after 10 min"
+    return False, "OSPF not FULL to both leaves after 15 min"
 
 
 # ── C. Fabric build — Dashboard session ───────────────────────────────────────
@@ -875,36 +1106,56 @@ class DashboardSession:
         pg.wait_for_timeout(4_000)
         # The card lazy-mounts tiles near the viewport, so scroll while looking
         # (same reason as _scc_open_session).
-        opener = None
         sections = list(da.IDAC_SCC_SECTIONS) + list(da.IDAC_NON_SCC_SECTIONS)
-        for _ in range(24):
+        cands = []
+        for i in range(24):
             pg.evaluate("window.scrollBy(0, 600)")
             pg.wait_for_timeout(400)
             btns = pg.evaluate(da._JS_IDAC_BTNS, sections) or []
-            opener = next((b for b in btns if b.get("section") == "Meraki Dashboard"
-                           and re.match(da._IDAC_OPENERS, b.get("label") or "", re.I)), None)
-            if opener:
+            cands = meraki_tile_candidates(btns, da._IDAC_OPENERS)
+            if cands:
                 break
+            # An iDAC URL from an older dCloud session still loads, but its tiles
+            # read "Found error" and carry no buttons — no point waiting it out.
+            if i >= 3 and idac_card_is_stale(pg.evaluate("() => document.body.innerText")):
+                raise StaleIdacError("iDAC card is from an expired session (tiles read 'Found error')")
             pg.wait_for_timeout(2_000)
-        if not opener:
-            raise RuntimeError("iDAC card has no Meraki Dashboard opener after 60s")
+        if not cands:
+            raise StaleIdacError("iDAC card has no Meraki Dashboard opener after 60s")
+        tab = None
+        for c in cands:
+            tab = self._try_opener(ctx, pg, da, c)
+            if tab:
+                break
+        if not tab:
+            raise RuntimeError("no iDAC control landed on Meraki Dashboard — tried "
+                               + ", ".join(f"{c['label']!r}" for c in cands))
+        self.page = tab
+        self.log(f"  Dashboard session open on {tab.url.split('/')[2]}")
+        return self
+
+    def _try_opener(self, ctx, pg, da, c):
+        """Click one candidate; the tab if it reached Dashboard, else None (the wrong
+        tab is closed, so an SCC 'View' can never be taken for Meraki's)."""
         try:
             with ctx.expect_page(timeout=20_000) as pi:
-                pg.evaluate(da._JS_IDAC_CLICK, opener["i"])
+                pg.evaluate(da._JS_IDAC_CLICK, c["i"])
             tab = pi.value
         except PlaywrightError as e:  # timed out waiting: the tile opened in place
-            self.log(f"    no popup ({type(e).__name__}) — following the same tab")
+            self.log(f"    {c['label']!r}: no popup ({type(e).__name__}) — following the same tab")
             tab = pg
         for _ in range(40):
             host = tab.url.split("/")[2] if "://" in tab.url else ""
             if host.endswith("dashboard.meraki.com") and "/login" not in tab.url:
-                break
+                return tab
+            if host and not any(k in host for k in ("meraki", "idac", "cat-dcloud")):
+                break                                       # landed somewhere else
             tab.wait_for_timeout(1_500)
-        else:
-            raise RuntimeError(f"Meraki tile did not land on Dashboard (at {tab.url[:80]})")
-        self.page = tab
-        self.log(f"  Dashboard session open on {tab.url.split('/')[2]}")
-        return self
+        self.log(f"    {c['label']!r} ({c.get('section') or 'no section'}) did not land on "
+                 f"Dashboard (at {tab.url.split('?')[0][:70]})")
+        if tab is not pg:
+            tab.close()
+        return None
 
     def call(self, method: str, path: str, body=None, ok=(200, 201, 202, 204)):
         res = self.page.evaluate(_JS_DASH_CALL, [method, path, body])
@@ -920,18 +1171,76 @@ class DashboardSession:
         self._browser = self.page = None
 
 
+class StaleIdacError(RuntimeError):
+    """The iDAC URL opens a card with no working Meraki tile — try the next URL."""
+
+
+def idac_card_is_stale(text: str) -> bool:
+    """An iDAC card from an expired session: its Meraki tile shows 'Found error'."""
+    i = text.find("Meraki")
+    return i != -1 and "Found error" in text[i:i + 400]
+
+
+def meraki_tile_candidates(btns: list, openers: str) -> list:
+    """iDAC controls that may open Meraki Dashboard, best first: one inside the
+    'Meraki Dashboard' tile, then openers the card did not attribute to any tile
+    (POD-18's card rendered Meraki's 'View' with no section). Never one owned by
+    another tile — and each is only accepted if it actually lands on Dashboard."""
+    is_opener = lambda b: re.match(openers, b.get("label") or "", re.I)
+    first = [b for b in btns if b.get("section") == "Meraki Dashboard" and is_opener(b)]
+    loose = [b for b in btns if not b.get("section") and is_opener(b)]
+    return first + [b for b in loose if b not in first]
+
+
+def idac_url_candidates(live: str, stored: str) -> list:
+    """The session's own iDAC URL first (read from the jump host's session log),
+    the stored org_credentials one as a fallback; duplicates and blanks dropped."""
+    out = []
+    for u in (live, stored):
+        u = (u or "").strip()
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
 _dash = None
 
 
 def _dash_session(log_fn) -> DashboardSession:
+    """A Dashboard session through whichever iDAC URL still has a working Meraki tile.
+
+    A stored iDAC URL from an older dCloud session still loads but its tiles read
+    "Found error" (POD-18, 2026-10-08), so the session's live URL is tried first.
+    Never minted — that reprovisions the orgs — and never written back: the Duo
+    card compares the stored value to detect a session change.
+    """
     global _dash
     if _dash is None:
-        creds = hostdb.call("org_creds_for_pod", db_path=DB_PATH, pod_id=POD_ID) or {}
-        idac = (creds.get("idac_url") or "").strip()
-        if not idac:
-            raise RuntimeError("org_credentials.idac_url is empty — cannot open a Dashboard "
-                               "session (never mint one: that reprovisions the orgs)")
-        _dash = DashboardSession(log_fn).open(idac)
+        import duo_automation as da
+        stored = (_org_creds() or {}).get("idac_url", "")
+        try:
+            live = da.read_idac_url_from_session(POD_ID, log=log_fn) if POD_ID else ""
+        except STEP_ERRORS as e:
+            log_fn(f"    could not read the session's iDAC URL ({e}) — using the stored one")
+            live = ""
+        urls = idac_url_candidates(live, stored)
+        if not urls:
+            raise RuntimeError("no iDAC URL (session log or org_credentials) — cannot open a "
+                               "Dashboard session (never mint one: that reprovisions the orgs)")
+        last = None
+        for n, url in enumerate(urls, 1):
+            label = "live session" if url == (live or "").strip() else "stored"
+            ds = DashboardSession(log_fn)
+            try:
+                _dash = ds.open(url)
+                log_fn(f"    via the {label} iDAC URL")
+                break
+            except StaleIdacError as e:
+                ds.close()
+                log_fn(f"    {label} iDAC URL: {e}" + (" — trying the next" if n < len(urls) else ""))
+                last = e
+        if _dash is None:
+            raise last
     return _dash
 
 
@@ -1249,9 +1558,7 @@ def lab_vlan_names(vlan_names: list) -> list:
 
 
 def _cleanup_fabric(log_fn):
-    creds = hostdb.call("org_creds_for_pod", db_path=DB_PATH, pod_id=POD_ID) or {}
-    if not (creds.get("idac_url") or "").strip():
-        raise RuntimeError("no idac_url for this org — cannot open a Dashboard session")
+    # _dash_session finds a working iDAC URL (live session first) or says why not.
     return step_delete_fabric(log_fn)[1]
 
 

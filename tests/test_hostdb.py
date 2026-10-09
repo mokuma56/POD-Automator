@@ -291,6 +291,17 @@ def test_cloudfabric_cloud_ids_survive_step_clear(db):
     assert _run(db, "cloudfabric_devices", pod_id="POD-6") == {"leaf1": "Q5VJ-JL9A-0000"}
     assert _run(db, "cloudfabric_devices", pod_id="POD-7") == {}
 
+
+def test_cloudfabric_org_link_only_when_no_scc_org(db):
+    _run(db, "cloudfabric_ensure_table")
+    with sqlite3.connect(db) as c:
+        c.execute("INSERT INTO pods (pod_id) VALUES ('POD-18')")
+    assert _run(db, "cloudfabric_org_creds", pod_id="POD-18") is None
+    _run(db, "cloudfabric_device_set", pod_id="POD-18", role="_org", serial="501")
+    assert _run(db, "cloudfabric_org_creds", pod_id="POD-18")["org_number"] == "501"
+    # a POD with a discovered scc_org keeps using it
+    assert _run(db, "cloudfabric_org_creds", pod_id="POD-6")["scc_org"].startswith("cisco-pseudoco-501")
+
 # ── nothing that runs in a container opens the file itself ────────────────────
 
 CONTAINER_MODULES = ["onboard.py", "ise_integrations.py", "evpn_fabric.py", "sda_fabric.py",

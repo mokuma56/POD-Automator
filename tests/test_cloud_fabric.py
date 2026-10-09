@@ -163,3 +163,92 @@ def test_vrfs_are_created_before_the_fabric_and_deleted_last():
     deploy = [n for n, _ in cf.DEPLOY_STEPS]
     assert deploy.index("fabric_vrfs") == deploy.index("fabric_create") - 1
     assert [n for n, _ in cf.ROLLBACK_STEPS][-1] == "delete_vrfs"
+
+
+def test_cloud_mgmt_output_is_parsed_like_the_meraki_form():
+    """IOS XE renamed `show meraki connect` → `show cloud-mgmt connect` (POD-18)."""
+    renamed = REGISTERED.replace("Meraki Tunnel", "Cloud-mgmt Tunnel").replace(
+        "Meraki Device Registration", "Cloud-mgmt Device Registration")
+    assert cf.parse_meraki_connect(renamed)["registered"]
+    down = renamed.replace("  Primary:              Up", "  Primary:              Down")
+    assert not cf.parse_meraki_connect(down)["tunnel_up"]
+
+
+def test_new_command_is_tried_first():
+    assert cf.CONNECT_CMDS[0] == "service cloud-mgmt connect"
+    assert cf.SHOW_CMDS[0] == "show cloud-mgmt connect"
+
+
+def _lldp(ports):  # {port: (remote systemName, remote port)}
+    return {"ports": {p: {"lldp": {"systemName": n, "portId": rp}} for p, (n, rp) in ports.items()}}
+
+
+# POD-18, 2026-10-08: three C9350-24U, still default hostnames (Switch-<mac>).
+C9350 = {
+    "B": ("94466700b261", ""), "L1": ("e4135c833200", ""), "L2": ("84dd84cff700", "")}
+C9350_LLDP = {
+    "B":  _lldp({"1": ("Switch-e4135c833200.corp", "Gi1/0/23"), "2": ("Switch-84dd84cff700.corp", "Gi1/0/24"),
+                 "24": ("BRANCH-SEC-RTR", "Tw0/0/4")}),
+    "L1": _lldp({"10": ("Switch-84dd84cff700.corp", "Gi1/0/10"), "11": ("Switch-84dd84cff700.corp", "Gi1/0/11"),
+                 "23": ("Switch-94466700b261.corp", "Gi1/0/1"), "24": ("BRANCH-SEC-RTR", "Tw0/0/5")}),
+    "L2": _lldp({"10": ("Switch-e4135c833200.corp", "Gi1/0/10"), "11": ("Switch-e4135c833200.corp", "Gi1/0/11"),
+                 "24": ("Switch-94466700b261.corp", "Gi1/0/2")}),
+}
+# POD-17-like C9300-48, already named in Dashboard (LLDP shows the names).
+C9300 = {"B": ("aaaa00000001", "Site_105-Border-Spine"), "L1": ("aaaa00000002", "Site_105-Leaf1"),
+         "L2": ("aaaa00000003", "Site_105-Leaf2")}
+C9300_LLDP = {
+    "B":  _lldp({"1": ("Site_105-Leaf1", "Gi1/0/47"), "2": ("Site_105-Leaf2", "Gi1/0/48")}),
+    "L1": _lldp({"10": ("Site_105-Leaf2", "Gi1/0/10"), "11": ("Site_105-Leaf2", "Gi1/0/11"),
+                 "47": ("Site_105-Border-Spine", "Gi1/0/1")}),
+    "L2": _lldp({"10": ("Site_105-Leaf1", "Gi1/0/10"), "11": ("Site_105-Leaf1", "Gi1/0/11"),
+                 "48": ("Site_105-Border-Spine", "Gi1/0/2")}),
+}
+
+
+def test_roles_and_ports_on_c9350_24():
+    roles = cf.infer_roles(C9350_LLDP, C9350)
+    assert roles == {"border_spine": "B", "leaf1": "L1", "leaf2": "L2"}
+    assert cf.underlay_ports(C9350_LLDP, C9350, roles) == {
+        ("border_spine", "leaf1"): "1", ("leaf1", "border_spine"): "23",
+        ("border_spine", "leaf2"): "2", ("leaf2", "border_spine"): "24"}
+
+
+def test_roles_and_ports_on_c9300_48():
+    roles = cf.infer_roles(C9300_LLDP, C9300)
+    assert roles == {"border_spine": "B", "leaf1": "L1", "leaf2": "L2"}
+    assert cf.underlay_ports(C9300_LLDP, C9300, roles)[("leaf2", "border_spine")] == "48"
+
+
+def test_roles_do_not_depend_on_serial_order():
+    shuffled = {k: C9350[k] for k in ("L2", "B", "L1")}
+    assert cf.infer_roles(C9350_LLDP, shuffled)["border_spine"] == "B"
+
+
+def test_unreadable_cabling_raises_instead_of_guessing():
+    import pytest
+    flat = {k: _lldp({}) for k in C9350}
+    with pytest.raises(RuntimeError):
+        cf.infer_roles(flat, C9350)
+
+
+def test_stale_idac_card_is_recognised():
+    """POD-18's stored iDAC URL (older session) rendered the tile like this."""
+    stale = "Cisco Duo\nEmail Found error\nMeraki\nMeraki Org ID Found error\nAPI Key Found error"
+    live = "Cisco Duo\nActivate Account\nMeraki Dashboard\nMeraki Org ID 1734868\nView"
+    assert cf.idac_card_is_stale(stale) and not cf.idac_card_is_stale(live)
+
+
+def test_live_idac_url_is_tried_before_the_stored_one():
+    assert cf.idac_url_candidates("https://idac/live", "https://idac/old") == ["https://idac/live", "https://idac/old"]
+    assert cf.idac_url_candidates("", "https://idac/old") == ["https://idac/old"]
+    assert cf.idac_url_candidates("https://idac/x", "https://idac/x") == ["https://idac/x"]
+
+
+def test_meraki_tile_candidates_never_take_another_tiles_button():
+    openers = r"^(log ?in|view|open|go|launch)$"
+    btns = [{"i": 4, "label": "Login", "section": "Cisco Duo"},
+            {"i": 5, "label": "View", "section": ""},                 # POD-18: Meraki, unattributed
+            {"i": 6, "label": "Login", "section": "Cisco Security Cloud Control"},
+            {"i": 9, "label": "View", "section": "Meraki Dashboard"}]
+    assert [b["i"] for b in cf.meraki_tile_candidates(btns, openers)] == [9, 5]
