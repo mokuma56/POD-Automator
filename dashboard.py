@@ -4859,6 +4859,46 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             browser.close()
 
 
+def _ippool_delete_control(row):
+    """The delete control on one Secure Access IP pool row, or None."""
+    for sel in ('button[aria-label*="delete" i]', 'button[aria-label*="remove" i]',
+                '[title*="delete" i]', 'button[data-testid*="delete" i]'):
+        try:
+            t = row.locator(sel).first
+            if t.is_visible(timeout=500):
+                return t
+        except Exception:
+            continue
+    # No labelled control: the right-most small button on the row is the trash.
+    best, best_x = None, -1
+    try:
+        for b in row.locator('button').all():
+            try:
+                bb = b.bounding_box()
+                if bb and bb['width'] < 60 and b.is_visible(timeout=300) and bb['x'] > best_x:
+                    best, best_x = b, bb['x']
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return best
+
+
+def _ippool_control_disabled(el) -> bool:
+    """Whether a pool row's delete control is disabled — the built-in pool's is."""
+    try:
+        if el.is_disabled(timeout=500):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(el.evaluate(
+            "e => e.getAttribute('aria-disabled') === 'true' || "
+            "/disabled/i.test(String(e.getAttribute('class') || ''))"))
+    except Exception:
+        return False
+
+
 def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
     """
     Automate all 7 manual SCC checklist items via Playwright using the saved SCC session.
@@ -6100,54 +6140,45 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                             pass
                         _shot("4_ippool_pools")
                         _ip_deleted = 0
+                        _ip_builtin = 0
                         for _attempt in range(5):
                             _body = page.inner_text("body").lower()
                             if "system pool" not in _body and "user pool" not in _body:
                                 break
-                            _pool_row = None
+                            # Look at EVERY pool row and take the first whose delete
+                            # control is enabled. Taking the first matching row made the
+                            # loop land on the built-in pool once the lab pool was gone,
+                            # and its control never becomes clickable: 3 x 8s timeouts
+                            # logged as failures on every POD (2026-10-11).
+                            _trash, _skipped = None, 0
                             for _rs in [
                                 'tr:has-text("System Pool")', '[role="row"]:has-text("System Pool")',
                                 'tr:has-text("User Pool")',   '[role="row"]:has-text("User Pool")',
                                 'tr:has-text("PseudoCo")',    '[role="row"]:has-text("PseudoCo")',
                             ]:
                                 try:
-                                    _r = page.locator(_rs).first
-                                    if _r.is_visible(timeout=1500):
-                                        _pool_row = _r; break
+                                    _rows = [r for r in page.locator(_rs).all()
+                                             if r.is_visible(timeout=1500)]
                                 except Exception:
                                     continue
-                            if not _pool_row:
-                                break
-                            _trash = None
-                            for _ts in [
-                                'button[aria-label*="delete" i]', 'button[aria-label*="remove" i]',
-                                '[title*="delete" i]', 'button[data-testid*="delete" i]',
-                            ]:
-                                try:
-                                    _t = _pool_row.locator(_ts).first
-                                    if _t.is_visible(timeout=500):
-                                        _trash = _t; break
-                                except Exception:
-                                    continue
+                                for _pool_row in _rows:
+                                    _t = _ippool_delete_control(_pool_row)
+                                    if _t is None:
+                                        continue
+                                    if _ippool_control_disabled(_t):
+                                        _skipped += 1
+                                        continue
+                                    _trash = _t
+                                    break
+                                if _trash:
+                                    break
                             if not _trash:
-                                try:
-                                    _btns = _pool_row.locator('button').all()
-                                    _best = None; _best_x = -1
-                                    for _b in _btns:
-                                        try:
-                                            _bb = _b.bounding_box()
-                                            if (_bb and _bb['width'] < 60
-                                                    and _b.is_visible(timeout=300)
-                                                    and _bb['x'] > _best_x):
-                                                _best = _b; _best_x = _bb['x']
-                                        except Exception:
-                                            continue
-                                    if _best:
-                                        _trash = _best
-                                except Exception:
-                                    pass
-                            if not _trash:
-                                log_fn("[scc-reset] ravpn_ip_pool: trash can not found on row")
+                                if _skipped:
+                                    _ip_builtin = _skipped
+                                    log_fn(f"[scc-reset] ravpn_ip_pool: {_skipped} pool row(s) "
+                                           "have a disabled delete control (built-in) — leaving them")
+                                else:
+                                    log_fn("[scc-reset] ravpn_ip_pool: trash can not found on row")
                                 break
                             # A stray overlay (leftover modal, tour tip, etc.) can sit on
                             # top of this button and block the click for the full default
@@ -6195,7 +6226,10 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                                      f"Deleted {_ip_deleted} IP pool(s) ✓")
                         else:
                             _body_final = page.inner_text("body").lower()
-                            if "system pool" in _body_final or "user pool" in _body_final:
+                            if _ip_builtin:
+                                _persist("ravpn_ip_pool", "completed",
+                                         f"Only built-in IP pool(s) left ({_ip_builtin}, not deletable)")
+                            elif "system pool" in _body_final or "user pool" in _body_final:
                                 _persist("ravpn_ip_pool", "failed",
                                          "IP pool rows found but could not delete — check screenshots")
                             else:
@@ -8042,6 +8076,16 @@ threading.Thread(target=_cdfmc_otp_watcher, daemon=True, name="cdfmc-otp-watcher
 
 # ── SGT Propagation Verify (step 5) — host-side Playwright ───────────────────
 
+# The lab pushes 16 Security Group Tags from ISE. Counts above that are
+# duplicates and fine; any count below it means propagation is partial — and
+# "more than zero" used to pass PODs 3, 12 and 14 on 2 tags (2026-10-11).
+SGT_MIN = 16
+
+
+def _sgt_count_ok(count: int) -> bool:
+    return count >= SGT_MIN
+
+
 def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
                      skip_wait: bool = False) -> tuple:
     """Verify Security Group Tags in Secure Access after ISE→SCC propagation.
@@ -8094,7 +8138,7 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
                         count = page.locator("table tbody tr").count()
                     except Exception:
                         pass
-                return count > 0, count
+                return _sgt_count_ok(count), count
         except Exception:
             if page:
                 try:
@@ -8121,7 +8165,8 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
             if ok:
                 log_fn(f"[sgt-verify] ✓ Found {count} SGTs")
                 return True, f"SGT verify passed: {count} Security Group Tags found in Secure Access"
-            return True, f"WARN: No SGTs found — ISE→SCC integration may not be active yet"
+            return False, (f"only {count} of {SGT_MIN} Security Group Tags in Secure Access — "
+                           f"ISE→SCC propagation is incomplete")
 
         # ── Check every 5 min up to 20 min ───────────────────────────────────
         log_fn(f"[sgt-verify] Checking every 5 min up to 20 min (4 checks)...")
@@ -8150,12 +8195,12 @@ def _host_sgt_verify(pod_id: str, sa_org_id: str, session_path: str, log_fn,
                 log_fn(f"[sgt-verify] ✓ Found {count} SGTs at check {check_num} ({e_mins:02d}:{e_secs:02d} elapsed)")
                 return True, f"SGT verify passed: {count} Security Group Tags found after {e_mins}m{e_secs:02d}s"
 
-            log_fn(f"[sgt-verify] No SGTs yet (count={count}) — next check in 5 min...")
+            log_fn(f"[sgt-verify] {count} of {SGT_MIN} SGTs so far — next check in 5 min...")
 
-        log_fn(f"[sgt-verify] ⚠ WARN: No SGTs after 20 min — check ISE → cdFMC integration")
-        return True, (
-            f"WARN: No SGTs in Secure Access after 20 min — "
-            f"check ISE→cdFMC integration (screenshot: sgt_verify_check4_{pod_id}.png)"
+        log_fn(f"[sgt-verify] ⚠ only {count} of {SGT_MIN} SGTs after 20 min")
+        return False, (
+            f"only {count} of {SGT_MIN} Security Group Tags in Secure Access after 20 min — "
+            f"ISE→SCC propagation is incomplete (screenshot: sgt_verify_check4_{pod_id}.png)"
         )
 
     except Exception as _e:
