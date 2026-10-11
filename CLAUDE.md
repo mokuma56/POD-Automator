@@ -156,9 +156,10 @@ misleading messages:
 - The **AD external authentication source must be Enabled** *and* carry its server
   configuration (host/port/base DN). Blank config → "The authentication source is not
   configured"; disabled → the login is refused before any auth event is logged.
-- **Every user email domain must be a Permitted Domain.** These are pod-specific — POD-17
-  carries both `corp.pseudoco.com` and `rtp17.corp.pseudoco.com` — so derive them from the
-  users in Duo, never hardcode.
+- **The base domain `corp.pseudoco.com` must be a Permitted Domain.** Users carry per-pod
+  subdomains (`kit@sjc14.corp.pseudoco.com`), but Duo matches a subdomain against the
+  permitted base domain, so the base alone is enough — the guide asks for exactly that and
+  `sso_test` passes with it on every POD (verified 2026-10-11, 13 PODs).
 - The **Routing Rules default rule** must point at Active Directory. It defaults to Duo,
   which cannot authenticate AD-synced users.
 - The **Auth Proxy must be enrolled with Duo SSO**, or the login reaches the password
