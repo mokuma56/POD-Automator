@@ -252,3 +252,36 @@ def test_meraki_tile_candidates_never_take_another_tiles_button():
             {"i": 6, "label": "Login", "section": "Cisco Security Cloud Control"},
             {"i": 9, "label": "View", "section": "Meraki Dashboard"}]
     assert [b["i"] for b in cf.meraki_tile_candidates(btns, openers)] == [9, 5]
+
+
+def _cleanup_harness(monkeypatch, networks):
+    """Run meraki_cleanup with every part stubbed; return (ok, msg, parts run)."""
+    ran = []
+    parts = [(n, (lambda name: lambda log_fn: ran.append(name) or "done")(n))
+             for n, _ in cf.CLEANUP_PARTS]
+    monkeypatch.setattr(cf, "CLEANUP_PARTS", parts)
+    monkeypatch.setattr(cf, "_org_id", lambda: "1734909")
+    monkeypatch.setattr(cf, "meraki", lambda *a, **k: networks)
+    monkeypatch.setattr(cf, "close_session", lambda: None)
+    monkeypatch.setattr(cf, "POD_ID", "")
+    ok, msg = cf.meraki_cleanup(log_fn=lambda m: None)
+    return ok, msg, ran
+
+
+def test_cleanup_without_site_105_is_clean_not_partial(monkeypatch):
+    # POD-4's org on 2026-10-11: no networks at all.
+    ok, msg, ran = _cleanup_harness(monkeypatch, [])
+    assert ok is True
+    assert "partial" not in msg
+    assert not set(ran) & cf.NETWORK_PARTS
+    assert {"ISE integration", "VRFs", "adaptive policy"} <= set(ran)
+
+
+def test_cleanup_with_site_105_runs_every_part(monkeypatch):
+    ok, msg, ran = _cleanup_harness(monkeypatch, [{"name": "SITE_105", "id": "L_1"}])
+    assert ok is True
+    assert ran == [n for n, _ in cf.CLEANUP_PARTS]
+
+
+def test_network_parts_name_real_cleanup_parts():
+    assert cf.NETWORK_PARTS <= {n for n, _ in cf.CLEANUP_PARTS}

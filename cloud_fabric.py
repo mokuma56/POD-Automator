@@ -1631,12 +1631,37 @@ CLEANUP_PARTS = [
 ]
 
 
+# Parts that only exist inside SITE_105: a fabric needs switches in a network,
+# and the other two act on the network itself.
+NETWORK_PARTS = {"fabric", "switches", "switching config"}
+
+
+def _lab_network_present() -> bool:
+    """Whether SITE_105 exists. An org that never ran Cloud Fabric prep has no
+    networks at all (2026-10-11: 7 of 15 PODs), and there the network parts have
+    nothing to clean — they used to soft-fail with "network SITE_105 not found"
+    and a fabric 404, which read like a broken org rather than a clean one."""
+    nets = meraki("GET", f"/organizations/{_org_id()}/networks", params={"perPage": 1000})
+    return any(n.get("name") == NETWORK_NAME for n in nets or [])
+
+
 def meraki_cleanup(log_fn=print):
     """Core-pipeline step: (ok, summary). Each part is independent — one failing
     is reported but does not stop the rest."""
     results, failed = [], []
     try:
+        try:
+            has_net = _lab_network_present()
+        except STEP_ERRORS as e:
+            # Unknown is not absent: let each part run and report for itself.
+            log_fn(f"  ? could not list networks ({type(e).__name__}: {e}) — running every part")
+            has_net = True
         for name, fn in CLEANUP_PARTS:
+            if name in NETWORK_PARTS and not has_net:
+                msg = f"no {NETWORK_NAME} network — nothing to clean"
+                log_fn(f"  ✓ {name}: {msg}")
+                results.append(f"{name}: {msg}")
+                continue
             try:
                 msg = fn(log_fn)
                 log_fn(f"  ✓ {name}: {msg}")
