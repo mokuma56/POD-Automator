@@ -9368,6 +9368,66 @@ def sa_sso_idp_host(t, sa_org: str, ent: str, name: str = "DuoSSO",
         popup.close()
 
 
+def _sa_duo_directory_names(page_text: str) -> list:
+    """The Duo-NNNNN directory names on a rendered Configuration management page.
+
+    sa_generate_scim_token_ui names every directory it creates Duo-<digits>,
+    so this is what a live one looks like.
+    """
+    import re as _re
+    return sorted(set(_re.findall(r"\bDuo-\d+\b", page_text or "")),
+                  key=lambda n: int(n.split("-")[1]))
+
+
+def sa_live_duo_directory(pod_id: str, db_path: str, log=None) -> tuple:
+    """Does this pod's Secure Access org still hold a Duo directory?
+
+    Returns (known, name). known=False means the page could not be read, which
+    proves nothing — the caller must keep what it has. known=True with name ""
+    means the page rendered and no Duo-NNNNN directory is on it.
+
+    Needed because a 200 from SCIM /Users does not prove the directory exists:
+    on POD-7 (org 529, 2026-10-11) the stored token kept accepting writes after
+    a session reset had deleted its directory — the IoT/MAIN/PROD groups showed
+    "(deleted)" in the org — so users were provisioned into a directory nothing
+    can see and sso_saml then had no directory to pick.
+    """
+    import sqlite3 as _sq
+    from playwright.sync_api import sync_playwright
+    _log = log or (lambda m: None)
+    with _sq.connect(db_path) as conn:
+        conn.row_factory = _sq.Row
+        pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
+        m = _re.search(r"pseudoco-(\d+)", (pod["scc_org"] if pod else "") or "")
+        oc = dict(conn.execute("SELECT * FROM org_credentials WHERE org_number=?",
+                               (m.group(1),)).fetchone() or {}) if m else {}
+    idac = read_idac_url_from_session(pod_id, log=_log) or (oc.get("idac_url") or "").strip()
+    sa_org = (oc.get("sa_org_id") or "").strip()
+    if not (idac and sa_org):
+        _log("directory check: no idac_url / sa_org_id — cannot look")
+        return False, ""
+    pw = br = None
+    try:
+        pw = sync_playwright().start()
+        br = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = br.new_context(ignore_https_errors=True,
+                             viewport={"width": 1600, "height": 1200})
+        t, ent = _scc_open_session(ctx, idac, log=_log)
+        if not _sa_config_page(t, sa_org, ent):
+            _log("directory check: Configuration management never rendered — unknown")
+            return False, ""
+        names = _sa_duo_directory_names(_scc_text(t) or "")
+        return True, (names[-1] if names else "")
+    except Exception as e:
+        _log(f"directory check failed ({type(e).__name__}: {str(e)[:80]}) — unknown")
+        return False, ""
+    finally:
+        if br:
+            br.close()
+        if pw:
+            pw.stop()
+
+
 def _sa_wizard_open(t, sa_org: str, ent: str, log=None) -> str:
     """Open Connect -> Configuration management -> SSO authentication wizard.
 
@@ -9380,8 +9440,15 @@ def _sa_wizard_open(t, sa_org: str, ent: str, log=None) -> str:
     # control lookup below finds nothing on a page that simply had not painted.
     if not _sa_config_page(t, sa_org, ent):
         raise RuntimeError("Secure Access configuration page never rendered its cards")
-    m = _re.search(r"Duo-\d+", _scc_text(t) or "")
-    dirname = m.group(0) if m else "Duo"
+    names = _sa_duo_directory_names(_scc_text(t) or "")
+    if not names:
+        # There used to be a fallback to the literal "Duo" here. No directory is
+        # ever named that, so the wizard then failed as "name or user directory
+        # not accepted", which hid the real cause: the org has no directory.
+        raise RuntimeError(
+            "no Duo-NNNNN directory in this Secure Access org — saml_scim_config "
+            "must (re)generate the SCIM token, which creates one")
+    dirname = names[-1]
     hit = t.evaluate("""() => {
         const els = Array.from(document.querySelectorAll('div,section'))
             .filter(e => /SSO authentication/i.test(e.innerText||'') &&
@@ -12043,6 +12110,17 @@ def duo_run_card(
             if not _v_ok:
                 _log(f"stored sa_scim_token {_v_why} — discarding and regenerating")
                 scim_tok = ""
+            else:
+                # Accepted is not alive: a deleted directory's token can still
+                # return 200 (POD-7, 2026-10-11). Only a page that rendered
+                # without a Duo-NNNNN directory counts as gone; unknown keeps it.
+                _d_known, _d_name = sa_live_duo_directory(pod_id, db_path, log=_log)
+                if _d_known and not _d_name:
+                    _log("stored sa_scim_token is accepted but its directory is gone "
+                         "— discarding and regenerating")
+                    scim_tok = ""
+                elif _d_known:
+                    _log(f"stored sa_scim_token: directory {_d_name} present")
         if not scim_tok:
             _log("no SCIM token for this org — generating one via Secure Access")
             g_ok, g_msg = sa_generate_scim_token_ui(pod_id, db_path, log=_log)
