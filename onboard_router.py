@@ -493,7 +493,7 @@ def phase_copy_bootstrap():
     vpn_ip = _find_vpn_ip()
     if not vpn_ip:
         print("     VPN host IP not found!")
-        return False
+        return False, "VPN host IP not found — the router has nowhere to fetch the bootstrap from"
     print(f"     VPN host IP: {vpn_ip}")
 
     import http.server, socketserver, threading
@@ -505,13 +505,14 @@ def phase_copy_bootstrap():
     print(f"     HTTP server started on port {http_port}")
 
     client = None
+    last_err = ""
+    src = f"http://{vpn_ip}:{http_port}/ciscosdwan.cfg"
     for attempt in range(3):
         try:
             client, shell = router_shell()
             router_enable(shell)
             shell_send(shell, "terminal length 0\n"); time.sleep(1); read_shell(shell, 1)
 
-            src = f"http://{vpn_ip}:{http_port}/ciscosdwan.cfg"
             shell_send(shell, f"copy {src} bootflash:ciscosdwan.cfg\n")
             time.sleep(3)
             all_out = ""
@@ -540,13 +541,21 @@ def phase_copy_bootstrap():
                 if "?" in out.lower() or any(kw in out.lower() for kw in ("confirm", "over write", "destination")):
                     shell_send(shell, "\n")
             print(f"     HTTP copy result: {all_out[-200:]}")
+            # The router names the cause ("%Error opening http://...
+            # (HTTP error: Connection timeout)"); the step used to drop it and
+            # log a bare "copy_bootstrap FAILED:" (POD-7, 2026-10-11).
+            errs = [l.strip() for l in all_out.splitlines() if "%error" in l.lower()]
+            last_err = errs[-1] if errs else "no 'bytes copied' from the router"
         except Exception as e:
             print(f"     Attempt {attempt+1}: {e}")
+            last_err = f"{type(e).__name__}: {e}"
         finally:
             if client: client.close()
         time.sleep(3)
     httpd.shutdown()
-    return False
+    return False, (f"router could not fetch {src} after 3 "
+                   f"attempts: {last_err[:150]} — the router cannot reach this POD's VPN "
+                   f"address {vpn_ip}:{http_port}; reconnect the VPN and re-run")
 
 
 def _wait_router_online(timeout=600):
@@ -593,7 +602,8 @@ def phase_controller_mode():
     if not found:
         print("     Re-copying bootstrap...")
         client.close()
-        if not phase_copy_bootstrap():
+        ok_copy = phase_copy_bootstrap()
+        if not (ok_copy[0] if isinstance(ok_copy, tuple) else ok_copy):
             return False
         client, shell = router_shell()
         router_enable(shell)
@@ -1410,6 +1420,19 @@ def run_switch_checks(step_name):
     return overall_ok, result
 
 
+def _vmanage_task_reason(body: dict) -> str:
+    """Why a vManage device-action task failed. `details` is often empty — POD-12
+    logged a bare "Deploy task failed:" on 2026-10-11 — and the cause sits in
+    currentActivity or the per-device activity log instead."""
+    d0 = (body.get("data") or [{}])[0] or {}
+    activity = d0.get("activity") or []
+    for v in (d0.get("details"), d0.get("currentActivity"),
+              activity[-1] if activity else "", (body.get("summary") or {}).get("status")):
+        if v and str(v).strip():
+            return str(v).strip()
+    return "vManage gave no reason (check Monitor > Tasks for the deploy task)"
+
+
 def phase_redeploy_config_group(s):
     """Re-deploy PseudocoBranches config group after router is online.
     Ensures vManage config group is in sync with the running device config.
@@ -1449,8 +1472,7 @@ def phase_redeploy_config_group(s):
                         if "done" in status.lower():
                             return True, f"Deploy task done after {(i+1)*5}s"
                         elif status.lower() in ("error", "fail", "failure"):
-                            detail = (tr.json().get("data") or [{}])[0].get("details", "")
-                            return False, f"Deploy task failed: {detail[:200]}"
+                            return False, f"Deploy task failed: {_vmanage_task_reason(tr.json())[:200]}"
                 except Exception:
                     pass
 
