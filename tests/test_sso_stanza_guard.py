@@ -66,3 +66,14 @@ def test_a_path_mentioned_inside_a_real_stanza_is_still_accepted():
     references a path in a comment is legitimate."""
     body = REAL_STANZA + "; see C:\\Program Files\\Duo Security\\conf\\authproxy.cfg\n"
     assert _looks_like_sso_stanza(body) is True
+
+
+def test_ext_auth_setup_does_not_enrol_the_proxy_itself():
+    """The inline enrolment in _pw_sso_ext_auth_setup scraped the cfg path and
+    ran `authproxyctl.exe <path>` on every POD (2026-10-11). Enrolment belongs to
+    duo_enroll_sso_authproxy(); this function must not grow a second copy."""
+    import inspect
+    import duo_automation as da
+    src = inspect.getsource(da._pw_sso_ext_auth_setup)
+    assert "AUTHPROXY_ENROLL_EXE" not in src
+    assert "_winrm_run_cmd" not in src

@@ -7569,90 +7569,10 @@ def _pw_sso_ext_auth_setup(
         duo_page.wait_for_timeout(2000)
         log(f"after Configure AD: {duo_page.url[:80]}")
 
-    # ── Add Authentication Proxy ──────────────────────────────────────────────
-    log("adding Authentication Proxy ...")
-    _pw_click_first(duo_page, [
-        "button:has-text('Add Authentication Proxy')",
-        "a:has-text('Add Authentication Proxy')",
-        "button:has-text('+ Add Authentication Proxy')",
-    ], timeout=T, log=log)
-    duo_page.wait_for_timeout(2000)
-
-    # ── Step 1.2: capture [sso] config section ────────────────────────────────
-    log("capturing [sso] config from step 1.2 ...")
-    sso_cfg = (
-        _pw_get_copy_content(duo_page, "1.2", log=log)
-        or _pw_get_copy_content(duo_page, "SSO section", log=log)
-        or _pw_get_copy_content(duo_page, "service account", log=log)
-    )
-    if sso_cfg and not _looks_like_sso_stanza(sso_cfg):
-        log(f"[sso] capture returned something that is not a stanza "
-            f"({len(sso_cfg)} chars, starts {sso_cfg.strip()[:40]!r}) — discarding "
-            f"rather than corrupting authproxy.cfg")
-        sso_cfg = ""
-    if sso_cfg:
-        log(f"[sso] config captured ({len(sso_cfg)} chars)")
-        # Append [sso] section to authproxy.cfg on AD1
-        log("appending [sso] section to authproxy.cfg on AD1 ...")
-        current_cfg = _winrm_read_file(winrm_session, AUTHPROXY_CFG_PATH)
-        # Remove any prior [sso] block
-        import re as _rc4
-        current_clean = _rc4.sub(
-            r'\[sso\].*?(?=\[|\Z)', '', current_cfg, flags=_rc4.DOTALL
-        ).rstrip()
-        new_cfg = current_clean + "\n\n" + sso_cfg.strip() + "\n"
-        ok_a, msg_a = _winrm_write_restart_cfg(winrm_session, new_cfg, log)
-        if not ok_a:
-            log(f"WARN: [sso] append failed: {msg_a}")
-        else:
-            log(f"[sso] append: {msg_a}")
-    else:
-        log("WARN: could not capture [sso] config — manual copy may be needed")
-
-    # ── Step 2: capture + run enrollment command ──────────────────────────────
-    log("capturing enrollment command from step 2 ...")
-    enroll_raw = (
-        _pw_get_copy_content(duo_page, "2.", log=log)
-        or _pw_get_copy_content(duo_page, "Connect the Authentication", log=log)
-        or _pw_get_copy_content(duo_page, "Generate Command", log=log)
-    )
-    if not enroll_raw:
-        # Scan page HTML for authproxyctl
-        import re as _rc5
-        m_enroll = _rc5.search(r'(authproxyctl[^\n<"]+)', duo_page.content())
-        if m_enroll:
-            enroll_raw = m_enroll.group(1).strip()
-
-    if enroll_raw:
-        log(f"enrollment command: {enroll_raw[:120]}")
-        # Strip 'authproxyctl' prefix — run via the full EXE path on AD1
-        import re as _rc6
-        tail = _rc6.sub(r'^.*?authproxyctl\.exe?\s*', '', enroll_raw).strip()
-        if not tail:
-            tail = enroll_raw.strip()
-        log(f"running enrollment on AD1: {AUTHPROXY_ENROLL_EXE} {tail[:60]}")
-        _winrm_run_cmd(
-            winrm_session,
-            f"'{AUTHPROXY_ENROLL_EXE}' {tail}",
-            log,
-        )
-        duo_page.wait_for_timeout(5000)
-    else:
-        log("WARN: could not capture enrollment command — proxy may need manual enrollment")
-
-    # ── Step 3: verify Connected ──────────────────────────────────────────────
-    log("running connection test (step 3) ...")
-    _pw_click_first(duo_page, [
-        "button:has-text('Run test')", "a:has-text('Run test')",
-        "button:has-text('Test')",
-    ], timeout=T, log=log)
-    for _ in range(12):
-        duo_page.wait_for_timeout(5000)
-        if any(kw in duo_page.inner_text("body") for kw in ["Connected to Duo", "Connected", "Success"]):
-            log("SSO Auth Proxy: ✓ Connected to Duo")
-            break
-    else:
-        log("WARN: could not confirm Connected within 60 s — continuing")
+    # The Authentication Proxy is NOT enrolled here. An inline copy of that used
+    # to live here: it read the config FILE PATH out of the wrong <pre> and ran
+    # `authproxyctl.exe <path>`, a usage error on every POD. Enrolment belongs to
+    # duo_enroll_sso_authproxy(), which sso_authsource runs after this.
 
     # ── Configure AD server: hostname, port, base DN ──────────────────────────
     log("configuring Active Directory server settings ...")
