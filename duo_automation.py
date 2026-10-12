@@ -6,6 +6,7 @@ Uses HMAC-SHA1 signed requests per Duo Admin API v1/v3 spec.
 """
 
 import hashlib
+import contextlib
 import hmac
 import base64
 import urllib.parse
@@ -1269,7 +1270,7 @@ def duo_sa_configure_headless(
 
     # ── 0. Load creds ──────────────────────────────────────────────────────────
     try:
-        with _sq6.connect(db_path) as conn:
+        with contextlib.closing(_sq6.connect(db_path)) as conn, conn:
             conn.row_factory = _sq6.Row
             pod_row = conn.execute(
                 "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
@@ -1314,7 +1315,7 @@ def duo_sa_configure_headless(
             if not app_ikey:
                 _log(f"integration types found: {list(set(all_types))}")
             if app_ikey:
-                with _sq6.connect(db_path) as conn:
+                with contextlib.closing(_sq6.connect(db_path)) as conn, conn:
                     conn.execute(
                         "UPDATE org_credentials SET duo_saml_app_ikey=? WHERE org_number=?",
                         (app_ikey, org_num)
@@ -2068,7 +2069,7 @@ def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
     _log = log or (lambda m: print(f"  [duo-session] {m}"))
 
     try:
-        with _sq_rs.connect(db_path) as conn:
+        with contextlib.closing(_sq_rs.connect(db_path)) as conn, conn:
             conn.row_factory = _sq_rs.Row
             row = conn.execute(
                 "SELECT idac_url, duo_admin_email FROM org_credentials "
@@ -2124,7 +2125,7 @@ def duo_refresh_session_scope(pod_id: str, db_path: str, org_num: str,
     # locked two admins out on 2026-08-31 — same session, already-activated
     # admin, one-shot activation link. Hence the exact-match check above.)
     try:
-        with _sq_rs.connect(db_path) as conn:
+        with contextlib.closing(_sq_rs.connect(db_path)) as conn, conn:
             conn.row_factory = _sq_rs.Row
             cols = {r[1] for r in conn.execute(
                 "PRAGMA table_info(org_credentials)")}
@@ -2773,7 +2774,7 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
     _log = log or (lambda s: print(f"  [duo-bootstrap] {s}"))
     duo_ensure_table(db_path)
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -2940,7 +2941,7 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
             _log(f"passkey enrolled ({len(creds)} credential, rpId={creds[0].get('rpId')})")
             hwm = _pw_read_signcount(cdp2, auth2)
 
-            with _sq.connect(db_path) as conn:
+            with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                 conn.execute(
                     "UPDATE org_credentials SET duo_admin_email=?, duo_admin_password=?, "
                     "duo_admin_host=?, duo_passkey_cred=?, duo_passkey_hwm=?, idac_url=?, "
@@ -2976,7 +2977,7 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
                     # admin/passkey side was missing, and creating a second
                     # app here would leave the org with two API apps for no
                     # reason. Just bank the fresh signCount.
-                    with _sq.connect(db_path) as conn:
+                    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                         conn.execute(
                             "UPDATE org_credentials SET duo_passkey_hwm=? "
                             "WHERE org_number=?", (hwm, org_num))
@@ -2990,7 +2991,7 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
                      f"new Admin API app in this org")
                 _stale = [c for c in DUO_SESSION_SCOPED_COLUMNS
                           if c not in _ADMIN_LOGIN_COLUMNS]
-                with _sq.connect(db_path) as conn:
+                with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                     _have = {r[1] for r in conn.execute("PRAGMA table_info(org_credentials)")}
                     _stale = [c for c in _stale if c in _have]
                     conn.execute(
@@ -3000,7 +3001,7 @@ def duo_passkey_bootstrap(pod_id: str, db_path: str, log=None) -> tuple[bool, st
 
             api = _pw_create_admin_api_app(page2, admin_host, log=_log)
 
-            with _sq.connect(db_path) as conn:
+            with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                 conn.execute(
                     "UPDATE org_credentials SET duo_ikey=?, duo_skey=?, duo_host=?, "
                     "duo_passkey_hwm=?, updated_at=datetime('now') WHERE org_number=?",
@@ -3033,7 +3034,7 @@ def duo_harvest_sso_enrollment(pod_id: str, db_path: str, log=None) -> tuple[boo
     _log = log or (lambda s: print(f"  [duo-sso] {s}"))
     duo_ensure_table(db_path)
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -3138,7 +3139,7 @@ def duo_harvest_sso_enrollment(pod_id: str, db_path: str, log=None) -> tuple[boo
             return False, (f"captured {len(values)} clipboard value(s) but no enrollment "
                            f"blob (sso_cfg={'yes' if sso_cfg else 'no'})")
 
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             conn.execute(
                 "UPDATE org_credentials SET authproxy_enroll_blob=?, "
                 "authproxy_blob_saved_at=datetime('now') WHERE org_number=?",
@@ -3219,7 +3220,7 @@ def duo_setup_secure_access_app(pod_id: str, db_path: str, log=None) -> tuple[bo
     _log = log or (lambda s: print(f"  [duo-sa-app] {s}"))
     AD_GROUPS = ("IoT", "MAIN", "PROD")
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -3546,7 +3547,7 @@ def duo_setup_secure_access_app(pod_id: str, db_path: str, log=None) -> tuple[bo
                 pass
         ok = total > 0
 
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             conn.execute("UPDATE org_credentials SET duo_saml_app_ikey=?, "
                          "updated_at=datetime('now') WHERE org_number=?",
                          (app_ikey, org_num))
@@ -3645,7 +3646,7 @@ def duo_delete_directory_sync(pod_id: str, db_path: str, log=None) -> tuple[bool
 
     _log = log or (lambda s: print(f"  [duo-dirsync] {s}"))
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -3727,7 +3728,7 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
 
     _log = log or (lambda s: print(f"  [duo-rollback] {s}"))
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -3818,7 +3819,7 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
                   "duo_passkey_hwm", "idac_url"]
     # Column names are from the fixed CLEAR list above, never user input.
     assignments = ", ".join(f"{c}=''" for c in CLEAR)
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.execute(
             f"UPDATE org_credentials SET {assignments}, updated_at=datetime('now') "
             f"WHERE org_number=?", (org_num,))
@@ -3967,7 +3968,7 @@ def _scc_enterprise_id(page, db_path: str = "", log=None) -> str:
     if not cands:
         return ""
     try:
-        with _sq.connect(db_path or _scc_default_db_path()) as conn:
+        with contextlib.closing(_sq.connect(db_path or _scc_default_db_path())) as conn, conn:
             known = {(r[0] or "").strip().lower() for r in conn.execute(
                 "SELECT scc_org_uuid FROM org_credentials "
                 "WHERE scc_org_uuid IS NOT NULL AND scc_org_uuid != ''")}
@@ -4258,7 +4259,7 @@ def sa_generate_scim_token_ui(pod_id: str, db_path: str, log=None) -> tuple[bool
 
     _log = log or (lambda s: print(f"  [sa-scim] {s}"))
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -4371,7 +4372,7 @@ def sa_generate_scim_token_ui(pod_id: str, db_path: str, log=None) -> tuple[bool
 
         # The provisioning URL is needed verbatim by the Duo application in
         # section 3, so keep it rather than only logging it.
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             try:
                 conn.execute("ALTER TABLE org_credentials ADD COLUMN "
                              "sa_scim_url TEXT DEFAULT ''")
@@ -4413,7 +4414,7 @@ def duo_sync_now(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
 
     _log = log or (lambda s: print(f"  [duo-sync] {s}"))
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -4551,7 +4552,7 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
     AD_GROUPS = ("IoT", "MAIN", "PROD")
     CFG = r"C:\Program Files\Duo Security Authentication Proxy\conf\authproxy.cfg"
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -4652,7 +4653,7 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
             # Preserve the SSO stanza — the enrollment step needs its rikey, and
             # an earlier merge dropped it.
             if "[sso]" not in rest:
-                with _sq.connect(db_path) as c2:
+                with contextlib.closing(_sq.connect(db_path)) as c2, c2:
                     c2.row_factory = _sq.Row
                     row = c2.execute("SELECT authproxy_sso_cfg FROM org_credentials "
                                      "WHERE org_number=?", (org_num,)).fetchone()
@@ -5002,7 +5003,7 @@ def duo_provision_admin_totp(pod_id: str, db_path: str, serial: str = "",
     _log = log or (lambda s: print(f"  [duo-totp] {s}"))
     duo_ensure_table(db_path)
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -5096,7 +5097,7 @@ def duo_provision_admin_totp(pod_id: str, db_path: str, serial: str = "",
     except Exception as e:
         return False, f"token provisioning failed: {e}"
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.execute(
             "UPDATE org_credentials SET duo_admin_totp_secret=?, "
             "updated_at=datetime('now') WHERE org_number=?",
@@ -5334,7 +5335,7 @@ def duo_publish_totp_page(pod_id: str, db_path: str,
 
     _log = log or (lambda s: print(f"  [duo-page] {s}"))
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -5439,7 +5440,7 @@ def duo_admin_totp_code(pod_id: str, db_path: str) -> str:
     import re as _re
     import sqlite3 as _sq
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         org_num = _re.search(r"pseudoco-(\d+)", (pod["scc_org"] or "")).group(1)
@@ -5481,7 +5482,7 @@ def duo_passkey_login(pod_id: str, db_path: str, log=None):
     from playwright.sync_api import sync_playwright
 
     _log = log or (lambda s: print(f"  [duo-login] {s}"))
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         org_num = _re.search(r"pseudoco-(\d+)", (pod["scc_org"] or "")).group(1)
@@ -5521,7 +5522,7 @@ def duo_passkey_login(pod_id: str, db_path: str, log=None):
         if ok:
             # Persist only on success. Saving after a failure would bank a
             # counter the relying party never accepted.
-            with _sq.connect(db_path) as conn:
+            with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                 conn.execute(
                     "UPDATE org_credentials SET duo_passkey_hwm=? WHERE org_number=?",
                     (hwm, org_num))
@@ -5731,7 +5732,7 @@ def duo_activate_and_get_sessions(pod_id: str, db_path: str, log=None) -> dict:
     _log = log or (lambda s: print(f"     [duo-activate] {s}"))
 
     # ── 1. Load credentials from DB ───────────────────────────────────────────
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod_row = conn.execute(
             "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
@@ -5786,7 +5787,7 @@ def duo_activate_and_get_sessions(pod_id: str, db_path: str, log=None) -> dict:
     # Each dCloud session is a new Duo org; these values are stale the moment
     # the session ends.  We store them purely for post-run inspection.
     try:
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             conn.execute(
                 "UPDATE org_credentials SET "
                 "duo_admin_email=?, duo_admin_password=?, "
@@ -5843,7 +5844,7 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
     # configure the Duo org that session created. Step 2 below opens SCC with
     # exactly that URL, so this must precede the credential load.
     try:
-        with _sq.connect(db_path) as _c0:
+        with contextlib.closing(_sq.connect(db_path)) as _c0, _c0:
             _c0.row_factory = _sq.Row
             _p0 = _c0.execute("SELECT scc_org FROM pods WHERE pod_id=?",
                               (pod_id,)).fetchone()
@@ -5857,7 +5858,7 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
     # ── 1. Load credentials ───────────────────────────────────────────────────
     _log("loading credentials from DB...")
     try:
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             conn.row_factory = _sq.Row
             pod_row = conn.execute(
                 "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
@@ -6058,7 +6059,7 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
     # ── 12. Persist app ikey + profile_id to DB ───────────────────────────────
     _log("persisting results to DB...")
     try:
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             conn.execute(
                 "UPDATE org_credentials "
                 "SET duo_saml_app_ikey=?, sa_saml_profile_id=?, updated_at=datetime('now') "
@@ -7741,7 +7742,7 @@ def duo_push_authproxy_config(
     # ── 1. Load credentials from DB ──────────────────────────────────────────
     _log("loading credentials from DB ...")
     try:
-        with _sq4.connect(db_path) as conn:
+        with contextlib.closing(_sq4.connect(db_path)) as conn, conn:
             conn.row_factory = _sq4.Row
             pod_row = conn.execute(
                 "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
@@ -7795,7 +7796,7 @@ def duo_push_authproxy_config(
         ap_skey = creds["skey"]
         _log(f"auth proxy ikey: {ap_ikey}")
         try:
-            with _sq4.connect(db_path) as conn:
+            with contextlib.closing(_sq4.connect(db_path)) as conn, conn:
                 conn.execute(
                     "UPDATE org_credentials SET authproxy_ikey=?, authproxy_skey=? "
                     "WHERE org_number=?",
@@ -7869,7 +7870,7 @@ def duo_authproxy_enroll_and_update(
 
     # ── 1. Load creds from DB ──────────────────────────────────────────────────
     try:
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             conn.row_factory = _sq.Row
             pod_row = conn.execute(
                 "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
@@ -7960,7 +7961,7 @@ def duo_authproxy_enroll_and_update(
                 new_cfg, flags=_re.MULTILINE | _re.DOTALL,
             )
             try:
-                with _sq.connect(db_path) as conn:
+                with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                     conn.execute(
                         "UPDATE org_credentials SET authproxy_cfg=?, updated_at=datetime('now') "
                         "WHERE org_number=?",
@@ -8015,7 +8016,7 @@ def duo_admin_portal_configure(
 
     # ── Load org creds ─────────────────────────────────────────────────────────
     try:
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             conn.row_factory = _sq.Row
             pod_row = conn.execute(
                 "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
@@ -8649,7 +8650,7 @@ def duo_ext_dir_and_sso_setup(
     # ── 1. Load credentials ───────────────────────────────────────────────────
     _log("loading credentials from DB ...")
     try:
-        with _sq3.connect(db_path) as conn:
+        with contextlib.closing(_sq3.connect(db_path)) as conn, conn:
             conn.row_factory = _sq3.Row
             pod_row = conn.execute(
                 "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
@@ -9315,7 +9316,7 @@ def sa_live_duo_directory(pod_id: str, db_path: str, log=None) -> tuple:
     import sqlite3 as _sq
     from playwright.sync_api import sync_playwright
     _log = log or (lambda m: None)
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         m = _re.search(r"pseudoco-(\d+)", (pod["scc_org"] if pod else "") or "")
@@ -9527,7 +9528,7 @@ def duo_setup_saml_sso(pod_id: str, db_path: str, log=None) -> tuple[bool, str]:
 
     _log = log or (lambda s: print(f"  [duo-sso] {s}"))
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -9694,7 +9695,7 @@ def duo_disable_lab_mfa(pod_id: str, db_path: str, log=None) -> tuple[bool, str]
         "sections.authentication_policy.user_auth_behavior": "Authentication policy",
     }
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -9865,7 +9866,7 @@ def duo_configure_sso_auth_source(pod_id: str, db_path: str, log=None) -> tuple[
 
     _log = log or (lambda s: print(f"  [duo-authsrc] {s}"))
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -10139,7 +10140,7 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
 
     _log = log or (lambda s: print(f"  [duo-sso-proxy] {s}"))
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -10276,7 +10277,7 @@ def duo_enroll_sso_authproxy(pod_id: str, db_path: str, log=None) -> tuple[bool,
             if not ok_w:
                 return False, f"could not add the [sso] stanza to authproxy.cfg: {msg_w}"
             _log("[sso] stanza written to authproxy.cfg")
-            with _sq.connect(db_path) as conn:
+            with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                 conn.execute(
                     "UPDATE org_credentials SET authproxy_sso_cfg=?, "
                     "updated_at=datetime('now') WHERE org_number=?",
@@ -10370,7 +10371,7 @@ def _pod_ad_kit_email(pod_id: str, db_path: str, log=None) -> str:
     import sqlite3 as _sq
     _log = log or (lambda m: None)
     try:
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             row = conn.execute(
                 "SELECT result FROM pipeline_steps WHERE pod_id=? AND step_name='ad_verify'",
                 (pod_id,)).fetchone()
@@ -10425,7 +10426,7 @@ def duo_test_sso_login(pod_id: str, db_path: str, username: str = "",
         return False, ("no test password — set LAB_USER_PASSWORD "
                        "(the lab user password) in the environment")
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -10798,7 +10799,7 @@ def sa_teardown_identity(pod_id: str, db_path: str, log=None) -> tuple[bool, str
 
     _log = log or (lambda s: print(f"  [sa-teardown] {s}"))
 
-    with _sq.connect(db_path) as conn:
+    with contextlib.closing(_sq.connect(db_path)) as conn, conn:
         conn.row_factory = _sq.Row
         pod = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
         if not pod:
@@ -10893,7 +10894,7 @@ def sa_generate_scim_token_playwright(pod_id: str, db_path: str, log=None) -> tu
 
     # ── Load creds ───────────────────────────────────────────────────────────────
     try:
-        with _sq.connect(db_path) as _c:
+        with contextlib.closing(_sq.connect(db_path)) as _c, _c:
             _c.row_factory = _sq.Row
             pod_row = dict(_c.execute(
                 "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
@@ -11196,7 +11197,7 @@ def sa_generate_scim_token_playwright(pod_id: str, db_path: str, log=None) -> tu
 
     # ── Save token to DB ─────────────────────────────────────────────────────────
     try:
-        with _sq.connect(db_path) as _c:
+        with contextlib.closing(_sq.connect(db_path)) as _c, _c:
             _c.execute(
                 "UPDATE org_credentials SET sa_scim_token=?, updated_at=datetime('now') "
                 "WHERE org_number=?",
@@ -11236,7 +11237,7 @@ def duo_create_cisco_sa_app_playwright(pod_id: str, db_path: str, log=None,
 
     # ── Load creds ──────────────────────────────────────────────────────────────
     try:
-        with _sq.connect(db_path) as _c:
+        with contextlib.closing(_sq.connect(db_path)) as _c, _c:
             _c.row_factory = _sq.Row
             oc = dict(_c.execute(
                 "SELECT * FROM org_credentials WHERE org_number=("
@@ -11274,7 +11275,7 @@ def duo_create_cisco_sa_app_playwright(pod_id: str, db_path: str, log=None,
 
     # derive SCC CDO URL for login entry point
     try:
-        with _sq.connect(db_path) as _c2:
+        with contextlib.closing(_sq.connect(db_path)) as _c2, _c2:
             _c2.row_factory = _sq.Row
             _pod_row = _c2.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
             scc_org = (_pod_row["scc_org"] or "") if _pod_row else ""
@@ -11660,7 +11661,7 @@ def _save_saml_app_ikey(db_path: str, oc: dict, app_ikey: str) -> None:
     if not org_num:
         return
     try:
-        with _sq.connect(db_path) as c:
+        with contextlib.closing(_sq.connect(db_path)) as c, c:
             c.execute(
                 "UPDATE org_credentials SET duo_saml_app_ikey=?, updated_at=datetime('now') "
                 "WHERE org_number=?",
@@ -11673,7 +11674,7 @@ def _save_saml_app_ikey(db_path: str, oc: dict, app_ikey: str) -> None:
 def duo_ensure_table(db_path: str) -> None:
     """Create duo_steps table and ensure org_credentials has all required columns."""
     import sqlite3 as _sq
-    with _sq.connect(db_path) as c:
+    with contextlib.closing(_sq.connect(db_path)) as c, c:
         c.execute("""
             CREATE TABLE IF NOT EXISTS duo_steps (
                 pod_id        TEXT,
@@ -11718,7 +11719,7 @@ def _duo_step_set(pod_id: str, step: str, status: str, result: str, db_path: str
     """Upsert a single row in duo_steps."""
     import sqlite3 as _sq, datetime as _dt
     now = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    with _sq.connect(db_path) as c:
+    with contextlib.closing(_sq.connect(db_path)) as c, c:
         c.execute("""
             INSERT INTO duo_steps (pod_id, step_name, status, result, started_at, completed_at)
             VALUES (?,?,?,?,?,?)
@@ -11762,7 +11763,7 @@ def duo_run_card(
 
     # ── Load org credentials ──────────────────────────────────────────────────
     try:
-        with _sq.connect(db_path) as conn:
+        with contextlib.closing(_sq.connect(db_path)) as conn, conn:
             conn.row_factory = _sq.Row
             pod_row = conn.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
             if not pod_row:
@@ -11785,7 +11786,7 @@ def duo_run_card(
     try:
         _scope = duo_refresh_session_scope(pod_id, db_path, org_num, log=_log)
         if _scope == "rotated":
-            with _sq.connect(db_path) as conn:
+            with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                 conn.row_factory = _sq.Row
                 oc = dict(conn.execute(
                     "SELECT * FROM org_credentials WHERE org_number=?", (org_num,)
@@ -11875,7 +11876,7 @@ def duo_run_card(
             parts.append(msg)
             # Re-read what bootstrap just persisted so later steps see it.
             try:
-                with _sq.connect(db_path) as conn:
+                with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                     conn.row_factory = _sq.Row
                     row = conn.execute(
                         "SELECT duo_ikey, duo_skey, duo_host FROM org_credentials "
@@ -11918,7 +11919,7 @@ def duo_run_card(
                 duo_ikey = creds["ikey"]
                 duo_skey = creds["skey"]
                 duo_host = creds.get("host") or duo_host
-                with _sq.connect(db_path) as conn:
+                with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                     conn.execute(
                         "UPDATE org_credentials SET duo_ikey=?, duo_skey=?, duo_host=?, "
                         "updated_at=datetime('now') WHERE org_number=?",
@@ -11933,7 +11934,7 @@ def duo_run_card(
         # a TOTP token and republish the standalone login page on the jump host
         # on every run — a pod reset or reimage wipes the Public Desktop.
         try:
-            with _sq.connect(db_path) as conn:
+            with contextlib.closing(_sq.connect(db_path)) as conn, conn:
                 conn.row_factory = _sq.Row
                 srow = conn.execute(
                     "SELECT duo_admin_totp_secret FROM org_credentials WHERE org_number=?",
@@ -12047,7 +12048,7 @@ def duo_run_card(
             if not g_ok:
                 return False, f"could not generate SCIM token: {g_msg}"
             try:
-                with _sq.connect(db_path) as _c:
+                with contextlib.closing(_sq.connect(db_path)) as _c, _c:
                     _c.row_factory = _sq.Row
                     _r = _c.execute("SELECT sa_scim_token FROM org_credentials "
                                     "WHERE org_number=?", (org_num,)).fetchone()
@@ -12391,7 +12392,7 @@ def duo_run_card(
             # under load and the step blamed the lab for its own blind spot.
             gaps, unknown = [], []
             try:
-                with _sq.connect(db_path) as _cv:
+                with contextlib.closing(_sq.connect(db_path)) as _cv, _cv:
                     _cv.row_factory = _sq.Row
                     # ikey/skey/host come from the DB, not from the enclosing
                     # scope: step_bootstrap re-creates the Admin API application
