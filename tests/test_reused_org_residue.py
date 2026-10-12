@@ -36,10 +36,23 @@ def test_cdfmc_guard_distinguishes_our_instance_from_a_leftover():
     assert "_existing.startswith(_ours)" in _DASH
 
 
-def test_a_foreign_active_instance_is_flagged_not_silently_passed():
-    """It cannot be deleted — cdFMC is shared — but it must not read as green."""
-    assert "WARN: cdFMC pxGrid instance" in _DASH
-    # the WARN prefix is what makes api_pods count it as degraded
+def test_a_foreign_active_instance_is_replaced_not_silently_passed():
+    """A stale active instance must neither read as green nor stop the step.
+
+    It used to return "WARN: ... delete it in cdFMC and re-run" — advice cdFMC
+    will not let anyone follow, because the active row's delete control is
+    disabled. Since 09342e8 the step remembers it, creates and activates ours,
+    and only then purges the stale one (POD-15 did exactly this on 2026-10-11).
+    """
+    src = _DASH[_DASH.index("def _host_cdfmc_integrate"):]
+    src = src[:src.index("\ndef ", 1)]
+    stale_branch = src[src.index("has a stale active pxGrid"):]
+    stale_branch = stale_branch[:stale_branch.index("_stale_active = _existing")]
+    # no early success return between noticing it and remembering it
+    assert "return True" not in stale_branch
+    # and it is handed to the purge that runs once ours is active
+    assert "also=({_stale_active} if _stale_active else None)" in src
+    # a WARN-prefixed result still counts as degraded wherever one is produced
     assert d._result_contradicts_success(
         "WARN: cdFMC pxGrid instance 'X' is active for PseudoCo-520 but was "
         "not created by this POD")
