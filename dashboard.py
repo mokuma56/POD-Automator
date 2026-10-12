@@ -1,6 +1,7 @@
 """POD Dashboard — upload events CSV, start pipelines, monitor live progress."""
 
 import sqlite3, json, threading, csv, io, os, time, sys, subprocess, re
+import contextlib
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -2053,7 +2054,7 @@ def api_scc_run_check_sync(pod_id):
     # so the pipeline badge shows orange Warn rather than green Done.
     failed_items = []
     try:
-        with _sq3.connect(db_path) as _c:
+        with contextlib.closing(_sq3.connect(db_path)) as _c, _c:
             _rows = _c.execute(
                 "SELECT item_key FROM scc_checklist WHERE pod_id=? AND status='failed'",
                 (pod_id,)
@@ -4918,7 +4919,7 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
 
     def _persist(item_key, status, detail=""):
         try:
-            with _sq.connect(db_path) as _c:
+            with contextlib.closing(_sq.connect(db_path)) as _c, _c:
                 _c.execute(
                     "INSERT OR REPLACE INTO scc_checklist (pod_id, item_key, status, detail) "
                     "VALUES (?,?,?,?)", (pod_id, item_key, status, str(detail)[:500])
@@ -4942,7 +4943,7 @@ def _scc_auto_reset_manual(pod_id: str, log_fn) -> tuple:
                            # session _eid IS the POD org UUID; picker may update it
     try:
         import re as _re_org
-        with _sq.connect(db_path) as _c_org:
+        with contextlib.closing(_sq.connect(db_path)) as _c_org, _c_org:
             _row_org = _c_org.execute(
                 "SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)
             ).fetchone()
@@ -6972,7 +6973,7 @@ def api_scc_manual_reset(pod_id):
         try:
             import sqlite3 as _sq_ps
             _db_path = str(Path(__file__).parent / "data" / "pod_state.db")
-            with _sq_ps.connect(_db_path) as _c_ps:
+            with contextlib.closing(_sq_ps.connect(_db_path)) as _c_ps, _c_ps:
                 _failed = _c_ps.execute(
                     "SELECT COUNT(*) FROM scc_checklist WHERE pod_id=? AND status='failed'",
                     (pod_id,)
@@ -7013,7 +7014,7 @@ def api_scc_reset_all():
     db_path = str(Path(__file__).parent / "data" / "pod_state.db")
     try:
         import sqlite3 as _sq_ra
-        with _sq_ra.connect(db_path) as _c_ra:
+        with contextlib.closing(_sq_ra.connect(db_path)) as _c_ra, _c_ra:
             _c_ra.row_factory = _sq_ra.Row
             pod_rows = _c_ra.execute(
                 "SELECT pod_id FROM pods WHERE scc_org IS NOT NULL AND scc_org != '' "
@@ -7039,7 +7040,7 @@ def api_scc_reset_all():
         # Clear scc_checklist to pending for every POD about to be reset so the
         # dashboard shows live progress instead of stale results from a prior run.
         try:
-            with _sq2.connect(db_path) as _c_clear:
+            with contextlib.closing(_sq2.connect(db_path)) as _c_clear, _c_clear:
                 for _pid in pod_ids:
                     _c_clear.execute("DELETE FROM scc_checklist WHERE pod_id=?", (_pid,))
         except Exception as _ce:
@@ -7075,7 +7076,7 @@ def api_scc_reset_all():
 
             # ── Sync pipeline_steps ───────────────────────────────────────────
             try:
-                with _sq2.connect(db_path) as _c2:
+                with contextlib.closing(_sq2.connect(db_path)) as _c2, _c2:
                     _failed = _c2.execute(
                         "SELECT COUNT(*) FROM scc_checklist WHERE pod_id=? AND status='failed'",
                         (pod_id,)
@@ -8307,7 +8308,7 @@ def api_ise_sgt_recheck(pod_id):
     _sa_org = None
     try:
         import re as _re
-        with sqlite3.connect(str(DATA_DIR / "data" / "pod_state.db")) as _c:
+        with contextlib.closing(sqlite3.connect(str(DATA_DIR / "data" / "pod_state.db"))) as _c, _c:
             _row = _c.execute("SELECT scc_org FROM pods WHERE pod_id=?", (pod_id,)).fetchone()
             if _row and _row[0]:
                 _m = _re.search(r"pseudoco-(\d+)", _row[0])
@@ -8331,7 +8332,7 @@ def api_ise_sgt_recheck(pod_id):
             log(pod_id, f"[sgt-recheck] {'✓' if _ok else '✗'} {_msg}")
             # Update step 5 result in DB
             try:
-                with sqlite3.connect(str(DATA_DIR / "data" / "pod_state.db")) as _c:
+                with contextlib.closing(sqlite3.connect(str(DATA_DIR / "data" / "pod_state.db"))) as _c, _c:
                     _status = "completed" if _ok else "failed"
                     _c.execute(
                         "UPDATE ise_steps SET status=?, result=?, completed_at=? WHERE pod_id=? AND step_name='ise_sgt_verify'",
@@ -17863,6 +17864,29 @@ def api_update():
 IMAGE_NAME = "pod-automator:latest"
 
 
+def _docker_up() -> bool:
+    """Whether the Docker daemon answers."""
+    try:
+        return subprocess.run(["docker", "info", "--format", "{{.ServerVersion}}"],
+                              capture_output=True, text=True, timeout=15).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _startup_image_check(wait_s: int = 300, poll_s: int = 5) -> None:
+    """Report image staleness once Docker is up, without holding up startup."""
+    deadline = time.time() + wait_s
+    while not _docker_up():
+        if time.time() >= deadline:
+            print(f"[image] Docker still not running after {wait_s}s — "
+                  f"image check skipped (GET /api/image-status rechecks)", flush=True)
+            return
+        time.sleep(poll_s)
+    st = _warn_if_image_stale()
+    if not st["stale"] and not st.get("docker_down"):
+        print(f"[image] {IMAGE_NAME} is current (built {st['image_built']})", flush=True)
+
+
 def _image_staleness(image: str = IMAGE_NAME) -> dict:
     """Compare the image's build time against the sources the Dockerfile COPYs.
 
@@ -17873,11 +17897,20 @@ def _image_staleness(image: str = IMAGE_NAME) -> dict:
     import datetime as _dt
     import re as _re
 
-    out = {"stale": False, "reason": "", "image_built": None, "newer": []}
+    out = {"stale": False, "reason": "", "image_built": None, "newer": [],
+           "docker_down": False}
     try:
         r = subprocess.run(["docker", "image", "inspect", image, "--format", "{{.Created}}"],
                            capture_output=True, text=True, timeout=15)
         if r.returncode != 0:
+            # A failed inspect is only "not found" if Docker itself answered.
+            # At login launchd starts the dashboard before Docker Desktop is
+            # up, and every boot logged "image not found — build it" for an
+            # image that was there (2026-10-12).
+            if not _docker_up():
+                out["docker_down"] = True
+                out["reason"] = "Docker is not running — cannot check the image"
+                return out
             out["reason"] = f"image {image} not found — build it"
             out["stale"] = True
             return out
@@ -17961,7 +17994,6 @@ def api_image_status():
 
 
 if __name__ == "__main__":
-    _st = _warn_if_image_stale()
-    if not _st["stale"]:
-        print(f"[image] {IMAGE_NAME} is current (built {_st['image_built']})", flush=True)
+    threading.Thread(target=_startup_image_check, daemon=True,
+                     name="startup-image-check").start()
     app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False)
