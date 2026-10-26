@@ -4257,6 +4257,7 @@ const PIPELINE_STEPS = [
   ['connectivity_test',      'Connectivity'],
   ['route_verification',     'Route Verify'],
   ['cdfmc_check',            'cdFMC Check'],
+  ['ad_time_sync',           'AD Time Sync'],
   ['ad_verify',              'AD Verify'],
   ['scc_reset_check',        'SCC Reset'],
 ];

@@ -239,6 +239,16 @@ downstream card step failing.
 pipeline container re-runs `cdfmc_check` and `ad_verify` even when already completed.
 Use `docker run --rm --network container:vpn-{pod_id}` directly.
 
+### AD1 clock (`ad_time_sync`, runs just before `ad_verify`)
+dCloud ships AD1 with **no NTP source** (`w32tm /query /source` → "Local CMOS Clock" on
+every POD, 2026-10-26). It free-runs, and on POD-5/POD-9 came up 5½+ minutes fast —
+past Kerberos' 300s, so ISE's AD join failed and TEAP was rejected (24708). The step
+points w32time at the dCloud gateway NTP `198.18.128.1` and verifies source **and**
+skew. The resync steps the clock, which drops WinRM mid-command (HTTP 400 /
+`WinRMTransportError`) — that is expected; it reconnects and re-applies, because on
+POD-9 the source did not persist on the first pass. Proven live on POD-11 with an
+injected +361s skew.
+
 ### AD verification
 Use `get_info=NONE` + UPN bind (`administrator@corp.pseudoco.com`). `get_info=ALL` hangs;
 NTLM needs MD4, which is disabled in Python 3.14-slim.

@@ -10216,15 +10216,15 @@ PIPELINE_STEP_NAMES = [
     "deploy_config_group", "generate_bootstrap", "copy_bootstrap",
     "controller_mode_enable", "verify_online", "redeploy_config_group",
     "verify_border_spine", "verify_leaf1", "verify_leaf2", "connectivity_test",
-    "route_verification", "cdfmc_check", "ad_verify", "scc_reset_check",
-    "meraki_cleanup",
+    "route_verification", "cdfmc_check", "ad_time_sync", "ad_verify",
+    "scc_reset_check", "meraki_cleanup",
 ]
 
 PIPELINE_SOFT_FAIL = {
     "detect_pod_number", "controller_mode_enable", "verify_online",
     "redeploy_config_group", "verify_border_spine", "verify_leaf1",
     "verify_leaf2", "connectivity_test", "route_verification",
-    "cdfmc_check", "ad_verify", "scc_reset_check", "meraki_cleanup",
+    "cdfmc_check", "ad_time_sync", "ad_verify", "scc_reset_check", "meraki_cleanup",
 }
 
 
@@ -11450,6 +11450,7 @@ const PIPELINE_ORDER = [
   "connectivity_test",
   "route_verification",
   "cdfmc_check",
+  "ad_time_sync",
   "ad_verify",
   "scc_reset_check",
   "meraki_cleanup",
@@ -12085,7 +12086,7 @@ function badge(val, yesLabel) {
 const SOFT_FAIL_STEPS = new Set([
   'detect_pod_number','controller_mode_enable','verify_online','redeploy_config_group',
   'verify_border_spine','verify_leaf1','verify_leaf2','connectivity_test',
-  'route_verification','cdfmc_check','ad_verify','scc_reset_check','meraki_cleanup',
+  'route_verification','cdfmc_check','ad_time_sync','ad_verify','scc_reset_check','meraki_cleanup',
 ]);
 
 function pipelineBadge(val, result, name) {

@@ -1497,7 +1497,7 @@ STEP_TARGET = {
     "redeploy_config_group": "cloud", "verify_online": "cloud",
     "cdfmc_check": "cloud", "scc_reset_check": "cloud",
     # directory / windows hosts
-    "ad_verify": "directory",
+    "ad_verify": "directory", "ad_time_sync": "directory",
     # local
     "detect_pod_number": "local",
 }
