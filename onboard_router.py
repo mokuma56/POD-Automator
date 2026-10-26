@@ -2418,6 +2418,159 @@ JUMPHOST_PASS = "C1sco12345"
 AD_PS1_PATH   = r"C:\Scripts\ADDuoTenantUserProvisioning.ps1"
 
 
+# AD1's clock. dCloud ships AD1 with NO NTP source — w32time free-runs on the
+# hardware clock — and two PODs came up 331s (POD-5, 2026-10-22) and 343s
+# (POD-9, 2026-10-23) fast. Kerberos allows 300s, so ISE's AD join failed and
+# 802.1X/TEAP was rejected with 24708 "User not found in Active Directory";
+# ISE's own clock was correct to the second. The dCloud gateway serves NTP
+# that agreed with ISE, so AD1 is pointed at it.
+AD_NTP_PEER    = "198.18.128.1"
+AD_MAX_SKEW_S  = 30     # Kerberos allows 300s; leave room for drift before the lab
+_NTP_EPOCH     = 2208988800
+
+
+def _ntp_transmit_time(packet: bytes) -> float:
+    """UTC epoch seconds from an SNTP reply's transmit timestamp."""
+    import struct
+    if len(packet) < 48:
+        raise ValueError(f"short NTP reply ({len(packet)} bytes)")
+    secs, frac = struct.unpack("!II", packet[40:48])
+    if not secs:
+        raise ValueError("NTP reply has no transmit timestamp")
+    return secs - _NTP_EPOCH + frac / 2**32
+
+
+def _ntp_offset(host: str, timeout: float = 3.0) -> float:
+    """Seconds to ADD to this machine's clock to get the NTP server's time."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        t0 = time.time()
+        s.sendto(b"\x1b" + 47 * b"\0", (host, 123))
+        data = s.recv(48)
+        t1 = time.time()
+    return _ntp_transmit_time(data) - (t0 + t1) / 2
+
+
+def _w32tm_source_is(source: str, peer: str) -> bool:
+    """`w32tm /query /source` prints e.g. "198.18.128.1,0x8" — or "Local CMOS
+    Clock" / "Free-running System Clock" when no peer is configured."""
+    return (source or "").strip().split(",")[0].strip() == peer
+
+
+def _ad_time_verdict(source: str, skew_s: float, peer: str = AD_NTP_PEER,
+                     max_skew_s: float = AD_MAX_SKEW_S) -> tuple:
+    """(ok, why) for AD1's time state. Both must hold: a correct clock with no
+    NTP source drifts back, and the right source with a bad clock still breaks
+    Kerberos until it converges."""
+    on_peer = _w32tm_source_is(source, peer)
+    in_sync = abs(skew_s) <= max_skew_s
+    if on_peer and in_sync:
+        return True, f"source {peer}, skew {skew_s:+.0f}s"
+    why = []
+    if not on_peer:
+        why.append(f"source is {(source or '').strip() or 'unknown'!r}, not {peer}")
+    if not in_sync:
+        why.append(f"skew {skew_s:+.0f}s (limit ±{max_skew_s}s)")
+    return False, "; ".join(why)
+
+
+def phase_ad_time_sync():
+    """Point AD1's time service at the dCloud NTP gateway and verify it holds.
+
+    Checks first and changes nothing when AD1 already uses AD_NTP_PEER and is
+    within AD_MAX_SKEW_S. Otherwise configures w32time, resyncs, and verifies
+    by re-reading the source and the clock — never by the command's exit code.
+    Returns (ok, result_string).
+    """
+    import datetime as _dt
+    try:
+        import winrm as _winrm
+    except ImportError:
+        return False, "pywinrm not installed — run: pip install pywinrm"
+
+    def _session():
+        return _winrm.Session(f"http://{AD_DC_IP}:5985/wsman",
+                              auth=(AD_DC_USER, AD_DC_PASS), transport="ntlm")
+
+    # The reference clock. AD1's skew is measured against the gateway itself
+    # when it answers here; otherwise against this container's clock (Docker's,
+    # i.e. the NTP-synced Mac), and the result says which was used.
+    try:
+        _off, ref = _ntp_offset(AD_NTP_PEER), f"NTP {AD_NTP_PEER}"
+    except (OSError, ValueError) as e:
+        _off, ref = 0.0, f"this controller's clock ({AD_NTP_PEER} unreachable: {e})"
+
+    def _read():
+        """(source, skew_s) — AD1's time minus the reference, sampled mid-call."""
+        t0 = time.time()
+        r = _session().run_ps("w32tm /query /source; [DateTime]::UtcNow.ToString('o')")
+        t1 = time.time()
+        lines = [x.strip() for x in r.std_out.decode(errors="replace").splitlines()
+                 if x.strip()]
+        if len(lines) < 2:
+            raise RuntimeError(f"unexpected w32tm output: {lines!r}")
+        ad_utc = _dt.datetime.fromisoformat(lines[-1].replace("Z", "+00:00"))
+        if ad_utc.tzinfo is None:
+            ad_utc = ad_utc.replace(tzinfo=_dt.timezone.utc)
+        return lines[0], ad_utc.timestamp() - ((t0 + t1) / 2 + _off)
+
+    print(f"     Reading AD1 ({AD_DC_IP}) time source and skew vs {ref}...")
+    try:
+        src0, skew0 = _read()
+    except Exception as e:
+        return False, f"could not read AD1's clock over WinRM: {type(e).__name__}: {e}"
+    ok, why = _ad_time_verdict(src0, skew0)
+    print(f"     AD1 before: {why if not ok else 'OK — ' + why}")
+    if ok:
+        return True, f"already in sync — {why} (vs {ref})"
+
+    apply_ps = (f'w32tm /config /manualpeerlist:"{AD_NTP_PEER},0x8" '
+                "/syncfromflags:manual /reliable:yes /update; "
+                "Restart-Service w32time; Start-Sleep 3; w32tm /resync /force")
+    # Two passes. The resync steps the clock by minutes, which drops the WinRM
+    # session mid-command (HTTP 400, POD-5) — and on POD-9 the first pass fixed
+    # the clock but the source did not persist. Reconnect and apply again; the
+    # config is idempotent, so a second pass on a healthy AD1 is harmless.
+    for _pass in (1, 2):
+        try:
+            out = _session().run_ps(apply_ps).std_out.decode(errors="replace")
+            print(f"     pass {_pass}: {' '.join(out.split())[:200]}")
+        except Exception as e:
+            print(f"     pass {_pass}: WinRM dropped ({type(e).__name__}) — expected "
+                  f"when the clock steps; reconnecting")
+        time.sleep(5)
+        try:
+            src, skew = _read()
+        except Exception as e:
+            print(f"     re-read after pass {_pass} failed: {type(e).__name__}: {e}")
+            continue
+        ok, why = _ad_time_verdict(src, skew)
+        if ok:
+            return True, (f"fixed — was {skew0:+.0f}s on {src0.strip()!r}, now {why} "
+                          f"(vs {ref})")
+
+    # AD1 could not sync from the peer (unreachable from its subnet, or w32time
+    # refused). Set the clock from the reference so Kerberos works for this
+    # session, and fail the step anyway: with no working NTP source it drifts.
+    try:
+        _now = _dt.datetime.fromtimestamp(time.time() + _off, _dt.timezone.utc)
+        _iso = _now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            _session().run_ps(
+                "$c = [DateTime]::Parse('" + _iso + "', $null, "
+                "[System.Globalization.DateTimeStyles]::RoundtripKind); Set-Date -Date $c")
+        except Exception as e:
+            print(f"     Set-Date: WinRM dropped ({type(e).__name__}) — re-reading")
+        time.sleep(3)
+        src, skew = _read()
+    except Exception as e:
+        return False, f"NTP sync failed and Set-Date fallback failed: {type(e).__name__}: {e}"
+    _, why = _ad_time_verdict(src, skew)
+    return False, (f"NTP source did not take ({why}); clock set directly from {ref} "
+                   f"— was {skew0:+.0f}s, now {skew:+.0f}s, but it will drift")
+
+
 def _ad_query_users():
     """Query Kit/Lee/Pat/Nik from AD via LDAP. Returns list of dicts with cn/mail/upn."""
     try:
