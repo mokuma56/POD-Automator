@@ -2860,6 +2860,12 @@ def phase_duo_setup():
     )
 
 
+def _cdfmc_host_is_real(host: str) -> bool:
+    """True for a cdFMC hostname, False for a tfvars template value."""
+    import re as _re
+    return bool(_re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", (host or "").strip().lower()))
+
+
 def phase_cdfmc_check():
     """
     1. SSH to the Terraform-Automation Ubuntu PC (via VPN).
@@ -2934,6 +2940,13 @@ def phase_cdfmc_check():
         m = _re.match(r'^device_name\s*=\s*\["([^"]+)"', line)
         if m:
             device_name = m.group(1)
+    # dCloud ships tfvars with template values ("Insert Host") until the
+    # session's cloud provisioning runs. POD-11, 2026-10-26: that placeholder
+    # was stored as scc_org "Insert", so Duo and ISE silently never started.
+    if scc_org and not _cdfmc_host_is_real(scc_org):
+        return False, (f"terraform.tfvars cdfmc_host is the unfilled placeholder "
+                       f"{scc_org!r} — this dCloud session's cloud provisioning "
+                       f"has not run, so there is no SCC org or cdFMC yet")
     print(f"     SCC org: {scc_org or '(not found)'}")
 
     # --- 3. Verify FTD online via cdFMC API — run on Ubuntu PC (has internet) ---

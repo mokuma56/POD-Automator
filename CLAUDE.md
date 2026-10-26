@@ -129,6 +129,22 @@ be named `ciscosdwan.cfg` in `bootflash:` root.
 - React synthetic events ignore JS `.click()` on SCC pages. Use a JS coordinate lookup then
   `page.mouse.click()` for three-dot menus, Edit, toggles, and Save.
 - Okta ignores Playwright `fill()` — use `press_sequentially()`.
+- **SCC login goes through Cisco Cloud Control** (since 2026-10-26). The iDAC card's
+  Security Cloud Control "Login" reaches `/dashboard`, then the SPA redirects to a Webex
+  idbroker "Enter your password" page — sometimes in 5s, sometimes minutes later mid-step.
+  The card's "Cisco Cloud Control" Login → **Security** nav → `security.cisco.com/?cl_token=…`
+  holds. `IDAC_SCC_SECTIONS` lists Cloud Control first; `_scc_open_session` verifies the
+  session still holds after 10s and retries the Security click once (it can land on
+  `chrome-error://`).
+- **One ISE integration per SCC org**, and orgs are reused across lab events. A leftover
+  row from another POD (any state) blocks ours — the Integration Hub tile reads "Connected"
+  with no Connect. The SCC step deletes any ISE row that isn't this POD's own
+  (`ISE-POD-<pod_id>-<n>`, matched by `_scc_has_own_ise_row`) before creating ours. Never
+  test for ISE with a bare `"ise" in page_text` — "Enterprise" contains it.
+- `/api/ise/logs/<pod>` returns the first 400 lines unless you pass `since=`; busy PODs
+  look frozen to a poller that doesn't page.
+- `kill -USR1 <dashboard pid>` dumps every thread's stack to `dashboard.log` (py-spy needs
+  root on macOS).
 
 ### Duo admin UI
 - The application page is ~5,400px tall and its **Save is a submit at y≈5353**. Neither

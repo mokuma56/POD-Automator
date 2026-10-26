@@ -3713,6 +3713,33 @@ def _idac_child_reason(proc) -> str:
     return "reader produced no diagnostic"
 
 
+def _scc_has_own_ise_row(page_text: str, pod_id: str) -> bool:
+    """True if SCC's integrations page lists THIS POD's ISE integration.
+
+    Our rows are named ISE-POD-<pod_id>-<n> (e.g. ISE-POD-POD-3-6175). Orgs are
+    reused across lab sessions, so another POD's row can sit in this org; and
+    the digit guard keeps POD-1 from matching POD-12's row.
+    """
+    import re as _re
+    pat = r"\bise-pod-" + _re.escape(pod_id.lower()) + r"-\d+\b"
+    return bool(_re.search(pat, (page_text or "").lower()))
+
+
+def _scc_ise_row_count(page) -> int:
+    """Rows in SCC's Active Integrations table that are ISE integrations.
+
+    Names are not reliable (one was "PseudoCo-510-SCC"), so match the type
+    column text or a whole-word ISE — never the bare letters, which "Enterprise"
+    contains.
+    """
+    try:
+        return page.evaluate(r"""() => Array.from(document.querySelectorAll('tr'))
+            .filter(r => /Identity Service|\bISE\b/.test(r.innerText || '')).length""")
+    except Exception as e:  # a navigating page reads as zero, and says so
+        print(f"[scc-nav] ISE row count failed: {e}")
+        return 0
+
+
 def _host_scc_open(browser, pod_id: str, log_fn, session_path: str = "") -> tuple:
     """Open an authenticated SCC session on the host. Returns (context, page, enterprise_id).
 
@@ -4173,10 +4200,31 @@ def _host_scc_integrate(pod_id: str, otp_token: str, session_path: str, log_fn) 
             _page_text = page.inner_text("body").lower()
             _ise_opened = False
 
-            # If ISE entry already exists and is active/connected → done.
+            # If THIS POD's ISE entry already exists and is active/connected → done.
             # If it exists but is Deactivated/Failed → delete it and create fresh with new OTP.
-            if "ise" in _page_text:
-                _is_bad = any(kw in _page_text for kw in ("deactivated", "failed", "error"))
+            #
+            # This used to be `"ise" in _page_text`, which matches "Enterprise",
+            # "Promise" and every other word containing those letters. On the
+            # Cloud Control layout (2026-10-26) that is always true, so POD-3
+            # logged "already active — done" off a stale ISE-POD-POD-1-3908 row
+            # left in its reused org, never entered its OTP, and step 3 timed
+            # out with "ISE instance pending". Only our own row counts.
+            #
+            # An org allows ONE ISE integration, and orgs are reused across lab
+            # events, so a leftover row from another POD (ISE-POD-POD-1-3908
+            # Connected on 537, ISE-POD-POD-17-3901 Failed on 515, ISE-POD10
+            # Failed on 524) blocks ours: the Integration Hub tile reads
+            # "Connected" and offers no Connect. Any ISE row that is not ours
+            # is therefore treated as bad — deleted, then ours created
+            # (operator-approved 2026-10-26).
+            _own_row = _scc_has_own_ise_row(_page_text, pod_id)
+            _any_ise_row = _own_row or _scc_ise_row_count(page) > 0
+            if _any_ise_row:
+                _is_bad = (not _own_row) or any(
+                    kw in _page_text for kw in ("deactivated", "failed", "error"))
+                if not _own_row:
+                    log_fn("[scc-nav] org holds an ISE integration that is not "
+                           f"{pod_id}'s — deleting it so ours can be created")
                 if not _is_bad:
                     try:
                         page.screenshot(path=str(DATA_DIR / "data" / f"scc_after_save_{pod_id}.png"))
@@ -6931,6 +6979,14 @@ def _scc_otp_watcher():
 
 
 threading.Thread(target=_scc_otp_watcher, daemon=True, name="scc-otp-watcher").start()
+
+# `kill -USR1 <dashboard pid>` writes every thread's stack to stderr
+# (dashboard.log). 2026-10-26: two SCC-nav workers hung before logging a line
+# and held both slots, so six PODs' ISE step 2 timed out behind them — and
+# py-spy needs root on macOS, so there was no way to see where they were.
+import faulthandler as _faulthandler
+import signal as _signal
+_faulthandler.register(_signal.SIGUSR1, all_threads=True)
 
 
 # ── SCC Manual Reset Automation endpoint ──────────────────────────────────────

@@ -3856,7 +3856,12 @@ def duo_rollback_for_test(pod_id: str, db_path: str, keep_bootstrap: bool = True
 # ORDERED LIST of candidates and let the caller verify where each one actually
 # lands, rather than betting on one label or one section name. Same shape as
 # _winrm_connect_jump, which tries credential candidates and probes each.
-IDAC_SCC_SECTIONS = ("Cisco Security Cloud Control", "Cisco Cloud Control")
+# Cloud Control FIRST since 2026-10-26: the SCC tile's own Login now reaches
+# /dashboard and is then sent to a Webex idbroker password page — sometimes
+# within 5s, sometimes only minutes later mid-step (POD-12), so no hold check
+# can make it trustworthy. Cloud Control -> Security has held on every POD.
+# The SCC tile stays as the fallback for cards that predate Cloud Control.
+IDAC_SCC_SECTIONS = ("Cisco Cloud Control", "Cisco Security Cloud Control")
 IDAC_NON_SCC_SECTIONS = ("Meraki Dashboard", "Cisco Duo", "Webex Credentials",
                          "Cisco SaaS Accounts - ThousandEyes")
 _IDAC_OPENERS = r"^(log ?in|view|open|go|launch)$"
@@ -3983,6 +3988,53 @@ def _scc_enterprise_id(page, db_path: str = "", log=None) -> str:
     return ""
 
 
+def _cloud_control_to_scc(ctx, t, is_scc, log, timeout_s: int = 60):
+    """From a signed-in Cisco Cloud Control tab, open SCC via its Security nav.
+
+    Returns the SCC page, or None if Security never rendered or never led to a
+    security.cisco.com page that stayed signed in. Measured 2026-10-26 on
+    POD-3: cloud.cisco.com/home renders ~10s after the iDAC click, Security
+    navigates the SAME tab to security.cisco.com/dashboard, and it was still
+    signed in 40s later — unlike the SCC tile, which bounced at ~5s.
+    """
+    # Two tries: POD-7, 2026-10-26, the Security click left the tab on
+    # chrome-error://chromewebdata/ (a dropped load) minutes after the same
+    # hop had worked in the same step. Back to Cloud Control home, click again.
+    for _try in range(2):
+        if _try:
+            log("Cloud Control: retrying from cloud.cisco.com/home")
+            try:
+                t.goto("https://cloud.cisco.com/home", wait_until="load",
+                       timeout=45_000)
+            except Exception as e:
+                log(f"Cloud Control: reload failed ({str(e)[:60]})")
+                return None
+        nav = None
+        for _ in range(12):
+            try:
+                loc = t.get_by_text("Security", exact=True)
+                if loc.count():
+                    nav = loc.first
+                    break
+            except Exception as e:
+                log(f"Cloud Control nav read retrying ({str(e)[:60]})")
+            t.wait_for_timeout(2_500)
+        if nav is None:
+            log("Cloud Control: no Security entry in its nav after 30s")
+            continue
+        nav.click()
+        log("Cloud Control: clicked Security — waiting for security.cisco.com")
+
+        for _ in range(timeout_s // 4):
+            t.wait_for_timeout(4_000)
+            page = next((p for p in reversed(ctx.pages) if is_scc(p.url)), None)
+            if page is not None:
+                return page
+        log("Cloud Control: Security did not open SCC within "
+            f"{timeout_s}s (tabs: {[p.url[:50] for p in ctx.pages]})")
+    return None
+
+
 def _scc_open_session(ctx, idac_url: str, log=None, db_path: str = ""):
     """Open an authenticated SCC tab via the iDAC card's SAML auto-login.
 
@@ -4064,6 +4116,9 @@ def _scc_open_session(ctx, idac_url: str, log=None, db_path: str = ""):
         for _ in range(probes):
             if "enterpriseId=" in t.url or _is_scc(t.url):
                 return
+            # Cloud Control's signed-in shell, not its /product-login hop.
+            if _host(t.url) == "cloud.cisco.com" and "/home" in t.url:
+                return
             t.wait_for_timeout(5_000)
 
     def _close(t):
@@ -4118,6 +4173,21 @@ def _scc_open_session(ctx, idac_url: str, log=None, db_path: str = ""):
                                 f"(sign-on.security.cisco.com) on both tries")
                 break
 
+            # Cisco Cloud Control is SCC's successor console and signs in where
+            # the SCC tile no longer does (2026-10-26: every POD's SCC Login
+            # bounced to a Webex idbroker password page). Its "Security" nav
+            # entry opens security.cisco.com on the same identity session.
+            if _host(t.url) == "cloud.cisco.com":
+                _via = _cloud_control_to_scc(ctx, t, _is_scc, _log)
+                if _via is not None:
+                    t = _via
+                    break
+                attempts.append(f"{_label!r} in {_sect}: on Cloud Control but its "
+                                f"Security entry never reached SCC")
+                _close(t)
+                t = None
+                break
+
             # Say WHERE it landed. Without the URL this read as a slow or
             # blocked SCC login for a whole run, when in fact the click had
             # opened the Meraki dashboard and waiting could never have helped.
@@ -4145,6 +4215,20 @@ def _scc_open_session(ctx, idac_url: str, log=None, db_path: str = ""):
         if not ent:
             attempts.append(f"{_label!r} in {_sect}: on SCC at {t.url[:60]} but "
                             "no enterprise id")
+            _close(t)
+            continue
+
+        # Landing is not the same as staying. Since 2026-10-26 the SCC tile
+        # reaches /dashboard and resolves an enterprise id, then ~5s later the
+        # SPA sends the tab to a Webex idbroker "Enter your password" page.
+        # Reporting that as established cost every SCC step a 2-min timeout
+        # on a page that could never render, so confirm the session held.
+        t.wait_for_timeout(10_000)
+        if not _is_scc(t.url):
+            attempts.append(f"{_label!r} in {_sect}: reached SCC, then was sent to "
+                            f"{_host(t.url)} for a password")
+            _log(f"{_label!r} in {_sect}: SCC session did not hold (now on "
+                 f"{_host(t.url)}) — trying next")
             _close(t)
             continue
 
