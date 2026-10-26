@@ -46,10 +46,12 @@ OLD_CARD = [
 ]
 
 
-def test_new_card_picks_the_scc_login_first():
+def test_new_card_picks_cloud_control_first():
+    """Since 2026-10-26 the SCC tile's Login bounces to a password page;
+    Cloud Control -> Security is the route that holds."""
     first = _idac_scc_candidates(NEW_CARD)[0]
-    assert first["i"] == 6
-    assert first["section"] == "Cisco Security Cloud Control"
+    assert first["i"] == 7
+    assert first["section"] == "Cisco Cloud Control"
 
 
 def test_old_card_picks_the_scc_view_first():
@@ -72,10 +74,9 @@ def test_duo_and_webex_logins_are_never_offered():
     assert 2 not in offered      # Webex's Go to Control Hub
 
 
-def test_scc_section_outranks_the_similarly_named_one():
-    """'Cisco Cloud Control' also carries a Login; SCC's must come first."""
+def test_scc_tile_is_still_offered_as_the_fallback():
     order = [c["i"] for c in _idac_scc_candidates(NEW_CARD)]
-    assert order.index(6) < order.index(7)
+    assert order.index(7) < order.index(6)
 
 
 def test_unsectioned_opener_is_a_fallback_not_a_first_choice():

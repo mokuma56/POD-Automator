@@ -4775,6 +4775,32 @@ def ise_run_card(pod_id: str, db_path: str, from_step: int = 0, log=None) -> tup
 # treating "the click did not raise" as success.
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def _cloud_control_to_scc_async(ctx, t, is_scc, log, timeout_s: int = 60):
+    """Async twin of duo_automation._cloud_control_to_scc (single try)."""
+    nav = None
+    for _ in range(12):
+        try:
+            loc = t.get_by_text("Security", exact=True)
+            if await loc.count():
+                nav = loc.first
+                break
+        except Exception as e:
+            log(f"Cloud Control nav read retrying ({str(e)[:60]})")
+        await t.wait_for_timeout(2_500)
+    if nav is None:
+        log("Cloud Control: no Security entry in its nav after 30s")
+        return None
+    await nav.click()
+    log("Cloud Control: clicked Security — waiting for security.cisco.com")
+    for _ in range(timeout_s // 4):
+        await t.wait_for_timeout(4_000)
+        page = next((p for p in reversed(ctx.pages) if is_scc(p.url)), None)
+        if page is not None:
+            return page
+    log(f"Cloud Control: Security did not open SCC within {timeout_s}s")
+    return None
+
+
 async def _scc_open_session_async(ctx, idac_url: str, log, db_path: str = ""):
     """Async twin of duo_automation._scc_open_session.
 
@@ -4842,6 +4868,8 @@ async def _scc_open_session_async(ctx, idac_url: str, log, db_path: str = ""):
         for _ in range(probes):
             if "enterpriseId=" in tab.url or _is_scc(tab.url):
                 return
+            if _host(tab.url) == "cloud.cisco.com" and "/home" in tab.url:
+                return
             await tab.wait_for_timeout(5_000)
 
     async def _close(tab):
@@ -4889,6 +4917,19 @@ async def _scc_open_session_async(ctx, idac_url: str, log, db_path: str = ""):
                                 f"(sign-on.security.cisco.com) on both tries")
                 break
 
+            # Same as the sync twin: Cloud Control's Security entry reaches SCC
+            # where the SCC tile now bounces to a password page (2026-10-26).
+            if _host(tab.url) == "cloud.cisco.com":
+                _via = await _cloud_control_to_scc_async(ctx, tab, _is_scc, log)
+                if _via is not None:
+                    tab = _via
+                    break
+                attempts.append(f"{_label!r} in {_sect}: on Cloud Control but its "
+                                f"Security entry never reached SCC")
+                await _close(tab)
+                tab = None
+                break
+
             attempts.append(f"{_label!r} in {_sect}: landed on {tab.url[:70]}")
             log(f"{_label!r} in {_sect} opened {_host(tab.url)} — not SCC, trying next")
             await _close(tab)
@@ -4924,6 +4965,16 @@ async def _scc_open_session_async(ctx, idac_url: str, log, db_path: str = ""):
                 await tab.close()
             except Exception:
                 pass
+            continue
+
+        # Landing is not staying — see the sync twin.
+        await tab.wait_for_timeout(10_000)
+        if not _is_scc(tab.url):
+            attempts.append(f"{_label!r} in {_sect}: reached SCC, then was sent to "
+                            f"{_host(tab.url)} for a password")
+            log(f"{_label!r} in {_sect}: SCC session did not hold (now on "
+                f"{_host(tab.url)}) — trying next")
+            await _close(tab)
             continue
 
         log(f"SCC session established via {_label!r} in {_sect} "
