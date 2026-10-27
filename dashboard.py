@@ -7789,39 +7789,73 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
             # Try the locator first since it is cheaper and reports better, then
             # fall back to coordinates. Log `disabled`, because a disabled button
             # means a precondition upstream is unmet and no click will ever work.
-            try:
-                _fmc_tab.locator(
-                    'button:has-text("Create pxGrid Application Instance")'
-                ).first.click(timeout=10000)
-                log_fn("[cdfmc-nav] Clicked Create pxGrid Application Instance")
-            except Exception as _ce:
-                log_fn(f"[cdfmc-nav] locator click failed ({str(_ce).splitlines()[0][:90]}) "
-                       f"— retrying as a trusted coordinate click")
-                _info = _fmc_tab.evaluate("""() => {
-                    const b = Array.from(document.querySelectorAll('button,[role="button"]'))
-                        .find(x => /create\\s+pxgrid\\s+application\\s+instance/i
-                                   .test((x.innerText || '').trim()));
-                    if (!b) return null;
-                    b.scrollIntoView({block: 'center', behavior: 'instant'});
-                    const r = b.getBoundingClientRect();
-                    return {x: r.left + r.width / 2, y: r.top + r.height / 2,
-                            w: r.width, h: r.height,
-                            disabled: !!b.disabled || b.getAttribute('aria-disabled') === 'true'};
-                }""")
-                if not _info:
-                    raise RuntimeError("'Create pxGrid Application Instance' button "
-                                       "not present on the cdFMC tab")
-                if _info["disabled"]:
-                    raise RuntimeError(
-                        "'Create pxGrid Application Instance' is DISABLED — a "
-                        "precondition is unmet (no click will help); check the "
-                        "cdFMC tab state")
-                if _info["w"] <= 0 or _info["h"] <= 0:
-                    raise RuntimeError("'Create pxGrid Application Instance' has zero "
-                                       "size — it is present but not rendered")
-                _fmc_tab.mouse.click(_info["x"], _info["y"])
-                log_fn(f"[cdfmc-nav] Clicked Create pxGrid Application Instance via "
-                       f"mouse.click at ({_info['x']:.0f}, {_info['y']:.0f})")
+            def _click_create():
+                try:
+                    _fmc_tab.locator(
+                        'button:has-text("Create pxGrid Application Instance")'
+                    ).first.click(timeout=10000)
+                    log_fn("[cdfmc-nav] Clicked Create pxGrid Application Instance")
+                except Exception as _ce:
+                    log_fn(f"[cdfmc-nav] locator click failed ({str(_ce).splitlines()[0][:90]}) "
+                           f"— retrying as a trusted coordinate click")
+                    _info = _fmc_tab.evaluate("""() => {
+                        const b = Array.from(document.querySelectorAll('button,[role="button"]'))
+                            .find(x => /create\\s+pxgrid\\s+application\\s+instance/i
+                                       .test((x.innerText || '').trim()));
+                        if (!b) return null;
+                        b.scrollIntoView({block: 'center', behavior: 'instant'});
+                        const r = b.getBoundingClientRect();
+                        return {x: r.left + r.width / 2, y: r.top + r.height / 2,
+                                w: r.width, h: r.height,
+                                disabled: !!b.disabled || b.getAttribute('aria-disabled') === 'true'};
+                    }""")
+                    if not _info:
+                        raise RuntimeError("'Create pxGrid Application Instance' button "
+                                           "not present on the cdFMC tab")
+                    if _info["disabled"]:
+                        raise RuntimeError(
+                            "'Create pxGrid Application Instance' is DISABLED — a "
+                            "precondition is unmet (no click will help); check the "
+                            "cdFMC tab state")
+                    if _info["w"] <= 0 or _info["h"] <= 0:
+                        raise RuntimeError("'Create pxGrid Application Instance' has zero "
+                                           "size — it is present but not rendered")
+                    _fmc_tab.mouse.click(_info["x"], _info["y"])
+                    log_fn(f"[cdfmc-nav] Clicked Create pxGrid Application Instance via "
+                           f"mouse.click at ({_info['x']:.0f}, {_info['y']:.0f})")
+
+            # The click is not the outcome — the form opening is. PODs 2, 14 and
+            # 19 (2026-10-26): after deleting leftover instances and saving, the
+            # button RESOLVED but was not actionable for 10s (an overlay from the
+            # save), the coordinate fallback landed on that overlay, and the step
+            # then waited 30s on input[name="name"] for a form that never opened.
+            # A re-run always worked because it began on a freshly loaded page,
+            # so do that here: Escape, reload pxGrid, wait for Create, click again.
+            for _try in range(3):
+                if _try:
+                    log_fn(f"[cdfmc-nav] Create form did not open — reloading the "
+                           f"pxGrid page and clicking again ({_try + 1}/3)")
+                    try:
+                        _fmc_tab.keyboard.press("Escape")
+                    except PlaywrightError:
+                        pass
+                    _fmc_tab.goto(_pxgrid_url, wait_until="domcontentloaded",
+                                  timeout=60000)
+                    _fmc_tab.locator(
+                        'button:has-text("Create pxGrid Application Instance")'
+                    ).first.wait_for(state="visible", timeout=30000)
+                    _fmc_tab.wait_for_timeout(2000)
+                _click_create()
+                try:
+                    _fmc_tab.locator('input[name="name"]').first.wait_for(
+                        state="visible", timeout=10000)
+                    break
+                except PlaywrightError:
+                    continue
+            else:
+                raise RuntimeError(
+                    "'Create pxGrid Application Instance' never opened its form "
+                    "(3 clicks, pxGrid page reloaded between them)")
             _fmc_tab.wait_for_timeout(4000)
 
             # ── 6. Fill name and OTP ──────────────────────────────────────────
@@ -8041,8 +8075,14 @@ def _host_cdfmc_integrate(pod_id: str, otp_token: str, instance_name: str,
 
         except Exception as _e:
             log_fn(f"[cdfmc-nav] Exception: {_e}")
+            # The cdFMC tab, not the SCC page: the SCC-page shot hid the
+            # Create-form failure for a whole day (2026-10-26).
             try:
-                page.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_exception_{pod_id}.png"))
+                _shot = _fmc_tab
+            except NameError:
+                _shot = page
+            try:
+                _shot.screenshot(path=str(DATA_DIR / "data" / f"cdfmc_exception_{pod_id}.png"))
             except Exception:
                 pass
             return False, f"cdFMC nav exception: {_e}"
