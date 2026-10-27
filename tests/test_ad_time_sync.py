@@ -33,7 +33,9 @@ def _ntp_packet(epoch: float) -> bytes:
 
 
 def test_ntp_transmit_time_round_trips():
-    assert orr._ntp_transmit_time(_ntp_packet(1793037600.25)) == pytest.approx(1793037600.25)
+    # Plain arithmetic, not pytest.approx: approx imports numpy, and another
+    # test can leave numpy half-imported, failing this one depending on order.
+    assert abs(orr._ntp_transmit_time(_ntp_packet(1793037600.25)) - 1793037600.25) < 1e-6
 
 
 def test_ntp_reply_without_a_timestamp_is_rejected():
