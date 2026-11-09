@@ -4707,10 +4707,29 @@ def duo_setup_external_directory(pod_id: str, db_path: str, log=None) -> tuple[b
             _log("expanded 'Show details' to reveal connection keys")
             page.wait_for_timeout(3_000)
 
-        vals = _pw_capture_copy_buttons(page)
-        ikey = next((v for v in vals if _re.fullmatch(r"DI[A-Z0-9]{18}", v)), "")
-        apih = next((v for v in vals if "duosecurity.com" in v), "")
-        skey = next((v for v in vals if len(v) == 40 and v != ikey), "")
+        # The secret key's Copy button can render after the ikey/host ones: on
+        # POD-10 (2026-11-09) a fresh connection gave ikey+host but no skey, the
+        # proxy never registered, 'Sync Now' never rendered and no users came
+        # in. Re-capture a few times, reloading the page before the last try.
+        ikey = apih = skey = ""
+        for _try in range(3):
+            vals = _pw_capture_copy_buttons(page)
+            ikey = next((v for v in vals if _re.fullmatch(r"DI[A-Z0-9]{18}", v)), "")
+            apih = next((v for v in vals if "duosecurity.com" in v), "")
+            skey = next((v for v in vals if len(v) == 40 and v != ikey), "")
+            if ikey and skey and apih:
+                break
+            _log(f"directory-sync keys incomplete (ikey={bool(ikey)} skey={len(skey)} "
+                 f"host={bool(apih)}) — retrying capture ({_try + 1}/3)")
+            if _try == 1:
+                page.goto(conn_url, wait_until="load", timeout=35_000)
+                page.wait_for_timeout(3_000)
+                page.evaluate("""() => {
+                    const b = Array.from(document.querySelectorAll('button,a'))
+                        .find(x => /^show details$/i.test((x.innerText || '').trim()));
+                    if (b) b.click();
+                }""")
+            page.wait_for_timeout(4_000)
         if not (ikey and skey and apih):
             return False, (f"could not capture directory-sync credentials "
                            f"(ikey={bool(ikey)} skey={len(skey)} host={bool(apih)})")
@@ -12092,7 +12111,14 @@ def duo_run_card(
             return True, msg
         _log(f"Sync Now path failed ({msg[:90]}) — trying the per-user API")
         ok2, msg2 = duo_trigger_ad_sync(duo_ikey, duo_skey, duo_host, log=_log)
-        return ok2, (msg2 if ok2 else f"{msg}; API fallback also failed: {msg2[:110]}")
+        # duo_trigger_ad_sync soft-passes ("directory sync skipped …") on any
+        # error. Here both paths failed and no user was synced, so say so: on
+        # POD-10 (2026-11-09) a green ad_sync hid the cause and the failure only
+        # surfaced two steps later as "Secure Access still reports 0 users".
+        if ok2 and msg2.startswith("directory sync skipped"):
+            ok2 = False
+        dir_note = "" if ed_ok else f" [directory config: {ed_msg[:90]}]"
+        return ok2, (msg2 if ok2 else f"{msg}; API fallback also failed: {msg2[:110]}{dir_note}")
 
     def step_saml_scim_config():
         """
