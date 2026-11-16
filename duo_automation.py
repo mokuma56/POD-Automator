@@ -89,18 +89,36 @@ def _duo_request(ikey: str, skey: str, host: str,
     Raises on non-2xx or stat != 'OK'.
     """
     params = params or {}
-    headers = _sign_request(ikey, skey, host, method, path, params)
     url = f"https://{host}{path}"
-
     m = method.upper()
-    if m == "GET":
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
-    elif m == "POST":
-        r = requests.post(url, data=params, headers=headers, timeout=timeout)
-    elif m == "DELETE":
-        r = requests.delete(url, headers=headers, timeout=timeout)
-    else:
+    if m not in ("GET", "POST", "DELETE"):
         raise ValueError(f"Unsupported HTTP method: {method}")
+
+    # GETs are retried on transient failures: on 2026-11-16 Duo's API stalled for
+    # a few minutes and two PODs hard-failed their cards on a single 20s read
+    # timeout (POD-13 org_setup, POD-8 authproxy_push). POST/DELETE are not
+    # retried here — repeating a create can duplicate the object; callers that
+    # can check first (duo_create_authproxy_integration) retry themselves.
+    attempts = 3 if m == "GET" else 1
+    for attempt in range(1, attempts + 1):
+        # Re-sign every attempt: the signature covers the Date header.
+        headers = _sign_request(ikey, skey, host, method, path, params)
+        try:
+            if m == "GET":
+                r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            elif m == "POST":
+                r = requests.post(url, data=params, headers=headers, timeout=timeout)
+            else:
+                r = requests.delete(url, headers=headers, timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == attempts:
+                raise
+            time.sleep(5 * attempt)
+            continue
+        if attempt < attempts and (r.status_code == 429 or r.status_code >= 500):
+            time.sleep(5 * attempt)
+            continue
+        break
 
     r.raise_for_status()
     body = r.json()
@@ -330,27 +348,43 @@ def duo_get_authproxy_creds(ikey: str, skey: str, host: str):
     return None
 
 
-def duo_create_authproxy_integration(ikey: str, skey: str, host: str) -> Optional[dict]:
+def duo_create_authproxy_integration(ikey: str, skey: str, host: str,
+                                     log=None) -> Optional[dict]:
     """
     Create a new 'radius'-type integration named 'Authentication Proxy'.
 
     The 'radius' type's credentials work with the DRPC endpoint that Auth
     Proxy uses to connect to the Duo cloud — 'adminapi' type returns 403.
 
+    A failed create is retried once, after checking whether it landed anyway
+    (a timed-out POST may still have created it). The error used to be
+    swallowed, so the card said only "Could not find or create" (POD-8,
+    2026-11-16, a transient Duo API stall).
+
     Returns {"ikey": ..., "skey": ..., "host": host} or None on failure.
     """
-    try:
-        resp = _duo_request(
-            ikey, skey, host, "POST", "/admin/v1/integrations",
-            params={"type": "radius", "name": "Authentication Proxy"},
-        )
-        integ = resp.get("response", {})
-        ap_ikey = integ.get("integration_key", "")
-        ap_skey = integ.get("secret_key", "")
-        if ap_ikey and ap_skey:
-            return {"ikey": ap_ikey, "skey": ap_skey, "host": host}
-    except Exception:
-        pass
+    _log = log or (lambda m: None)
+    for attempt in (1, 2):
+        try:
+            resp = _duo_request(
+                ikey, skey, host, "POST", "/admin/v1/integrations",
+                params={"type": "radius", "name": "Authentication Proxy"},
+            )
+            integ = resp.get("response", {})
+            ap_ikey = integ.get("integration_key", "")
+            ap_skey = integ.get("secret_key", "")
+            if ap_ikey and ap_skey:
+                return {"ikey": ap_ikey, "skey": ap_skey, "host": host}
+            _log(f"create Auth Proxy integration: response had no keys (attempt {attempt})")
+        except Exception as e:
+            _log(f"create Auth Proxy integration failed (attempt {attempt}): "
+                 f"{type(e).__name__}: {str(e)[:150]}")
+        existing = duo_get_authproxy_creds(ikey, skey, host)
+        if existing:
+            _log("…but the integration exists now — using it")
+            return existing
+        if attempt == 1:
+            time.sleep(10)
     return None
 
 
@@ -7892,7 +7926,7 @@ def duo_push_authproxy_config(
         creds = duo_get_authproxy_creds(duo_ikey, duo_skey, duo_host)
         if not creds:
             _log("no existing auth proxy integration — creating new one ...")
-            creds = duo_create_authproxy_integration(duo_ikey, duo_skey, duo_host)
+            creds = duo_create_authproxy_integration(duo_ikey, duo_skey, duo_host, log=_log)
         if not creds:
             return False, "Could not find or create Auth Proxy integration in Duo"
         ap_ikey = creds["ikey"]
