@@ -51,7 +51,10 @@ variable "ssh_username" {
 }
 
 variable "ssh_password" {
-  default = "<LAB_PASS>"
+  # Required: must match the hash in http/user-data.
+  #   packer build -var "ssh_password=$LAB_PASS" .
+  type      = string
+  sensitive = true
 }
 
 variable "ubuntu_iso_url" {

@@ -3,6 +3,7 @@ Onboard C8231-G2 Secure Router with correct values from CSV template.
 Usage: uv run --directory ~/sw_projects/pod_automator python3 onboard_router.py [SERIAL]
 """
 
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 import csv, json, os, re, sys, time, paramiko, requests, subprocess, urllib3
 urllib3.disable_warnings()
 
@@ -92,7 +93,7 @@ UPGRADE_IMAGE_ROUTER  = ""
 
 UBUNTU_HOST = "198.18.134.12"
 UBUNTU_USER = "cisco"
-UBUNTU_PASS = "<LAB_PASS>"
+UBUNTU_PASS = LAB_PASS
 UBUNTU_IMAGE_DIR = "/home/cisco"
 UBUNTU_HTTP_PORT = 8088
 
@@ -116,7 +117,7 @@ BOOTSTRAP_PATH = os.environ.get(
 
 def vmanage_session():
     s = requests.Session()
-    s.auth = ("admin", "<LAB_PASS>")
+    s.auth = ("admin", LAB_PASS)
     s.verify = False
     r = s.get(f"{VMANAGE}/dataservice/client/token", timeout=10)
     token = r.text.strip()
@@ -140,7 +141,7 @@ def read_csv_values():
 def router_shell():
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(ROUTER_IP, username="admin", password="<LAB_PASS>",
+    client.connect(ROUTER_IP, username="admin", password=LAB_PASS,
                    look_for_keys=False, allow_agent=False, timeout=15)
     shell = client.invoke_shell(width=200, height=50)
     time.sleep(2)
@@ -180,7 +181,7 @@ def router_enable(shell):
     shell_send(shell, "enable\n")
     time.sleep(1)
     read_shell(shell, 1)
-    shell_send(shell, "<LAB_PASS>\n")
+    shell_send(shell, LAB_PASS + "\n")
     time.sleep(2)
     read_shell(shell, 2)
 
@@ -569,7 +570,7 @@ def _wait_router_online(timeout=600):
         try:
             c = paramiko.SSHClient()
             c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            c.connect(ROUTER_IP, username="admin", password="<LAB_PASS>",
+            c.connect(ROUTER_IP, username="admin", password=LAB_PASS,
                       look_for_keys=False, allow_agent=False, timeout=8)
             c.close()
             waited = int(time.time() - t0)
@@ -680,7 +681,7 @@ def phase_controller_mode():
             try:
                 c = paramiko.SSHClient()
                 c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                c.connect(ROUTER_IP, username="admin", password="<LAB_PASS>",
+                c.connect(ROUTER_IP, username="admin", password=LAB_PASS,
                           look_for_keys=False, allow_agent=False, timeout=5)
                 c.close()
             except:
@@ -739,7 +740,7 @@ def _wait_sdwan_tunnels(timeout=480):
 def ssh_switch(ip):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(ip, username="netadmin", password="<LAB_PASS>",
+    client.connect(ip, username="netadmin", password=LAB_PASS,
                    look_for_keys=False, allow_agent=False, timeout=15)
     shell = client.invoke_shell(width=200, height=50)
     time.sleep(2)
@@ -748,7 +749,7 @@ def ssh_switch(ip):
     # Enable if needed
     shell.send("enable\n")
     time.sleep(1)
-    shell.send("<LAB_PASS>\n")
+    shell.send(LAB_PASS + "\n")
     time.sleep(2)
     shell.recv(4096)
     shell.send("terminal length 0\n")
@@ -783,8 +784,6 @@ SWITCHES = {
 # ---------------------------------------------------------------------------
 
 CATC_HOST     = "198.18.5.100"
-CATC_USER     = "admin"
-CATC_PASS     = "<CATC_PASS>"
 CATC_BASE     = f"https://{CATC_HOST}"
 CATC_MAIN_SITE_ID        = "919ce2a1-39b7-4c1f-a7ec-c76e50170ab7"  # Global/NORTH CAROLINA/Durham/Site-105/MAIN
 CATC_MAIN_SITE_HIERARCHY = "Global/NORTH CAROLINA/Durham/Site-105/MAIN"
@@ -822,6 +821,9 @@ CATC_WLC = {
 
 def _catc_token():
     import requests, urllib3
+    if not (CATC_USER and CATC_PASS):
+        raise RuntimeError("CATC_USER / CATC_PASS not set — add them to .env "
+                           "(the dashboard passes them to containers by name)")
     urllib3.disable_warnings()
     r = requests.post(f"{CATC_BASE}/dna/system/api/v1/auth/token",
                       auth=(CATC_USER, CATC_PASS), verify=False, timeout=60)
@@ -1789,7 +1791,7 @@ def phase_baseconfig_reset(switch_key, log_fn=print):
 
 ISE_HOST = "198.18.5.101"
 ISE_USER = "admin"
-ISE_PASS = "<LAB_PASS>"
+ISE_PASS = LAB_PASS
 
 # NAD names added by Catalyst Center discovery — should be removed on reset
 ISE_SWITCH_NAD_NAMES = [
@@ -1963,7 +1965,7 @@ def phase_catc_cleanup(log_fn=print):
 
 CDFMC_AUTOMATION_HOST = "198.18.134.12"
 CDFMC_AUTOMATION_USER = "cisco"
-CDFMC_AUTOMATION_PASS = "<LAB_PASS>"
+CDFMC_AUTOMATION_PASS = LAB_PASS
 CDFMC_LAB_DIR = "/home/cisco/Documents/elevateLab"
 
 
@@ -2258,7 +2260,7 @@ def phase_router_upgrade():
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(ROUTER_IP, username="admin", password="<LAB_PASS>",
+        client.connect(ROUTER_IP, username="admin", password=LAB_PASS,
                        look_for_keys=False, allow_agent=False, timeout=20)
         shell = client.invoke_shell(width=200, height=50)
         time.sleep(2); shell.recv(4096)
@@ -2304,7 +2306,7 @@ def phase_router_upgrade():
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(ROUTER_IP, username="admin", password="<LAB_PASS>",
+        client.connect(ROUTER_IP, username="admin", password=LAB_PASS,
                        look_for_keys=False, allow_agent=False, timeout=20)
         shell = client.invoke_shell(width=200, height=50)
         time.sleep(2); shell.recv(4096)
@@ -2368,7 +2370,7 @@ def phase_router_upgrade():
         try:
             c2 = paramiko.SSHClient()
             c2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            c2.connect(ROUTER_IP, username="admin", password="<LAB_PASS>",
+            c2.connect(ROUTER_IP, username="admin", password=LAB_PASS,
                        look_for_keys=False, allow_agent=False, timeout=15)
             sh2 = c2.invoke_shell(width=200, height=50)
             time.sleep(2); sh2.recv(4096)
@@ -2406,7 +2408,7 @@ def phase_router_upgrade():
 
 AD_DC_IP      = "198.18.5.102"
 AD_DC_USER    = "administrator"
-AD_DC_PASS    = "<LAB_PASS>"
+AD_DC_PASS    = LAB_PASS
 AD_BASE_DN    = "DC=corp,DC=pseudoco,DC=com"
 AD_TARGET_USERS = ["Kit", "Lee", "Pat", "Nik"]
 AD_DEFAULT_DOMAIN = "@corp.pseudoco.com"
@@ -2414,7 +2416,7 @@ AD_DEFAULT_DOMAIN = "@corp.pseudoco.com"
 # Jumphost1 (where ADDuoTenantUserProvisioning.ps1 lives)
 JUMPHOST_IP   = "198.18.133.36"
 JUMPHOST_USER = "administrator"
-JUMPHOST_PASS = "<LAB_PASS>"
+JUMPHOST_PASS = LAB_PASS
 AD_PS1_PATH   = r"C:\Scripts\ADDuoTenantUserProvisioning.ps1"
 
 
@@ -2684,7 +2686,7 @@ def phase_detect_pod_number():
         import winrm
         sess = winrm.Session(
             "198.18.133.36",
-            auth=("administrator", "<LAB_PASS>"),
+            auth=("administrator", LAB_PASS),
             transport="ntlm",
             read_timeout_sec=30,
             operation_timeout_sec=20,
@@ -3174,7 +3176,7 @@ for i in items:
         print(f"     Primary check did not pass — trying secondary FTD 'show managers' check...")
         FTD_HOST = "198.18.133.39"
         FTD_USER = "admin"
-        FTD_PASS = "<LAB_PASS>"
+        FTD_PASS = LAB_PASS
         try:
             ftd_client = paramiko.SSHClient()
             ftd_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -3954,7 +3956,7 @@ conn.commit()"""], timeout=5)
 
 HQ_CEDGE_IP   = "198.18.133.13"
 HQ_CEDGE_USER = "admin"
-HQ_CEDGE_PASS = "<LAB_PASS>"
+HQ_CEDGE_PASS = LAB_PASS
 
 # All prefixes expected in 'show ip route vrf 10' after a successful SITE_105 onboard.
 # Prefixes via 100.100.100.105 are POD-specific (Site_105 SDWAN routes).

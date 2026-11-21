@@ -56,11 +56,11 @@ system mtu 9100
 spanning-tree mode rapid-pvst
 spanning-tree extend system-id
 !
-enable password <LAB_PASS>
+enable password {{LAB_PASS}}
 !
-username admin privilege 15 password <LAB_PASS>
-username netadmin privilege 15 password <LAB_PASS>
-username dnacadmin privilege 15 password <LAB_PASS>
+username admin privilege 15 password {{LAB_PASS}}
+username netadmin privilege 15 password {{LAB_PASS}}
+username dnacadmin privilege 15 password {{LAB_PASS}}
 !
 !
 interface Loopback0
@@ -119,7 +119,7 @@ line con 0
  stopbits 1
 line vty 0 4
  exec-timeout 0 0
- password <LAB_PASS>
+ password {{LAB_PASS}}
  transport input telnet ssh
 line vty 5 31
  exec-timeout 0 0

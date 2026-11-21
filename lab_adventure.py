@@ -7,6 +7,9 @@ The app deploys the chosen fabric and streams live verification results.
 Run:  python3 lab_adventure.py
 """
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 from flask import Flask, Response, jsonify, request, redirect
 import paramiko
 import threading
@@ -32,9 +35,9 @@ SWITCHES = {
 }
 ROUTER_IP   = "198.18.133.25"
 ROUTER_USER = "admin"
-ROUTER_PASS = "<LAB_PASS>"
+ROUTER_PASS = LAB_PASS
 SW_USER = "netadmin"
-SW_PASS = "<LAB_PASS>"
+SW_PASS = LAB_PASS
 
 # Global stream queues keyed by session_id
 _streams = {}
@@ -747,7 +750,7 @@ def _run_sda_verify(sid):
     urllib3.disable_warnings()
 
     CATC = "https://198.18.5.100"
-    AUTH = ("admin", "<CATC_PASS>")
+    AUTH = (CATC_USER, CATC_PASS)
     FABRIC_SITE_ID = "75f6262f-f08e-4241-a87d-ff5b8be2e3e4"
 
     def catc_get(path):
@@ -882,7 +885,7 @@ def _run_sda_deploy(sid):
 # ── Breach simulation constants ───────────────────────────────────────────────
 ISE_HOST  = "198.18.5.101"
 ISE_USER  = "admin"
-ISE_PASS  = "<LAB_PASS>"
+ISE_PASS  = LAB_PASS
 
 # ISE ERS object IDs (queried once, static for this lab)
 # SGT 19 = Production

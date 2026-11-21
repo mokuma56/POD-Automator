@@ -1,5 +1,6 @@
 """POD Dashboard — upload events CSV, start pipelines, monitor live progress."""
 
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 import sqlite3, json, threading, csv, io, os, time, sys, subprocess, re
 import contextlib
 from contextlib import contextmanager
@@ -1740,7 +1741,7 @@ def api_cdfmc_redeploy(pod_id):
         try:
             client = _p.SSHClient()
             client.set_missing_host_key_policy(_p.AutoAddPolicy())
-            client.connect("198.18.134.12", username="cisco", password="<LAB_PASS>",
+            client.connect("198.18.134.12", username="cisco", password=LAB_PASS,
                            look_for_keys=False, allow_agent=False, timeout=15)
         except Exception as e:
             _live_log(f"[cdFMC] SSH to automation PC failed: {e}")
@@ -2855,15 +2856,18 @@ def api_sda_clear(pod_id):
 # ---------------------------------------------------------------------------
 
 CLOUDFABRIC_SECRETS = ("MERAKI_API_KEY", "LAB_PASS")
+# Catalyst Center login for onboard_router's CatC phases (discover / cleanup /
+# baseconfig reset). Passed to those containers by name: `-e CATC_USER -e CATC_PASS`.
+CATC_SECRETS = ("CATC_USER", "CATC_PASS")
 
 
-def _cloudfabric_secrets():
-    """The secrets cloud_fabric.py needs, from the environment or the gitignored .env.
+def _cloudfabric_secrets(keys=CLOUDFABRIC_SECRETS):
+    """The named secrets, from the environment or the gitignored .env.
 
     Returns (env, missing). They reach the container by name only (`-e NAME`), so
     the values never appear on a docker command line or in `ps`.
     """
-    env = {k: os.environ.get(k, "") for k in CLOUDFABRIC_SECRETS}
+    env = {k: os.environ.get(k, "") for k in keys}
     dotenv = Path(__file__).resolve().parent / ".env"
     if not all(env.values()) and dotenv.exists():
         for line in dotenv.read_text().splitlines():
@@ -2877,6 +2881,12 @@ def _cloudfabric_secrets():
 # container inherits them (compose-template.yml interpolates ${MERAKI_API_KEY}
 # and ${LAB_PASS} — the core pipeline's meraki_cleanup step needs both).
 os.environ.update({k: v for k, v in _cloudfabric_secrets()[0].items() if v and not os.environ.get(k)})
+os.environ.update({k: v for k, v in _cloudfabric_secrets(CATC_SECRETS)[0].items() if v and not os.environ.get(k)})
+
+import lab_secrets as _lab_secrets  # noqa: E402
+if _lab_secrets.missing():
+    print(f"[startup] WARNING: missing from .env: {', '.join(_lab_secrets.missing())} "
+          "— device/CatC logins will fail. See .env.example.", flush=True)
 
 
 def _ensure_cloudfabric_table():
@@ -8589,6 +8599,7 @@ def api_catc_discover(pod_id):
             "--network", f"container:vpn-{pod_id}",
             "-e", f"POD_ID={pod_id}",
             "-e", "DB_PATH=/pipeline/host-data/pod_state.db",
+            "-e", "CATC_USER", "-e", "CATC_PASS",
             "-v", f"{os.path.abspath(DATA_DIR / 'data')}:/pipeline/host-data",
             "--entrypoint", "python3",
             "pod-automator:latest", "-u", "-c",
@@ -8823,6 +8834,7 @@ def api_baseconfig_reset(pod_id, switch_key):
                 result = subprocess.run([
                     "docker", "run", "--rm",
                     "--network", f"container:vpn-{pod_id}",
+                    "-e", "CATC_USER", "-e", "CATC_PASS",
                     "--entrypoint", "python3",
                     "pod-automator:latest", "-c", script
                 ], capture_output=True, text=True, timeout=120)  # best-effort delete, ~30s task poll per device
@@ -8855,6 +8867,7 @@ def api_baseconfig_reset(pod_id, switch_key):
                     "--network", f"container:vpn-{pod_id}",
                     "-v", f"{os.path.abspath(DATA_DIR / 'base_configs')}:/pipeline/base_configs:ro",
                     "-e", "BASE_CONFIGS_DIR=/pipeline/base_configs",
+                    "-e", "CATC_USER", "-e", "CATC_PASS",
                     "--entrypoint", "python3",
                     "pod-automator:latest", "-c", script
                 ], capture_output=True, text=True, timeout=900)  # two-pass reset: 2×300s waits + overhead ≈ 750s; 900s gives headroom
@@ -8936,6 +8949,7 @@ def api_baseconfig_service(pod_id, service):
             result = subprocess.run([
                 "docker", "run", "--rm",
                 "--network", f"container:vpn-{pod_id}",
+                "-e", "CATC_USER", "-e", "CATC_PASS",
                 "--entrypoint", "python3",
                 "pod-automator:latest", "-c", script
             ], capture_output=True, text=True, timeout=60)
@@ -9004,7 +9018,7 @@ def api_ssh_terminal(pod_id, ip):
     import tempfile, stat
     script_content = (
         "#!/bin/bash\n"
-        f"docker exec -it vpn-{pod_id} sshpass -p '<LAB_PASS>' "
+        f"docker exec -it vpn-{pod_id} sshpass -p '{LAB_PASS}' "
         f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
         f"netadmin@{ip}\n"
         "echo ''\n"
@@ -13876,12 +13890,12 @@ async function loadOrgCreds(orgNum) {
     + '<div style="grid-column:1/-1;font-size:11px;color:#02c8ff;font-weight:600;padding:4px 0;margin-top:4px;">SCC Admin Credentials</div>'
     + '<div style="grid-column:1/-1;">'
     + lbl('SCC Admin Email')
-    + inp('scc_email', d.scc_email || '', 'user@example.com', false)
+    + inp('scc_email', d.scc_email || '', 'admin@example.com', false)
     + '<div style="font-size:10px;color:#445566;margin-top:2px;">Cisco account email used to log into security.cisco.com. Varies per facilitator.</div>'
     + '</div>'
     + '<div style="grid-column:1/-1;">'
     + lbl('SCC Admin Password')
-    + inp('scc_password', d.scc_password || '', '<LAB_PASS>!!', true)
+    + inp('scc_password', d.scc_password || '', 'SCC password', true)
     + '</div>'
      + '<div style="grid-column:1/-1;">'
      + lbl('Auth Proxy Config (authproxy.cfg content)')

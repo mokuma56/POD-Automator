@@ -9,6 +9,7 @@ Provides tools to automate POD prep steps:
   - POD state tracking + dashboard
 """
 
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 from fastmcp import FastMCP
 import json, os, time, sqlite3, csv, io
 from datetime import datetime
@@ -133,9 +134,9 @@ hostname {hostname}
 !
 ip domain name corp.pseudoco.com
 !
-enable secret <LAB_PASS>
+enable secret {LAB_PASS}
 aaa new-model
-username admin privilege 15 password <LAB_PASS>
+username admin privilege 15 password {LAB_PASS}
 !
 interface TwoGigabitEthernet0/0/6
  ip address 198.18.4.14 255.255.255.0

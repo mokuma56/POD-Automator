@@ -28,6 +28,7 @@ Rollback steps (in reverse order):
   11. delete_network_profile — remove site from profile then delete profile
 """
 
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 import time
 import logging
 import os
@@ -82,13 +83,11 @@ def _set_step(mode, step_name, status, result=None, _retries=5, _retry_delay=2):
 # ---------------------------------------------------------------------------
 
 CATC_HOST = "198.18.5.100"
-CATC_USER = "admin"
-CATC_PASS = "<CATC_PASS>"
 CATC_BASE = f"https://{CATC_HOST}"
 
 ISE_HOST  = "198.18.5.101"
 ISE_USER  = "admin"
-ISE_PASS  = "<LAB_PASS>"
+ISE_PASS  = LAB_PASS
 
 SITE_ID        = "919ce2a1-39b7-4c1f-a7ec-c76e50170ab7"  # Site-105/MAIN
 SITE_HIERARCHY = "Global/NORTH CAROLINA/Durham/Site-105/MAIN"
@@ -112,7 +111,7 @@ SWITCH_IPS = {
 }
 
 SWITCH_USER = "netadmin"
-SWITCH_PASS = "<LAB_PASS>"
+SWITCH_PASS = LAB_PASS
 
 # VLANs/SVIs that must NOT exist before adding devices to SDA fabric
 FABRIC_CONFLICT_VLANS = [10, 101, 102, 1010, 1101, 1102]
@@ -378,7 +377,7 @@ def _ssh_push_aaa_config(mgmt_ip, log_fn=print):
     """
     import time as _time
     ISE_IP  = "198.18.5.101"
-    ISE_KEY = "<LAB_PASS>"
+    ISE_KEY = LAB_PASS
     RS_NAME = f"dnac-radius_{ISE_IP}"
 
     try:

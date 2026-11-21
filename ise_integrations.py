@@ -13,7 +13,7 @@ Skip logic: each step checks whether it is already done before running.
 
 Convention: return (True, "SKIP: <reason>") to mark a step as skipped.
 
-ISE is at 198.18.5.101 (admin / <LAB_PASS>).
+ISE is at 198.18.5.101 (admin / LAB_PASS from .env).
 pxGrid Cloud credentials (Catalyst Cloud Portal login + account name) are stored per-org
 in org_credentials.pxgrid_cloud_email / pxgrid_cloud_password / pxgrid_cloud_account.
 SCC access uses the saved session file data/scc_session.json (from the existing pipeline).
@@ -21,6 +21,7 @@ SCC access uses the saved session file data/scc_session.json (from the existing 
 
 from __future__ import annotations
 
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 import asyncio
 import datetime
 import json
@@ -34,7 +35,7 @@ import hostdb  # every pod_state.db access goes through the host — see db_ops.
 
 ISE_HOST = "198.18.5.101"
 ISE_USER = "admin"
-ISE_PASS = "<LAB_PASS>"
+ISE_PASS = LAB_PASS
 ISE_URL  = f"https://{ISE_HOST}"
 # pxGrid Cloud region the lab guide specifies. The Dijit Select defaults to
 # ap-southeast-1, so this must be actively set and verified.

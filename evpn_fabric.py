@@ -29,6 +29,7 @@ Usage:
   uv run python3 evpn_fabric.py --verify     # verify-only (steps 12+13)
 """
 
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 import argparse
 import os
 import sys
@@ -57,7 +58,7 @@ SWITCHES = {
 }
 
 SWITCH_USER = "netadmin"
-SWITCH_PASS = "<LAB_PASS>"
+SWITCH_PASS = LAB_PASS
 
 DB_PATH = os.environ.get("DB_PATH", "data/pod_state.db")
 POD_ID  = os.environ.get("POD_ID", "")

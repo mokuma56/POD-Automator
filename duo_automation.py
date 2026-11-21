@@ -5,6 +5,7 @@ Handles: org reset, group creation, user creation (with group assignments).
 Uses HMAC-SHA1 signed requests per Duo Admin API v1/v3 spec.
 """
 
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 import hashlib
 import contextlib
 import hmac
@@ -392,7 +393,7 @@ AUTHPROXY_CFG_PATH = (
     r"C:\Program Files\Duo Security Authentication Proxy\conf\authproxy.cfg"
 )
 AD_WINRM_USER = "administrator"
-AD_WINRM_PASS = "<LAB_PASS>"
+AD_WINRM_PASS = LAB_PASS
 
 
 def duo_push_authproxy_cfg(
@@ -1879,7 +1880,7 @@ JUMP_HOST_IP = "198.18.133.36"
 # forward; the defaults keep existing setups working without a .env.
 JUMP_HOST_WINRM_CREDS = (
     os.environ.get("JUMP_HOST_WINRM_USER", "corp.pseudoco.com\\demouser"),
-    os.environ.get("LAB_PASS", "<LAB_PASS>"),
+    LAB_PASS,
 )
 
 # Python script written to jump host temp file to generate a fresh iDAC URL.
@@ -6037,11 +6038,11 @@ def duo_saml_full_setup(pod_id: str, db_path: str,
     ap_ikey = oc.get("authproxy_ikey", "").strip()
     ap_skey = oc.get("authproxy_skey", "").strip()
 
-    # ── 2. SCC browser login (user@example.com or scc_email) → Duo admin session
+    # ── 2. SCC browser login (scc_email) → Duo admin session
     if not scc_email or not scc_password:
         return False, (
             "scc_email/scc_password not configured in org_credentials — "
-            "cannot log in to SCC (set user@example.com / <LAB_PASS>!! for this org)"
+            "cannot log in to SCC (set scc_email / scc_password for this org)"
         )
     import re as _re_ah
     _m_ah = _re_ah.search(r"api-([a-z0-9]+)\.duosecurity\.com", duo_host)

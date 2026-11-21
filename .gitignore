@@ -57,3 +57,12 @@ data/**/*.log
 # ---- Editor / OS cruft ----
 ~$*.docx
 ~$*.xlsx
+
+# ---- Removed from the repo 2026-11-21 (GitGuardian STE0217780) ----
+# Legacy per-org SCC API key files — live key/secret pairs. Code still reads
+# them locally (onboard_router.SCC_KEYS_DIR); they just never get committed.
+data/scc_keys/*.json
+data/*.har.gz
+# The proctor guide carries lab passwords inside the .docx zip, where
+# scanners and history rewrites can't redact them; share it outside git.
+POD_Automator_Proctor_Guide.docx

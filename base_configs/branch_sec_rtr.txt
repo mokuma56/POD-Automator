@@ -2,9 +2,9 @@ hostname BRANCH-SEC-RTR
 !
 ip domain name corp.pseudoco.com
 !
-enable secret <LAB_PASS>
+enable secret {{LAB_PASS}}
 aaa new-model
-username admin privilege 15 password <LAB_PASS>
+username admin privilege 15 password {{LAB_PASS}}
 !
 interface TwoGigabitEthernet0/0/6
  ip address 198.18.4.14 255.255.255.0

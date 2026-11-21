@@ -6,7 +6,7 @@ running, by copying the base config directly into startup-config then
 reloading.  Works for EVPN, SDA, manual config, or any other state.
 
 Flow (single pass):
-  1. SSH connect           (netadmin / <LAB_PASS>)
+  1. SSH connect           (netadmin / LAB_PASS)
   2. Enable SCP server     (temporarily — not in base config, removed on reload)
   3. SCP base config       → flash:oc_reset_base.txt
   4. write erase           (clear NVRAM startup-config)
@@ -24,6 +24,7 @@ Each switch uses its own base config:
   leaf2        → base_configs/leaf2.txt
 """
 
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 import os
 import time
 import tempfile
@@ -32,8 +33,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 SWITCH_USER   = "netadmin"
-SWITCH_PASS   = "<LAB_PASS>"
-SWITCH_SECRET = "<LAB_PASS>"
+SWITCH_PASS   = LAB_PASS
+SWITCH_SECRET = LAB_PASS
 
 SWITCH_IPS = {
     "border_spine": "198.18.128.24",
@@ -129,7 +130,8 @@ def _reset_to_base(host, local_config_path, log_fn):
         mode="w", suffix=".txt", delete=False, prefix="oc_base_"
     ) as tmp:
         with open(local_config_path) as src:
-            tmp.write(src.read())
+            # base_configs/*.txt carry {{LAB_PASS}} instead of the password
+            tmp.write(src.read().replace("{{LAB_PASS}}", LAB_PASS))
         tmp_path = tmp.name
 
     try:
@@ -228,7 +230,7 @@ def reset_switch(switch_key, local_config_path, log_fn=print, on_pass1_wait=None
     Reset a switch back to its base config via SSH + configure replace.
 
     Works regardless of the current switch state (EVPN, SDA, manual config,
-    or anything else) as long as SSH is reachable with netadmin / <LAB_PASS>.
+    or anything else) as long as SSH is reachable with netadmin / LAB_PASS.
 
     Each switch_key uses its own base config file:
       border_spine → base_configs/border_spine.txt

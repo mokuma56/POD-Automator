@@ -4,6 +4,7 @@ Generates a Cisco-branded PDF with 4 lab detail cards per page (2x2 grid).
 Called from dashboard.py via /api/generate-lab-pdf
 """
 
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 import io
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.lib.units import inch
@@ -113,7 +114,7 @@ def _draw_card(c: canvas.Canvas, idx: int, pod: dict):
         ("Password",     pod.get("vpn_password", ""),      True),
         ("Jump Host",    "RDP: 198.18.133.36",              True),
         ("JH User",      r"corp.pseudoco.com\demouser",    True),
-        ("JH Password",  "<LAB_PASS>",                      True),
+        ("JH Password",  LAB_PASS,                      True),
     ]
 
     for i, (label, value, mono) in enumerate(fields):

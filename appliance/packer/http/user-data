@@ -62,7 +62,7 @@ autoinstall:
   identity:
     hostname: pod-automator
     username: podmgr
-    # Password: <LAB_PASS>  (mkpasswd --method=SHA-512)
+    # Password: the lab password (mkpasswd --method=SHA-512)
     password: "$6$rounds=4096$podmgr$VBkSuMeGCTbVJ0Wp8I6XjIxHD7LByH0qIcL9zA2GcgHWVMYiRiHa/M7XLg5bH2V5SWl.j8iGJ7ZD1WUiHJo1/"
 
   # ── SSH ───────────────────────────────────────────────────────────────────

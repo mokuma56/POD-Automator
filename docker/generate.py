@@ -18,6 +18,8 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 PROJECT_ROOT = HERE.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from lab_secrets import LAB_PASS  # noqa: E402  (.env, gitignored)
 TEMPLATE = HERE / "compose-template.yml"
 IMAGE = "pod-automator:latest"
 DB_PATH = PROJECT_ROOT / "data" / "pod_state.db"
@@ -25,10 +27,10 @@ DB_PATH = PROJECT_ROOT / "data" / "pod_state.db"
 DEFAULTS = {
     "vmanage_ip": "198.18.133.10",
     "vmanage_user": "admin",
-    "vmanage_pass": "<LAB_PASS>",
+    "vmanage_pass": LAB_PASS,
     "router_ip": "198.18.133.25",
     "router_user": "admin",
-    "router_pass": "<LAB_PASS>",
+    "router_pass": LAB_PASS,
 }
 REQUIRED_CSV = ["pod_id", "vpn_host", "vpn_user", "vpn_pass", "router_ip", "router_serial"]
 

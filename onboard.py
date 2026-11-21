@@ -6,6 +6,7 @@ onboard_router.py.  All phases (Quick Connect → Associate → License
 → Variables → Deploy → Bootstrap → HTTP Copy → Controller-Mode) use
 the same working code validated in onboard_router.py.
 """
+from lab_secrets import LAB_PASS, CATC_USER, CATC_PASS  # noqa: E402  (.env, gitignored)
 import os, sys, time, subprocess, json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -60,7 +61,7 @@ if not SERIAL:
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
                 onboard_router.ROUTER_IP, username=os.getenv("ROUTER_USER", "admin"),
-                password=os.getenv("ROUTER_PASS", "<LAB_PASS>"),
+                password=os.getenv("ROUTER_PASS") or LAB_PASS,
                 look_for_keys=False, allow_agent=False, timeout=30
             )
             _, stdout, _ = client.exec_command("show inventory", timeout=15)
