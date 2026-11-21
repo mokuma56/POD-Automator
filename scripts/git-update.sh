@@ -20,6 +20,16 @@ AFTER=$(git -C "$INSTALL_DIR" rev-parse origin/main)
 
 if [ "$BEFORE" != "$AFTER" ]; then
     echo "New commits detected ($BEFORE -> $AFTER) — updating..."
+    # Since 2026-11-21 lab passwords come from $INSTALL_DIR/.env (lab_secrets.py).
+    # Without it every device login would fail after the update, so skip it.
+    if git -C "$INSTALL_DIR" cat-file -e "$AFTER:lab_secrets.py" 2>/dev/null; then
+        for n in LAB_PASS CATC_PASS; do
+            if ! grep -qE "^${n}=.+" "$INSTALL_DIR/.env" 2>/dev/null; then
+                echo "Skipping update: $n not set in $INSTALL_DIR/.env (copy .env.example and fill it in)"
+                exit 0
+            fi
+        done
+    fi
     git -C "$INSTALL_DIR" reset --hard origin/main
 
     # Re-sync dependencies if pyproject.toml changed

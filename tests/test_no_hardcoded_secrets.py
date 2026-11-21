@@ -27,6 +27,8 @@ def _tracked_text_files():
     for rel in out.split():
         if rel.endswith((".docx", ".pdf", ".png", ".jpg", ".gz", ".bin", ".lock")):
             continue
+        if rel == "tests/test_no_hardcoded_secrets.py":   # its own patterns
+            continue
         path = os.path.join(_ROOT, rel)
         try:
             with open(path, encoding="utf-8") as f:

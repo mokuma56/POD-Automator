@@ -235,6 +235,33 @@ so all checks always run even if an earlier step fails.
 - Python 3.9+ with `uv`
 - Access to dCloud One Experience Lab session
 
+### Credentials (`.env`)
+No password is in the code. `lab_secrets.py` reads them from the environment or
+a gitignored `.env` in the repo root:
+
+```bash
+cp .env.example .env    # then fill in LAB_PASS, CATC_USER, CATC_PASS, MERAKI_API_KEY
+docker compose -f docker-compose.yml build   # the image copies .env in; rebuild after editing it
+```
+
+The dashboard prints `[startup] WARNING: missing from .env: ...` if anything is
+unset, and **Check for Updates** refuses to update a copy that has no `.env`.
+
+### Updating a pre-2026-11-21 copy
+The git history was rewritten on 2026-11-21 to remove leaked credentials, so a
+copy cloned before then can't pull (Check for Updates reports "diverged").
+Re-clone it once, keeping your local data:
+
+```bash
+mv pod-automator pod-automator.old
+git clone https://github.com/mokuma56/POD-Automator.git pod-automator
+cp -a pod-automator.old/data/. pod-automator/data/     # DB, keys, profiles
+cp pod-automator.old/.env pod-automator/ 2>/dev/null || cp pod-automator/.env.example pod-automator/.env
+# fill in .env, rebuild the image, start the dashboard, then delete pod-automator.old
+```
+
+Never push from the old copy: it would put the old history back.
+
 ### Start Dashboard
 ```bash
 cd pod-automator

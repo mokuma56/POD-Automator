@@ -63,8 +63,25 @@ if git merge-base --is-ancestor "$REMOTE" "$LOCAL"; then
     exit 0
 fi
 if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
-    echo "ERROR:Local $(git rev-parse --short HEAD) and origin/main $(git rev-parse --short "$REMOTE") have diverged — resolve by hand (git log --oneline --graph HEAD origin/main)"
+    # The history was rewritten on 2026-11-21 to purge leaked credentials
+    # (STE0217780), so every copy cloned before then lands here. It cannot be
+    # pulled across; it needs a fresh clone (README: "Updating a pre-2026-11-21 copy").
+    echo "ERROR:Local $(git rev-parse --short HEAD) and origin/main $(git rev-parse --short "$REMOTE") have diverged. If this copy was cloned before 2026-11-21 the repo history was rewritten: re-clone it (see README, Updating a pre-2026-11-21 copy). Otherwise resolve by hand (git log --oneline --graph HEAD origin/main)"
     exit 1
+fi
+
+# Since 2026-11-21 no lab password is in the code: lab_secrets.py reads them
+# from .env. Updating a copy that has no .env would make every device and
+# Catalyst Center login fail, so stop here, before anything changes.
+if git cat-file -e "$REMOTE:lab_secrets.py" 2>/dev/null; then
+    MISSING=""
+    for n in LAB_PASS CATC_PASS; do
+        if [ -z "${!n:-}" ] && ! grep -qE "^${n}=.+" .env 2>/dev/null; then MISSING="$MISSING $n"; fi
+    done
+    if [ -n "$MISSING" ]; then
+        echo "ERROR:This update reads lab passwords from .env and these are not set:$MISSING. Run: cp .env.example .env, fill it in, then update again (nothing was changed)."
+        exit 1
+    fi
 fi
 
 log "Update available: $(git rev-parse --short HEAD) → $(git rev-parse --short origin/main)"
@@ -92,7 +109,7 @@ fi
 # from what the image really contains (a hardcoded list missed
 # ise_integrations.py, duo_automation.py, hostdb.py, db_ops.py … and left the
 # image stale). data/ is bind-mounted at run time, so it does not count.
-IMAGE_FILES=$(awk '/^COPY /{for(i=2;i<NF;i++) print $i}' docker/Dockerfile | sed 's#/$##' | grep -vx "data")
+IMAGE_FILES=$(awk '/^COPY /{for(i=2;i<NF;i++) print $i}' docker/Dockerfile | sed 's#/$##' | grep -vx "data" | grep -v '[*]')
 NEED_DOCKER=0
 while IFS= read -r f; do
     [ -z "$f" ] && continue
